@@ -173,6 +173,8 @@ impl Client {
             }
         }
 
+        session.pending.check_capacity()?;
+
         let negotiated = self
             .negotiated
             .as_ref()
@@ -230,7 +232,7 @@ impl Client {
         Ok(vec![])
     }
 
-    pub fn recv_once(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+    pub fn recv_once(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         match self.phase {
             ClientPhase::Open { .. } => {}
             ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
@@ -394,13 +396,13 @@ impl Client {
                 remote: self.remote,
                 received_at: now,
             }])
-        } else {
-            let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
-            update_highest_received(session, wire_seq);
+        } else if session.highest_received_seq.is_some_and(|h| wire_seq < h) {
+            // TODO: u32 ordering is acceptable for finite tests but continuous
+            // probing will eventually require wrap-aware comparison.
             Ok(vec![ClientEvent::LateReply {
                 seq: wire_seq,
                 logical_seq: None,
-                highest_seen,
+                highest_seen: session.highest_received_seq.unwrap(),
                 remote: self.remote,
                 sent_at: None,
                 received_at: now,
@@ -409,6 +411,12 @@ impl Client {
                 one_way: None,
                 received_stats: build_received_stats(&reply),
                 packet_meta: PacketMeta::default(),
+            }])
+        } else {
+            Ok(vec![ClientEvent::Warning {
+                message: format!(
+                    "dropped reply with untracked seq {wire_seq} (no pending or completed entry)"
+                ),
             }])
         }
     }
