@@ -2388,6 +2388,186 @@ mod tests {
     }
 
     #[test]
+    fn matched_reply_with_reversed_monotonic_time_still_emits_event() {
+        let params = default_params();
+        let server = silent_open_server(params.clone());
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        let base = Instant::now() + Duration::from_secs(1);
+        let send_ts = ClientTimestamp {
+            mono: base,
+            wall: SystemTime::now(),
+        };
+        client.send_probe_at(send_ts).unwrap();
+
+        let recv_ts = ClientTimestamp {
+            mono: send_ts.mono - Duration::from_millis(500),
+            wall: send_ts.wall + Duration::from_millis(10),
+        };
+        let reply = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
+        let events = client.process_received_packet(&reply, recv_ts).unwrap();
+
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientEvent::EchoReply { rtt, .. } => {
+                assert_eq!(rtt.raw, Duration::ZERO);
+                assert_eq!(rtt.effective, Duration::ZERO);
+            }
+            other => panic!("expected EchoReply, got {other:?}"),
+        }
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn recv_available_drains_burst_replies() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(80));
+
+        let events = client
+            .recv_available(RecvBudget { max_packets: 8 })
+            .unwrap();
+        assert_eq!(events.len(), 3);
+        for (seq, event) in events.iter().enumerate() {
+            assert!(matches!(
+                event,
+                ClientEvent::EchoReply {
+                    seq: actual_seq,
+                    ..
+                } if *actual_seq == seq as u32
+            ));
+        }
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn recv_available_respects_packet_budget() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(80));
+
+        let first = client
+            .recv_available(RecvBudget { max_packets: 1 })
+            .unwrap();
+        assert_eq!(first.len(), 1);
+        assert!(matches!(&first[0], ClientEvent::EchoReply { seq: 0, .. }));
+
+        let second = client
+            .recv_available(RecvBudget { max_packets: 8 })
+            .unwrap();
+        assert_eq!(second.len(), 1);
+        assert!(matches!(&second[0], ClientEvent::EchoReply { seq: 1, .. }));
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn send_probe_wraps_wire_sequence_at_u32_max() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        let session = client.session.as_mut().unwrap();
+        session.next_wire_seq = u32::MAX;
+        session.next_logical_seq = 41;
+
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(30));
+
+        let packets: Vec<_> = server.rx.try_iter().collect();
+        let seqs: Vec<u32> = packets
+            .iter()
+            .filter(|p| p.len() >= 16 && p[3] & FLAG_OPEN == 0 && p[3] & flags::FLAG_CLOSE == 0)
+            .map(|p| u32::from_le_bytes(p[12..16].try_into().unwrap()))
+            .collect();
+        assert_eq!(seqs, vec![u32::MAX, 0]);
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn send_probe_after_sending_done_is_noop() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        client.session.as_mut().unwrap().sending_done = true;
+        let events = client.send_probe().unwrap();
+        assert!(events.is_empty());
+        assert_eq!(client.session.as_ref().unwrap().packets_sent, 0);
+
+        thread::sleep(Duration::from_millis(30));
+        let packets: Vec<_> = server.rx.try_iter().collect();
+        let echo_count = packets
+            .iter()
+            .filter(|p| p.len() >= 4 && p[3] & FLAG_OPEN == 0 && p[3] & flags::FLAG_CLOSE == 0)
+            .count();
+        assert_eq!(echo_count, 0);
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn compute_one_way_returns_available_direction_samples() {
+        let sent_at = ClientTimestamp {
+            mono: Instant::now(),
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+        };
+        let received_at = ClientTimestamp {
+            mono: sent_at.mono + Duration::from_millis(40),
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(10) + Duration::from_millis(40),
+        };
+        let ts = TimestampFields {
+            recv_wall: Some(10_000_000_000 + 15_000_000),
+            send_wall: Some(10_000_000_000 + 25_000_000),
+            ..Default::default()
+        };
+
+        let sample = compute_one_way(&sent_at, &received_at, &ts).unwrap();
+        assert_eq!(sample.client_to_server, Some(Duration::from_millis(15)));
+        assert_eq!(sample.server_to_client, Some(Duration::from_millis(15)));
+    }
+
+    #[test]
     fn recv_buffer_uses_negotiated_packet_length() {
         let params = Params {
             protocol_version: 1,
