@@ -383,6 +383,56 @@ mod tests {
     }
 
     #[test]
+    fn open_fails_when_already_open() {
+        let config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+        let params = params_from_config(&config).unwrap();
+        let server = open_success_server(params);
+        let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        assert!(matches!(
+            client.open(ClientTimestamp::now()),
+            Err(ClientError::AlreadyOpen)
+        ));
+        server.join();
+    }
+
+    #[test]
+    fn open_fails_after_close() {
+        let config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+        let params = params_from_config(&config).unwrap();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+            let _ = recv_request(&socket, &tx);
+        });
+        let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.close(ClientTimestamp::now()).unwrap();
+        assert!(matches!(
+            client.open(ClientTimestamp::now()),
+            Err(ClientError::AlreadyClosed)
+        ));
+        server.join();
+    }
+
+    #[test]
+    fn open_fails_after_no_test_completed() {
+        let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+        config.run_mode = RunMode::NoTest;
+        let params = params_from_config(&config).unwrap();
+        let server = no_test_server(params, 0);
+        config.server_addr = server.addr.to_string();
+        let mut client = Client::connect(config).unwrap();
+        assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
+        assert!(matches!(
+            client.open(ClientTimestamp::now()),
+            Err(ClientError::AlreadyCompleted)
+        ));
+        server.join();
+    }
+
+    #[test]
     fn open_retries_after_first_timeout() {
         let server = start_fake_server(|socket, tx| {
             let (first, _) = recv_request(&socket, &tx);
