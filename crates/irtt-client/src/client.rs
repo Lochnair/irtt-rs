@@ -201,9 +201,8 @@ impl Client {
             payload: vec![],
         };
         let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
-        self.socket.send(&packet)?;
-
         let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
+        self.socket.send(&packet)?;
 
         let session = self
             .session
