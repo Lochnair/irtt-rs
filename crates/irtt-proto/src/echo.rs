@@ -1,5 +1,5 @@
 use crate::{
-    flags::{has, FLAG_CLOSE, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY},
+    flags::{has, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY},
     hmac,
     layout::{echo_packet_len, PacketLayout},
     open::{check_hmac_presence, reject},
@@ -145,11 +145,6 @@ fn read_i64(packet: &[u8], pos: &mut usize) -> i64 {
     let value = i64::from_le_bytes(packet[*pos..*pos + TIMESTAMP_SIZE].try_into().unwrap());
     *pos += TIMESTAMP_SIZE;
     value
-}
-
-#[allow(dead_code)]
-fn _assert_close_flag_imported(_: u8) {
-    let _ = FLAG_CLOSE;
 }
 
 #[cfg(test)]

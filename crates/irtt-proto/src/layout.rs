@@ -1,5 +1,5 @@
 use crate::{
-    params::{Clock, Params, StampAt},
+    params::{Params, StampAt},
     HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE,
     TOKEN_SIZE,
 };
@@ -117,13 +117,10 @@ pub fn echo_packet_len(hmac: bool, params: &Params) -> usize {
     header_len.max(requested)
 }
 
-#[allow(dead_code)]
-fn _assert_clock_is_used(_: Clock) {}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{ReceivedStats, StampAt};
+    use crate::params::{Clock, ReceivedStats, StampAt};
 
     fn params(stats: ReceivedStats, stamp_at: StampAt, clock: Clock) -> Params {
         Params {
