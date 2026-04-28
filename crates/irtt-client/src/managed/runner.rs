@@ -28,7 +28,7 @@ pub struct ManagedClient;
 pub struct ManagedClientSession {
     hub: EventHub,
     cancellation: CancellationToken,
-    worker: JoinHandle<Result<SessionOutcome, ClientError>>,
+    worker: Option<JoinHandle<Result<SessionOutcome, ClientError>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -92,7 +92,7 @@ impl ManagedClient {
             ManagedClientSession {
                 hub,
                 cancellation,
-                worker,
+                worker: Some(worker),
             },
             initial_subscription,
         ))
@@ -108,8 +108,9 @@ impl ManagedClientSession {
         self.cancellation.cancel();
     }
 
-    pub fn join(self) -> Result<SessionOutcome, ClientError> {
-        match self.worker.join() {
+    pub fn join(mut self) -> Result<SessionOutcome, ClientError> {
+        let worker = self.worker.take().expect("worker handle must be present");
+        match worker.join() {
             Ok(outcome) => {
                 self.hub.disconnect_all();
                 outcome
@@ -119,6 +120,12 @@ impl ManagedClientSession {
                 Err(ClientError::WorkerPanicked)
             }
         }
+    }
+}
+
+impl Drop for ManagedClientSession {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
     }
 }
 
@@ -495,7 +502,7 @@ mod tests {
         let session = ManagedClientSession {
             hub,
             cancellation,
-            worker,
+            worker: Some(worker),
         };
 
         assert!(matches!(session.join(), Err(ClientError::WorkerPanicked)));
