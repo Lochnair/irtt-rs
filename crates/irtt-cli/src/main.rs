@@ -10,6 +10,8 @@ use irtt_cli::{format_event, CliArgs};
 use irtt_client::{Client, ClientEvent, ClientTimestamp, OpenOutcome, RecvBudget};
 
 const RECV_BUDGET: RecvBudget = RecvBudget { max_packets: 16 };
+// TODO: derive final drain from pending probe timeout behavior once the client
+// exposes enough state for the CLI to stop guessing.
 const FINAL_DRAIN: Duration = Duration::from_millis(100);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
 
