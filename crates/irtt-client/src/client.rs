@@ -27,7 +27,8 @@ pub struct Client {
     remote: SocketAddr,
     requested: Params,
     negotiated: Option<NegotiatedParams>,
-    state: ClientState,
+    phase: ClientPhase,
+    session: Option<ActiveSession>,
 }
 
 impl Client {
@@ -43,16 +44,17 @@ impl Client {
             remote,
             requested,
             negotiated: None,
-            state: ClientState::Connected,
+            phase: ClientPhase::Connected,
+            session: None,
         })
     }
 
     pub fn open(&mut self, now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
-        match self.state {
-            ClientState::Connected => {}
-            ClientState::Open { .. } => return Err(ClientError::AlreadyOpen),
-            ClientState::Closed => return Err(ClientError::AlreadyClosed),
-            ClientState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        match self.phase {
+            ClientPhase::Connected => {}
+            ClientPhase::Open { .. } => return Err(ClientError::AlreadyOpen),
+            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
 
         let outcome = self.open_inner(now);
@@ -61,15 +63,7 @@ impl Client {
             .set_read_timeout(self.config.socket_config.recv_timeout);
         match (outcome, restore) {
             (Ok(outcome), Ok(())) => Ok(outcome),
-            (Ok(outcome), Err(_)) => {
-                // Open succeeded and state already advanced. Treating a
-                // read-timeout restore failure as fatal would leave the
-                // caller believing open failed while internal state is
-                // Open/NoTestCompleted. The socket remains usable; the
-                // worst case is a stale read timeout which Milestone 3
-                // send/recv methods will set per-operation anyway.
-                Ok(outcome)
-            }
+            (Ok(outcome), Err(_)) => Ok(outcome),
             (Err(err), Ok(())) => Err(err),
             (Err(err), Err(_)) => Err(err),
         }
@@ -105,10 +99,10 @@ impl Client {
     }
 
     pub fn close(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
-        let token = match self.state {
-            ClientState::Open { token } => token,
-            ClientState::Closed => return Err(ClientError::AlreadyClosed),
-            ClientState::Connected | ClientState::NoTestCompleted => {
+        let token = match self.phase {
+            ClientPhase::Open { token } => token,
+            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Connected | ClientPhase::NoTestCompleted => {
                 return Err(ClientError::NotOpen)
             }
         };
@@ -116,7 +110,8 @@ impl Client {
         let packet =
             encode_close_request(&CloseRequest { token }, self.config.hmac_key.as_deref())?;
         self.socket.send(&packet)?;
-        self.state = ClientState::Closed;
+        self.phase = ClientPhase::Closed;
+        self.session = None;
 
         Ok(vec![ClientEvent::SessionClosed {
             remote: self.remote,
@@ -164,7 +159,28 @@ impl Client {
             params: reply.params.clone(),
         };
         self.negotiated = Some(negotiated.clone());
-        self.state = ClientState::Open { token: reply.token };
+        self.phase = ClientPhase::Open { token: reply.token };
+
+        let duration_ns = negotiated.params.duration_ns;
+        let end_mono = if duration_ns > 0 {
+            Some(now.mono + Duration::from_nanos(duration_ns as u64))
+        } else {
+            None
+        };
+
+        self.session = Some(ActiveSession {
+            next_wire_seq: 0,
+            next_logical_seq: 0,
+            highest_received_seq: None,
+            packets_sent: 0,
+            start_mono: now.mono,
+            end_mono,
+            next_send_at: now.mono,
+            pending: PendingMap::new(self.config.max_pending_probes),
+            completed: CompletedSet::new(self.config.max_pending_probes),
+            sending_done: false,
+        });
+
         let event = ClientEvent::SessionStarted {
             remote: self.remote,
             token: reply.token,
@@ -194,7 +210,7 @@ impl Client {
             params: reply.params.clone(),
         };
         self.negotiated = Some(negotiated.clone());
-        self.state = ClientState::NoTestCompleted;
+        self.phase = ClientPhase::NoTestCompleted;
         let event = ClientEvent::NoTestCompleted {
             remote: self.remote,
             negotiated: negotiated.clone(),
@@ -393,7 +409,7 @@ mod tests {
 
         let negotiated = assert_open_started(client.open(ClientTimestamp::now()).unwrap());
         assert_eq!(negotiated.params, params);
-        assert!(matches!(client.state, ClientState::Open { token: TOKEN }));
+        assert!(matches!(client.phase, ClientPhase::Open { token: TOKEN }));
         server.join();
     }
 
