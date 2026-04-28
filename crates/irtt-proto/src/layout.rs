@@ -139,7 +139,7 @@ mod tests {
         assert_eq!(
             echo_header_len(
                 false,
-                &params(ReceivedStats::None, StampAt::None, Clock::None)
+                &params(ReceivedStats::None, StampAt::None, Clock::Both)
             ),
             16
         );
@@ -178,6 +178,16 @@ mod tests {
             ),
             76
         );
+    }
+
+    #[test]
+    fn no_timestamp_layout_ignores_clock() {
+        for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
+            assert_eq!(
+                echo_header_len(false, &params(ReceivedStats::None, StampAt::None, clock)),
+                16
+            );
+        }
     }
 
     #[test]
