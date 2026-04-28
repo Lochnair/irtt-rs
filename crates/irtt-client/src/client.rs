@@ -525,6 +525,116 @@ impl Client {
     }
 }
 
+#[cfg(test)]
+impl Client {
+    fn send_probe_at(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+        let token = match self.phase {
+            ClientPhase::Open { token } => token,
+            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Connected => return Err(ClientError::NotOpen),
+            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        };
+
+        let session = self
+            .session
+            .as_mut()
+            .expect("session must exist when phase is Open");
+
+        if session.sending_done {
+            return Ok(vec![]);
+        }
+
+        if let Some(end) = session.end_mono {
+            if now.mono >= end {
+                session.sending_done = true;
+                return Ok(vec![]);
+            }
+        }
+
+        session.pending.check_capacity()?;
+
+        let negotiated = self
+            .negotiated
+            .as_ref()
+            .expect("negotiated must exist when Open");
+
+        let wire_seq = session.next_wire_seq;
+        let logical_seq = session.next_logical_seq;
+
+        let request = EchoRequest {
+            token,
+            sequence: wire_seq,
+            params: negotiated.params.clone(),
+            payload: vec![],
+        };
+        let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
+        self.socket.send(&packet)?;
+
+        let session = self
+            .session
+            .as_mut()
+            .expect("session must exist when phase is Open");
+
+        let pending = PendingProbe {
+            logical_seq,
+            wire_seq,
+            sent_at: now,
+            timeout_at: now.mono + self.config.probe_timeout,
+        };
+        session.pending.insert(pending)?;
+
+        session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
+        session.next_logical_seq += 1;
+        session.packets_sent += 1;
+
+        let negotiated = self
+            .negotiated
+            .as_ref()
+            .expect("negotiated must exist when Open");
+        let interval_ns = negotiated.params.interval_ns as u64;
+        let session = self
+            .session
+            .as_mut()
+            .expect("session must exist when phase is Open");
+        session.next_send_at =
+            session.start_mono + Duration::from_nanos(interval_ns * session.packets_sent);
+
+        if let Some(end) = session.end_mono {
+            if session.next_send_at >= end {
+                session.sending_done = true;
+            }
+        }
+
+        Ok(vec![])
+    }
+
+    fn recv_once_at(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+        match self.phase {
+            ClientPhase::Open { .. } => {}
+            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Connected => return Err(ClientError::NotOpen),
+            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        }
+
+        let buf_size = self.recv_buffer_size();
+        let mut buf = vec![0_u8; buf_size];
+        let size = match self.socket.recv(&mut buf) {
+            Ok(size) => size,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(vec![]);
+            }
+            Err(err) => return Err(ClientError::Socket(err)),
+        };
+
+        self.process_received_packet(&buf[..size], now)
+    }
+}
+
 fn update_highest_received(session: &mut ActiveSession, wire_seq: u32) {
     session.highest_received_seq = Some(
         session
@@ -1534,19 +1644,19 @@ mod tests {
             mono: start,
             wall: SystemTime::now(),
         };
-        assert!(client.send_probe(now0).is_ok());
+        assert!(client.send_probe_at(now0).is_ok());
 
         let now1 = ClientTimestamp {
             mono: start + interval,
             wall: SystemTime::now(),
         };
-        assert!(client.send_probe(now1).is_ok());
+        assert!(client.send_probe_at(now1).is_ok());
 
         let now2 = ClientTimestamp {
             mono: start + Duration::from_secs(1),
             wall: SystemTime::now(),
         };
-        let events = client.send_probe(now2).unwrap();
+        let events = client.send_probe_at(now2).unwrap();
         assert!(events.is_empty());
         assert!(client.session.as_ref().unwrap().sending_done);
         assert!(client.next_send_deadline().is_none());
@@ -2155,6 +2265,278 @@ mod tests {
             }
             other => panic!("expected LateReply, got {other:?}"),
         }
+        server.join();
+    }
+
+    // ---------- Correctness cleanup regression tests ----------
+
+    #[test]
+    fn pending_full_does_not_send_packet() {
+        let params = Params {
+            duration_ns: 60_000_000_000,
+            ..default_params()
+        };
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            duration: Some(Duration::from_secs(60)),
+            max_pending_probes: 2,
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+
+        thread::sleep(Duration::from_millis(30));
+        let before_count: Vec<_> = server.rx.try_iter().collect();
+        let echo_before: Vec<_> = before_count
+            .iter()
+            .filter(|p| p.len() >= 4 && p[3] & FLAG_OPEN == 0 && p[3] & flags::FLAG_CLOSE == 0)
+            .collect();
+        assert_eq!(echo_before.len(), 2);
+
+        assert!(matches!(
+            client.send_probe(),
+            Err(ClientError::PendingLimitExceeded { limit: 2 })
+        ));
+
+        thread::sleep(Duration::from_millis(30));
+        let after: Vec<_> = server.rx.try_iter().collect();
+        let echo_after: Vec<_> = after
+            .iter()
+            .filter(|p| p.len() >= 4 && p[3] & FLAG_OPEN == 0 && p[3] & flags::FLAG_CLOSE == 0)
+            .collect();
+        assert_eq!(
+            echo_after.len(),
+            0,
+            "no packet should be sent when pending is full"
+        );
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn unmatched_future_reply_emits_warning_not_late() {
+        let params = default_params();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 2048];
+            if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                tx.send(buf[..size].to_vec()).unwrap();
+                let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                let ts = TimestampFields::default();
+                let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, None);
+                socket.send_to(&reply_packet, peer).unwrap();
+                thread::sleep(Duration::from_millis(10));
+                let future_reply = echo_reply_packet(TOKEN, 999, &params, &ts, None);
+                socket.send_to(&future_reply, peer).unwrap();
+            }
+        });
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let ev1 = client.recv_once().unwrap();
+        assert!(matches!(&ev1[0], ClientEvent::EchoReply { seq: 0, .. }));
+
+        thread::sleep(Duration::from_millis(30));
+        let ev2 = client.recv_once().unwrap();
+        assert_eq!(ev2.len(), 1);
+        assert!(
+            matches!(&ev2[0], ClientEvent::Warning { .. }),
+            "unmatched future reply should emit Warning, got {:?}",
+            ev2[0]
+        );
+        server.join();
+    }
+
+    #[test]
+    fn unmatched_future_reply_does_not_update_highest_received_seq() {
+        let params = default_params();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+
+            let mut seqs = Vec::new();
+            for _ in 0..2 {
+                let mut buf = [0_u8; 2048];
+                if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                    tx.send(buf[..size].to_vec()).unwrap();
+                    let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                    seqs.push(seq);
+                }
+            }
+
+            let ts = TimestampFields::default();
+            let reply0 = echo_reply_packet(TOKEN, seqs[0], &params, &ts, None);
+            socket.send_to(&reply0, peer).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            let future_reply = echo_reply_packet(TOKEN, 999, &params, &ts, None);
+            socket.send_to(&future_reply, peer).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            let reply1 = echo_reply_packet(TOKEN, seqs[1], &params, &ts, None);
+            socket.send_to(&reply1, peer).unwrap();
+        });
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let ev0 = client.recv_once().unwrap();
+        assert!(matches!(&ev0[0], ClientEvent::EchoReply { seq: 0, .. }));
+
+        thread::sleep(Duration::from_millis(30));
+        let ev_future = client.recv_once().unwrap();
+        assert!(matches!(&ev_future[0], ClientEvent::Warning { .. }));
+
+        assert_eq!(
+            client.session.as_ref().unwrap().highest_received_seq,
+            Some(0),
+            "highest_received_seq should not be updated by unmatched future reply"
+        );
+
+        thread::sleep(Duration::from_millis(30));
+        let ev1 = client.recv_once().unwrap();
+        assert!(
+            matches!(&ev1[0], ClientEvent::EchoReply { seq: 1, .. }),
+            "valid pending reply seq=1 should not be poisoned, got {:?}",
+            ev1[0]
+        );
+        server.join();
+    }
+
+    #[test]
+    fn connect_rejects_zero_max_pending_probes() {
+        let config = ClientConfig {
+            max_pending_probes: 0,
+            ..ClientConfig::default()
+        };
+        assert!(matches!(
+            Client::connect(config),
+            Err(ClientError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn connect_rejects_zero_probe_timeout() {
+        let config = ClientConfig {
+            probe_timeout: Duration::ZERO,
+            ..ClientConfig::default()
+        };
+        assert!(matches!(
+            Client::connect(config),
+            Err(ClientError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn compute_one_way_returns_none_when_both_directions_fail() {
+        let ts = TimestampFields::default();
+        let now = ClientTimestamp::now();
+        let result = compute_one_way(&now, &now, &ts);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn recv_buffer_uses_negotiated_packet_length() {
+        let params = Params {
+            protocol_version: 1,
+            duration_ns: 3_000_000_000,
+            interval_ns: 1_000_000_000,
+            length: 4096,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Params::default()
+        };
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            loop {
+                let mut buf = [0_u8; 8192];
+                match socket.recv_from(&mut buf) {
+                    Ok((size, _)) => {
+                        tx.send(buf[..size].to_vec()).unwrap();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let config = ClientConfig {
+            length: 4096,
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        let buf_size = client.recv_buffer_size();
+        assert!(
+            buf_size >= 4096,
+            "recv buffer should be at least negotiated length, got {buf_size}"
+        );
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn recv_once_at_test_helper_provides_deterministic_timestamp() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let fixed_ts = ClientTimestamp {
+            mono: Instant::now(),
+            wall: SystemTime::now(),
+        };
+        let events = client.recv_once_at(fixed_ts).unwrap();
+        assert_eq!(events.len(), 1);
+        if let ClientEvent::EchoReply { received_at, .. } = &events[0] {
+            assert_eq!(*received_at, fixed_ts);
+        } else {
+            panic!("expected EchoReply");
+        }
+        client.close(ClientTimestamp::now()).unwrap();
         server.join();
     }
 }
