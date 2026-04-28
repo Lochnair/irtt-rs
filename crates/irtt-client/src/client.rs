@@ -311,6 +311,13 @@ mod tests {
         })
     }
 
+    fn timeout_server(wait: Duration) -> FakeServer {
+        start_fake_server(move |socket, tx| {
+            socket.set_read_timeout(Some(wait)).unwrap();
+            while recv_request_timeout(&socket, &tx).is_some() {}
+        })
+    }
+
     fn assert_open_started(outcome: OpenOutcome) -> NegotiatedParams {
         match outcome {
             OpenOutcome::Started {
@@ -455,12 +462,7 @@ mod tests {
 
     #[test]
     fn open_timeout_after_all_timeouts() {
-        let server = start_fake_server(|socket, tx| {
-            socket
-                .set_read_timeout(Some(Duration::from_millis(700)))
-                .unwrap();
-            while recv_request_timeout(&socket, &tx).is_some() {}
-        });
+        let server = timeout_server(Duration::from_millis(700));
         let config = ClientConfig {
             open_timeouts: vec![Duration::from_millis(200), Duration::from_millis(200)],
             ..default_test_config(server.addr)
