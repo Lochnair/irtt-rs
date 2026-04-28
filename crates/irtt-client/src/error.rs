@@ -43,4 +43,6 @@ pub enum ClientError {
     DurationOverflow,
     #[error("pending probe limit exceeded ({limit})")]
     PendingLimitExceeded { limit: usize },
+    #[error("invalid configuration: {reason}")]
+    InvalidConfig { reason: String },
 }
