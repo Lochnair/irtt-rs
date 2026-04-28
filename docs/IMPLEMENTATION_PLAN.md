@@ -139,10 +139,10 @@ The intended architecture from `RUST_DESIGN.md` is confirmed with no structural 
 
 **Main public types:**
 - `ClientConfig`, `SocketConfig`
-- `Client`, `SessionState`
+- `Client`, `OpenOutcome`
 - `ManagedClient`, `ManagedClientSession`
 - `EventHub`, `EventSubscription`, `SubscriberConfig`, `SubscriberOverflow`
-- `ClientEvent`, `RttSample`, `OneWayDelaySample`, `ServerTiming`
+- `ClientEvent`, `RttSample`, `ServerTiming`
 - `ReceivedStatsSample`, `PacketMeta`, `LossKind`
 - `ClientWarning`, `SessionOutcome`, `SessionEndReason`
 - `NegotiatedParams`, `NegotiationPolicy`, `ValidationPolicy`
@@ -489,8 +489,8 @@ Internal struct tracking:
 logical_seq: u64
 wire_seq: u32
 sent_at_mono: Instant
-sent_at_wall: SystemTime
-replied: bool
+sent_at_wall: Option<SystemTime>
+timeout_at: Instant
 ```
 
 ### `BoundedPendingMap`
@@ -507,6 +507,24 @@ A bounded map from `u32` (wire seq) to `PendingProbe`. Capacity limited to preve
 
 ### `Client::open`
 
+Returns `Result<OpenOutcome, ClientError>` (not `Vec<ClientEvent>`).
+
+```rust
+pub enum OpenOutcome {
+    Started {
+        session_id: SessionId,
+        remote: SocketAddr,
+        negotiated: NegotiatedParams,
+        event: ClientEvent,
+    },
+    NoTestCompleted {
+        remote: SocketAddr,
+        event: ClientEvent,
+    },
+}
+```
+
+Steps:
 1. Encode open request with proposed params
 2. Send open request
 3. Set read timeout to first timeout value
@@ -515,13 +533,13 @@ A bounded map from `u32` (wire seq) to `PendingProbe`. Capacity limited to preve
 6. On all timeouts exhausted: return `ClientError::OpenTimeout`
 7. On valid reply:
    - If Close flag and client didn't request close: return `ClientError::ServerRejected`
-   - If Close flag and client requested close (no-test): return `SessionEnded` event
+   - If Close flag and client requested close (no-test): return `OpenOutcome::NoTestCompleted`
    - Extract connection token, negotiated params
    - Apply negotiation policy (reject or accept restrictions)
    - Compute minimum packet length from negotiated params
    - Transition to Active phase
    - Set DSCP on socket (only now, for echo phase)
-   - Return `SessionStarted` event
+   - Return `OpenOutcome::Started`
 
 ### `Client::send_probe`
 
@@ -546,7 +564,7 @@ A bounded map from `u32` (wire seq) to `PendingProbe`. Capacity limited to preve
 8. Compute `OneWayDelaySample` if wall timestamps available
 9. Extract `ReceivedStatsSample` if negotiated
 10. Emit `EchoReply` event
-11. Return `Ok(Some(events))` or `Ok(None)` on timeout/would-block
+11. Return `Ok(events)` — empty Vec on timeout/would-block
 
 ### `Client::recv_available`
 
@@ -582,9 +600,8 @@ Loop calling `recv_once` up to a budget limit (max packets or max duration). Col
 
 ### Negotiation Policy
 
-- `AcceptServerRestrictions`: accept any server-returned params, emit warnings if changed
-- `RequireExact`: reject if any param was changed by server
-- `RequireWithin(LocalRequirements)`: reject if params exceed caller-specified bounds
+- `Strict` (default): reject if any param was changed by server
+- `Loose`: accept server-returned params, emit warnings if changed
 
 ### Validation Policy
 
@@ -671,8 +688,9 @@ When coordinator emits an event:
 2. Attempt send according to subscriber's overflow policy:
    - `Block`: blocking send (only if subscriber is trusted to keep up)
    - `DropNewest`: try_send, increment drops on failure
-   - `DropOldest`: complex — not trivially supported by flume; implement by draining one and retrying, or use a ring-buffer channel
    - `Disconnect`: try_send, on failure remove subscriber
+
+`DropOldest` is deferred from MVP. It is useful for SQM/live-control freshness, but `flume` does not provide it natively and it is not worth blocking the managed runner. A future implementation may use a drain-one-and-retry workaround or a ring-buffer channel.
 
 **Critical invariant:** Public subscriber backpressure must NOT delay the sender/pacer thread. The sender never touches the event hub. Only the coordinator touches the event hub, and the coordinator is not on the timing-critical path.
 
@@ -688,7 +706,7 @@ SubscriberConfig {
 
 Preset profiles:
 - `SubscriberConfig::stats()`: Block, large capacity, all events
-- `SubscriberConfig::live()`: DropOldest, small capacity (e.g., 4), EchoReply/EchoLoss only
+- `SubscriberConfig::live()`: DropNewest, small capacity (e.g., 4), EchoReply/EchoLoss only (future: DropOldest when available)
 - `SubscriberConfig::cli()`: DropNewest, moderate capacity (e.g., 1024), all events
 - `SubscriberConfig::debug()`: DropNewest, small capacity, all events
 
@@ -739,6 +757,8 @@ It does NOT reuse `Client` directly (the managed runner has different ownership 
 
 ### `ClientEvent`
 
+Do **not** define or emit `EchoSent` in MVP. It is debug/instrumentation noise that can be added later behind a tracing or debug event option.
+
 ```rust
 pub enum ClientEvent {
     SessionStarted {
@@ -786,10 +806,12 @@ pub enum ClientEvent {
     },
     FatalError {
         session_id: Option<SessionId>,
-        error: ClientErrorKind,
+        error: ClientError,
     },
 }
 ```
+
+**Change from initial design:** `FatalError` uses `ClientError` directly instead of a separate `ClientErrorKind` enum.
 
 ### `RttSample`
 
@@ -922,7 +944,7 @@ pub enum SessionEndReason {
     TestComplete,
     Cancelled,
     ServerClosed,
-    Error(ClientErrorKind),
+    Error(ClientError),
 }
 ```
 
@@ -1357,23 +1379,7 @@ pub enum ClientError {
 }
 ```
 
-### `ClientErrorKind`
-
-A clonable, non-source-chaining variant of error info for embedding in `ClientEvent::FatalError`:
-
-```rust
-#[derive(Debug, Clone)]
-pub enum ClientErrorKind {
-    OpenTimeout,
-    ServerRejected,
-    ProtocolVersionMismatch { expected: i64, got: i64 },
-    SendFailed(String),
-    RecvFailed(String),
-    MalformedSessionPacket,
-    ThreadPanic,
-    ChannelDisconnected,
-}
-```
+`ClientError` is used directly in `ClientEvent::FatalError` and `SessionEndReason::Error`. No separate `ClientErrorKind` is needed — `ClientError` should derive `Clone` where possible, or the event variants should use `Arc<ClientError>` for cheap cloning if `io::Error` prevents `Clone`.
 
 ---
 
@@ -1889,18 +1895,9 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
 
 **Recommended behavior:** Follow the design document exactly. `stats` is default on for irtt-cli. All others are opt-in.
 
-### Q7: DropOldest Subscriber Overflow with Flume
+### Q7: DropOldest Subscriber Overflow with Flume — RESOLVED
 
-**Why it matters:** `flume` doesn't natively support drop-oldest semantics.
-
-**Blocks implementation:** No, but requires a design decision.
-
-**Options:**
-1. Implement DropOldest by draining one item from the receiver before retrying send (requires access to both ends)
-2. Use a different channel type for DropOldest subscribers (e.g., a ring buffer)
-3. Defer DropOldest and only implement DropNewest/Block/Disconnect initially
-
-**Recommended temporary behavior:** Implement DropOldest as: try_send fails → recv one from the same channel → try_send again. This requires the EventHub to hold both sender and receiver for DropOldest subscribers, which is slightly unusual but workable.
+**Decision:** Deferred from MVP. Initial overflow policies are `DropNewest`, `Block`, and `Disconnect`. `DropOldest` may be added post-MVP using a drain-one-and-retry approach or a ring-buffer channel.
 
 ---
 
@@ -1921,7 +1918,7 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
 | CLI format instability | Medium — downstream breakage | Low | Machine format fields are positional and documented. New fields added at end only. | irtt-cli |
 | IPv6 Traffic Class socket option | Low — IPv6 DSCP may not work | Medium | Use socket2 if available. Fall back to libc setsockopt. Test on target platforms. | irtt-client |
 | Server behavior divergence across versions | Low — untested server behavior | Low | Target irtt 0.9.1 only. Black-box tests as regression suite. | all |
-| flume DropOldest not native | Low — subscriber policy gap | Medium | Workaround with drain-and-retry. Or defer DropOldest initially. | irtt-client (managed) |
+| flume DropOldest not native | Low — subscriber policy gap | Medium | Deferred from MVP. DropNewest/Block/Disconnect available. | irtt-client (managed) |
 
 ---
 
@@ -1979,49 +1976,61 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
 
 - One commit per logical unit of work (e.g., "implement varint encoding" or "add open request encoding")
 - Tag milestone completion with a clear commit message (e.g., "milestone 1: irtt-proto complete")
-- Ensure `cargo test` passes at every commit
-- Ensure `cargo clippy` is clean at every commit
-- Run `cargo test --features interop` at milestone boundaries (2, 3, 4, 5, 8)
+- At every commit, ensure:
+  - `cargo fmt --check --workspace`
+  - `cargo clippy --workspace --all-targets`
+  - `cargo test --workspace`
+- Run `cargo test --workspace --features interop` at milestone boundaries (2, 3, 4, 5, 8)
+
+### First work order
+
+The first implementation agent task should be:
+
+Implement Milestone 0 and Milestone 1 only. Create the Cargo workspace and complete `irtt-proto`. Do not implement sockets, client runtime, stats, CLI behavior, managed runner, serde, tracing, ancillary networking, or interop tests yet.
+
+Success means:
+- `cargo check --workspace` passes
+- `cargo test -p irtt-proto` passes
+- All 14 packet vectors pass
+- No upstream source or tests are present
 
 ---
 
 ## 18. Design Brief Amendments
 
-### Amendment 1: `irtt-stats` dependency on `irtt-client`
+The following amendments to `RUST_DESIGN.md` have been incorporated into this plan. They are listed here for traceability.
 
-The design lists `irtt-client` as a dependency of `irtt-stats`. This is correct because `irtt-stats` needs `ClientEvent` types. However, consider whether `ClientEvent` and related types should be in a separate `irtt-client-types` crate or re-exported from `irtt-proto` to avoid pulling in socket/thread code. 
+### Incorporated: `Client::open` return type
 
-**Recommendation:** Keep as-is for now. The dependency is on the types, not the runtime. Rust's dead-code elimination handles this. If binary size becomes an issue, extract types later.
+Changed from `Result<Vec<ClientEvent>, ClientError>` to `Result<OpenOutcome, ClientError>`. See Section 5.
 
-### Amendment 2: `DropOldest` subscriber overflow
+### Incorporated: `recv_once` return type
 
-The design specifies `DropOldest` as a subscriber overflow policy. Flume doesn't natively support this. 
+Changed from `Result<Option<Vec<ClientEvent>>, ClientError>` to `Result<Vec<ClientEvent>, ClientError>` with empty Vec meaning "no data available." See Section 5.
 
-**Recommendation:** Implement `DropOldest` in MVP using the drain-one-and-retry approach (EventHub holds both Sender and a cloned Receiver for DropOldest subscribers). If this proves problematic, defer DropOldest to post-MVP and document the limitation.
+### Incorporated: `EchoSent` event omitted
 
-### Amendment 3: `Client::open` return type
+`EchoSent` is not defined in MVP. Can be added later behind a debug/tracing option.
 
-The design shows `Client::open` returning `Result<Vec<ClientEvent>, ClientError>`. For the manual API, returning a typed result struct might be cleaner than a Vec:
+### Incorporated: `DropOldest` deferred
 
-**Recommendation:** Use `Result<OpenOutcome, ClientError>` where `OpenOutcome` contains the `SessionStarted` event and negotiated params. The Vec<ClientEvent> pattern is better suited for `send_probe`/`recv_once` which may produce multiple events.
+`DropOldest` subscriber overflow is deferred from MVP. Initial overflow policies: `DropNewest`, `Block`, `Disconnect`. See Section 6.
 
-### Amendment 4: `recv_once` return type
+### Incorporated: `NegotiationPolicy` simplified
 
-`recv_once` currently returns `Result<Option<Vec<ClientEvent>>, ClientError>`. This is a triple-nested result (Result → Option → Vec). Consider simplifying to `Result<SmallVec<[ClientEvent; 2]>, ClientError>` where an empty SmallVec means "no data available."
+Changed from three-variant (`AcceptServerRestrictions`/`RequireExact`/`RequireWithin`) to two-variant (`Strict`/`Loose`). See Section 5.
 
-**Recommendation:** Use `Result<Vec<ClientEvent>, ClientError>` with empty Vec meaning "no data." This is simpler and the allocation cost is negligible per-recv. Or use a custom `RecvResult` enum: `Data(Vec<ClientEvent>)`, `WouldBlock`, `Timeout`.
+### Incorporated: `ClientErrorKind` removed
 
-### Amendment 5: `EchoSent` event
+`FatalError` and `SessionEndReason::Error` use `ClientError` directly. No separate `ClientErrorKind` enum.
 
-The design says `EchoSent` should not be emitted by default. Consider not defining it at all in MVP, to avoid dead code.
+### Remaining: `irtt-stats` dependency on `irtt-client`
 
-**Recommendation:** Omit `EchoSent` entirely from MVP. Add it later if needed for debugging.
+Keep as-is. The dependency is on the types, not the runtime. Rust's dead-code elimination handles this. If binary size becomes an issue, extract types later.
 
-### Amendment 6: Clock value 0
+### Remaining: Clock value 0
 
-The spec defines Clock enum values as 1=Wall, 2=Monotonic, 3=Both. Value 0 is not defined. The implementation should treat Clock=0 as equivalent to "no timestamps" (the StampAt=None case makes Clock irrelevant).
-
-**Recommendation:** If StampAt is None, ignore Clock value. If StampAt is non-None and Clock is 0, treat as an error or default to Wall. Document the decision.
+The spec defines Clock enum values as 1=Wall, 2=Monotonic, 3=Both. Value 0 is not defined. If StampAt is None, ignore Clock value. If StampAt is non-None and Clock is 0, treat as an error or default to Wall. Document the decision.
 
 ---
 
