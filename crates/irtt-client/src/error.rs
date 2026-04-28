@@ -31,6 +31,10 @@ pub enum ClientError {
     NegotiationRejected { reason: String },
     #[error("client is not open")]
     NotOpen,
+    #[error("client session is already open")]
+    AlreadyOpen,
+    #[error("client session is already completed")]
+    AlreadyCompleted,
     #[error("client session is already closed")]
     AlreadyClosed,
     #[error("operation is not implemented for this milestone")]
