@@ -791,4 +791,16 @@ mod tests {
             Err(ClientError::OpenTimeoutTooSmall { .. })
         ));
     }
+
+    #[test]
+    fn empty_open_timeouts_is_rejected() {
+        let config = ClientConfig {
+            open_timeouts: vec![],
+            ..ClientConfig::default()
+        };
+        assert!(matches!(
+            Client::connect(config),
+            Err(ClientError::NoOpenTimeouts)
+        ));
+    }
 }
