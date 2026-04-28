@@ -15,7 +15,7 @@ use crate::{
     error::ClientError,
     event::{
         ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
-        ServerTiming,
+        ServerTiming, WarningKind,
     },
     probe::{CompletedSet, PendingMap, PendingProbe},
     session::{validate_negotiated_params, ActiveSession, ClientPhase, NegotiatedParams},
@@ -337,6 +337,7 @@ impl Client {
                 Ok(reply) => reply,
                 Err(_) => {
                     return Ok(vec![ClientEvent::Warning {
+                        kind: WarningKind::MalformedOrUnrelatedPacket,
                         message: "dropped malformed or unrelated packet".to_owned(),
                     }]);
                 }
@@ -348,6 +349,7 @@ impl Client {
         };
         if reply.token != token {
             return Ok(vec![ClientEvent::Warning {
+                kind: WarningKind::WrongToken,
                 message: format!(
                     "dropped reply with wrong token: expected {token:#x}, got {:#x}",
                     reply.token
@@ -427,6 +429,7 @@ impl Client {
             }])
         } else {
             Ok(vec![ClientEvent::Warning {
+                kind: WarningKind::UntrackedReply,
                 message: format!(
                     "dropped reply with untracked seq {wire_seq} (no pending or completed entry)"
                 ),
