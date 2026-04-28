@@ -137,7 +137,7 @@ impl Client {
         Some(session.next_send_at)
     }
 
-    pub fn send_probe(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+    pub fn send_probe(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         let token = match self.phase {
             ClientPhase::Open { token } => token,
             ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
@@ -153,6 +153,8 @@ impl Client {
         if session.sending_done {
             return Ok(vec![]);
         }
+
+        let now = ClientTimestamp::now();
 
         if let Some(end) = session.end_mono {
             if now.mono >= end {
@@ -178,11 +180,18 @@ impl Client {
         let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
         self.socket.send(&packet)?;
 
+        let sent_at = ClientTimestamp::now();
+
+        let session = self
+            .session
+            .as_mut()
+            .expect("session must exist when phase is Open");
+
         let pending = PendingProbe {
             logical_seq,
             wire_seq,
-            sent_at: now,
-            timeout_at: now.mono + self.config.probe_timeout,
+            sent_at,
+            timeout_at: sent_at.mono + self.config.probe_timeout,
         };
         session.pending.insert(pending)?;
 
@@ -190,7 +199,15 @@ impl Client {
         session.next_logical_seq += 1;
         session.packets_sent += 1;
 
+        let negotiated = self
+            .negotiated
+            .as_ref()
+            .expect("negotiated must exist when Open");
         let interval_ns = negotiated.params.interval_ns as u64;
+        let session = self
+            .session
+            .as_mut()
+            .expect("session must exist when phase is Open");
         session.next_send_at =
             session.start_mono + Duration::from_nanos(interval_ns * session.packets_sent);
 
@@ -225,23 +242,31 @@ impl Client {
             Err(err) => return Err(ClientError::Socket(err)),
         };
 
+        let now = ClientTimestamp::now();
         self.process_received_packet(&buf[..size], now)
     }
 
-    pub fn recv_available(
-        &mut self,
-        now: ClientTimestamp,
-        budget: RecvBudget,
-    ) -> Result<Vec<ClientEvent>, ClientError> {
+    pub fn recv_available(&mut self, budget: RecvBudget) -> Result<Vec<ClientEvent>, ClientError> {
         let mut all_events = Vec::new();
         for _ in 0..budget.max_packets {
-            let events = self.recv_once(now)?;
+            let events = self.recv_once()?;
             if events.is_empty() {
                 break;
             }
             all_events.extend(events);
         }
         Ok(all_events)
+    }
+
+    fn recv_buffer_size(&self) -> usize {
+        match self.negotiated.as_ref() {
+            Some(negotiated) => {
+                let has_hmac = self.config.hmac_key.is_some();
+                let pkt_len = echo_packet_len(has_hmac, &negotiated.params);
+                pkt_len.max(MIN_RECV_BUFFER_SIZE)
+            }
+            None => MIN_RECV_BUFFER_SIZE,
+        }
     }
 
     pub fn poll_timeouts(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
@@ -1320,10 +1345,7 @@ mod tests {
     fn send_probe_fails_before_open() {
         let server = start_fake_server(|_socket, _tx| {});
         let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-        assert!(matches!(
-            client.send_probe(ClientTimestamp::now()),
-            Err(ClientError::NotOpen)
-        ));
+        assert!(matches!(client.send_probe(), Err(ClientError::NotOpen)));
         server.join();
     }
 
@@ -1337,7 +1359,7 @@ mod tests {
         let mut client = Client::connect(config).unwrap();
         assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
         assert!(matches!(
-            client.send_probe(ClientTimestamp::now()),
+            client.send_probe(),
             Err(ClientError::AlreadyCompleted)
         ));
         server.join();
@@ -1367,7 +1389,7 @@ mod tests {
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
         client.close(ClientTimestamp::now()).unwrap();
         assert!(matches!(
-            client.send_probe(ClientTimestamp::now()),
+            client.send_probe(),
             Err(ClientError::AlreadyClosed)
         ));
         server.join();
@@ -1406,7 +1428,7 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(30));
         let packets: Vec<_> = server.rx.try_iter().collect();
         let echo_reqs: Vec<_> = packets
@@ -1437,9 +1459,9 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(30));
         let packets: Vec<_> = server.rx.try_iter().collect();
         let echo_reqs: Vec<_> = packets
@@ -1518,11 +1540,11 @@ mod tests {
         let deadline0 = client.next_send_deadline().unwrap();
         assert_eq!(deadline0, start);
 
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         let deadline1 = client.next_send_deadline().unwrap();
         assert_eq!(deadline1, start + Duration::from_secs(1));
 
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         let deadline2 = client.next_send_deadline().unwrap();
         assert_eq!(deadline2, start + Duration::from_secs(2));
 
@@ -1543,7 +1565,7 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events = client.recv_once().unwrap();
         assert!(events.is_empty());
         server.join();
     }
@@ -1553,12 +1575,10 @@ mod tests {
         let params = default_params();
         let (mut client, server) = open_client_with_echo_server(&params);
 
-        let send_ts = ClientTimestamp::now();
-        client.send_probe(send_ts).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(50));
 
-        let recv_ts = ClientTimestamp::now();
-        let events = client.recv_once(recv_ts).unwrap();
+        let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);
         match &events[0] {
             ClientEvent::EchoReply {
@@ -1592,12 +1612,10 @@ mod tests {
         let params = default_params();
         let (mut client, server) = open_client_with_echo_server(&params);
 
-        let send_ts = ClientTimestamp::now();
-        client.send_probe(send_ts).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(20));
 
-        let recv_ts = ClientTimestamp::now();
-        let events = client.recv_once(recv_ts).unwrap();
+        let events = client.recv_once().unwrap();
         if let ClientEvent::EchoReply { rtt, .. } = &events[0] {
             assert!(rtt.raw >= Duration::from_millis(15));
         } else {
@@ -1611,9 +1629,9 @@ mod tests {
     fn server_processing_subtracted_when_valid() {
         let params = default_params();
         let (mut client, server) = open_client_with_echo_server(&params);
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(20));
-        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events = client.recv_once().unwrap();
         if let ClientEvent::EchoReply {
             rtt, server_timing, ..
         } = &events[0]
@@ -1658,9 +1676,9 @@ mod tests {
     fn received_stats_parsed_into_sample() {
         let params = default_params();
         let (mut client, server) = open_client_with_echo_server(&params);
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(30));
-        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events = client.recv_once().unwrap();
         if let ClientEvent::EchoReply { received_stats, .. } = &events[0] {
             let rs = received_stats.as_ref().unwrap();
             assert_eq!(rs.count, Some(42));
@@ -1702,9 +1720,9 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(30));
-        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ClientEvent::Warning { .. }));
         server.join();
@@ -1747,9 +1765,9 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(30));
-        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ClientEvent::Warning { .. }));
         server.join();
@@ -1786,15 +1804,15 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(50));
 
-        let events1 = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events1 = client.recv_once().unwrap();
         assert_eq!(events1.len(), 1);
         assert!(matches!(&events1[0], ClientEvent::EchoReply { .. }));
 
         thread::sleep(Duration::from_millis(30));
-        let events2 = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events2 = client.recv_once().unwrap();
         assert_eq!(events2.len(), 1);
         assert!(matches!(
             &events2[0],
@@ -1840,16 +1858,16 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(50));
 
-        let ev1 = client.recv_once(ClientTimestamp::now()).unwrap();
+        let ev1 = client.recv_once().unwrap();
         assert_eq!(ev1.len(), 1);
         assert!(matches!(&ev1[0], ClientEvent::EchoReply { seq: 1, .. }));
 
         thread::sleep(Duration::from_millis(30));
-        let ev2 = client.recv_once(ClientTimestamp::now()).unwrap();
+        let ev2 = client.recv_once().unwrap();
         assert_eq!(ev2.len(), 1);
         match &ev2[0] {
             ClientEvent::LateReply {
@@ -1882,8 +1900,8 @@ mod tests {
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
 
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
 
         let no_loss = client.poll_timeouts(ClientTimestamp::now()).unwrap();
         assert!(no_loss.is_empty());
@@ -1912,7 +1930,7 @@ mod tests {
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
 
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(150));
         client.poll_timeouts(ClientTimestamp::now()).unwrap();
 
@@ -1939,11 +1957,11 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
         assert!(matches!(
-            client.send_probe(ClientTimestamp::now()),
+            client.send_probe(),
             Err(ClientError::PendingLimitExceeded { limit: 3 })
         ));
         client.close(ClientTimestamp::now()).unwrap();
@@ -1989,9 +2007,9 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(30));
-        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);
         if let ClientEvent::EchoReply {
             received_stats,
@@ -2048,9 +2066,9 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(50));
-        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);
         assert!(matches!(&events[0], ClientEvent::EchoReply { .. }));
         server.join();
@@ -2092,16 +2110,16 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
-        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
+        client.send_probe().unwrap();
         thread::sleep(Duration::from_millis(50));
 
-        let ev1 = client.recv_once(ClientTimestamp::now()).unwrap();
+        let ev1 = client.recv_once().unwrap();
         assert!(matches!(&ev1[0], ClientEvent::EchoReply { seq: 2, .. }));
 
         thread::sleep(Duration::from_millis(30));
-        let ev2 = client.recv_once(ClientTimestamp::now()).unwrap();
+        let ev2 = client.recv_once().unwrap();
         match &ev2[0] {
             ClientEvent::LateReply {
                 seq, rtt, sent_at, ..
