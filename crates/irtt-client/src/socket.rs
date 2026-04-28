@@ -11,6 +11,9 @@ use crate::{
 };
 
 pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), ClientError> {
+    if timeouts.is_empty() {
+        return Err(ClientError::NoOpenTimeouts);
+    }
     for timeout in timeouts {
         if *timeout < MIN_OPEN_TIMEOUT {
             return Err(ClientError::OpenTimeoutTooSmall {

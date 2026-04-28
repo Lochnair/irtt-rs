@@ -17,6 +17,8 @@ pub enum ClientError {
         timeout: Duration,
         minimum: Duration,
     },
+    #[error("open_timeouts must not be empty")]
+    NoOpenTimeouts,
     #[error("server rejected the open request")]
     ServerRejected,
     #[error("unexpected no-test open reply")]
