@@ -28,7 +28,7 @@ fn main() -> ExitCode {
 
 fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mode = args.output;
-    let mut stdout = io::BufWriter::new(io::stdout().lock());
+    let mut stdout = io::LineWriter::new(io::stdout().lock());
     let mut client = Client::connect(args.to_client_config())?;
 
     let open = client.open(ClientTimestamp::now())?;
