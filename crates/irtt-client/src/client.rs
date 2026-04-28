@@ -61,13 +61,21 @@ impl Client {
             .set_read_timeout(self.config.socket_config.recv_timeout);
         match (outcome, restore) {
             (Ok(outcome), Ok(())) => Ok(outcome),
+            (Ok(outcome), Err(_)) => {
+                // Open succeeded and state already advanced. Treating a
+                // read-timeout restore failure as fatal would leave the
+                // caller believing open failed while internal state is
+                // Open/NoTestCompleted. The socket remains usable; the
+                // worst case is a stale read timeout which Milestone 3
+                // send/recv methods will set per-operation anyway.
+                Ok(outcome)
+            }
             (Err(err), Ok(())) => Err(err),
-            (_, Err(err)) => Err(ClientError::Socket(err)),
+            (Err(err), Err(_)) => Err(err),
         }
     }
 
     fn open_inner(&mut self, now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
-        validate_open_timeouts(&self.config.open_timeouts)?;
         let request = OpenRequest {
             params: self.requested.clone(),
             close: self.config.run_mode == RunMode::NoTest,
