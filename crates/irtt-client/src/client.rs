@@ -373,35 +373,33 @@ impl Client {
             session.completed.insert(wire_seq, pending.logical_seq);
 
             let mut events = Vec::new();
-            if let Some(rtt_sample) = rtt {
-                if is_late {
-                    events.push(ClientEvent::LateReply {
-                        seq: wire_seq,
-                        logical_seq: Some(pending.logical_seq),
-                        highest_seen,
-                        remote: self.remote,
-                        sent_at: Some(pending.sent_at),
-                        received_at: now,
-                        rtt: Some(rtt_sample),
-                        server_timing,
-                        one_way,
-                        received_stats,
-                        packet_meta: PacketMeta::default(),
-                    });
-                } else {
-                    events.push(ClientEvent::EchoReply {
-                        seq: wire_seq,
-                        logical_seq: pending.logical_seq,
-                        remote: self.remote,
-                        sent_at: pending.sent_at,
-                        received_at: now,
-                        rtt: rtt_sample,
-                        server_timing,
-                        one_way,
-                        received_stats,
-                        packet_meta: PacketMeta::default(),
-                    });
-                }
+            if is_late {
+                events.push(ClientEvent::LateReply {
+                    seq: wire_seq,
+                    logical_seq: Some(pending.logical_seq),
+                    highest_seen,
+                    remote: self.remote,
+                    sent_at: Some(pending.sent_at),
+                    received_at: now,
+                    rtt: Some(rtt),
+                    server_timing,
+                    one_way,
+                    received_stats,
+                    packet_meta: PacketMeta::default(),
+                });
+            } else {
+                events.push(ClientEvent::EchoReply {
+                    seq: wire_seq,
+                    logical_seq: pending.logical_seq,
+                    remote: self.remote,
+                    sent_at: pending.sent_at,
+                    received_at: now,
+                    rtt,
+                    server_timing,
+                    one_way,
+                    received_stats,
+                    packet_meta: PacketMeta::default(),
+                });
             }
             Ok(events)
         } else if session.completed.contains(wire_seq) {
@@ -564,8 +562,11 @@ fn compute_rtt(
     sent_at: &ClientTimestamp,
     received_at: &ClientTimestamp,
     ts: &TimestampFields,
-) -> Option<RttSample> {
-    let raw = received_at.mono.checked_duration_since(sent_at.mono)?;
+) -> RttSample {
+    let raw = received_at
+        .mono
+        .checked_duration_since(sent_at.mono)
+        .unwrap_or(Duration::ZERO);
 
     let server_processing = compute_server_processing(ts);
 
@@ -573,11 +574,11 @@ fn compute_rtt(
 
     let effective = adjusted.unwrap_or(raw);
 
-    Some(RttSample {
+    RttSample {
         raw,
         adjusted,
         effective,
-    })
+    }
 }
 
 fn compute_server_processing(ts: &TimestampFields) -> Option<Duration> {
@@ -1718,8 +1719,7 @@ mod tests {
                 send_mono: Some(1_000_000_000),
                 ..Default::default()
             },
-        )
-        .unwrap();
+        );
         assert!(rtt.adjusted.is_none());
         assert_eq!(rtt.effective, rtt.raw);
     }
