@@ -151,10 +151,9 @@ impl TryFrom<i64> for StampAt {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i64)]
 pub enum Clock {
-    #[default]
-    None = 0,
     Wall = 1,
     Monotonic = 2,
+    #[default]
     Both = 3,
 }
 
@@ -173,7 +172,6 @@ impl TryFrom<i64> for Clock {
 
     fn try_from(value: i64) -> Result<Self> {
         match value {
-            0 => Ok(Self::None),
             1 => Ok(Self::Wall),
             2 => Ok(Self::Monotonic),
             3 => Ok(Self::Both),
@@ -231,5 +229,20 @@ mod tests {
 
         let params = Params::decode(&encoded).unwrap();
         assert_eq!(params.protocol_version, 1);
+    }
+
+    #[test]
+    fn explicit_clock_zero_is_rejected() {
+        let mut encoded = Vec::new();
+        varint::encode_uvarint(7, &mut encoded);
+        varint::encode_varint(0, &mut encoded);
+
+        assert_eq!(
+            Params::decode(&encoded),
+            Err(ProtoError::InvalidEnum {
+                name: "Clock",
+                value: 0,
+            })
+        );
     }
 }
