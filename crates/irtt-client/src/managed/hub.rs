@@ -2,7 +2,7 @@ use std::{
     collections::{HashMap, VecDeque},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        Arc, Condvar, Mutex, Weak,
     },
 };
 
@@ -43,6 +43,8 @@ struct HubInner {
 
 #[derive(Debug)]
 pub struct EventSubscription {
+    id: u64,
+    hub: Weak<HubInner>,
     inner: Arc<SubscriberInner>,
 }
 
@@ -94,7 +96,11 @@ impl EventHub {
             .expect("event hub mutex poisoned")
             .insert(id, inner.clone());
 
-        Ok(EventSubscription { inner })
+        Ok(EventSubscription {
+            id,
+            hub: Arc::downgrade(&self.inner),
+            inner,
+        })
     }
 
     pub fn publish(&self, event: ClientEvent) {
@@ -177,6 +183,18 @@ impl EventSubscription {
             return Err(EventSubscriptionError::Disconnected);
         }
         Ok(None)
+    }
+}
+
+impl Drop for EventSubscription {
+    fn drop(&mut self) {
+        self.inner.disconnect();
+        if let Some(hub) = self.hub.upgrade() {
+            hub.subscribers
+                .lock()
+                .expect("event hub mutex poisoned")
+                .remove(&self.id);
+        }
     }
 }
 
