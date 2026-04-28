@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "crates/irtt-proto",
+    "crates/irtt-client",
+    "crates/irtt-stats",
+    "crates/irtt-cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.75"
