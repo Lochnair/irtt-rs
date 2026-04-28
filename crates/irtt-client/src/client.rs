@@ -591,26 +591,32 @@ fn compute_one_way(
     received_at: &ClientTimestamp,
     ts: &TimestampFields,
 ) -> Option<OneWayDelaySample> {
-    let server_recv_wall = ts.recv_wall.or(ts.midpoint_wall)?;
-    let server_send_wall = ts.send_wall.or(ts.midpoint_wall)?;
+    let server_recv_wall = ts.recv_wall.or(ts.midpoint_wall);
+    let server_send_wall = ts.send_wall.or(ts.midpoint_wall);
 
     let client_send_ns = sent_at
         .wall
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
+        .ok()
+        .map(|d| d.as_nanos() as i64);
     let client_recv_ns = received_at
         .wall
         .duration_since(std::time::UNIX_EPOCH)
-        .ok()?
-        .as_nanos() as i64;
+        .ok()
+        .map(|d| d.as_nanos() as i64);
 
     let c2s = server_recv_wall
-        .checked_sub(client_send_ns)
+        .zip(client_send_ns)
+        .and_then(|(srv, cli)| srv.checked_sub(cli))
         .and_then(|d| u64::try_from(d).ok().map(Duration::from_nanos));
     let s2c = client_recv_ns
-        .checked_sub(server_send_wall)
+        .zip(server_send_wall)
+        .and_then(|(cli, srv)| cli.checked_sub(srv))
         .and_then(|d| u64::try_from(d).ok().map(Duration::from_nanos));
+
+    if c2s.is_none() && s2c.is_none() {
+        return None;
+    }
 
     Some(OneWayDelaySample {
         client_to_server: c2s,
