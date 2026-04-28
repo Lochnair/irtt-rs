@@ -45,4 +45,12 @@ pub enum ClientError {
     PendingLimitExceeded { limit: usize },
     #[error("invalid configuration: {reason}")]
     InvalidConfig { reason: String },
+    #[error("managed client worker thread panicked")]
+    WorkerPanicked,
+}
+
+#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
+pub enum EventSubscriptionError {
+    #[error("event subscription is disconnected")]
+    Disconnected,
 }
