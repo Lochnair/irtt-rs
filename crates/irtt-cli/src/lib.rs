@@ -2,13 +2,13 @@
 
 use std::{
     fmt::Write as _,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    net::SocketAddr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use clap::{Parser, ValueEnum};
 use irtt_client::{
-    ClientConfig, ClientEvent, ClientTimestamp, NegotiatedParams, OneWayDelaySample, PacketMeta,
+    ClientConfig, ClientEvent, NegotiatedParams, OneWayDelaySample, PacketMeta,
     ReceivedStatsSample, RttSample, ServerTiming, SocketConfig, WarningKind,
 };
 use irtt_proto::{Clock, ReceivedStats, StampAt};
@@ -471,26 +471,35 @@ fn warning_kind(kind: WarningKind) -> &'static str {
 }
 
 fn escape_value(value: &str) -> String {
-    value.replace('\\', "\\\\").replace(' ', "\\s")
-}
-
-pub fn test_timestamp(offset: Duration) -> ClientTimestamp {
-    ClientTimestamp {
-        wall: UNIX_EPOCH + offset,
-        mono: Instant::now() + offset,
-    }
-}
-
-pub fn test_remote() -> SocketAddr {
-    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112)
+    value
+        .replace('\\', "\\\\")
+        .replace(' ', "\\s")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use clap::Parser;
-    use irtt_client::{PacketMeta, RttSample};
+    use irtt_client::{ClientTimestamp, PacketMeta, RttSample};
     use irtt_proto::{Params, PROTOCOL_VERSION};
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Instant,
+    };
+
+    fn test_timestamp(offset: Duration) -> ClientTimestamp {
+        ClientTimestamp {
+            wall: UNIX_EPOCH + offset,
+            mono: Instant::now() + offset,
+        }
+    }
+
+    fn test_remote() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112)
+    }
 
     fn parse(args: &[&str]) -> Result<CliArgs, clap::Error> {
         let mut argv = vec!["irtt-rs"];
