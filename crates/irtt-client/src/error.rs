@@ -39,8 +39,8 @@ pub enum ClientError {
     AlreadyCompleted,
     #[error("client session is already closed")]
     AlreadyClosed,
-    #[error("operation is not implemented for this milestone")]
-    NotImplementedForMilestone,
     #[error("duration is too large to encode as nanoseconds")]
     DurationOverflow,
+    #[error("pending probe limit exceeded ({limit})")]
+    PendingLimitExceeded { limit: usize },
 }
