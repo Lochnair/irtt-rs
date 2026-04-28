@@ -39,6 +39,9 @@ pub(crate) fn normalize_server_addr(addr: &str) -> String {
     if addr.parse::<SocketAddr>().is_ok() {
         return addr.to_owned();
     }
+    if addr.starts_with('[') && addr.ends_with(']') {
+        return format!("{addr}:{DEFAULT_PORT}");
+    }
     if addr.starts_with('[') {
         return addr.to_owned();
     }
@@ -98,6 +101,7 @@ mod tests {
         assert_eq!(normalize_server_addr("localhost"), "localhost:2112");
         assert_eq!(normalize_server_addr("localhost:1234"), "localhost:1234");
         assert_eq!(normalize_server_addr("::1"), "[::1]:2112");
+        assert_eq!(normalize_server_addr("[::1]"), "[::1]:2112");
         assert_eq!(normalize_server_addr("[::1]:1234"), "[::1]:1234");
     }
 }
