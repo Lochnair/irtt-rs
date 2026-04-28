@@ -6,3 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+irtt-proto = { path = "../irtt-proto" }
+socket2 = "0.5"
+thiserror = "1"
+
+[features]
+default = []
+interop = []
