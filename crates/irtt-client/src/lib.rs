@@ -14,7 +14,7 @@ pub use config::{ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketCon
 pub use error::ClientError;
 pub use event::{
     ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
-    ServerTiming,
+    ServerTiming, WarningKind,
 };
 pub use session::NegotiatedParams;
 pub use timing::ClientTimestamp;

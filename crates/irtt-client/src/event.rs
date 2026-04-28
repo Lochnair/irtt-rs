@@ -77,8 +77,16 @@ pub enum ClientEvent {
     },
 
     Warning {
+        kind: WarningKind,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WarningKind {
+    MalformedOrUnrelatedPacket,
+    WrongToken,
+    UntrackedReply,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
