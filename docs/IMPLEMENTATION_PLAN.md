@@ -546,8 +546,8 @@ Steps:
 1. Assert Active phase
 2. Check if duration exceeded (if finite mode) → if so, transition to Draining
 3. Encode echo request with current sequence number, connection token
-4. Call `socket.send()`
-5. Capture send timestamp (Instant + SystemTime) immediately after send returns
+4. Capture send timestamp (Instant + SystemTime) immediately before send call
+5. Call `socket.send()`
 6. Insert PendingProbe into pending map
 7. Increment sequence counters
 8. Return any events (e.g., eviction-triggered loss events from bounded map)
@@ -649,7 +649,7 @@ No signal handling in `Client`. Caller controls lifecycle by:
 - Maintains absolute send schedule: `scheduled_time(seq) = session_start + seq * interval`
 - Prepares echo request packets
 - Sends packets at scheduled times
-- Captures send timestamps immediately after send
+- Captures send timestamps immediately before send call
 - Sends compact `SentRecord { wire_seq, logical_seq, sent_at_mono, sent_at_wall }` to coordinator
 - Must NOT perform: event fanout, stats, subscriber delivery, blocking coordination
 
@@ -1861,7 +1861,7 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
 
 **Blocks implementation:** No. This is an implementation choice.
 
-**Recommended behavior:** Capture `Instant::now()` + `SystemTime::now()` immediately after `send()` returns. This is what the spec recommends and is the simplest correct approach.
+**Recommended behavior:** Capture `Instant::now()` + `SystemTime::now()` immediately before `send()`. This ensures the measured RTT includes local send/enqueue overhead, which is more conservative for latency-control consumers like sqm-autorate-rust. The receive timestamp remains captured immediately after `recv()` returns.
 
 ### Q3: RTT When Server Processing > Raw RTT (Section 19.12)
 

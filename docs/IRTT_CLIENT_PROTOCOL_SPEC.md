@@ -692,7 +692,8 @@ The following configuration parameters affect protocol behavior:
 
 - **Client send timestamp:** SHOULD be captured as close as possible to the
   send system call. For best RTT accuracy, the timestamp should be taken
-  immediately after the send call returns.
+  immediately before the send call, so that the measured RTT includes any
+  local send/enqueue overhead.
 - **Client receive timestamp:** SHOULD be captured as close as possible to
   the receive system call return, before any packet processing.
 - **Server timestamps:** Determined by the negotiated StampAt parameter:

@@ -558,7 +558,7 @@ It should only:
 - maintain absolute send schedule
 - prepare outgoing packets before deadline where possible
 - send packets
-- timestamp successful sends immediately after send returns
+- timestamp immediately before send call
 - report compact sent records to coordinator
 
 ### Receiver Thread
@@ -845,7 +845,9 @@ The server is authoritative unless the caller explicitly requires exact or bound
 
 ## Send Timestamp
 
-Capture send timestamp immediately after `send` returns.
+Capture send timestamp immediately before the `send` call. This ensures the
+measured RTT includes local send/enqueue overhead, which is the more
+conservative direction for latency-control consumers.
 
 ## Receive Timestamp
 
