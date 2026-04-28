@@ -5,9 +5,9 @@ use std::{
 };
 
 use irtt_proto::{
-    close::CloseRequest, decode_echo_reply, encode_close_request, encode_echo_request,
-    encode_open_request, flags, EchoReply, EchoRequest, OpenReply, OpenRequest, Params, ServerFill,
-    TimestampFields, PROTOCOL_VERSION,
+    close::CloseRequest, decode_echo_reply, echo_packet_len, encode_close_request,
+    encode_echo_request, encode_open_request, flags, EchoReply, EchoRequest, OpenReply,
+    OpenRequest, Params, ServerFill, TimestampFields, PROTOCOL_VERSION,
 };
 
 use crate::{
@@ -24,7 +24,7 @@ use crate::{
 };
 
 const MAX_OPEN_PACKET_SIZE: usize = 512;
-const MAX_RECV_PACKET_SIZE: usize = 2048;
+const MIN_RECV_BUFFER_SIZE: usize = 2048;
 
 #[derive(Debug)]
 pub struct Client {
@@ -238,7 +238,8 @@ impl Client {
             ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
 
-        let mut buf = [0_u8; MAX_RECV_PACKET_SIZE];
+        let buf_size = self.recv_buffer_size();
+        let mut buf = vec![0_u8; buf_size];
         let size = match self.socket.recv(&mut buf) {
             Ok(size) => size,
             Err(err)
