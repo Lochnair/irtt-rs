@@ -607,13 +607,15 @@ mod tests {
     use super::*;
     use crate::config::{NegotiationPolicy, DEFAULT_OPEN_TIMEOUTS};
     use irtt_proto::{
-        compute_hmac_in_place, flags::FLAG_HMAC, flags::FLAG_OPEN, flags::FLAG_REPLY, verify_hmac,
-        Clock, ReceivedStats, StampAt, HMAC_SIZE, MAGIC,
+        compute_hmac_in_place, echo_packet_len, flags::FLAG_HMAC, flags::FLAG_OPEN,
+        flags::FLAG_REPLY, layout::PacketLayout, verify_hmac, Clock, ReceivedStats, StampAt,
+        HMAC_SIZE, MAGIC,
     };
     use std::{
         net::UdpSocket,
         sync::mpsc,
         thread::{self, JoinHandle},
+        time::SystemTime,
     };
 
     const TOKEN: u64 = 0x1234_5678_90ab_cdef;
@@ -673,6 +675,64 @@ mod tests {
         packet
     }
 
+    fn echo_reply_packet(
+        token: u64,
+        seq: u32,
+        params: &Params,
+        timestamps: &TimestampFields,
+        hmac_key: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let has_hmac = hmac_key.is_some();
+        let layout = PacketLayout::echo(has_hmac, params);
+        let packet_len = echo_packet_len(has_hmac, params);
+        let mut packet = Vec::with_capacity(packet_len);
+
+        let mut flags = FLAG_REPLY;
+        if has_hmac {
+            flags |= FLAG_HMAC;
+        }
+        packet.extend_from_slice(&MAGIC);
+        packet.push(flags);
+        if has_hmac {
+            packet.extend_from_slice(&[0_u8; HMAC_SIZE]);
+        }
+        packet.extend_from_slice(&token.to_le_bytes());
+        packet.extend_from_slice(&seq.to_le_bytes());
+
+        if layout.recv_count {
+            packet.extend_from_slice(&42_u32.to_le_bytes());
+        }
+        if layout.recv_window {
+            packet.extend_from_slice(&0x07_u64.to_le_bytes());
+        }
+
+        if layout.recv_wall {
+            packet.extend_from_slice(&timestamps.recv_wall.unwrap_or(0).to_le_bytes());
+        }
+        if layout.recv_mono {
+            packet.extend_from_slice(&timestamps.recv_mono.unwrap_or(0).to_le_bytes());
+        }
+        if layout.midpoint_wall {
+            packet.extend_from_slice(&timestamps.midpoint_wall.unwrap_or(0).to_le_bytes());
+        }
+        if layout.midpoint_mono {
+            packet.extend_from_slice(&timestamps.midpoint_mono.unwrap_or(0).to_le_bytes());
+        }
+        if layout.send_wall {
+            packet.extend_from_slice(&timestamps.send_wall.unwrap_or(0).to_le_bytes());
+        }
+        if layout.send_mono {
+            packet.extend_from_slice(&timestamps.send_mono.unwrap_or(0).to_le_bytes());
+        }
+
+        packet.resize(packet_len, 0);
+
+        if let Some(key) = hmac_key {
+            compute_hmac_in_place(key, &mut packet, HMAC_OFFSET).unwrap();
+        }
+        packet
+    }
+
     fn open_success_server(params: Params) -> FakeServer {
         start_fake_server(move |socket, tx| {
             let (_, peer) = recv_request(&socket, &tx);
@@ -699,6 +759,57 @@ mod tests {
         start_fake_server(move |socket, tx| {
             socket.set_read_timeout(Some(wait)).unwrap();
             while recv_request_timeout(&socket, &tx).is_some() {}
+        })
+    }
+
+    fn recv_request_timeout(
+        socket: &UdpSocket,
+        tx: &mpsc::Sender<Vec<u8>>,
+    ) -> Option<(Vec<u8>, SocketAddr)> {
+        let mut buf = [0_u8; 512];
+        match socket.recv_from(&mut buf) {
+            Ok((size, peer)) => {
+                let packet = buf[..size].to_vec();
+                tx.send(packet.clone()).unwrap();
+                Some((packet, peer))
+            }
+            Err(_) => None,
+        }
+    }
+
+    fn echo_server(params: Params) -> FakeServer {
+        start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            loop {
+                let mut buf = [0_u8; 2048];
+                let size = match socket.recv_from(&mut buf) {
+                    Ok((size, _)) => size,
+                    Err(_) => break,
+                };
+                let packet = buf[..size].to_vec();
+                tx.send(packet.clone()).unwrap();
+
+                if buf[3] & flags::FLAG_CLOSE != 0 {
+                    break;
+                }
+
+                let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                let ts = TimestampFields {
+                    recv_wall: Some(1_000_000_000),
+                    recv_mono: Some(100_000),
+                    send_wall: Some(1_000_100_000),
+                    send_mono: Some(200_000),
+                    ..Default::default()
+                };
+                let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, None);
+                socket.send_to(&reply_packet, peer).unwrap();
+            }
         })
     }
 
@@ -732,6 +843,34 @@ mod tests {
         }
     }
 
+    fn open_client_with_echo_server(params: &Params) -> (Client, FakeServer) {
+        let server = echo_server(params.clone());
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        (client, server)
+    }
+
+    fn default_params() -> Params {
+        Params {
+            protocol_version: 1,
+            duration_ns: 3_000_000_000,
+            interval_ns: 1_000_000_000,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Params::default()
+        }
+    }
+
+    // ---------- Existing Milestone 2 tests ----------
+
     #[test]
     fn client_config_default() {
         let config = ClientConfig::default();
@@ -747,6 +886,8 @@ mod tests {
         assert_eq!(config.open_timeouts, DEFAULT_OPEN_TIMEOUTS);
         assert_eq!(config.run_mode, RunMode::Normal);
         assert_eq!(config.negotiation_policy, NegotiationPolicy::Strict);
+        assert_eq!(config.probe_timeout, Duration::from_secs(4));
+        assert_eq!(config.max_pending_probes, 4096);
     }
 
     #[test]
@@ -882,21 +1023,6 @@ mod tests {
         assert!(client.socket.recv(&mut buf).is_err());
         assert!(start.elapsed() >= Duration::from_millis(350));
         server.join();
-    }
-
-    fn recv_request_timeout(
-        socket: &UdpSocket,
-        tx: &mpsc::Sender<Vec<u8>>,
-    ) -> Option<(Vec<u8>, SocketAddr)> {
-        let mut buf = [0_u8; 512];
-        match socket.recv_from(&mut buf) {
-            Ok((size, peer)) => {
-                let packet = buf[..size].to_vec();
-                tx.send(packet.clone()).unwrap();
-                Some((packet, peer))
-            }
-            Err(_) => None,
-        }
     }
 
     #[test]
@@ -1186,5 +1312,806 @@ mod tests {
             Client::connect(config),
             Err(ClientError::NoOpenTimeouts)
         ));
+    }
+
+    // ---------- Milestone 3 probe tests ----------
+
+    #[test]
+    fn send_probe_fails_before_open() {
+        let server = start_fake_server(|_socket, _tx| {});
+        let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+        assert!(matches!(
+            client.send_probe(ClientTimestamp::now()),
+            Err(ClientError::NotOpen)
+        ));
+        server.join();
+    }
+
+    #[test]
+    fn send_probe_fails_after_no_test_completed() {
+        let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+        config.run_mode = RunMode::NoTest;
+        let params = params_from_config(&config).unwrap();
+        let server = no_test_server(params, 0);
+        config.server_addr = server.addr.to_string();
+        let mut client = Client::connect(config).unwrap();
+        assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
+        assert!(matches!(
+            client.send_probe(ClientTimestamp::now()),
+            Err(ClientError::AlreadyCompleted)
+        ));
+        server.join();
+    }
+
+    #[test]
+    fn send_probe_fails_after_close() {
+        let params = default_params();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            loop {
+                let mut buf = [0_u8; 512];
+                match socket.recv_from(&mut buf) {
+                    Ok((size, _)) => {
+                        tx.send(buf[..size].to_vec()).unwrap();
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.close(ClientTimestamp::now()).unwrap();
+        assert!(matches!(
+            client.send_probe(ClientTimestamp::now()),
+            Err(ClientError::AlreadyClosed)
+        ));
+        server.join();
+    }
+
+    fn silent_open_server(params: Params) -> FakeServer {
+        start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            loop {
+                let mut buf = [0_u8; 2048];
+                match socket.recv_from(&mut buf) {
+                    Ok((size, _)) => {
+                        tx.send(buf[..size].to_vec()).unwrap();
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn send_probe_sends_valid_echo_request() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let packets: Vec<_> = server.rx.try_iter().collect();
+        let echo_reqs: Vec<_> = packets
+            .iter()
+            .filter(|p| p.len() >= 4 && p[3] & FLAG_OPEN == 0)
+            .collect();
+        let echo_req = echo_reqs.first().unwrap();
+        assert_eq!(&echo_req[..3], &MAGIC);
+        assert_eq!(echo_req[3], 0x00);
+        let req_token = u64::from_le_bytes(echo_req[4..12].try_into().unwrap());
+        assert_eq!(req_token, TOKEN);
+        let seq = u32::from_le_bytes(echo_req[12..16].try_into().unwrap());
+        assert_eq!(seq, 0);
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn send_probe_starts_seq_at_zero_and_increments() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let packets: Vec<_> = server.rx.try_iter().collect();
+        let echo_reqs: Vec<_> = packets
+            .iter()
+            .filter(|p| p.len() >= 4 && p[3] & FLAG_OPEN == 0 && p[3] & flags::FLAG_CLOSE == 0)
+            .collect();
+        assert_eq!(echo_reqs.len(), 3);
+        for (i, pkt) in echo_reqs.iter().enumerate() {
+            let seq = u32::from_le_bytes(pkt[12..16].try_into().unwrap());
+            assert_eq!(seq, i as u32);
+        }
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn send_probe_respects_finite_duration_exclusive_end() {
+        let params = Params {
+            protocol_version: 1,
+            duration_ns: 1_000_000_000,
+            interval_ns: 500_000_000,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Params::default()
+        };
+        let server = silent_open_server(params.clone());
+        let config = ClientConfig {
+            duration: Some(Duration::from_secs(1)),
+            interval: Duration::from_millis(500),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        let session = client.session.as_ref().unwrap();
+        let start = session.start_mono;
+        let interval = Duration::from_millis(500);
+
+        let now0 = ClientTimestamp {
+            mono: start,
+            wall: SystemTime::now(),
+        };
+        assert!(client.send_probe(now0).is_ok());
+
+        let now1 = ClientTimestamp {
+            mono: start + interval,
+            wall: SystemTime::now(),
+        };
+        assert!(client.send_probe(now1).is_ok());
+
+        let now2 = ClientTimestamp {
+            mono: start + Duration::from_secs(1),
+            wall: SystemTime::now(),
+        };
+        let events = client.send_probe(now2).unwrap();
+        assert!(events.is_empty());
+        assert!(client.session.as_ref().unwrap().sending_done);
+        assert!(client.next_send_deadline().is_none());
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn next_send_deadline_advances_by_interval() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+
+        let session = client.session.as_ref().unwrap();
+        let start = session.start_mono;
+        let deadline0 = client.next_send_deadline().unwrap();
+        assert_eq!(deadline0, start);
+
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        let deadline1 = client.next_send_deadline().unwrap();
+        assert_eq!(deadline1, start + Duration::from_secs(1));
+
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        let deadline2 = client.next_send_deadline().unwrap();
+        assert_eq!(deadline2, start + Duration::from_secs(2));
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn recv_once_returns_empty_on_timeout() {
+        let params = default_params();
+        let server = open_success_server(params);
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert!(events.is_empty());
+        server.join();
+    }
+
+    #[test]
+    fn recv_once_decodes_echo_reply_and_emits_event() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+
+        let send_ts = ClientTimestamp::now();
+        client.send_probe(send_ts).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let recv_ts = ClientTimestamp::now();
+        let events = client.recv_once(recv_ts).unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientEvent::EchoReply {
+                seq,
+                logical_seq,
+                rtt,
+                received_stats,
+                server_timing,
+                ..
+            } => {
+                assert_eq!(*seq, 0);
+                assert_eq!(*logical_seq, 0);
+                assert!(rtt.raw > Duration::ZERO);
+                assert_eq!(rtt.effective, rtt.adjusted.unwrap_or(rtt.raw));
+                assert!(received_stats.is_some());
+                let stats = received_stats.as_ref().unwrap();
+                assert_eq!(stats.count, Some(42));
+                assert_eq!(stats.window, Some(0x07));
+                assert!(server_timing.is_some());
+                let st = server_timing.as_ref().unwrap();
+                assert!(st.processing.is_some());
+            }
+            other => panic!("expected EchoReply, got {other:?}"),
+        }
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn echo_reply_rtt_uses_client_monotonic() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+
+        let send_ts = ClientTimestamp::now();
+        client.send_probe(send_ts).unwrap();
+        thread::sleep(Duration::from_millis(20));
+
+        let recv_ts = ClientTimestamp::now();
+        let events = client.recv_once(recv_ts).unwrap();
+        if let ClientEvent::EchoReply { rtt, .. } = &events[0] {
+            assert!(rtt.raw >= Duration::from_millis(15));
+        } else {
+            panic!("expected EchoReply");
+        }
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn server_processing_subtracted_when_valid() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(20));
+        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        if let ClientEvent::EchoReply {
+            rtt, server_timing, ..
+        } = &events[0]
+        {
+            let st = server_timing.as_ref().unwrap();
+            let processing = st.processing.unwrap();
+            assert!(processing > Duration::ZERO);
+            if let Some(adj) = rtt.adjusted {
+                assert!(adj < rtt.raw);
+                assert_eq!(rtt.effective, adj);
+            }
+        } else {
+            panic!("expected EchoReply");
+        }
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn server_processing_greater_than_raw_does_not_underflow() {
+        let rtt = compute_rtt(
+            &ClientTimestamp {
+                mono: Instant::now(),
+                wall: SystemTime::now(),
+            },
+            &ClientTimestamp {
+                mono: Instant::now() + Duration::from_nanos(1),
+                wall: SystemTime::now(),
+            },
+            &TimestampFields {
+                recv_mono: Some(0),
+                send_mono: Some(1_000_000_000),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(rtt.adjusted.is_none());
+        assert_eq!(rtt.effective, rtt.raw);
+    }
+
+    #[test]
+    fn received_stats_parsed_into_sample() {
+        let params = default_params();
+        let (mut client, server) = open_client_with_echo_server(&params);
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        if let ClientEvent::EchoReply { received_stats, .. } = &events[0] {
+            let rs = received_stats.as_ref().unwrap();
+            assert_eq!(rs.count, Some(42));
+            assert_eq!(rs.window, Some(0x07));
+        } else {
+            panic!("expected EchoReply");
+        }
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn wrong_token_reply_is_dropped() {
+        let params = default_params();
+        let wrong_token: u64 = 0xDEAD_BEEF_CAFE_BABE;
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 2048];
+            if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                tx.send(buf[..size].to_vec()).unwrap();
+                let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                let ts = TimestampFields::default();
+                let reply_packet = echo_reply_packet(wrong_token, seq, &params, &ts, None);
+                socket.send_to(&reply_packet, peer).unwrap();
+            }
+        });
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ClientEvent::Warning { .. }));
+        server.join();
+    }
+
+    #[test]
+    fn bad_hmac_reply_is_dropped() {
+        let key = b"secret".to_vec();
+        let wrong_key = b"wrong".to_vec();
+        let params = default_params();
+        let server_key = key.clone();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, Some(&server_key));
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 2048];
+            if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                tx.send(buf[..size].to_vec()).unwrap();
+                let seq = u32::from_le_bytes(
+                    buf[4 + HMAC_SIZE + 8..4 + HMAC_SIZE + 12]
+                        .try_into()
+                        .unwrap(),
+                );
+                let ts = TimestampFields::default();
+                let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, Some(&wrong_key));
+                socket.send_to(&reply_packet, peer).unwrap();
+            }
+        });
+        let config = ClientConfig {
+            hmac_key: Some(key),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ClientEvent::Warning { .. }));
+        server.join();
+    }
+
+    #[test]
+    fn duplicate_reply_emits_duplicate_event() {
+        let params = default_params();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 2048];
+            if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                tx.send(buf[..size].to_vec()).unwrap();
+                let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                let ts = TimestampFields::default();
+                let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, None);
+                socket.send_to(&reply_packet, peer).unwrap();
+                thread::sleep(Duration::from_millis(10));
+                socket.send_to(&reply_packet, peer).unwrap();
+            }
+        });
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let events1 = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(events1.len(), 1);
+        assert!(matches!(&events1[0], ClientEvent::EchoReply { .. }));
+
+        thread::sleep(Duration::from_millis(30));
+        let events2 = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(events2.len(), 1);
+        assert!(matches!(
+            &events2[0],
+            ClientEvent::DuplicateReply { seq: 0, .. }
+        ));
+        server.join();
+    }
+
+    #[test]
+    fn out_of_order_reply_emits_late_event() {
+        let params = default_params();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+
+            let mut seqs = Vec::new();
+            for _ in 0..2 {
+                let mut buf = [0_u8; 2048];
+                if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                    tx.send(buf[..size].to_vec()).unwrap();
+                    let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                    seqs.push(seq);
+                }
+            }
+            let ts = TimestampFields::default();
+            let reply1 = echo_reply_packet(TOKEN, seqs[1], &params, &ts, None);
+            socket.send_to(&reply1, peer).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            let reply0 = echo_reply_packet(TOKEN, seqs[0], &params, &ts, None);
+            socket.send_to(&reply0, peer).unwrap();
+        });
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let ev1 = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(ev1.len(), 1);
+        assert!(matches!(&ev1[0], ClientEvent::EchoReply { seq: 1, .. }));
+
+        thread::sleep(Duration::from_millis(30));
+        let ev2 = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(ev2.len(), 1);
+        match &ev2[0] {
+            ClientEvent::LateReply {
+                seq,
+                highest_seen,
+                rtt,
+                ..
+            } => {
+                assert_eq!(*seq, 0);
+                assert_eq!(*highest_seen, 1);
+                assert!(rtt.is_some());
+            }
+            other => panic!("expected LateReply, got {other:?}"),
+        }
+        server.join();
+    }
+
+    #[test]
+    fn poll_timeouts_emits_echo_loss() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            probe_timeout: Duration::from_millis(100),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+
+        let no_loss = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+        assert!(no_loss.is_empty());
+
+        thread::sleep(Duration::from_millis(150));
+        let events = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+        assert_eq!(events.len(), 2);
+        for event in &events {
+            assert!(matches!(event, ClientEvent::EchoLoss { .. }));
+        }
+        server.join();
+    }
+
+    #[test]
+    fn poll_timeouts_removes_expired_pending() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            probe_timeout: Duration::from_millis(100),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(150));
+        client.poll_timeouts(ClientTimestamp::now()).unwrap();
+
+        let session = client.session.as_ref().unwrap();
+        assert_eq!(session.pending.len(), 0);
+        server.join();
+    }
+
+    #[test]
+    fn pending_map_bounded() {
+        let params = Params {
+            duration_ns: 60_000_000_000,
+            ..default_params()
+        };
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            duration: Some(Duration::from_secs(60)),
+            max_pending_probes: 3,
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        assert!(matches!(
+            client.send_probe(ClientTimestamp::now()),
+            Err(ClientError::PendingLimitExceeded { limit: 3 })
+        ));
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn minimal_negotiated_layout_works() {
+        let params = Params {
+            protocol_version: 1,
+            duration_ns: 3_000_000_000,
+            interval_ns: 1_000_000_000,
+            received_stats: ReceivedStats::None,
+            stamp_at: StampAt::None,
+            clock: Clock::Both,
+            ..Params::default()
+        };
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 2048];
+            if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                tx.send(buf[..size].to_vec()).unwrap();
+                let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                let ts = TimestampFields::default();
+                let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, None);
+                socket.send_to(&reply_packet, peer).unwrap();
+            }
+        });
+        let config = ClientConfig {
+            received_stats: ReceivedStats::None,
+            stamp_at: StampAt::None,
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(events.len(), 1);
+        if let ClientEvent::EchoReply {
+            received_stats,
+            server_timing,
+            ..
+        } = &events[0]
+        {
+            assert!(received_stats.is_none());
+            assert!(server_timing.is_none());
+        } else {
+            panic!("expected EchoReply");
+        }
+        server.join();
+    }
+
+    #[test]
+    fn hmac_echo_request_reply_works() {
+        let key = b"testkey".to_vec();
+        let params = default_params();
+        let server_key = key.clone();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, Some(&server_key));
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut buf = [0_u8; 2048];
+            if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                tx.send(buf[..size].to_vec()).unwrap();
+                verify_hmac(&server_key, &buf[..size], HMAC_OFFSET).unwrap();
+                let seq = u32::from_le_bytes(
+                    buf[4 + HMAC_SIZE + 8..4 + HMAC_SIZE + 12]
+                        .try_into()
+                        .unwrap(),
+                );
+                let ts = TimestampFields {
+                    recv_mono: Some(100),
+                    send_mono: Some(200),
+                    ..Default::default()
+                };
+                let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, Some(&server_key));
+                socket.send_to(&reply_packet, peer).unwrap();
+            }
+        });
+        let config = ClientConfig {
+            hmac_key: Some(key),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+        let events = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(&events[0], ClientEvent::EchoReply { .. }));
+        server.join();
+    }
+
+    #[test]
+    fn late_reply_with_pending_preserves_rtt() {
+        let params = default_params();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            let mut seqs = Vec::new();
+            for _ in 0..3 {
+                let mut buf = [0_u8; 2048];
+                if let Ok((size, _)) = socket.recv_from(&mut buf) {
+                    tx.send(buf[..size].to_vec()).unwrap();
+                    let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+                    seqs.push(seq);
+                }
+            }
+            let ts = TimestampFields::default();
+            let reply2 = echo_reply_packet(TOKEN, seqs[2], &params, &ts, None);
+            socket.send_to(&reply2, peer).unwrap();
+            thread::sleep(Duration::from_millis(10));
+            let reply0 = echo_reply_packet(TOKEN, seqs[0], &params, &ts, None);
+            socket.send_to(&reply0, peer).unwrap();
+        });
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        client.send_probe(ClientTimestamp::now()).unwrap();
+        thread::sleep(Duration::from_millis(50));
+
+        let ev1 = client.recv_once(ClientTimestamp::now()).unwrap();
+        assert!(matches!(&ev1[0], ClientEvent::EchoReply { seq: 2, .. }));
+
+        thread::sleep(Duration::from_millis(30));
+        let ev2 = client.recv_once(ClientTimestamp::now()).unwrap();
+        match &ev2[0] {
+            ClientEvent::LateReply {
+                seq, rtt, sent_at, ..
+            } => {
+                assert_eq!(*seq, 0);
+                assert!(rtt.is_some());
+                assert!(sent_at.is_some());
+            }
+            other => panic!("expected LateReply, got {other:?}"),
+        }
+        server.join();
     }
 }
