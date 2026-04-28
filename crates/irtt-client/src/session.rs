@@ -8,11 +8,25 @@ pub struct NegotiatedParams {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientState {
+pub(crate) enum ClientPhase {
     Connected,
     Open { token: u64 },
     NoTestCompleted,
     Closed,
+}
+
+#[derive(Debug)]
+pub(crate) struct ActiveSession {
+    pub next_wire_seq: u32,
+    pub next_logical_seq: u64,
+    pub highest_received_seq: Option<u32>,
+    pub packets_sent: u64,
+    pub start_mono: Instant,
+    pub end_mono: Option<Instant>,
+    pub next_send_at: Instant,
+    pub pending: PendingMap,
+    pub completed: CompletedSet,
+    pub sending_done: bool,
 }
 
 pub(crate) fn validate_negotiated_params(
