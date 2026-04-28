@@ -40,6 +40,16 @@ pub struct Client {
 impl Client {
     pub fn connect(config: ClientConfig) -> Result<Self, ClientError> {
         validate_open_timeouts(&config.open_timeouts)?;
+        if config.max_pending_probes == 0 {
+            return Err(ClientError::InvalidConfig {
+                reason: "max_pending_probes must be greater than zero".to_owned(),
+            });
+        }
+        if config.probe_timeout == Duration::ZERO {
+            return Err(ClientError::InvalidConfig {
+                reason: "probe_timeout must be greater than zero".to_owned(),
+            });
+        }
         let remote = resolve_remote(&config)?;
         let socket = connect_udp_socket(&config.socket_config, remote)?;
         let requested = params_from_config(&config)?;
