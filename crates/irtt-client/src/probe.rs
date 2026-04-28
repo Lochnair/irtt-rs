@@ -1,4 +1,7 @@
-use std::{collections::HashMap, time::Instant};
+use std::{
+    collections::{HashMap, VecDeque},
+    time::Instant,
+};
 
 use crate::{error::ClientError, timing::ClientTimestamp};
 
@@ -69,6 +72,7 @@ impl PendingMap {
 #[derive(Debug)]
 pub(crate) struct CompletedSet {
     set: HashMap<u32, u64>,
+    insertion_order: VecDeque<u32>,
     max_capacity: usize,
 }
 
@@ -76,14 +80,20 @@ impl CompletedSet {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             set: HashMap::new(),
+            insertion_order: VecDeque::new(),
             max_capacity,
         }
     }
 
     pub fn insert(&mut self, wire_seq: u32, logical_seq: u64) {
+        if let Some(existing) = self.set.get_mut(&wire_seq) {
+            *existing = logical_seq;
+            return;
+        }
         if self.set.len() >= self.max_capacity {
             self.evict_oldest();
         }
+        self.insertion_order.push_back(wire_seq);
         self.set.insert(wire_seq, logical_seq);
     }
 
@@ -92,8 +102,10 @@ impl CompletedSet {
     }
 
     fn evict_oldest(&mut self) {
-        if let Some((&oldest_key, _)) = self.set.iter().min_by_key(|(_, &seq)| seq) {
-            self.set.remove(&oldest_key);
+        while let Some(oldest_key) = self.insertion_order.pop_front() {
+            if self.set.remove(&oldest_key).is_some() {
+                break;
+            }
         }
     }
 }
