@@ -38,7 +38,7 @@ pub struct SessionOutcome {
     pub replies_received: u64,
     pub duplicates: u64,
     pub late: u64,
-    pub malformed: u64,
+    pub warning_events: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +143,7 @@ fn run_client(
             replies_received: 0,
             duplicates: 0,
             late: 0,
-            malformed: 0,
+            warning_events: 0,
         });
     }
 
@@ -209,7 +209,7 @@ fn run_client(
         replies_received: counters.replies_received,
         duplicates: counters.duplicates,
         late: counters.late,
-        malformed: counters.malformed,
+        warning_events: counters.warning_events,
     })
 }
 
@@ -235,7 +235,7 @@ struct OutcomeCounters {
     replies_received: u64,
     duplicates: u64,
     late: u64,
-    malformed: u64,
+    warning_events: u64,
 }
 
 impl OutcomeCounters {
@@ -244,7 +244,7 @@ impl OutcomeCounters {
             ClientEvent::EchoReply { .. } => self.replies_received += 1,
             ClientEvent::DuplicateReply { .. } => self.duplicates += 1,
             ClientEvent::LateReply { .. } => self.late += 1,
-            ClientEvent::Warning { .. } => self.malformed += 1,
+            ClientEvent::Warning { .. } => self.warning_events += 1,
             _ => {}
         }
     }
