@@ -322,6 +322,22 @@ impl Client {
         Ok(events)
     }
 
+    pub(crate) fn is_run_complete(&self) -> bool {
+        let Some(session) = self.session.as_ref() else {
+            return matches!(
+                self.phase,
+                ClientPhase::Closed | ClientPhase::NoTestCompleted
+            );
+        };
+        session.sending_done && session.pending.len() == 0
+    }
+
+    pub(crate) fn packets_sent(&self) -> u64 {
+        self.session
+            .as_ref()
+            .map_or(0, |session| session.packets_sent)
+    }
+
     fn process_received_packet(
         &mut self,
         packet: &[u8],
