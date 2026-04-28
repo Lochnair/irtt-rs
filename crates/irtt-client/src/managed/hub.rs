@@ -148,6 +148,15 @@ impl EventHub {
             subscriber.disconnect();
         }
     }
+
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
+        self.inner
+            .subscribers
+            .lock()
+            .expect("event hub mutex poisoned")
+            .len()
+    }
 }
 
 impl Default for EventHub {
@@ -361,6 +370,17 @@ mod tests {
         let sub = hub.subscribe(SubscriberConfig::default()).unwrap();
 
         assert!(sub.try_recv().unwrap().is_none());
+    }
+
+    #[test]
+    fn dropping_subscription_unregisters_from_hub() {
+        let hub = EventHub::new();
+        let sub = hub.subscribe(SubscriberConfig::default()).unwrap();
+        assert_eq!(hub.subscriber_count(), 1);
+
+        drop(sub);
+
+        assert_eq!(hub.subscriber_count(), 0);
     }
 
     #[test]

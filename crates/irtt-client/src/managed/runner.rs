@@ -329,8 +329,8 @@ mod tests {
                 let ts = TimestampFields {
                     recv_wall: Some(1_000_000_000),
                     recv_mono: Some(100_000),
-                    send_wall: Some(1_000_100_000),
-                    send_mono: Some(200_000),
+                    send_wall: Some(1_000_000_000),
+                    send_mono: Some(100_000),
                     ..Default::default()
                 };
                 socket
@@ -408,20 +408,37 @@ mod tests {
         packet
     }
 
+    fn recv_event_with_timeout(sub: &EventSubscription) -> ClientEvent {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match sub.try_recv() {
+                Ok(Some(event)) => return event,
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Ok(None) => panic!("timed out waiting for managed client event"),
+                Err(err) => panic!("subscription ended while waiting for event: {err}"),
+            }
+        }
+    }
+
     fn collect_until_closed(sub: &EventSubscription) -> Vec<ClientEvent> {
         let mut events = Vec::new();
-        loop {
-            match sub.recv() {
-                Ok(event) => {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            match sub.try_recv() {
+                Ok(Some(event)) => {
                     let closed = matches!(event, ClientEvent::SessionClosed { .. });
                     events.push(event);
                     if closed {
                         return events;
                     }
                 }
+                Ok(None) => thread::sleep(Duration::from_millis(1)),
                 Err(_) => return events,
             }
         }
+        panic!("timed out waiting for session close event");
     }
 
     #[test]
@@ -477,7 +494,7 @@ mod tests {
             .unwrap();
 
         loop {
-            if matches!(sub.recv().unwrap(), ClientEvent::EchoReply { .. }) {
+            if matches!(recv_event_with_timeout(&sub), ClientEvent::EchoReply { .. }) {
                 break;
             }
         }
@@ -530,7 +547,7 @@ mod tests {
         let mut cfg = config(addr, Some(Duration::from_millis(10)));
         cfg.run_mode = RunMode::NoTest;
         let session = ManagedClient::start(cfg).unwrap();
-        assert!(rx.recv().unwrap());
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap());
         let outcome = session.join().unwrap();
         done.join().unwrap();
 
