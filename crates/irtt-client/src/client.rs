@@ -48,6 +48,25 @@ impl Client {
     }
 
     pub fn open(&mut self, now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
+        match self.state {
+            ClientState::Connected => {}
+            ClientState::Open { .. } => return Err(ClientError::AlreadyOpen),
+            ClientState::Closed => return Err(ClientError::AlreadyClosed),
+            ClientState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        }
+
+        let outcome = self.open_inner(now);
+        let restore = self
+            .socket
+            .set_read_timeout(self.config.socket_config.recv_timeout);
+        match (outcome, restore) {
+            (Ok(outcome), Ok(())) => Ok(outcome),
+            (Err(err), Ok(())) => Err(err),
+            (_, Err(err)) => Err(ClientError::Socket(err)),
+        }
+    }
+
+    fn open_inner(&mut self, now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
         validate_open_timeouts(&self.config.open_timeouts)?;
         let request = OpenRequest {
             params: self.requested.clone(),
