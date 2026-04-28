@@ -12,6 +12,8 @@ pub(crate) const DEFAULT_OPEN_TIMEOUTS: [Duration; 4] = [
     Duration::from_secs(8),
 ];
 pub(crate) const MIN_OPEN_TIMEOUT: Duration = Duration::from_millis(200);
+pub(crate) const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+pub(crate) const DEFAULT_MAX_PENDING: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
@@ -29,6 +31,8 @@ pub struct ClientConfig {
     pub run_mode: RunMode,
     pub negotiation_policy: NegotiationPolicy,
     pub socket_config: SocketConfig,
+    pub probe_timeout: Duration,
+    pub max_pending_probes: usize,
 }
 
 impl Default for ClientConfig {
@@ -48,6 +52,8 @@ impl Default for ClientConfig {
             run_mode: RunMode::Normal,
             negotiation_policy: NegotiationPolicy::Strict,
             socket_config: SocketConfig::default(),
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            max_pending_probes: DEFAULT_MAX_PENDING,
         }
     }
 }
@@ -71,4 +77,15 @@ pub enum NegotiationPolicy {
 pub enum RunMode {
     Normal,
     NoTest,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecvBudget {
+    pub max_packets: usize,
+}
+
+impl Default for RecvBudget {
+    fn default() -> Self {
+        Self { max_packets: 64 }
+    }
 }
