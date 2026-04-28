@@ -24,12 +24,17 @@ impl PendingMap {
         }
     }
 
-    pub fn insert(&mut self, probe: PendingProbe) -> Result<(), ClientError> {
+    pub fn check_capacity(&self) -> Result<(), ClientError> {
         if self.map.len() >= self.max_capacity {
             return Err(ClientError::PendingLimitExceeded {
                 limit: self.max_capacity,
             });
         }
+        Ok(())
+    }
+
+    pub fn insert(&mut self, probe: PendingProbe) -> Result<(), ClientError> {
+        self.check_capacity()?;
         self.map.insert(probe.wire_seq, probe);
         Ok(())
     }
