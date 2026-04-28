@@ -1,24 +1,30 @@
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use irtt_proto::{
-    close::CloseRequest, decode_open_reply, encode_close_request, encode_open_request, flags,
-    OpenReply, OpenRequest, Params, ServerFill, PROTOCOL_VERSION,
+    close::CloseRequest, decode_echo_reply, encode_close_request, encode_echo_request,
+    encode_open_request, flags, EchoReply, EchoRequest, OpenReply, OpenRequest, Params, ServerFill,
+    TimestampFields, PROTOCOL_VERSION,
 };
 
 use crate::{
-    config::{ClientConfig, RunMode},
+    config::{ClientConfig, RecvBudget, RunMode},
     error::ClientError,
-    event::{ClientEvent, OpenOutcome},
-    session::{validate_negotiated_params, ClientState, NegotiatedParams},
+    event::{
+        ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
+        ServerTiming,
+    },
+    probe::{CompletedSet, PendingMap, PendingProbe},
+    session::{validate_negotiated_params, ActiveSession, ClientPhase, NegotiatedParams},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     timing::ClientTimestamp,
 };
 
 const MAX_OPEN_PACKET_SIZE: usize = 512;
+const MAX_RECV_PACKET_SIZE: usize = 2048;
 
 #[derive(Debug)]
 pub struct Client {
@@ -83,7 +89,10 @@ impl Client {
 
             match self.socket.recv(&mut buf) {
                 Ok(size) => {
-                    let reply = decode_open_reply(&buf[..size], self.config.hmac_key.as_deref())?;
+                    let reply = irtt_proto::decode_open_reply(
+                        &buf[..size],
+                        self.config.hmac_key.as_deref(),
+                    )?;
                     return self.accept_open_reply(reply, now);
                 }
                 Err(err)
@@ -118,6 +127,254 @@ impl Client {
             token,
             at: now,
         }])
+    }
+
+    pub fn next_send_deadline(&self) -> Option<Instant> {
+        let session = self.session.as_ref()?;
+        if session.sending_done {
+            return None;
+        }
+        Some(session.next_send_at)
+    }
+
+    pub fn send_probe(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+        let token = match self.phase {
+            ClientPhase::Open { token } => token,
+            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Connected => return Err(ClientError::NotOpen),
+            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        };
+
+        let session = self
+            .session
+            .as_mut()
+            .expect("session must exist when phase is Open");
+
+        if session.sending_done {
+            return Ok(vec![]);
+        }
+
+        if let Some(end) = session.end_mono {
+            if now.mono >= end {
+                session.sending_done = true;
+                return Ok(vec![]);
+            }
+        }
+
+        let negotiated = self
+            .negotiated
+            .as_ref()
+            .expect("negotiated must exist when Open");
+
+        let wire_seq = session.next_wire_seq;
+        let logical_seq = session.next_logical_seq;
+
+        let request = EchoRequest {
+            token,
+            sequence: wire_seq,
+            params: negotiated.params.clone(),
+            payload: vec![],
+        };
+        let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
+        self.socket.send(&packet)?;
+
+        let pending = PendingProbe {
+            logical_seq,
+            wire_seq,
+            sent_at: now,
+            timeout_at: now.mono + self.config.probe_timeout,
+        };
+        session.pending.insert(pending)?;
+
+        session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
+        session.next_logical_seq += 1;
+        session.packets_sent += 1;
+
+        let interval_ns = negotiated.params.interval_ns as u64;
+        session.next_send_at =
+            session.start_mono + Duration::from_nanos(interval_ns * session.packets_sent);
+
+        if let Some(end) = session.end_mono {
+            if session.next_send_at >= end {
+                session.sending_done = true;
+            }
+        }
+
+        Ok(vec![])
+    }
+
+    pub fn recv_once(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+        match self.phase {
+            ClientPhase::Open { .. } => {}
+            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Connected => return Err(ClientError::NotOpen),
+            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        }
+
+        let mut buf = [0_u8; MAX_RECV_PACKET_SIZE];
+        let size = match self.socket.recv(&mut buf) {
+            Ok(size) => size,
+            Err(err)
+                if matches!(
+                    err.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(vec![]);
+            }
+            Err(err) => return Err(ClientError::Socket(err)),
+        };
+
+        self.process_received_packet(&buf[..size], now)
+    }
+
+    pub fn recv_available(
+        &mut self,
+        now: ClientTimestamp,
+        budget: RecvBudget,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
+        let mut all_events = Vec::new();
+        for _ in 0..budget.max_packets {
+            let events = self.recv_once(now)?;
+            if events.is_empty() {
+                break;
+            }
+            all_events.extend(events);
+        }
+        Ok(all_events)
+    }
+
+    pub fn poll_timeouts(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+        match self.phase {
+            ClientPhase::Open { .. } => {}
+            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Connected => return Err(ClientError::NotOpen),
+            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        }
+
+        let session = self
+            .session
+            .as_mut()
+            .expect("session must exist when phase is Open");
+
+        let expired = session.pending.drain_expired(now.mono);
+        let events: Vec<ClientEvent> = expired
+            .into_iter()
+            .map(|probe| ClientEvent::EchoLoss {
+                seq: probe.wire_seq,
+                logical_seq: probe.logical_seq,
+                sent_at: probe.sent_at,
+                timeout_at: probe.timeout_at,
+            })
+            .collect();
+
+        Ok(events)
+    }
+
+    fn process_received_packet(
+        &mut self,
+        packet: &[u8],
+        now: ClientTimestamp,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
+        let negotiated = self
+            .negotiated
+            .as_ref()
+            .expect("negotiated must exist when Open");
+
+        let reply =
+            match decode_echo_reply(packet, &negotiated.params, self.config.hmac_key.as_deref()) {
+                Ok(reply) => reply,
+                Err(_) => {
+                    return Ok(vec![ClientEvent::Warning {
+                        message: "dropped malformed or unrelated packet".to_owned(),
+                    }]);
+                }
+            };
+
+        let token = match self.phase {
+            ClientPhase::Open { token } => token,
+            _ => unreachable!(),
+        };
+        if reply.token != token {
+            return Ok(vec![ClientEvent::Warning {
+                message: format!(
+                    "dropped reply with wrong token: expected {token:#x}, got {:#x}",
+                    reply.token
+                ),
+            }]);
+        }
+
+        let session = self.session.as_mut().expect("session must exist when Open");
+
+        let wire_seq = reply.sequence;
+
+        if let Some(pending) = session.pending.remove(wire_seq) {
+            let rtt = compute_rtt(&pending.sent_at, &now, &reply.timestamps);
+            let server_timing = build_server_timing(&reply.timestamps);
+            let one_way = compute_one_way(&pending.sent_at, &now, &reply.timestamps);
+            let received_stats = build_received_stats(&reply);
+            let is_late = session.highest_received_seq.is_some_and(|h| wire_seq < h);
+            let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
+
+            update_highest_received(session, wire_seq);
+            session.completed.insert(wire_seq, pending.logical_seq);
+
+            let mut events = Vec::new();
+            if let Some(rtt_sample) = rtt {
+                if is_late {
+                    events.push(ClientEvent::LateReply {
+                        seq: wire_seq,
+                        logical_seq: Some(pending.logical_seq),
+                        highest_seen,
+                        remote: self.remote,
+                        sent_at: Some(pending.sent_at),
+                        received_at: now,
+                        rtt: Some(rtt_sample),
+                        server_timing,
+                        one_way,
+                        received_stats,
+                        packet_meta: PacketMeta::default(),
+                    });
+                } else {
+                    events.push(ClientEvent::EchoReply {
+                        seq: wire_seq,
+                        logical_seq: pending.logical_seq,
+                        remote: self.remote,
+                        sent_at: pending.sent_at,
+                        received_at: now,
+                        rtt: rtt_sample,
+                        server_timing,
+                        one_way,
+                        received_stats,
+                        packet_meta: PacketMeta::default(),
+                    });
+                }
+            }
+            Ok(events)
+        } else if session.completed.contains(wire_seq) {
+            update_highest_received(session, wire_seq);
+            Ok(vec![ClientEvent::DuplicateReply {
+                seq: wire_seq,
+                remote: self.remote,
+                received_at: now,
+            }])
+        } else {
+            let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
+            update_highest_received(session, wire_seq);
+            Ok(vec![ClientEvent::LateReply {
+                seq: wire_seq,
+                logical_seq: None,
+                highest_seen,
+                remote: self.remote,
+                sent_at: None,
+                received_at: now,
+                rtt: None,
+                server_timing: build_server_timing(&reply.timestamps),
+                one_way: None,
+                received_stats: build_received_stats(&reply),
+                packet_meta: PacketMeta::default(),
+            }])
+        }
     }
 
     fn accept_open_reply(
@@ -222,6 +479,109 @@ impl Client {
             event,
         })
     }
+}
+
+fn update_highest_received(session: &mut ActiveSession, wire_seq: u32) {
+    session.highest_received_seq = Some(
+        session
+            .highest_received_seq
+            .map_or(wire_seq, |h| h.max(wire_seq)),
+    );
+}
+
+fn compute_rtt(
+    sent_at: &ClientTimestamp,
+    received_at: &ClientTimestamp,
+    ts: &TimestampFields,
+) -> Option<RttSample> {
+    let raw = received_at.mono.checked_duration_since(sent_at.mono)?;
+
+    let server_processing = compute_server_processing(ts);
+
+    let adjusted = server_processing.and_then(|sp| raw.checked_sub(sp));
+
+    let effective = adjusted.unwrap_or(raw);
+
+    Some(RttSample {
+        raw,
+        adjusted,
+        effective,
+    })
+}
+
+fn compute_server_processing(ts: &TimestampFields) -> Option<Duration> {
+    if let (Some(recv_mono), Some(send_mono)) = (ts.recv_mono, ts.send_mono) {
+        let diff = send_mono.checked_sub(recv_mono)?;
+        return Some(Duration::from_nanos(u64::try_from(diff).ok()?));
+    }
+    if let (Some(recv_wall), Some(send_wall)) = (ts.recv_wall, ts.send_wall) {
+        let diff = send_wall.checked_sub(recv_wall)?;
+        return Some(Duration::from_nanos(u64::try_from(diff).ok()?));
+    }
+    None
+}
+
+fn build_server_timing(ts: &TimestampFields) -> Option<ServerTiming> {
+    if ts.recv_wall.is_none()
+        && ts.recv_mono.is_none()
+        && ts.send_wall.is_none()
+        && ts.send_mono.is_none()
+        && ts.midpoint_wall.is_none()
+        && ts.midpoint_mono.is_none()
+    {
+        return None;
+    }
+    Some(ServerTiming {
+        receive_wall_ns: ts.recv_wall,
+        receive_mono_ns: ts.recv_mono,
+        send_wall_ns: ts.send_wall,
+        send_mono_ns: ts.send_mono,
+        midpoint_wall_ns: ts.midpoint_wall,
+        midpoint_mono_ns: ts.midpoint_mono,
+        processing: compute_server_processing(ts),
+    })
+}
+
+fn compute_one_way(
+    sent_at: &ClientTimestamp,
+    received_at: &ClientTimestamp,
+    ts: &TimestampFields,
+) -> Option<OneWayDelaySample> {
+    let server_recv_wall = ts.recv_wall.or(ts.midpoint_wall)?;
+    let server_send_wall = ts.send_wall.or(ts.midpoint_wall)?;
+
+    let client_send_ns = sent_at
+        .wall
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+    let client_recv_ns = received_at
+        .wall
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as i64;
+
+    let c2s = server_recv_wall
+        .checked_sub(client_send_ns)
+        .and_then(|d| u64::try_from(d).ok().map(Duration::from_nanos));
+    let s2c = client_recv_ns
+        .checked_sub(server_send_wall)
+        .and_then(|d| u64::try_from(d).ok().map(Duration::from_nanos));
+
+    Some(OneWayDelaySample {
+        client_to_server: c2s,
+        server_to_client: s2c,
+    })
+}
+
+fn build_received_stats(reply: &EchoReply) -> Option<ReceivedStatsSample> {
+    if reply.recv_count.is_none() && reply.recv_window.is_none() {
+        return None;
+    }
+    Some(ReceivedStatsSample {
+        count: reply.recv_count,
+        window: reply.recv_window,
+    })
 }
 
 fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {

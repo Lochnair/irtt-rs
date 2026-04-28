@@ -1,6 +1,12 @@
+use std::time::Instant;
+
 use irtt_proto::{Params, PROTOCOL_VERSION};
 
-use crate::{config::NegotiationPolicy, error::ClientError};
+use crate::{
+    config::NegotiationPolicy,
+    error::ClientError,
+    probe::{CompletedSet, PendingMap},
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiatedParams {
@@ -50,9 +56,6 @@ pub(crate) fn validate_negotiated_params(
             reason: "length increased".to_owned(),
         });
     }
-    // TODO/OPEN: apply a documented negotiated interval safety floor once the
-    // clean spec or black-box report defines one. For now, only reject
-    // impossible non-positive intervals.
     if returned.interval_ns <= 0 {
         return Err(ClientError::NegotiationRejected {
             reason: "interval must be positive".to_owned(),
