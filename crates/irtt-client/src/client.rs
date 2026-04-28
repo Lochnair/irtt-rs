@@ -148,6 +148,17 @@ impl Client {
     }
 
     pub fn send_probe(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+        self.send_probe_inner(None)
+    }
+
+    pub fn recv_once(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+        self.recv_once_inner(None)
+    }
+
+    fn send_probe_inner(
+        &mut self,
+        override_ts: Option<ClientTimestamp>,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
         let token = match self.phase {
             ClientPhase::Open { token } => token,
             ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
@@ -164,7 +175,7 @@ impl Client {
             return Ok(vec![]);
         }
 
-        let now = ClientTimestamp::now();
+        let now = override_ts.unwrap_or_else(ClientTimestamp::now);
 
         if let Some(end) = session.end_mono {
             if now.mono >= end {
@@ -192,7 +203,7 @@ impl Client {
         let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
         self.socket.send(&packet)?;
 
-        let sent_at = ClientTimestamp::now();
+        let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
 
         let session = self
             .session
@@ -232,7 +243,10 @@ impl Client {
         Ok(vec![])
     }
 
-    pub fn recv_once(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+    fn recv_once_inner(
+        &mut self,
+        override_ts: Option<ClientTimestamp>,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
         match self.phase {
             ClientPhase::Open { .. } => {}
             ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
@@ -255,7 +269,7 @@ impl Client {
             Err(err) => return Err(ClientError::Socket(err)),
         };
 
-        let now = ClientTimestamp::now();
+        let now = override_ts.unwrap_or_else(ClientTimestamp::now);
         self.process_received_packet(&buf[..size], now)
     }
 
@@ -527,111 +541,12 @@ impl Client {
 
 #[cfg(test)]
 impl Client {
-    fn send_probe_at(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
-        let token = match self.phase {
-            ClientPhase::Open { token } => token,
-            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
-            ClientPhase::Connected => return Err(ClientError::NotOpen),
-            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
-        };
-
-        let session = self
-            .session
-            .as_mut()
-            .expect("session must exist when phase is Open");
-
-        if session.sending_done {
-            return Ok(vec![]);
-        }
-
-        if let Some(end) = session.end_mono {
-            if now.mono >= end {
-                session.sending_done = true;
-                return Ok(vec![]);
-            }
-        }
-
-        session.pending.check_capacity()?;
-
-        let negotiated = self
-            .negotiated
-            .as_ref()
-            .expect("negotiated must exist when Open");
-
-        let wire_seq = session.next_wire_seq;
-        let logical_seq = session.next_logical_seq;
-
-        let request = EchoRequest {
-            token,
-            sequence: wire_seq,
-            params: negotiated.params.clone(),
-            payload: vec![],
-        };
-        let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
-        self.socket.send(&packet)?;
-
-        let session = self
-            .session
-            .as_mut()
-            .expect("session must exist when phase is Open");
-
-        let pending = PendingProbe {
-            logical_seq,
-            wire_seq,
-            sent_at: now,
-            timeout_at: now.mono + self.config.probe_timeout,
-        };
-        session.pending.insert(pending)?;
-
-        session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
-        session.next_logical_seq += 1;
-        session.packets_sent += 1;
-
-        let negotiated = self
-            .negotiated
-            .as_ref()
-            .expect("negotiated must exist when Open");
-        let interval_ns = negotiated.params.interval_ns as u64;
-        let session = self
-            .session
-            .as_mut()
-            .expect("session must exist when phase is Open");
-        session.next_send_at =
-            session.start_mono + Duration::from_nanos(interval_ns * session.packets_sent);
-
-        if let Some(end) = session.end_mono {
-            if session.next_send_at >= end {
-                session.sending_done = true;
-            }
-        }
-
-        Ok(vec![])
+    fn send_probe_at(&mut self, ts: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+        self.send_probe_inner(Some(ts))
     }
 
-    fn recv_once_at(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
-        match self.phase {
-            ClientPhase::Open { .. } => {}
-            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
-            ClientPhase::Connected => return Err(ClientError::NotOpen),
-            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
-        }
-
-        let buf_size = self.recv_buffer_size();
-        let mut buf = vec![0_u8; buf_size];
-        let size = match self.socket.recv(&mut buf) {
-            Ok(size) => size,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(vec![]);
-            }
-            Err(err) => return Err(ClientError::Socket(err)),
-        };
-
-        self.process_received_packet(&buf[..size], now)
+    fn recv_once_at(&mut self, ts: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+        self.recv_once_inner(Some(ts))
     }
 }
 
