@@ -86,7 +86,8 @@ impl ManagedClient {
         let cancellation = CancellationToken::new();
         let worker_hub = hub.clone();
         let worker_cancellation = cancellation.clone();
-        let worker = thread::spawn(move || run_client(client, worker_hub, worker_cancellation));
+        let worker =
+            thread::spawn(move || run_client_with_cleanup(client, worker_hub, worker_cancellation));
 
         Ok((
             ManagedClientSession {
@@ -143,7 +144,6 @@ fn run_client(
     cancellation: CancellationToken,
 ) -> Result<SessionOutcome, ClientError> {
     if client.is_run_complete() {
-        hub.disconnect_all();
         return Ok(SessionOutcome {
             end_reason: SessionEndReason::NoTestComplete,
             packets_sent: 0,
@@ -204,7 +204,6 @@ fn run_client(
     let packets_sent = client.packets_sent();
     let close_events = client.close(ClientTimestamp::now())?;
     publish_events(&hub, &mut counters, close_events);
-    hub.disconnect_all();
 
     Ok(SessionOutcome {
         end_reason: if cancelled {
@@ -218,6 +217,16 @@ fn run_client(
         late: counters.late,
         warning_events: counters.warning_events,
     })
+}
+
+fn run_client_with_cleanup(
+    client: Client,
+    hub: EventHub,
+    cancellation: CancellationToken,
+) -> Result<SessionOutcome, ClientError> {
+    let outcome = run_client(client, hub.clone(), cancellation);
+    hub.disconnect_all();
+    outcome
 }
 
 fn publish_events(hub: &EventHub, counters: &mut OutcomeCounters, events: Vec<ClientEvent>) {
