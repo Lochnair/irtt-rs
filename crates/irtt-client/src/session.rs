@@ -5,7 +5,7 @@ use irtt_proto::{Params, PROTOCOL_VERSION};
 use crate::{
     config::NegotiationPolicy,
     error::ClientError,
-    probe::{CompletedSet, PendingMap},
+    probe::{CompletedSet, PendingMap, TimedOutMap},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,6 +31,7 @@ pub(crate) struct ActiveSession {
     pub end_mono: Option<Instant>,
     pub next_send_at: Instant,
     pub pending: PendingMap,
+    pub timed_out: TimedOutMap,
     pub completed: CompletedSet,
     pub sending_done: bool,
 }
