@@ -15,9 +15,9 @@ use crate::{
     error::ClientError,
     event::{
         ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
-        ServerTiming, WarningKind,
+        ServerTiming, SignedDuration, WarningKind,
     },
-    probe::{CompletedSet, PendingMap, PendingProbe},
+    probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
     session::{validate_negotiated_params, ActiveSession, ClientPhase, NegotiatedParams},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     timing::ClientTimestamp,
@@ -130,6 +130,9 @@ impl Client {
             encode_close_request(&CloseRequest { token }, self.config.hmac_key.as_deref())?;
         self.socket.send(&packet)?;
         self.phase = ClientPhase::Closed;
+        if let Some(session) = self.session.as_mut() {
+            session.timed_out.clear();
+        }
         self.session = None;
 
         Ok(vec![ClientEvent::SessionClosed {
@@ -309,15 +312,16 @@ impl Client {
             .expect("session must exist when phase is Open");
 
         let expired = session.pending.drain_expired(now.mono);
-        let events: Vec<ClientEvent> = expired
-            .into_iter()
-            .map(|probe| ClientEvent::EchoLoss {
+        let mut events = Vec::with_capacity(expired.len());
+        for probe in expired {
+            events.push(ClientEvent::EchoLoss {
                 seq: probe.wire_seq,
                 logical_seq: probe.logical_seq,
                 sent_at: probe.sent_at,
                 timeout_at: probe.timeout_at,
-            })
-            .collect();
+            });
+            session.timed_out.insert(probe);
+        }
 
         Ok(events)
     }
@@ -426,6 +430,30 @@ impl Client {
                 seq: wire_seq,
                 remote: self.remote,
                 received_at: now,
+                bytes: packet.len(),
+            }])
+        } else if let Some(timed_out) = session.timed_out.remove(wire_seq) {
+            let rtt = compute_rtt(&timed_out.sent_at, &now, &reply.timestamps);
+            let server_timing = build_server_timing(&reply.timestamps);
+            let one_way = compute_one_way(&timed_out.sent_at, &now, &reply.timestamps);
+            let received_stats = build_received_stats(&reply);
+            let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
+            update_highest_received(session, wire_seq);
+            session.completed.insert(wire_seq, timed_out.logical_seq);
+
+            Ok(vec![ClientEvent::LateReply {
+                seq: wire_seq,
+                logical_seq: Some(timed_out.logical_seq),
+                highest_seen,
+                remote: self.remote,
+                sent_at: Some(timed_out.sent_at),
+                received_at: now,
+                rtt: Some(rtt),
+                server_timing,
+                one_way,
+                received_stats,
+                bytes: packet.len(),
+                packet_meta: PacketMeta::default(),
             }])
         } else if session.highest_received_seq.is_some_and(|h| wire_seq < h) {
             // TODO: u32 ordering is acceptable for finite tests but continuous
@@ -511,6 +539,7 @@ impl Client {
             end_mono,
             next_send_at: now.mono,
             pending: PendingMap::new(self.config.max_pending_probes),
+            timed_out: TimedOutMap::new(self.config.max_pending_probes),
             completed: CompletedSet::new(self.config.max_pending_probes),
             sending_done: false,
         });
@@ -2027,6 +2056,113 @@ mod tests {
 
         let session = client.session.as_ref().unwrap();
         assert_eq!(session.pending.len(), 0);
+        assert_eq!(session.timed_out.len(), 1);
+        server.join();
+    }
+
+    #[test]
+    fn late_reply_after_timeout_preserves_measurement_metadata() {
+        let params = default_params();
+        let server = start_fake_server(move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+
+            let mut buf = [0_u8; 2048];
+            let (size, _) = socket.recv_from(&mut buf).unwrap();
+            tx.send(buf[..size].to_vec()).unwrap();
+            let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+
+            thread::sleep(Duration::from_millis(90));
+            let ts = TimestampFields {
+                recv_wall: Some(1_000_000_000),
+                recv_mono: Some(100_000),
+                send_wall: Some(1_000_100_000),
+                send_mono: Some(200_000),
+                ..Default::default()
+            };
+            let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, None);
+            socket.send_to(&reply_packet, peer).unwrap();
+            socket.send_to(&reply_packet, peer).unwrap();
+        });
+        let config = ClientConfig {
+            probe_timeout: Duration::from_millis(40),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(60));
+        let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+        assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
+        assert_eq!(client.session.as_ref().unwrap().pending.len(), 0);
+        assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
+
+        let late = client.recv_once().unwrap();
+        match &late[0] {
+            ClientEvent::LateReply {
+                seq,
+                logical_seq,
+                sent_at,
+                rtt,
+                server_timing,
+                one_way,
+                bytes,
+                ..
+            } => {
+                assert_eq!(*seq, 0);
+                assert_eq!(*logical_seq, Some(0));
+                assert!(sent_at.is_some());
+                assert!(rtt.is_some());
+                assert!(server_timing.is_some());
+                assert!(one_way.is_some());
+                assert_eq!(*bytes, echo_packet_len(false, &default_params()));
+            }
+            other => panic!("expected stats-eligible LateReply, got {other:?}"),
+        }
+        assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 0);
+
+        let duplicate = client.recv_once().unwrap();
+        assert!(matches!(
+            &duplicate[0],
+            ClientEvent::DuplicateReply {
+                seq: 0,
+                bytes,
+                ..
+            } if *bytes == echo_packet_len(false, &default_params())
+        ));
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn close_clears_timed_out_metadata() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            probe_timeout: Duration::from_millis(40),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(50)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        client.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(60));
+        client.poll_timeouts(ClientTimestamp::now()).unwrap();
+        assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
+
+        client.close(ClientTimestamp::now()).unwrap();
+        assert!(client.session.is_none());
         server.join();
     }
 

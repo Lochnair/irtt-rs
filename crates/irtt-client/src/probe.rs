@@ -70,6 +70,62 @@ impl PendingMap {
 }
 
 #[derive(Debug)]
+pub(crate) struct TimedOutMap {
+    map: HashMap<u32, PendingProbe>,
+    insertion_order: VecDeque<u32>,
+    max_capacity: usize,
+}
+
+impl TimedOutMap {
+    pub fn new(max_capacity: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            insertion_order: VecDeque::new(),
+            max_capacity,
+        }
+    }
+
+    pub fn insert(&mut self, probe: PendingProbe) {
+        if self.max_capacity == 0 {
+            return;
+        }
+        if let std::collections::hash_map::Entry::Occupied(mut entry) =
+            self.map.entry(probe.wire_seq)
+        {
+            entry.insert(probe);
+            return;
+        }
+        while self.map.len() >= self.max_capacity {
+            self.evict_oldest();
+        }
+        self.insertion_order.push_back(probe.wire_seq);
+        self.map.insert(probe.wire_seq, probe);
+    }
+
+    pub fn remove(&mut self, wire_seq: u32) -> Option<PendingProbe> {
+        self.map.remove(&wire_seq)
+    }
+
+    pub fn clear(&mut self) {
+        self.map.clear();
+        self.insertion_order.clear();
+    }
+
+    #[allow(dead_code)]
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    fn evict_oldest(&mut self) {
+        while let Some(oldest_key) = self.insertion_order.pop_front() {
+            if self.map.remove(&oldest_key).is_some() {
+                break;
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct CompletedSet {
     set: HashMap<u32, u64>,
     insertion_order: VecDeque<u32>,
@@ -186,5 +242,19 @@ mod tests {
         assert_eq!(set.set.len(), 3);
         assert!(!set.contains(0));
         assert!(set.contains(3));
+    }
+
+    #[test]
+    fn timed_out_map_tracks_and_evicts() {
+        let mut map = TimedOutMap::new(2);
+        let now = Instant::now();
+        map.insert(pending(0, 0, now));
+        map.insert(pending(1, 1, now));
+        map.insert(pending(2, 2, now));
+
+        assert_eq!(map.len(), 2);
+        assert!(map.remove(0).is_none());
+        assert!(map.remove(1).is_some());
+        assert!(map.remove(2).is_some());
     }
 }
