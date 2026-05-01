@@ -24,7 +24,7 @@ const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 pub struct CliArgs {
     pub server: String,
 
-    #[arg(long, default_value = "10s", value_parser = parse_duration)]
+    #[arg(long, default_value = "10s", value_parser = parse_test_duration)]
     pub duration: Duration,
 
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
@@ -50,7 +50,7 @@ impl CliArgs {
     pub fn to_client_config(&self) -> ClientConfig {
         ClientConfig {
             server_addr: self.server.clone(),
-            duration: Some(self.duration),
+            duration: (!self.is_continuous()).then_some(self.duration),
             interval: self.interval,
             length: self.length,
             received_stats: ReceivedStats::Both,
@@ -63,6 +63,10 @@ impl CliArgs {
             },
             ..ClientConfig::default()
         }
+    }
+
+    pub fn is_continuous(&self) -> bool {
+        self.duration == Duration::ZERO
     }
 }
 
@@ -123,6 +127,30 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
         .map_err(|_| format!("invalid duration value {input:?}"))?;
     if value == 0 {
         return Err("duration must be greater than zero".to_owned());
+    }
+    match unit {
+        "ms" => Ok(Duration::from_millis(value)),
+        "s" => Ok(Duration::from_secs(value)),
+        "m" => value
+            .checked_mul(60)
+            .map(Duration::from_secs)
+            .ok_or_else(|| "duration is too large".to_owned()),
+        _ => Err(format!(
+            "unsupported duration unit {unit:?}; use ms, s, or m"
+        )),
+    }
+}
+
+pub fn parse_test_duration(input: &str) -> Result<Duration, String> {
+    if input == "0" {
+        return Ok(Duration::ZERO);
+    }
+    let (number, unit) = split_duration(input)?;
+    let value: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid duration value {input:?}"))?;
+    if value == 0 {
+        return Ok(Duration::ZERO);
     }
     match unit {
         "ms" => Ok(Duration::from_millis(value)),
@@ -581,6 +609,7 @@ mod tests {
         assert_eq!(config.length, 0);
         assert_eq!(config.stamp_at, StampAt::Both);
         assert_eq!(config.clock, Clock::Both);
+        assert!(!args.is_continuous());
     }
 
     #[test]
@@ -588,14 +617,27 @@ mod tests {
         assert_eq!(parse_duration("1ms").unwrap(), Duration::from_millis(1));
         assert_eq!(parse_duration("2s").unwrap(), Duration::from_secs(2));
         assert_eq!(parse_duration("3m").unwrap(), Duration::from_secs(180));
+        assert_eq!(parse_test_duration("0").unwrap(), Duration::ZERO);
+        assert_eq!(parse_test_duration("0s").unwrap(), Duration::ZERO);
+        assert_eq!(
+            parse_test_duration("1ms").unwrap(),
+            Duration::from_millis(1)
+        );
     }
 
     #[test]
     fn rejects_invalid_duration() {
-        assert!(parse(&["--duration", "0s", "127.0.0.1:2112"]).is_err());
         assert!(parse(&["--duration", "-1s", "127.0.0.1:2112"]).is_err());
         assert!(parse(&["--duration", "5", "127.0.0.1:2112"]).is_err());
         assert!(parse(&["--duration", "1h", "127.0.0.1:2112"]).is_err());
+    }
+
+    #[test]
+    fn duration_zero_selects_continuous_config() {
+        let args = parse(&["--duration", "0", "127.0.0.1:2112"]).unwrap();
+        assert!(args.is_continuous());
+        assert_eq!(args.duration, Duration::ZERO);
+        assert_eq!(args.to_client_config().duration, None);
     }
 
     #[test]

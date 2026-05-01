@@ -1735,6 +1735,47 @@ mod tests {
     }
 
     #[test]
+    fn continuous_duration_keeps_generating_send_deadlines() {
+        let params = Params {
+            protocol_version: 1,
+            duration_ns: 0,
+            interval_ns: 500_000_000,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Params::default()
+        };
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            duration: None,
+            interval: Duration::from_millis(500),
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+        let start = client.session.as_ref().unwrap().start_mono;
+        let interval = Duration::from_millis(500);
+        for seq in 0..4 {
+            let now = ClientTimestamp {
+                mono: start + interval * seq,
+                wall: SystemTime::now(),
+            };
+            let events = client.send_probe_at(now).unwrap();
+            assert_eq!(events.len(), 1);
+            assert!(client.next_send_deadline().is_some());
+            assert!(!client.session.as_ref().unwrap().sending_done);
+        }
+
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
     fn next_send_deadline_advances_by_interval() {
         let params = default_params();
         let (mut client, server) = open_client_with_echo_server(&params);
