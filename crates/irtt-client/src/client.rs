@@ -196,6 +196,7 @@ impl Client {
 
         let wire_seq = session.next_wire_seq;
         let logical_seq = session.next_logical_seq;
+        let scheduled_at = session.next_send_at;
 
         let request = EchoRequest {
             token,
@@ -205,7 +206,10 @@ impl Client {
         };
         let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
         let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
-        self.socket.send(&packet)?;
+        let send_call_start = Instant::now();
+        let bytes = self.socket.send(&packet)?;
+        let send_call = send_call_start.elapsed();
+        let timer_error = instant_abs_diff(sent_at.mono, scheduled_at);
 
         let session = self
             .session
@@ -242,7 +246,16 @@ impl Client {
             }
         }
 
-        Ok(vec![])
+        Ok(vec![ClientEvent::EchoSent {
+            seq: wire_seq,
+            logical_seq,
+            remote: self.remote,
+            scheduled_at,
+            sent_at,
+            bytes,
+            send_call,
+            timer_error,
+        }])
     }
 
     fn recv_once_inner(
@@ -604,6 +617,12 @@ fn update_highest_received(session: &mut ActiveSession, wire_seq: u32) {
             .highest_received_seq
             .map_or(wire_seq, |h| h.max(wire_seq)),
     );
+}
+
+fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
+    left.checked_duration_since(right)
+        .or_else(|| right.checked_duration_since(left))
+        .unwrap_or(Duration::ZERO)
 }
 
 fn compute_rtt(
@@ -1541,7 +1560,23 @@ mod tests {
         };
         let mut client = Client::connect(config).unwrap();
         assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-        client.send_probe().unwrap();
+        let events = client.send_probe().unwrap();
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            ClientEvent::EchoSent {
+                seq,
+                logical_seq,
+                remote,
+                bytes,
+                ..
+            } => {
+                assert_eq!(*seq, 0);
+                assert_eq!(*logical_seq, 0);
+                assert_eq!(*remote, server.addr);
+                assert_eq!(*bytes, echo_packet_len(false, &params));
+            }
+            other => panic!("expected EchoSent, got {other:?}"),
+        }
         thread::sleep(Duration::from_millis(30));
         let packets: Vec<_> = server.rx.try_iter().collect();
         let echo_reqs: Vec<_> = packets
@@ -1555,6 +1590,43 @@ mod tests {
         assert_eq!(req_token, TOKEN);
         let seq = u32::from_le_bytes(echo_req[12..16].try_into().unwrap());
         assert_eq!(seq, 0);
+        client.close(ClientTimestamp::now()).unwrap();
+        server.join();
+    }
+
+    #[test]
+    fn echo_sent_reports_schedule_and_timer_error() {
+        let params = default_params();
+        let server = silent_open_server(params);
+        let config = ClientConfig {
+            socket_config: crate::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..default_test_config(server.addr)
+        };
+        let mut client = Client::connect(config).unwrap();
+        let start = ClientTimestamp {
+            mono: Instant::now(),
+            wall: SystemTime::now(),
+        };
+        assert_open_started(client.open(start).unwrap());
+
+        let events = client.send_probe_at(start).unwrap();
+        match &events[0] {
+            ClientEvent::EchoSent {
+                scheduled_at,
+                sent_at,
+                timer_error,
+                ..
+            } => {
+                assert_eq!(*scheduled_at, start.mono);
+                assert_eq!(*sent_at, start);
+                assert_eq!(*timer_error, Duration::ZERO);
+            }
+            other => panic!("expected EchoSent, got {other:?}"),
+        }
+
         client.close(ClientTimestamp::now()).unwrap();
         server.join();
     }

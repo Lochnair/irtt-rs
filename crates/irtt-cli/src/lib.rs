@@ -152,6 +152,9 @@ pub fn parse_length(input: &str) -> Result<u32, String> {
 }
 
 pub fn format_event(event: &ClientEvent, mode: OutputMode) -> Option<String> {
+    if matches!(event, ClientEvent::EchoSent { .. }) {
+        return None;
+    }
     match mode {
         OutputMode::RttUs => format_rtt_us(event),
         OutputMode::Machine => Some(format_machine(event)),
@@ -197,6 +200,7 @@ fn format_machine(event: &ClientEvent) -> String {
             write_token(&mut out, *token);
             write_wall(&mut out, "at_ns", at.wall);
         }
+        ClientEvent::EchoSent { .. } => {}
         ClientEvent::EchoReply {
             seq,
             logical_seq,
@@ -300,12 +304,14 @@ fn format_simple(event: &ClientEvent) -> String {
         ClientEvent::SessionClosed { remote, token, .. } => {
             format!("session closed remote={remote} token={token:#x}")
         }
+        ClientEvent::EchoSent { .. } => String::new(),
         ClientEvent::EchoReply {
             seq,
             logical_seq,
             remote,
             rtt,
             server_timing,
+            bytes: _,
             ..
         } => {
             let mut out = format!(
@@ -665,6 +671,25 @@ mod tests {
             line,
             "reply seq=7 logical_seq=8 remote=127.0.0.1:2112 rtt_us=1200 raw_rtt_us=1500 server_processing_us=300"
         );
+    }
+
+    #[test]
+    fn echo_sent_is_not_formatted_for_stream_outputs() {
+        let ts = test_timestamp(Duration::from_secs(1));
+        let event = ClientEvent::EchoSent {
+            seq: 1,
+            logical_seq: 2,
+            remote: test_remote(),
+            scheduled_at: ts.mono,
+            sent_at: ts,
+            bytes: 64,
+            send_call: Duration::from_micros(10),
+            timer_error: Duration::ZERO,
+        };
+
+        assert!(format_event(&event, OutputMode::RttUs).is_none());
+        assert!(format_event(&event, OutputMode::Machine).is_none());
+        assert!(format_event(&event, OutputMode::Simple).is_none());
     }
 
     #[test]

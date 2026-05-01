@@ -1,4 +1,7 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant},
+};
 
 use crate::{session::NegotiatedParams, timing::ClientTimestamp};
 
@@ -34,6 +37,17 @@ pub enum ClientEvent {
         remote: SocketAddr,
         token: u64,
         at: ClientTimestamp,
+    },
+
+    EchoSent {
+        seq: u32,
+        logical_seq: u64,
+        remote: SocketAddr,
+        scheduled_at: Instant,
+        sent_at: ClientTimestamp,
+        bytes: usize,
+        send_call: Duration,
+        timer_error: Duration,
     },
 
     EchoReply {
