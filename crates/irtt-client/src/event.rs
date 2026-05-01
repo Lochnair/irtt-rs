@@ -46,6 +46,7 @@ pub enum ClientEvent {
         server_timing: Option<ServerTiming>,
         one_way: Option<OneWayDelaySample>,
         received_stats: Option<ReceivedStatsSample>,
+        bytes: usize,
         packet_meta: PacketMeta,
     },
 
@@ -60,6 +61,7 @@ pub enum ClientEvent {
         seq: u32,
         remote: SocketAddr,
         received_at: ClientTimestamp,
+        bytes: usize,
     },
 
     LateReply {
@@ -73,6 +75,7 @@ pub enum ClientEvent {
         server_timing: Option<ServerTiming>,
         one_way: Option<OneWayDelaySample>,
         received_stats: Option<ReceivedStatsSample>,
+        bytes: usize,
         packet_meta: PacketMeta,
     },
 
