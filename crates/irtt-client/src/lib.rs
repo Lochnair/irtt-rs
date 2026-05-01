@@ -15,7 +15,7 @@ pub use config::{ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketCon
 pub use error::{ClientError, EventSubscriptionError};
 pub use event::{
     ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
-    ServerTiming, WarningKind,
+    ServerTiming, SignedDuration, WarningKind,
 };
 pub use managed::{
     CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientSession,
