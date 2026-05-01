@@ -97,6 +97,13 @@ pub struct RttSample {
     pub raw: Duration,
     pub adjusted: Option<Duration>,
     pub effective: Duration,
+    pub adjusted_signed: Option<SignedDuration>,
+    pub effective_signed: SignedDuration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignedDuration {
+    pub ns: i128,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

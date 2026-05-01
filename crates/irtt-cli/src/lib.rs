@@ -486,7 +486,7 @@ fn escape_value(value: &str) -> String {
 mod tests {
     use super::*;
     use clap::Parser;
-    use irtt_client::{ClientTimestamp, PacketMeta, RttSample};
+    use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
     use irtt_proto::{Params, PROTOCOL_VERSION};
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -521,6 +521,8 @@ mod tests {
                 raw: Duration::from_micros(1500),
                 adjusted: Some(Duration::from_micros(1200)),
                 effective: Duration::from_micros(1200),
+                adjusted_signed: Some(SignedDuration { ns: 1_200_000 }),
+                effective_signed: SignedDuration { ns: 1_200_000 },
             },
             server_timing: Some(ServerTiming {
                 receive_wall_ns: Some(1_000),

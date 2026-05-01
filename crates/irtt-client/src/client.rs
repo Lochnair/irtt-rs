@@ -592,12 +592,24 @@ fn compute_rtt(
     let adjusted = server_processing.and_then(|sp| raw.checked_sub(sp));
 
     let effective = adjusted.unwrap_or(raw);
+    let adjusted_signed = server_processing.map(|sp| SignedDuration {
+        ns: duration_ns_i128(raw) - duration_ns_i128(sp),
+    });
+    let effective_signed = adjusted_signed.unwrap_or(SignedDuration {
+        ns: duration_ns_i128(raw),
+    });
 
     RttSample {
         raw,
         adjusted,
         effective,
+        adjusted_signed,
+        effective_signed,
     }
+}
+
+fn duration_ns_i128(duration: Duration) -> i128 {
+    i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
 }
 
 fn compute_server_processing(ts: &TimestampFields) -> Option<Duration> {
@@ -1726,13 +1738,14 @@ mod tests {
 
     #[test]
     fn server_processing_greater_than_raw_does_not_underflow() {
+        let base = Instant::now();
         let rtt = compute_rtt(
             &ClientTimestamp {
-                mono: Instant::now(),
+                mono: base,
                 wall: SystemTime::now(),
             },
             &ClientTimestamp {
-                mono: Instant::now() + Duration::from_nanos(1),
+                mono: base + Duration::from_nanos(1),
                 wall: SystemTime::now(),
             },
             &TimestampFields {
@@ -1743,6 +1756,11 @@ mod tests {
         );
         assert!(rtt.adjusted.is_none());
         assert_eq!(rtt.effective, rtt.raw);
+        assert_eq!(
+            rtt.adjusted_signed,
+            Some(SignedDuration { ns: -999_999_999 })
+        );
+        assert_eq!(rtt.effective_signed, SignedDuration { ns: -999_999_999 });
     }
 
     #[test]
