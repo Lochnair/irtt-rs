@@ -103,7 +103,11 @@ impl TimedOutMap {
     }
 
     pub fn remove(&mut self, wire_seq: u32) -> Option<PendingProbe> {
-        self.map.remove(&wire_seq)
+        let removed = self.map.remove(&wire_seq);
+        if removed.is_some() {
+            self.insertion_order.retain(|seq| *seq != wire_seq);
+        }
+        removed
     }
 
     pub fn clear(&mut self) {
@@ -114,6 +118,11 @@ impl TimedOutMap {
     #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    #[cfg(test)]
+    fn insertion_order_len(&self) -> usize {
+        self.insertion_order.len()
     }
 
     fn evict_oldest(&mut self) {
@@ -256,5 +265,18 @@ mod tests {
         assert!(map.remove(0).is_none());
         assert!(map.remove(1).is_some());
         assert!(map.remove(2).is_some());
+    }
+
+    #[test]
+    fn timed_out_map_remove_prunes_insertion_order() {
+        let mut map = TimedOutMap::new(4);
+        let now = Instant::now();
+
+        for i in 0..20 {
+            map.insert(pending(i, u64::from(i), now));
+            assert!(map.remove(i).is_some());
+            assert_eq!(map.len(), 0);
+            assert_eq!(map.insertion_order_len(), 0);
+        }
     }
 }
