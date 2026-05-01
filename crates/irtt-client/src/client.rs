@@ -85,7 +85,7 @@ impl Client {
         }
     }
 
-    fn open_inner(&mut self, now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
+    fn open_inner(&mut self, _now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
         let request = OpenRequest {
             params: self.requested.clone(),
             close: self.config.run_mode == RunMode::NoTest,
@@ -103,7 +103,7 @@ impl Client {
                         &buf[..size],
                         self.config.hmac_key.as_deref(),
                     )?;
-                    return self.accept_open_reply(reply, now);
+                    return self.accept_open_reply(reply, ClientTimestamp::now());
                 }
                 Err(err)
                     if matches!(
@@ -148,6 +148,10 @@ impl Client {
             return None;
         }
         Some(session.next_send_at)
+    }
+
+    pub fn probe_timeout(&self) -> Duration {
+        self.config.probe_timeout
     }
 
     pub fn send_probe(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
@@ -339,7 +343,7 @@ impl Client {
         Ok(events)
     }
 
-    pub(crate) fn is_run_complete(&self) -> bool {
+    pub fn is_run_complete(&self) -> bool {
         let Some(session) = self.session.as_ref() else {
             return matches!(
                 self.phase,
@@ -1617,8 +1621,17 @@ mod tests {
             wall: SystemTime::now(),
         };
         assert_open_started(client.open(start).unwrap());
+        let session_start = client.session.as_ref().unwrap().start_mono;
+        assert!(
+            session_start >= start.mono,
+            "probe schedule must start after open begins"
+        );
+        let first_probe_at = ClientTimestamp {
+            mono: session_start,
+            wall: SystemTime::now(),
+        };
 
-        let events = client.send_probe_at(start).unwrap();
+        let events = client.send_probe_at(first_probe_at).unwrap();
         match &events[0] {
             ClientEvent::EchoSent {
                 scheduled_at,
@@ -1626,8 +1639,8 @@ mod tests {
                 timer_error,
                 ..
             } => {
-                assert_eq!(*scheduled_at, start.mono);
-                assert_eq!(*sent_at, start);
+                assert_eq!(*scheduled_at, session_start);
+                assert_eq!(*sent_at, first_probe_at);
                 assert_eq!(*timer_error, Duration::ZERO);
             }
             other => panic!("expected EchoSent, got {other:?}"),
