@@ -12,9 +12,8 @@ use irtt_client::{Client, ClientEvent, ClientTimestamp, OpenOutcome, RecvBudget}
 use irtt_stats::{StatsCollector, StatsConfig};
 
 const RECV_BUDGET: RecvBudget = RecvBudget { max_packets: 16 };
-// TODO: derive final drain from pending probe timeout behavior once the client
-// exposes enough state for the CLI to stop guessing.
-const FINAL_DRAIN: Duration = Duration::from_millis(100);
+const MAX_FINAL_DRAIN: Duration = Duration::from_secs(30);
+const IDLE_SLEEP: Duration = Duration::from_millis(5);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
 
 fn main() -> ExitCode {
@@ -30,11 +29,13 @@ fn main() -> ExitCode {
 
 fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let mode = args.output;
+    let continuous = args.is_continuous();
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     #[cfg(feature = "stats")]
-    let mut stats = StatsCollector::new(StatsConfig::finite());
+    let mut stats = StatsCollector::new(stats_config(continuous));
     let mut output = EventOutput {
         mode,
+        print_finite_summary: !continuous,
         out: &mut stdout,
         #[cfg(feature = "stats")]
         stats: &mut stats,
@@ -44,9 +45,11 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     let open = client.open(ClientTimestamp::now())?;
     output.print_event(open_event(&open))?;
 
-    while let Some(deadline) = client.next_send_deadline() {
-        let now = Instant::now();
-        if deadline <= now {
+    while continuous || client.next_send_deadline().is_some() {
+        if client
+            .next_send_deadline()
+            .is_some_and(|deadline| deadline <= Instant::now())
+        {
             let events = client.send_probe()?;
             output.print_events(&events)?;
         }
@@ -60,7 +63,9 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         sleep_until_next_send(client.next_send_deadline());
     }
 
-    drain_final_replies(&mut client, &mut output)?;
+    if !continuous {
+        drain_final_replies(&mut client, &mut output)?;
+    }
 
     let events = client.poll_timeouts(ClientTimestamp::now())?;
     output.print_events(&events)?;
@@ -82,13 +87,24 @@ fn drain_final_replies<W: Write>(
     client: &mut Client,
     output: &mut EventOutput<'_, W>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let deadline = Instant::now() + FINAL_DRAIN;
-    while Instant::now() < deadline {
+    let deadline = Instant::now() + final_drain_duration(client.probe_timeout());
+    loop {
+        let mut printed = false;
+
         let events = client.recv_available(RECV_BUDGET)?;
-        if events.is_empty() {
-            thread::sleep(Duration::from_millis(5));
-        } else {
-            output.print_events(&events)?;
+        printed |= !events.is_empty();
+        output.print_events(&events)?;
+
+        let events = client.poll_timeouts(ClientTimestamp::now())?;
+        printed |= !events.is_empty();
+        output.print_events(&events)?;
+
+        if client.is_run_complete() || Instant::now() >= deadline {
+            break;
+        }
+
+        if !printed {
+            thread::sleep(IDLE_SLEEP);
         }
     }
     Ok(())
@@ -108,6 +124,7 @@ fn sleep_until_next_send(deadline: Option<Instant>) {
 
 struct EventOutput<'a, W: Write> {
     mode: irtt_cli::OutputMode,
+    print_finite_summary: bool,
     out: &'a mut W,
     #[cfg(feature = "stats")]
     stats: &'a mut StatsCollector,
