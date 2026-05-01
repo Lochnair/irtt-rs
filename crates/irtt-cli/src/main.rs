@@ -149,7 +149,7 @@ impl<W: Write> EventOutput<'_, W> {
     }
 
     fn print_summary(&mut self) -> io::Result<()> {
-        if !self.mode.prints_summary() {
+        if !self.print_finite_summary || !self.mode.prints_summary() {
             return Ok(());
         }
 
@@ -164,6 +164,19 @@ impl<W: Write> EventOutput<'_, W> {
 
         Ok(())
     }
+}
+
+#[cfg(feature = "stats")]
+fn stats_config(continuous: bool) -> StatsConfig {
+    if continuous {
+        StatsConfig::continuous()
+    } else {
+        StatsConfig::finite()
+    }
+}
+
+fn final_drain_duration(probe_timeout: Duration) -> Duration {
+    probe_timeout.min(MAX_FINAL_DRAIN)
 }
 
 #[cfg(all(test, feature = "stats"))]
@@ -227,6 +240,7 @@ mod tests {
         {
             let mut output = EventOutput {
                 mode: irtt_cli::OutputMode::RttUs,
+                print_finite_summary: true,
                 out: &mut out,
                 stats: &mut stats,
             };
@@ -239,5 +253,64 @@ mod tests {
         assert_eq!(rendered, "1200\n");
         assert_eq!(summary.packets.packets_sent, 1);
         assert_eq!(summary.packets.unique_replies, 1);
+    }
+
+    #[test]
+    fn continuous_output_does_not_print_finite_summary() {
+        let mut stats = StatsCollector::new(StatsConfig::continuous());
+        let mut out = Vec::new();
+        {
+            let mut output = EventOutput {
+                mode: irtt_cli::OutputMode::Human,
+                print_finite_summary: false,
+                out: &mut out,
+                stats: &mut stats,
+            };
+            output.print_summary().unwrap();
+        }
+
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn continuous_mode_uses_continuous_stats_config() {
+        let mut collector = StatsCollector::new(stats_config(true));
+        for seq in 0..5000 {
+            let sent_at = test_timestamp(Duration::from_micros(seq));
+            let received_at = test_timestamp(Duration::from_micros(seq + 1));
+            collector.process(&ClientEvent::EchoReply {
+                seq: seq as u32,
+                logical_seq: seq,
+                remote: test_remote(),
+                sent_at,
+                received_at,
+                rtt: RttSample {
+                    raw: Duration::from_micros(1),
+                    adjusted: None,
+                    effective: Duration::from_micros(1),
+                    adjusted_signed: None,
+                    effective_signed: SignedDuration { ns: 1_000 },
+                },
+                server_timing: None,
+                one_way: None,
+                received_stats: None,
+                bytes: 64,
+                packet_meta: PacketMeta::default(),
+            });
+        }
+
+        assert_eq!(collector.summary().rtt.primary.median_ns, None);
+    }
+
+    #[test]
+    fn final_drain_uses_capped_probe_timeout() {
+        assert_eq!(
+            final_drain_duration(Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            final_drain_duration(Duration::from_secs(60)),
+            Duration::from_secs(30)
+        );
     }
 }
