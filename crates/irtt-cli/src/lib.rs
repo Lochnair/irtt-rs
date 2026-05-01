@@ -192,7 +192,7 @@ fn format_machine(event: &ClientEvent) -> String {
             write_common(&mut out, "session_started");
             write_remote(&mut out, *remote);
             write_token(&mut out, *token);
-            write_wall(&mut out, "at_ns", at.wall);
+            write_wall(&mut out, "event_wall_ns", at.wall);
             write_negotiated(&mut out, negotiated);
         }
         ClientEvent::NoTestCompleted {
@@ -202,14 +202,14 @@ fn format_machine(event: &ClientEvent) -> String {
         } => {
             write_common(&mut out, "no_test_completed");
             write_remote(&mut out, *remote);
-            write_wall(&mut out, "at_ns", at.wall);
+            write_wall(&mut out, "event_wall_ns", at.wall);
             write_negotiated(&mut out, negotiated);
         }
         ClientEvent::SessionClosed { remote, token, at } => {
             write_common(&mut out, "session_closed");
             write_remote(&mut out, *remote);
             write_token(&mut out, *token);
-            write_wall(&mut out, "at_ns", at.wall);
+            write_wall(&mut out, "event_wall_ns", at.wall);
         }
         ClientEvent::EchoSent { .. } => {}
         ClientEvent::EchoReply {
@@ -228,8 +228,8 @@ fn format_machine(event: &ClientEvent) -> String {
             write_common(&mut out, "echo_reply");
             write_seq(&mut out, *seq, Some(*logical_seq));
             write_remote(&mut out, *remote);
-            write_wall(&mut out, "sent_ns", sent_at.wall);
-            write_wall(&mut out, "received_ns", received_at.wall);
+            write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
+            write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
             write_rtt(&mut out, rtt);
             write_server_timing(&mut out, *server_timing);
             write_one_way(&mut out, *one_way);
@@ -244,7 +244,7 @@ fn format_machine(event: &ClientEvent) -> String {
         } => {
             write_common(&mut out, "loss");
             write_seq(&mut out, *seq, Some(*logical_seq));
-            write_wall(&mut out, "sent_ns", sent_at.wall);
+            write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
             out.push_str(" warning=loss");
         }
         ClientEvent::DuplicateReply {
@@ -256,7 +256,7 @@ fn format_machine(event: &ClientEvent) -> String {
             write_common(&mut out, "duplicate");
             write_seq(&mut out, *seq, None);
             write_remote(&mut out, *remote);
-            write_wall(&mut out, "received_ns", received_at.wall);
+            write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
             out.push_str(" warning=duplicate");
         }
         ClientEvent::LateReply {
@@ -278,9 +278,9 @@ fn format_machine(event: &ClientEvent) -> String {
             write_remote(&mut out, *remote);
             write!(out, " highest_seen={highest_seen}").unwrap();
             if let Some(sent_at) = sent_at {
-                write_wall(&mut out, "sent_ns", sent_at.wall);
+                write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
             }
-            write_wall(&mut out, "received_ns", received_at.wall);
+            write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
             if let Some(rtt) = rtt {
                 write_rtt(&mut out, rtt);
             }
@@ -396,7 +396,7 @@ fn write_wall(out: &mut String, key: &str, wall: SystemTime) {
 fn write_negotiated(out: &mut String, negotiated: &NegotiatedParams) {
     write!(
         out,
-        " duration_ns={} interval_ns={} length={}",
+        " duration_ns={} interval_ns={} payload_length={}",
         negotiated.params.duration_ns, negotiated.params.interval_ns, negotiated.params.length
     )
     .unwrap();
@@ -669,8 +669,10 @@ mod tests {
         assert!(line.contains("seq=7"));
         assert!(line.contains("logical_seq=8"));
         assert!(line.contains("remote=127.0.0.1:2112"));
-        assert!(line.contains("sent_ns=1000000000"));
-        assert!(line.contains("received_ns=1001500000"));
+        assert!(line.contains("client_send_wall_ns=1000000000"));
+        assert!(line.contains("client_receive_wall_ns=1001500000"));
+        assert!(!line.contains(" sent_ns="));
+        assert!(!line.contains(" received_ns="));
         assert!(line.contains("raw_rtt_us=1500"));
         assert!(line.contains("adjusted_rtt_us=1200"));
         assert!(line.contains("effective_rtt_us=1200"));
@@ -783,5 +785,11 @@ mod tests {
         assert!(!line.contains("summary"));
         assert!(!line.contains("packets_sent"));
         assert!(!line.contains("packet_loss"));
+
+        let line = format_event(&event, OutputMode::Machine).unwrap();
+        assert!(line.contains("event_wall_ns=1000000000"));
+        assert!(line.contains("payload_length=0"));
+        assert!(!line.contains(" at_ns="));
+        assert!(!line.contains(" length=0"));
     }
 }
