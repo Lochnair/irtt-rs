@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+#[cfg(feature = "stats")]
+pub mod summary;
+
 use std::{
     fmt::Write as _,
     net::SocketAddr,
@@ -39,7 +42,7 @@ pub struct CliArgs {
     #[arg(long, value_enum, default_value_t = TimestampArg::Both)]
     pub timestamps: TimestampArg,
 
-    #[arg(long, value_enum, default_value_t = OutputMode::Simple)]
+    #[arg(long, value_enum, default_value_t = OutputMode::Human)]
     pub output: OutputMode,
 }
 
@@ -101,9 +104,16 @@ impl From<TimestampArg> for StampAt {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputMode {
+    Human,
     Machine,
     Simple,
     RttUs,
+}
+
+impl OutputMode {
+    pub fn prints_summary(self) -> bool {
+        matches!(self, Self::Human)
+    }
 }
 
 pub fn parse_duration(input: &str) -> Result<Duration, String> {
@@ -157,6 +167,7 @@ pub fn format_event(event: &ClientEvent, mode: OutputMode) -> Option<String> {
     }
     match mode {
         OutputMode::RttUs => format_rtt_us(event),
+        OutputMode::Human => Some(format_simple(event)),
         OutputMode::Machine => Some(format_machine(event)),
         OutputMode::Simple => Some(format_simple(event)),
     }
@@ -562,7 +573,7 @@ mod tests {
         assert_eq!(args.hmac, None);
         assert_eq!(args.clock, ClockArg::Both);
         assert_eq!(args.timestamps, TimestampArg::Both);
-        assert_eq!(args.output, OutputMode::Simple);
+        assert_eq!(args.output, OutputMode::Human);
 
         let config = args.to_client_config();
         assert_eq!(config.duration, Some(Duration::from_secs(10)));
@@ -622,6 +633,9 @@ mod tests {
         assert_eq!(args.output, OutputMode::RttUs);
         assert_eq!(args.clock, ClockArg::Monotonic);
         assert_eq!(args.timestamps, TimestampArg::Receive);
+
+        let args = parse(&["--output", "human", "127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.output, OutputMode::Human);
     }
 
     #[test]
@@ -674,6 +688,19 @@ mod tests {
     }
 
     #[test]
+    fn human_uses_readable_per_event_lines() {
+        let line = format_event(&reply_event(), OutputMode::Human).unwrap();
+        assert_eq!(
+            line,
+            "reply seq=7 logical_seq=8 remote=127.0.0.1:2112 rtt_us=1200 raw_rtt_us=1500 server_processing_us=300"
+        );
+        assert!(OutputMode::Human.prints_summary());
+        assert!(!OutputMode::Simple.prints_summary());
+        assert!(!OutputMode::Machine.prints_summary());
+        assert!(!OutputMode::RttUs.prints_summary());
+    }
+
+    #[test]
     fn echo_sent_is_not_formatted_for_stream_outputs() {
         let ts = test_timestamp(Duration::from_secs(1));
         let event = ClientEvent::EchoSent {
@@ -688,6 +715,7 @@ mod tests {
         };
 
         assert!(format_event(&event, OutputMode::RttUs).is_none());
+        assert!(format_event(&event, OutputMode::Human).is_none());
         assert!(format_event(&event, OutputMode::Machine).is_none());
         assert!(format_event(&event, OutputMode::Simple).is_none());
     }
