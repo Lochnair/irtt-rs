@@ -12,6 +12,8 @@ use irtt_client::{
     SignedDuration,
 };
 
+const CONTINUOUS_SEQUENCE_LIMIT: usize = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatsConfig {
     pub median: MedianMode,
@@ -28,6 +30,10 @@ impl StatsConfig {
         }
     }
 
+    /// Configuration for long-running use.
+    ///
+    /// This disables finite median retention and bounds sequence-adjacent IPDV
+    /// tracking. Exact arbitrary-late IPDV completion is finite-mode behavior.
     pub fn continuous() -> Self {
         Self {
             median: MedianMode::Disabled,
@@ -115,6 +121,11 @@ impl StatsCollector {
     #[cfg(test)]
     fn retained_median_samples(&self) -> usize {
         self.cumulative.retained_median_samples()
+    }
+
+    #[cfg(test)]
+    fn retained_sequence_samples(&self) -> usize {
+        self.cumulative.retained_sequence_samples()
     }
 }
 
@@ -255,6 +266,7 @@ impl SignedDurationStatsWithMedian {
 #[derive(Debug, Clone, PartialEq)]
 struct CoreStats {
     median: MedianMode,
+    sequence_limit: Option<usize>,
     events: EventCounts,
     packets: PacketCounts,
     send_call: MetricU64,
@@ -269,6 +281,7 @@ struct CoreStats {
     receive_delay: MetricU64,
     server_processing: MetricU64,
     samples: HashMap<u64, UniqueSample>,
+    sample_order: VecDeque<u64>,
     ipdv_pairs: HashSet<u64>,
 }
 
@@ -276,6 +289,11 @@ impl CoreStats {
     fn new(median: MedianMode) -> Self {
         Self {
             median,
+            sequence_limit: if median == MedianMode::ExactFinite {
+                None
+            } else {
+                Some(CONTINUOUS_SEQUENCE_LIMIT)
+            },
             events: EventCounts::default(),
             packets: PacketCounts::default(),
             send_call: MetricU64::new(false),
@@ -290,6 +308,7 @@ impl CoreStats {
             receive_delay: MetricU64::new(median == MedianMode::ExactFinite),
             server_processing: MetricU64::new(false),
             samples: HashMap::new(),
+            sample_order: VecDeque::new(),
             ipdv_pairs: HashSet::new(),
         }
     }
@@ -345,6 +364,8 @@ impl CoreStats {
 
                 let seq = sample.logical_seq;
                 if self.samples.insert(seq, sample).is_none() {
+                    self.sample_order.push_back(seq);
+                    self.enforce_sequence_limit();
                     self.try_ipdv_pair(seq);
                     if let Some(next) = seq.checked_add(1) {
                         self.try_ipdv_pair(next);
@@ -364,6 +385,23 @@ impl CoreStats {
             }
             WindowEvent::UntrackedLate { .. } => {
                 self.events.untracked_late_replies += 1;
+            }
+        }
+    }
+
+    fn enforce_sequence_limit(&mut self) {
+        let Some(limit) = self.sequence_limit else {
+            return;
+        };
+        while self.samples.len() > limit {
+            let Some(seq) = self.sample_order.pop_front() else {
+                break;
+            };
+            if self.samples.remove(&seq).is_some() {
+                self.ipdv_pairs.remove(&seq);
+                if let Some(next) = seq.checked_add(1) {
+                    self.ipdv_pairs.remove(&next);
+                }
             }
         }
     }
@@ -433,6 +471,11 @@ impl CoreStats {
             + self.ipdv_receive.retained_samples()
             + self.send_delay.retained_samples()
             + self.receive_delay.retained_samples()
+    }
+
+    #[cfg(test)]
+    fn retained_sequence_samples(&self) -> usize {
+        self.samples.len()
     }
 }
 
@@ -1100,6 +1143,21 @@ mod tests {
         collector.process(&reply(1, 20, 19));
         assert_eq!(collector.retained_median_samples(), 0);
         assert_eq!(collector.cumulative().rtt.primary.median_ns, None);
+    }
+
+    #[test]
+    fn continuous_mode_bounds_sequence_tracking() {
+        let mut collector = StatsCollector::new(StatsConfig::continuous());
+        for seq in 0..(CONTINUOUS_SEQUENCE_LIMIT as u64 + 8) {
+            collector.process(&reply(seq, 10, 10));
+        }
+
+        assert_eq!(collector.retained_median_samples(), 0);
+        assert!(collector.retained_sequence_samples() <= CONTINUOUS_SEQUENCE_LIMIT);
+        assert_eq!(
+            collector.cumulative().rtt.primary.stats.count,
+            CONTINUOUS_SEQUENCE_LIMIT as u64 + 8
+        );
     }
 
     #[test]
