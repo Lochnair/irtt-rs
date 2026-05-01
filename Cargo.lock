@@ -190,6 +190,9 @@ dependencies = [
 [[package]]
 name = "irtt-stats"
 version = "0.1.0"
+dependencies = [
+ "irtt-client",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
