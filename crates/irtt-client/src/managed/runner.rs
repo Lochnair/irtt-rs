@@ -18,6 +18,7 @@ use super::{
 
 const MANAGED_RECV_TIMEOUT: Duration = Duration::from_millis(20);
 const MANAGED_RECV_BUDGET: RecvBudget = RecvBudget { max_packets: 64 };
+const MANAGED_FINAL_DRAIN: Duration = Duration::from_millis(100);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
 
@@ -201,6 +202,10 @@ fn run_client(
         sleep_until_next_wakeup(client.next_send_deadline());
     }
 
+    if !cancelled {
+        drain_final_late_replies(&mut client, &hub, &mut counters)?;
+    }
+
     let packets_sent = client.packets_sent();
     let close_events = client.close(ClientTimestamp::now())?;
     publish_events(&hub, &mut counters, close_events);
@@ -227,6 +232,34 @@ fn run_client_with_cleanup(
     let outcome = run_client(client, hub.clone(), cancellation);
     hub.disconnect_all();
     outcome
+}
+
+fn drain_final_late_replies(
+    client: &mut Client,
+    hub: &EventHub,
+    counters: &mut OutcomeCounters,
+) -> Result<(), ClientError> {
+    if !client.has_timed_out_metadata() {
+        return Ok(());
+    }
+
+    let deadline = Instant::now() + MANAGED_FINAL_DRAIN;
+    while Instant::now() < deadline && client.has_timed_out_metadata() {
+        let mut published = false;
+
+        let events = client.recv_available(MANAGED_RECV_BUDGET)?;
+        published |= !events.is_empty();
+        publish_events(hub, counters, events);
+
+        let events = client.poll_timeouts(ClientTimestamp::now())?;
+        published |= !events.is_empty();
+        publish_events(hub, counters, events);
+
+        if !published {
+            thread::sleep(IDLE_SLEEP);
+        }
+    }
+    Ok(())
 }
 
 fn publish_events(hub: &EventHub, counters: &mut OutcomeCounters, events: Vec<ClientEvent>) {
@@ -345,6 +378,43 @@ mod tests {
                 socket
                     .send_to(&echo_reply_packet(TOKEN, seq, &params, &ts), peer)
                     .unwrap();
+            }
+        });
+        FakeServer { addr, done }
+    }
+
+    fn start_delayed_reply_server(params: Params, delay: Duration) -> FakeServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let done = thread::spawn(move || {
+            let (_, peer) = recv_request(&socket);
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+
+            let Some((packet, peer)) = recv_request_timeout(&socket) else {
+                return;
+            };
+            let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+            thread::sleep(delay);
+            let ts = TimestampFields {
+                recv_wall: Some(1_000_000_000),
+                recv_mono: Some(100_000),
+                send_wall: Some(1_001_000_000),
+                send_mono: Some(1_100_000),
+                ..Default::default()
+            };
+            socket
+                .send_to(&echo_reply_packet(TOKEN, seq, &params, &ts), peer)
+                .unwrap();
+
+            while let Some((packet, _)) = recv_request_timeout(&socket) {
+                if packet[3] & flags::FLAG_CLOSE != 0 {
+                    break;
+                }
             }
         });
         FakeServer { addr, done }
@@ -489,6 +559,57 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, ClientEvent::SessionClosed { .. })));
+    }
+
+    #[test]
+    fn finite_managed_run_drains_late_reply_after_timeout_before_close() {
+        let duration = Duration::from_millis(1);
+        let params = test_params(Some(duration), Duration::from_millis(10));
+        let server = start_delayed_reply_server(params, Duration::from_millis(60));
+        let mut cfg = config(server.addr, Some(duration));
+        cfg.probe_timeout = Duration::from_millis(20);
+
+        let (session, sub) = ManagedClient::start_with_subscription(
+            cfg,
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let events = collect_until_closed(&sub);
+        let outcome = session.join().unwrap();
+        server.join();
+
+        assert_eq!(outcome.end_reason, SessionEndReason::TestComplete);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ClientEvent::EchoLoss {
+                seq: 0,
+                logical_seq: 0,
+                ..
+            }
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ClientEvent::LateReply {
+                seq: 0,
+                logical_seq: Some(0),
+                sent_at: Some(_),
+                rtt: Some(_),
+                ..
+            }
+        )));
+        let late_before_close = events
+            .iter()
+            .position(|event| matches!(event, ClientEvent::LateReply { rtt: Some(_), .. }));
+        let close = events
+            .iter()
+            .position(|event| matches!(event, ClientEvent::SessionClosed { .. }));
+        let late_before_close = late_before_close.expect("missing stats-eligible LateReply");
+        let close = close.expect("missing SessionClosed");
+        assert!(late_before_close < close);
     }
 
     #[test]

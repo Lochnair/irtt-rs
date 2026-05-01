@@ -349,6 +349,12 @@ impl Client {
         session.sending_done && session.pending.len() == 0
     }
 
+    pub(crate) fn has_timed_out_metadata(&self) -> bool {
+        self.session
+            .as_ref()
+            .is_some_and(|session| session.timed_out.len() > 0)
+    }
+
     pub(crate) fn packets_sent(&self) -> u64 {
         self.session
             .as_ref()
