@@ -207,6 +207,7 @@ fn format_machine(event: &ClientEvent) -> String {
             server_timing,
             one_way,
             received_stats,
+            bytes: _,
             packet_meta,
         } => {
             write_common(&mut out, "echo_reply");
@@ -235,6 +236,7 @@ fn format_machine(event: &ClientEvent) -> String {
             seq,
             remote,
             received_at,
+            bytes: _,
         } => {
             write_common(&mut out, "duplicate");
             write_seq(&mut out, *seq, None);
@@ -253,6 +255,7 @@ fn format_machine(event: &ClientEvent) -> String {
             server_timing,
             one_way,
             received_stats,
+            bytes: _,
             packet_meta,
         } => {
             write_common(&mut out, "late");
@@ -536,6 +539,7 @@ mod tests {
                 count: Some(9),
                 window: Some(0x7),
             }),
+            bytes: 64,
             packet_meta: PacketMeta::default(),
         }
     }
@@ -675,6 +679,7 @@ mod tests {
                 seq: 3,
                 remote: test_remote(),
                 received_at: ts,
+                bytes: 64,
             },
             ClientEvent::LateReply {
                 seq: 4,
@@ -687,6 +692,7 @@ mod tests {
                 server_timing: None,
                 one_way: None,
                 received_stats: None,
+                bytes: 64,
                 packet_meta: PacketMeta::default(),
             },
             ClientEvent::Warning {

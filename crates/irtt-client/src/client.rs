@@ -401,6 +401,7 @@ impl Client {
                     server_timing,
                     one_way,
                     received_stats,
+                    bytes: packet.len(),
                     packet_meta: PacketMeta::default(),
                 });
             } else {
@@ -414,6 +415,7 @@ impl Client {
                     server_timing,
                     one_way,
                     received_stats,
+                    bytes: packet.len(),
                     packet_meta: PacketMeta::default(),
                 });
             }
@@ -439,6 +441,7 @@ impl Client {
                 server_timing: build_server_timing(&reply.timestamps),
                 one_way: None,
                 received_stats: build_received_stats(&reply),
+                bytes: packet.len(),
                 packet_meta: PacketMeta::default(),
             }])
         } else {
@@ -1487,7 +1490,7 @@ mod tests {
     #[test]
     fn send_probe_sends_valid_echo_request() {
         let params = default_params();
-        let server = silent_open_server(params);
+        let server = silent_open_server(params.clone());
         let config = ClientConfig {
             socket_config: crate::SocketConfig {
                 recv_timeout: Some(Duration::from_millis(200)),
@@ -1656,10 +1659,12 @@ mod tests {
                 rtt,
                 received_stats,
                 server_timing,
+                bytes,
                 ..
             } => {
                 assert_eq!(*seq, 0);
                 assert_eq!(*logical_seq, 0);
+                assert_eq!(*bytes, echo_packet_len(false, &params));
                 assert!(rtt.raw > Duration::ZERO);
                 assert_eq!(rtt.effective, rtt.adjusted.unwrap_or(rtt.raw));
                 assert!(received_stats.is_some());
