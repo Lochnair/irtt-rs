@@ -102,12 +102,12 @@ pub fn config_for_params(addr: SocketAddr, params: &Params) -> ClientConfig {
 
 pub fn standard_timestamps() -> TimestampFields {
     TimestampFields {
-        recv_wall: Some(1),
+        recv_wall: Some(0),
         recv_mono: Some(5_000_000),
-        midpoint_wall: Some(1),
+        midpoint_wall: Some(0),
         midpoint_mono: Some(5_000_000),
         send_wall: Some(1),
-        send_mono: Some(5_000_000),
+        send_mono: Some(5_000_001),
     }
 }
 
@@ -346,14 +346,14 @@ fn materialize_wall_timestamps(mut timestamps: TimestampFields) -> TimestampFiel
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
         .as_nanos() as i64;
-    if timestamps.recv_wall.is_some() {
-        timestamps.recv_wall = Some(now_ns);
+    if let Some(offset) = timestamps.recv_wall {
+        timestamps.recv_wall = Some(now_ns + offset);
     }
-    if timestamps.midpoint_wall.is_some() {
-        timestamps.midpoint_wall = Some(now_ns);
+    if let Some(offset) = timestamps.midpoint_wall {
+        timestamps.midpoint_wall = Some(now_ns + offset);
     }
-    if timestamps.send_wall.is_some() {
-        timestamps.send_wall = Some(now_ns);
+    if let Some(offset) = timestamps.send_wall {
+        timestamps.send_wall = Some(now_ns + offset);
     }
     timestamps
 }
