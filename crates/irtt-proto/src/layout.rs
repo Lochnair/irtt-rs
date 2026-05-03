@@ -131,6 +131,25 @@ mod tests {
         }
     }
 
+    fn expected_optional_len(stats: ReceivedStats, stamp_at: StampAt, clock: Clock) -> usize {
+        let stats_len = match stats {
+            ReceivedStats::None => 0,
+            ReceivedStats::Count => RECV_COUNT_SIZE,
+            ReceivedStats::Window => RECV_WINDOW_SIZE,
+            ReceivedStats::Both => RECV_COUNT_SIZE + RECV_WINDOW_SIZE,
+        };
+        let clock_count = match clock {
+            Clock::Wall | Clock::Monotonic => 1,
+            Clock::Both => 2,
+        };
+        let timestamp_groups = match stamp_at {
+            StampAt::None => 0,
+            StampAt::Send | StampAt::Receive | StampAt::Midpoint => 1,
+            StampAt::Both => 2,
+        };
+        stats_len + timestamp_groups * clock_count * TIMESTAMP_SIZE
+    }
+
     #[test]
     fn verified_layout_lengths() {
         assert_eq!(
@@ -175,6 +194,87 @@ mod tests {
             ),
             76
         );
+    }
+
+    #[test]
+    fn open_and_close_layout_lengths_account_for_hmac() {
+        assert_eq!(PacketLayout::open_request(false).header_len(), 4);
+        assert_eq!(PacketLayout::open_request(true).header_len(), 20);
+        assert_eq!(PacketLayout::open_reply(false).header_len(), 12);
+        assert_eq!(PacketLayout::open_reply(true).header_len(), 28);
+        assert_eq!(PacketLayout::close_request(false).header_len(), 12);
+        assert_eq!(PacketLayout::close_request(true).header_len(), 28);
+    }
+
+    #[test]
+    fn layout_matrix_matches_stats_timestamps_clock_and_hmac_rules() {
+        for stats in [
+            ReceivedStats::None,
+            ReceivedStats::Count,
+            ReceivedStats::Window,
+            ReceivedStats::Both,
+        ] {
+            for stamp_at in [
+                StampAt::None,
+                StampAt::Send,
+                StampAt::Receive,
+                StampAt::Both,
+                StampAt::Midpoint,
+            ] {
+                for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
+                    for hmac in [false, true] {
+                        let params = params(stats, stamp_at, clock);
+                        let layout = PacketLayout::echo(hmac, &params);
+                        let expected_len = HEADER_SIZE
+                            + TOKEN_SIZE
+                            + SEQ_SIZE
+                            + if hmac { HMAC_SIZE } else { 0 }
+                            + expected_optional_len(stats, stamp_at, clock);
+
+                        assert_eq!(
+                            layout.header_len(),
+                            expected_len,
+                            "unexpected length for stats={stats:?} stamp_at={stamp_at:?} clock={clock:?} hmac={hmac}"
+                        );
+                        assert_eq!(layout.recv_count, stats.has_count());
+                        assert_eq!(layout.recv_window, stats.has_window());
+                        assert_eq!(
+                            layout.recv_wall,
+                            matches!(stamp_at, StampAt::Receive | StampAt::Both)
+                                && clock.has_wall()
+                        );
+                        assert_eq!(
+                            layout.recv_mono,
+                            matches!(stamp_at, StampAt::Receive | StampAt::Both)
+                                && clock.has_mono()
+                        );
+                        assert_eq!(
+                            layout.midpoint_wall,
+                            matches!(stamp_at, StampAt::Midpoint) && clock.has_wall()
+                        );
+                        assert_eq!(
+                            layout.midpoint_mono,
+                            matches!(stamp_at, StampAt::Midpoint) && clock.has_mono()
+                        );
+                        assert_eq!(
+                            layout.send_wall,
+                            matches!(stamp_at, StampAt::Send | StampAt::Both) && clock.has_wall()
+                        );
+                        assert_eq!(
+                            layout.send_mono,
+                            matches!(stamp_at, StampAt::Send | StampAt::Both) && clock.has_mono()
+                        );
+
+                        if hmac {
+                            assert_eq!(
+                                echo_header_len(true, &params) - echo_header_len(false, &params),
+                                HMAC_SIZE
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -131,12 +131,49 @@ mod tests {
     }
 
     #[test]
+    fn hmac_open_request_inserts_hmac_before_params() {
+        let packet = encode_open_request(
+            &OpenRequest {
+                params: default_params(),
+                close: false,
+            },
+            Some(b"testkey"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            packet.len(),
+            4 + HMAC_SIZE + default_params().encode().len()
+        );
+        assert_eq!(&packet[..4], &[0x14, 0xa7, 0x5b, FLAG_OPEN | FLAG_HMAC]);
+        assert_eq!(&packet[4 + HMAC_SIZE..], &default_params().encode());
+        hmac::verify_hmac(b"testkey", &packet, hmac::hmac_offset()).unwrap();
+    }
+
+    #[test]
     fn open_reply_decodes_token() {
         let mut packet = vec![0x14, 0xa7, 0x5b, 0x03];
         packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
         packet.extend_from_slice(&default_params().encode());
 
         let reply = decode_open_reply(&packet, None).unwrap();
+        assert_eq!(reply.token, 0x7896_b6ab_8771_5213);
+        assert_eq!(reply.params, default_params());
+    }
+
+    #[test]
+    fn hmac_open_reply_decodes_token_after_hmac_field() {
+        let mut packet = vec![0x14, 0xa7, 0x5b, FLAG_OPEN | FLAG_REPLY | FLAG_HMAC];
+        packet.extend_from_slice(&[0; HMAC_SIZE]);
+        packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
+        packet.extend_from_slice(&default_params().encode());
+        hmac::compute_hmac_in_place(b"testkey", &mut packet, hmac::hmac_offset()).unwrap();
+
+        assert_eq!(
+            packet.len(),
+            4 + HMAC_SIZE + TOKEN_SIZE + default_params().encode().len()
+        );
+        let reply = decode_open_reply(&packet, Some(b"testkey")).unwrap();
         assert_eq!(reply.token, 0x7896_b6ab_8771_5213);
         assert_eq!(reply.params, default_params());
     }

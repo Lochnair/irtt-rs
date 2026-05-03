@@ -29,6 +29,7 @@ pub fn encode_close_request(request: &CloseRequest, hmac_key: Option<&[u8]>) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{hmac, FLAG_HMAC};
 
     #[test]
     fn close_request_sizes() {
@@ -42,5 +43,23 @@ mod tests {
                 .len(),
             28
         );
+    }
+
+    #[test]
+    fn hmac_close_request_places_token_after_hmac() {
+        let packet = encode_close_request(
+            &CloseRequest {
+                token: 0x7896_b6ab_8771_5213,
+            },
+            Some(b"testkey"),
+        )
+        .unwrap();
+
+        assert_eq!(packet[3], FLAG_CLOSE | FLAG_HMAC);
+        assert_eq!(
+            &packet[4 + HMAC_SIZE..],
+            &0x7896_b6ab_8771_5213u64.to_le_bytes()
+        );
+        hmac::verify_hmac(b"testkey", &packet, hmac::hmac_offset()).unwrap();
     }
 }

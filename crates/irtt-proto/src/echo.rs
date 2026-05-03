@@ -180,6 +180,32 @@ mod tests {
     }
 
     #[test]
+    fn hmac_echo_request_places_token_and_sequence_after_hmac() {
+        let packet = encode_echo_request(
+            &EchoRequest {
+                token: 0x7896_b6ab_8771_5213,
+                sequence: 9,
+                params: default_params(),
+                payload: Vec::new(),
+            },
+            Some(b"testkey"),
+        )
+        .unwrap();
+
+        assert_eq!(packet.len(), 76);
+        assert_eq!(&packet[..4], &[0x14, 0xa7, 0x5b, FLAG_HMAC]);
+        assert_eq!(
+            &packet[4 + HMAC_SIZE..4 + HMAC_SIZE + TOKEN_SIZE],
+            &0x7896_b6ab_8771_5213u64.to_le_bytes()
+        );
+        assert_eq!(
+            &packet[4 + HMAC_SIZE + TOKEN_SIZE..4 + HMAC_SIZE + TOKEN_SIZE + SEQ_SIZE],
+            &9_u32.to_le_bytes()
+        );
+        hmac::verify_hmac(b"testkey", &packet, hmac::hmac_offset()).unwrap();
+    }
+
+    #[test]
     fn echo_reply_decodes_default_fields() {
         let packet = [
             0x14, 0xa7, 0x5b, 0x02, 0x13, 0x52, 0x71, 0x87, 0xab, 0xb6, 0x96, 0x78, 0x02, 0x00,
@@ -195,5 +221,26 @@ mod tests {
         assert_eq!(reply.recv_window, Some(7));
         assert!(reply.timestamps.recv_wall.is_some());
         assert!(reply.timestamps.midpoint_wall.is_none());
+    }
+
+    #[test]
+    fn hmac_echo_reply_decodes_default_fields_after_hmac() {
+        let params = default_params();
+        let layout = PacketLayout::echo(true, &params);
+        let mut packet = Vec::with_capacity(layout.header_len());
+        write_header(&mut packet, FLAG_REPLY | FLAG_HMAC);
+        packet.extend_from_slice(&[0; HMAC_SIZE]);
+        packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
+        packet.extend_from_slice(&2_u32.to_le_bytes());
+        push_zeroed_layout_tail(layout, &mut packet);
+        hmac::compute_hmac_in_place(b"testkey", &mut packet, hmac::hmac_offset()).unwrap();
+
+        assert_eq!(packet.len(), 76);
+        let reply = decode_echo_reply(&packet, &params, Some(b"testkey")).unwrap();
+        assert_eq!(reply.token, 0x7896_b6ab_8771_5213);
+        assert_eq!(reply.sequence, 2);
+        assert_eq!(reply.recv_count, Some(0));
+        assert_eq!(reply.recv_window, Some(0));
+        assert_eq!(reply.payload.len(), 0);
     }
 }
