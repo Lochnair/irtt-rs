@@ -66,6 +66,8 @@ fn timestamp_modes_drive_reply_event_timing_fields() {
                 assert!(reply.server_timing.is_none());
                 assert!(reply.one_way.is_none());
                 assert!(reply.rtt.adjusted.is_none());
+                assert_eq!(reply.rtt.effective, reply.rtt.raw);
+                assert!(reply.rtt.raw > Duration::ZERO);
             }
             StampAt::Send => {
                 assert_timing_fields(reply.server_timing, false, false, false, false, true, true);
