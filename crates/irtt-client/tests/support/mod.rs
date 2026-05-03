@@ -1,7 +1,10 @@
 #![allow(dead_code)]
 
+mod real_irtt;
+
 use std::{
     net::{SocketAddr, UdpSocket},
+    process::Command,
     sync::mpsc,
     thread::{self, JoinHandle},
     time::{Duration, SystemTime},
@@ -15,10 +18,26 @@ use irtt_proto::{
     ReceivedStats, ServerFill, StampAt, TimestampFields, HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
 };
 
+pub use real_irtt::RealIrtServer;
+
 const HMAC_OFFSET: usize = 4;
 pub const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 pub const RECV_COUNT: u32 = 42;
 pub const RECV_WINDOW: u64 = 0x07;
+
+pub fn require_real_backend() -> bool {
+    match std::env::var("IRTT_TEST_BACKEND").as_deref() {
+        Ok("real") => {
+            let irtt_bin = std::env::var("IRTT_BIN").unwrap_or_else(|_| "irtt".to_string());
+            match Command::new(&irtt_bin).arg("version").output() {
+                Ok(output) if output.status.success() => true,
+                _ => panic!("IRTT_TEST_BACKEND=real but irtt binary not found at '{irtt_bin}'"),
+            }
+        }
+        Ok("fake") | Err(_) => false,
+        Ok(other) => panic!("unknown IRTT_TEST_BACKEND value: {other}"),
+    }
+}
 
 pub struct FakeServer {
     pub addr: SocketAddr,
