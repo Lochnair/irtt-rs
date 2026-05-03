@@ -11,8 +11,9 @@ use std::{
 
 use clap::{Parser, ValueEnum};
 use irtt_client::{
-    ClientConfig, ClientEvent, NegotiatedParams, OneWayDelaySample, PacketMeta,
-    ReceivedStatsSample, RttSample, ServerTiming, SocketConfig, WarningKind,
+    ClientConfig, ClientEvent, NegotiatedParams, NegotiationPolicy, OneWayDelaySample, PacketMeta,
+    ReceivedStatsSample, RttSample, ServerTiming, SocketConfig, WarningKind, MAX_DSCP_CODEPOINT,
+    MAX_SERVER_FILL_BYTES,
 };
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
@@ -22,25 +23,59 @@ const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "irtt-rs", about = "Minimal IRTT-compatible client")]
 pub struct CliArgs {
+    /// Server address or host, with optional port.
     pub server: String,
 
+    /// Test duration; use 0 for continuous mode.
     #[arg(long, default_value = "10s", value_parser = parse_test_duration)]
     pub duration: Duration,
 
+    /// Probe interval.
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     pub interval: Duration,
 
+    /// UDP payload length.
     #[arg(long, default_value_t = 0, value_parser = parse_length)]
     pub length: u32,
 
+    /// HMAC key.
     #[arg(long)]
     pub hmac: Option<String>,
 
+    /// Clock mode to request.
     #[arg(long, value_enum, default_value_t = ClockArg::Both)]
     pub clock: ClockArg,
 
-    #[arg(long, value_enum, default_value_t = TimestampArg::Both)]
-    pub timestamps: TimestampArg,
+    /// Timestamp mode to request.
+    #[arg(
+        long = "tstamp",
+        visible_alias = "timestamps",
+        value_enum,
+        value_name = "MODE",
+        default_value_t = TimestampArg::Both
+    )]
+    pub tstamp: TimestampArg,
+
+    /// Received-stats mode to request.
+    #[arg(long = "stats", value_enum, default_value_t = ReceivedStatsArg::Both)]
+    pub stats: ReceivedStatsArg,
+
+    /// Server payload fill string to request.
+    #[arg(
+        long = "sfill",
+        visible_alias = "server-fill",
+        value_name = "STRING",
+        value_parser = parse_server_fill
+    )]
+    pub server_fill: Option<String>,
+
+    /// DSCP codepoint to request; this is not a raw TOS or Traffic Class byte.
+    #[arg(long, default_value_t = 0, value_name = "0..=63", value_parser = parse_dscp)]
+    pub dscp: u8,
+
+    /// Accept safe server restrictions during negotiation.
+    #[arg(long)]
+    pub loose: bool,
 
     #[arg(long, value_enum, default_value_t = OutputMode::Human)]
     pub output: OutputMode,
@@ -53,10 +88,17 @@ impl CliArgs {
             duration: (!self.is_continuous()).then_some(self.duration),
             interval: self.interval,
             length: self.length,
-            received_stats: ReceivedStats::Both,
-            stamp_at: self.timestamps.into(),
+            received_stats: self.stats.into(),
+            stamp_at: self.timestamp_mode().into(),
             clock: self.clock.into(),
+            dscp: self.dscp,
             hmac_key: self.hmac.as_ref().map(|key| key.as_bytes().to_vec()),
+            server_fill: self.server_fill.clone(),
+            negotiation_policy: if self.loose {
+                NegotiationPolicy::Loose
+            } else {
+                NegotiationPolicy::Strict
+            },
             socket_config: SocketConfig {
                 recv_timeout: Some(DEFAULT_RECV_TIMEOUT),
                 ..SocketConfig::default()
@@ -67,6 +109,10 @@ impl CliArgs {
 
     pub fn is_continuous(&self) -> bool {
         self.duration == Duration::ZERO
+    }
+
+    pub fn timestamp_mode(&self) -> TimestampArg {
+        self.tstamp
     }
 }
 
@@ -208,6 +254,29 @@ pub fn parse_length(input: &str) -> Result<u32, String> {
         return Err(format!("packet length must be <= {MAX_UDP_PAYLOAD_LENGTH}"));
     }
     Ok(length)
+}
+
+pub fn parse_server_fill(input: &str) -> Result<String, String> {
+    if input.is_empty() {
+        return Err("server fill must not be empty".to_owned());
+    }
+    let len = input.len();
+    if len > MAX_SERVER_FILL_BYTES {
+        return Err(format!(
+            "server fill must be <= {MAX_SERVER_FILL_BYTES} bytes, got {len}"
+        ));
+    }
+    Ok(input.to_owned())
+}
+
+pub fn parse_dscp(input: &str) -> Result<u8, String> {
+    let value: u8 = input
+        .parse()
+        .map_err(|_| format!("invalid DSCP codepoint {input:?}"))?;
+    if value > MAX_DSCP_CODEPOINT {
+        return Err(format!("DSCP codepoint must be <= {MAX_DSCP_CODEPOINT}"));
+    }
+    Ok(value)
 }
 
 pub fn format_event(event: &ClientEvent, mode: OutputMode) -> Option<String> {
