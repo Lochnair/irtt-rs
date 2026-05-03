@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use std::{
     net::{SocketAddr, UdpSocket},
     sync::mpsc,
@@ -9,8 +11,8 @@ use irtt_client::{
     Client, ClientConfig, ClientEvent, ClientTimestamp, NegotiatedParams, OpenOutcome, SocketConfig,
 };
 use irtt_proto::{
-    compute_hmac_in_place, echo_packet_len, flags, verify_hmac, Clock, Params, ReceivedStats,
-    ServerFill, StampAt, TimestampFields, HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
+    compute_hmac_in_place, echo_packet_len, flags, verify_hmac, Clock, Params, ProtoError,
+    ReceivedStats, ServerFill, StampAt, TimestampFields, HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
 };
 
 const HMAC_OFFSET: usize = 4;
@@ -40,11 +42,19 @@ pub enum ServerObservation {
         params: Params,
         hmac: bool,
     },
+    RejectedHmac {
+        hmac: bool,
+        bad_hmac: bool,
+    },
     Echo {
         len: usize,
         hmac: bool,
         token: u64,
         sequence: u32,
+    },
+    Close {
+        hmac: bool,
+        token: u64,
     },
 }
 
@@ -168,6 +178,122 @@ pub fn start_open_server(params: Params, hmac_key: Option<Vec<u8>>) -> FakeServe
     })
 }
 
+pub fn start_hmac_required_open_drop_server(key: Vec<u8>, wait: Duration) -> FakeServer {
+    start_fake_server(move |socket, tx| {
+        socket.set_read_timeout(Some(wait)).unwrap();
+        while let Some(request) = recv_request_timeout(&socket) {
+            let hmac = request
+                .get(3)
+                .is_some_and(|flags| flags & flags::FLAG_HMAC != 0);
+            match verify_hmac(&key, &request, HMAC_OFFSET) {
+                Ok(()) => {}
+                Err(error) => {
+                    tx.send(ServerObservation::RejectedHmac {
+                        hmac,
+                        bad_hmac: error == ProtoError::BadHmac,
+                    })
+                    .unwrap();
+                }
+            }
+        }
+    })
+}
+
+pub fn start_hmac_close_server(params: Params, key: Vec<u8>) -> FakeServer {
+    start_fake_server(move |socket, tx| {
+        let (request, peer) = recv_request(&socket);
+        let (open_params, hmac) = decode_open_request_params(&request, Some(&key));
+        tx.send(ServerObservation::Open {
+            params: open_params,
+            hmac,
+        })
+        .unwrap();
+
+        let reply = open_reply(
+            flags::FLAG_OPEN | flags::FLAG_REPLY,
+            TOKEN,
+            &params,
+            Some(&key),
+        );
+        socket.send_to(&reply, peer).unwrap();
+
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (request, peer) = recv_request(&socket);
+        let close = observe_close_request(&request, &key);
+        tx.send(close).unwrap();
+
+        let reply = close_reply(TOKEN, &key);
+        socket.send_to(&reply, peer).unwrap();
+    })
+}
+
+pub fn start_bad_hmac_echo_reply_server(params: Params, key: Vec<u8>) -> FakeServer {
+    start_fake_server(move |socket, tx| {
+        let (request, peer) = recv_request(&socket);
+        let (open_params, hmac) = decode_open_request_params(&request, Some(&key));
+        tx.send(ServerObservation::Open {
+            params: open_params,
+            hmac,
+        })
+        .unwrap();
+
+        let reply = open_reply(
+            flags::FLAG_OPEN | flags::FLAG_REPLY,
+            TOKEN,
+            &params,
+            Some(&key),
+        );
+        socket.send_to(&reply, peer).unwrap();
+
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (request, peer) = recv_request(&socket);
+        let echo = observe_echo_request(&request, Some(&key));
+        let sequence = match echo {
+            ServerObservation::Echo { sequence, .. } => sequence,
+            _ => unreachable!(),
+        };
+        tx.send(echo).unwrap();
+
+        let mut reply_packet = echo_reply_packet(
+            TOKEN,
+            sequence,
+            &params,
+            &TimestampFields::default(),
+            Some(&key),
+        );
+        reply_packet[HMAC_OFFSET] ^= 0xff;
+        socket.send_to(&reply_packet, peer).unwrap();
+    })
+}
+
+pub fn start_bad_hmac_open_reply_server(
+    params: Params,
+    request_key: Vec<u8>,
+    reply_key: Vec<u8>,
+) -> FakeServer {
+    start_fake_server(move |socket, tx| {
+        let (request, peer) = recv_request(&socket);
+        let (open_params, hmac) = decode_open_request_params(&request, Some(&request_key));
+        tx.send(ServerObservation::Open {
+            params: open_params,
+            hmac,
+        })
+        .unwrap();
+
+        let reply = open_reply(
+            flags::FLAG_OPEN | flags::FLAG_REPLY,
+            TOKEN,
+            &params,
+            Some(&reply_key),
+        );
+        socket.send_to(&reply, peer).unwrap();
+    })
+}
+
 pub fn server_fill(value: &str) -> Option<ServerFill> {
     Some(ServerFill {
         value: value.to_owned(),
@@ -203,7 +329,7 @@ fn start_one_probe_server(
         let echo = observe_echo_request(&request, hmac_key.as_deref());
         let sequence = match echo {
             ServerObservation::Echo { sequence, .. } => sequence,
-            ServerObservation::Open { .. } => unreachable!(),
+            _ => unreachable!(),
         };
         tx.send(echo).unwrap();
 
@@ -229,6 +355,14 @@ fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0_u8; 2048];
     let (size, peer) = socket.recv_from(&mut buf).unwrap();
     (buf[..size].to_vec(), peer)
+}
+
+fn recv_request_timeout(socket: &UdpSocket) -> Option<Vec<u8>> {
+    let mut buf = [0_u8; 2048];
+    match socket.recv_from(&mut buf) {
+        Ok((size, _)) => Some(buf[..size].to_vec()),
+        Err(_) => None,
+    }
 }
 
 fn assert_started(outcome: OpenOutcome) -> NegotiatedParams {
@@ -272,6 +406,28 @@ fn observe_echo_request(packet: &[u8], hmac_key: Option<&[u8]>) -> ServerObserva
         token,
         sequence,
     }
+}
+
+fn observe_close_request(packet: &[u8], hmac_key: &[u8]) -> ServerObservation {
+    assert_eq!(&packet[..3], &MAGIC);
+    assert_eq!(packet[3] & flags::FLAG_CLOSE, flags::FLAG_CLOSE);
+    assert_eq!(packet[3] & flags::FLAG_HMAC, flags::FLAG_HMAC);
+    verify_hmac(hmac_key, packet, HMAC_OFFSET).unwrap();
+
+    let token_offset = 4 + HMAC_SIZE;
+    let token = u64::from_le_bytes(packet[token_offset..token_offset + 8].try_into().unwrap());
+
+    ServerObservation::Close { hmac: true, token }
+}
+
+fn close_reply(token: u64, hmac_key: &[u8]) -> Vec<u8> {
+    let mut packet = Vec::new();
+    packet.extend_from_slice(&MAGIC);
+    packet.push(flags::FLAG_REPLY | flags::FLAG_CLOSE | flags::FLAG_HMAC);
+    packet.extend_from_slice(&[0_u8; HMAC_SIZE]);
+    packet.extend_from_slice(&token.to_le_bytes());
+    compute_hmac_in_place(hmac_key, &mut packet, HMAC_OFFSET).unwrap();
+    packet
 }
 
 fn open_reply(flags: u8, token: u64, params: &Params, hmac_key: Option<&[u8]>) -> Vec<u8> {
