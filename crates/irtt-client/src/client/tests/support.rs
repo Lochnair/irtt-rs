@@ -176,6 +176,26 @@ pub(super) fn recv_request_timeout(
     }
 }
 
+pub(super) fn silent_open_server(params: Params) -> FakeServer {
+    start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+        socket.send_to(&reply, peer).unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        loop {
+            let mut buf = [0_u8; 2048];
+            match socket.recv_from(&mut buf) {
+                Ok((size, _)) => {
+                    tx.send(buf[..size].to_vec()).unwrap();
+                }
+                Err(_) => break,
+            }
+        }
+    })
+}
+
 pub(super) fn echo_server(params: Params) -> FakeServer {
     start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);

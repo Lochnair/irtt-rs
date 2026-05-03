@@ -9,5 +9,10 @@ use std::{thread, time::SystemTime};
 mod support;
 use support::*;
 
-mod config_open;
+mod close;
+mod config;
+mod hmac;
+mod negotiation;
+mod no_test;
+mod open;
 mod probes_replies;
