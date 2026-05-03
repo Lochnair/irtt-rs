@@ -93,6 +93,7 @@ pub enum TimestampArg {
     Send,
     Receive,
     Both,
+    Midpoint,
 }
 
 impl From<TimestampArg> for StampAt {
@@ -102,6 +103,26 @@ impl From<TimestampArg> for StampAt {
             TimestampArg::Send => Self::Send,
             TimestampArg::Receive => Self::Receive,
             TimestampArg::Both => Self::Both,
+            TimestampArg::Midpoint => Self::Midpoint,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ReceivedStatsArg {
+    None,
+    Count,
+    Window,
+    Both,
+}
+
+impl From<ReceivedStatsArg> for ReceivedStats {
+    fn from(value: ReceivedStatsArg) -> Self {
+        match value {
+            ReceivedStatsArg::None => Self::None,
+            ReceivedStatsArg::Count => Self::Count,
+            ReceivedStatsArg::Window => Self::Window,
+            ReceivedStatsArg::Both => Self::Both,
         }
     }
 }
