@@ -9,72 +9,6 @@ fn send_probe_fails_before_open() {
 }
 
 #[test]
-fn send_probe_fails_after_no_test_completed() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
-    let params = params_from_config(&config).unwrap();
-    let server = no_test_server(params, 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
-    assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
-    assert!(matches!(
-        client.send_probe(),
-        Err(ClientError::AlreadyCompleted)
-    ));
-    server.join();
-}
-
-#[test]
-fn send_probe_fails_after_close() {
-    let params = default_params();
-    let server = start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
-        socket.send_to(&reply, peer).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        loop {
-            let mut buf = [0_u8; 512];
-            match socket.recv_from(&mut buf) {
-                Ok((size, _)) => {
-                    tx.send(buf[..size].to_vec()).unwrap();
-                }
-                Err(_) => break,
-            }
-        }
-    });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-    client.close(ClientTimestamp::now()).unwrap();
-    assert!(matches!(
-        client.send_probe(),
-        Err(ClientError::AlreadyClosed)
-    ));
-    server.join();
-}
-
-fn silent_open_server(params: Params) -> FakeServer {
-    start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
-        socket.send_to(&reply, peer).unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
-        loop {
-            let mut buf = [0_u8; 2048];
-            match socket.recv_from(&mut buf) {
-                Ok((size, _)) => {
-                    tx.send(buf[..size].to_vec()).unwrap();
-                }
-                Err(_) => break,
-            }
-        }
-    })
-}
-
-#[test]
 fn send_probe_sends_valid_echo_request() {
     let params = default_params();
     let server = silent_open_server(params.clone());
@@ -498,51 +432,6 @@ fn wrong_token_reply_is_dropped() {
 }
 
 #[test]
-fn bad_hmac_reply_is_dropped() {
-    let key = b"secret".to_vec();
-    let wrong_key = b"wrong".to_vec();
-    let params = default_params();
-    let server_key = key.clone();
-    let server = start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, Some(&server_key));
-        socket.send_to(&reply, peer).unwrap();
-
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut buf = [0_u8; 2048];
-        if let Ok((size, _)) = socket.recv_from(&mut buf) {
-            tx.send(buf[..size].to_vec()).unwrap();
-            let seq = u32::from_le_bytes(
-                buf[4 + HMAC_SIZE + 8..4 + HMAC_SIZE + 12]
-                    .try_into()
-                    .unwrap(),
-            );
-            let ts = TimestampFields::default();
-            let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, Some(&wrong_key));
-            socket.send_to(&reply_packet, peer).unwrap();
-        }
-    });
-    let config = ClientConfig {
-        hmac_key: Some(key),
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(30));
-    let events = client.recv_once().unwrap();
-    assert_eq!(events.len(), 1);
-    assert!(matches!(&events[0], ClientEvent::Warning { .. }));
-    server.join();
-}
-
-#[test]
 fn duplicate_reply_emits_duplicate_event() {
     let params = default_params();
     let server = start_fake_server(move |socket, tx| {
@@ -791,31 +680,6 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
 }
 
 #[test]
-fn close_clears_timed_out_metadata() {
-    let params = default_params();
-    let server = silent_open_server(params);
-    let config = ClientConfig {
-        probe_timeout: Duration::from_millis(40),
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(60));
-    client.poll_timeouts(ClientTimestamp::now()).unwrap();
-    assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
-
-    client.close(ClientTimestamp::now()).unwrap();
-    assert!(client.session.is_none());
-    server.join();
-}
-
-#[test]
 fn pending_map_bounded() {
     let params = Params {
         duration_ns: 60_000_000_000,
@@ -898,55 +762,6 @@ fn minimal_negotiated_layout_works() {
     } else {
         panic!("expected EchoReply");
     }
-    server.join();
-}
-
-#[test]
-fn hmac_echo_request_reply_works() {
-    let key = b"testkey".to_vec();
-    let params = default_params();
-    let server_key = key.clone();
-    let server = start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, Some(&server_key));
-        socket.send_to(&reply, peer).unwrap();
-
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut buf = [0_u8; 2048];
-        if let Ok((size, _)) = socket.recv_from(&mut buf) {
-            tx.send(buf[..size].to_vec()).unwrap();
-            verify_hmac(&server_key, &buf[..size], HMAC_OFFSET).unwrap();
-            let seq = u32::from_le_bytes(
-                buf[4 + HMAC_SIZE + 8..4 + HMAC_SIZE + 12]
-                    .try_into()
-                    .unwrap(),
-            );
-            let ts = TimestampFields {
-                recv_mono: Some(100),
-                send_mono: Some(200),
-                ..Default::default()
-            };
-            let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, Some(&server_key));
-            socket.send_to(&reply_packet, peer).unwrap();
-        }
-    });
-    let config = ClientConfig {
-        hmac_key: Some(key),
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(50));
-    let events = client.recv_once().unwrap();
-    assert_eq!(events.len(), 1);
-    assert!(matches!(&events[0], ClientEvent::EchoReply { .. }));
     server.join();
 }
 
