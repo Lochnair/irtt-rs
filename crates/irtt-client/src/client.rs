@@ -1058,6 +1058,55 @@ mod tests {
     }
 
     #[test]
+    fn params_from_config_maps_compatibility_fields() {
+        let config = ClientConfig {
+            duration: Some(Duration::from_secs(5)),
+            interval: Duration::from_millis(250),
+            length: 1472,
+            received_stats: ReceivedStats::Window,
+            stamp_at: StampAt::Midpoint,
+            clock: Clock::Wall,
+            dscp: 46,
+            hmac_key: Some(b"secret".to_vec()),
+            server_fill: Some("rand".to_owned()),
+            ..ClientConfig::default()
+        };
+
+        let params = params_from_config(&config).unwrap();
+        assert_eq!(params.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(params.duration_ns, 5_000_000_000);
+        assert_eq!(params.interval_ns, 250_000_000);
+        assert_eq!(params.length, 1472);
+        assert_eq!(params.received_stats, ReceivedStats::Window);
+        assert_eq!(params.stamp_at, StampAt::Midpoint);
+        assert_eq!(params.clock, Clock::Wall);
+        assert_eq!(params.dscp, 46, "config DSCP codepoint must not be shifted");
+        assert_eq!(
+            params.server_fill.as_ref().map(|fill| fill.value.as_str()),
+            Some("rand")
+        );
+        assert_eq!(config.hmac_key.as_deref(), Some(b"secret".as_slice()));
+    }
+
+    #[test]
+    fn params_from_config_encodes_continuous_duration_as_zero() {
+        let config = ClientConfig {
+            duration: None,
+            ..ClientConfig::default()
+        };
+        assert_eq!(params_from_config(&config).unwrap().duration_ns, 0);
+    }
+
+    #[test]
+    fn params_from_config_accepts_max_dscp_codepoint() {
+        let config = ClientConfig {
+            dscp: 63,
+            ..ClientConfig::default()
+        };
+        assert_eq!(params_from_config(&config).unwrap().dscp, 63);
+    }
+
+    #[test]
     fn address_resolution_connects_to_local_fake_server() {
         let server = start_fake_server(|socket, tx| {
             let _ = recv_request(&socket, &tx);
