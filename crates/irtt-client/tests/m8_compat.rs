@@ -1,5 +1,7 @@
 mod support;
 
+use std::time::Duration;
+
 use irtt_client::{
     Client, ClientConfig, ClientError, ClientEvent, OneWayDelaySample, ReceivedStatsSample,
     RttSample, ServerTiming,
@@ -78,8 +80,7 @@ fn timestamp_modes_drive_reply_event_timing_fields() {
             StampAt::Both => {
                 assert_timing_fields(reply.server_timing, true, true, false, false, true, true);
                 assert_one_way_presence(reply.one_way, true, true);
-                assert!(reply.rtt.adjusted.is_some());
-                assert!(reply.rtt.effective <= reply.rtt.raw);
+                assert_processing_subtracted(reply);
             }
             StampAt::Midpoint => {
                 assert_timing_fields(reply.server_timing, false, false, true, true, false, false);
@@ -113,8 +114,7 @@ fn clock_modes_drive_reply_event_clock_fields() {
                 assert_one_way_presence(reply.one_way, true, true);
             }
         }
-        assert!(reply.rtt.adjusted.is_some());
-        assert!(reply.rtt.effective <= reply.rtt.raw);
+        assert_processing_subtracted(reply);
     }
 }
 
@@ -128,8 +128,7 @@ fn rich_mode_exposes_stats_server_timing_and_adjusted_rtt() {
     assert_received_stats(reply.received_stats, Some(RECV_COUNT), Some(RECV_WINDOW));
     assert_timing_fields(reply.server_timing, true, true, false, false, true, true);
     assert_one_way_presence(reply.one_way, true, true);
-    assert!(reply.rtt.adjusted.is_some());
-    assert!(reply.rtt.effective <= reply.rtt.raw);
+    assert_processing_subtracted(reply);
 }
 
 #[test]
@@ -346,6 +345,14 @@ fn assert_timing_fields(
         sample.processing.is_some(),
         (recv_mono && send_mono) || (recv_wall && send_wall)
     );
+}
+
+fn assert_processing_subtracted(reply: ReplyView<'_>) {
+    let processing = reply.server_timing.unwrap().processing.unwrap();
+    assert_eq!(processing, Duration::from_nanos(1));
+    let adjusted = reply.rtt.adjusted.unwrap();
+    assert_eq!(reply.rtt.effective, adjusted);
+    assert!(adjusted < reply.rtt.raw);
 }
 
 fn assert_one_way_presence(
