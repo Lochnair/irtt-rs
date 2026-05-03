@@ -620,7 +620,7 @@ fn escape_value(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
     use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
     use irtt_proto::{Params, PROTOCOL_VERSION};
     use std::{
@@ -690,15 +690,24 @@ mod tests {
         assert_eq!(args.length, 0);
         assert_eq!(args.hmac, None);
         assert_eq!(args.clock, ClockArg::Both);
-        assert_eq!(args.timestamps, TimestampArg::Both);
+        assert_eq!(args.tstamp, TimestampArg::Both);
+        assert_eq!(args.timestamp_mode(), TimestampArg::Both);
+        assert_eq!(args.stats, ReceivedStatsArg::Both);
+        assert_eq!(args.server_fill, None);
+        assert_eq!(args.dscp, 0);
+        assert!(!args.loose);
         assert_eq!(args.output, OutputMode::Human);
 
         let config = args.to_client_config();
         assert_eq!(config.duration, Some(Duration::from_secs(10)));
         assert_eq!(config.interval, Duration::from_secs(1));
         assert_eq!(config.length, 0);
+        assert_eq!(config.received_stats, ReceivedStats::Both);
         assert_eq!(config.stamp_at, StampAt::Both);
         assert_eq!(config.clock, Clock::Both);
+        assert_eq!(config.dscp, 0);
+        assert_eq!(config.server_fill, None);
+        assert_eq!(config.negotiation_policy, NegotiationPolicy::Strict);
         assert!(!args.is_continuous());
     }
 
@@ -743,14 +752,15 @@ mod tests {
             "machine",
             "--clock",
             "wall",
-            "--timestamps",
+            "--tstamp",
             "send",
             "127.0.0.1:2112",
         ])
         .unwrap();
         assert_eq!(args.output, OutputMode::Machine);
         assert_eq!(args.clock, ClockArg::Wall);
-        assert_eq!(args.timestamps, TimestampArg::Send);
+        assert_eq!(args.timestamp_mode(), TimestampArg::Send);
+        assert_eq!(args.to_client_config().stamp_at, StampAt::Send);
 
         let args = parse(&[
             "--output",
@@ -764,10 +774,125 @@ mod tests {
         .unwrap();
         assert_eq!(args.output, OutputMode::RttUs);
         assert_eq!(args.clock, ClockArg::Monotonic);
-        assert_eq!(args.timestamps, TimestampArg::Receive);
+        assert_eq!(args.timestamp_mode(), TimestampArg::Receive);
+        assert_eq!(args.to_client_config().stamp_at, StampAt::Receive);
 
         let args = parse(&["--output", "human", "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.output, OutputMode::Human);
+    }
+
+    #[test]
+    fn maps_tstamp_modes() {
+        for (value, expected) in [
+            ("none", StampAt::None),
+            ("send", StampAt::Send),
+            ("receive", StampAt::Receive),
+            ("both", StampAt::Both),
+            ("midpoint", StampAt::Midpoint),
+        ] {
+            let args = parse(&["--tstamp", value, "127.0.0.1:2112"]).unwrap();
+            assert_eq!(args.to_client_config().stamp_at, expected);
+        }
+    }
+
+    #[test]
+    fn timestamps_alias_accepts_midpoint() {
+        let args = parse(&["--timestamps", "midpoint", "127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.timestamp_mode(), TimestampArg::Midpoint);
+        assert_eq!(args.to_client_config().stamp_at, StampAt::Midpoint);
+    }
+
+    #[test]
+    fn rejects_duplicate_timestamp_options() {
+        assert!(parse(&[
+            "--tstamp",
+            "send",
+            "--timestamps",
+            "receive",
+            "127.0.0.1:2112"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn maps_received_stats_modes() {
+        for (value, expected) in [
+            ("none", ReceivedStats::None),
+            ("count", ReceivedStats::Count),
+            ("window", ReceivedStats::Window),
+            ("both", ReceivedStats::Both),
+        ] {
+            let args = parse(&["--stats", value, "127.0.0.1:2112"]).unwrap();
+            assert_eq!(args.to_client_config().received_stats, expected);
+        }
+
+        let args = parse(&["127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.to_client_config().received_stats, ReceivedStats::Both);
+    }
+
+    #[test]
+    fn maps_server_fill_options() {
+        let args = parse(&["--sfill", "abc", "127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.to_client_config().server_fill.as_deref(), Some("abc"));
+
+        let args = parse(&["--server-fill", "abc", "127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.to_client_config().server_fill.as_deref(), Some("abc"));
+
+        let max = "0123456789abcdef0123456789abcdef";
+        let args = parse(&["--sfill", max, "127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.to_client_config().server_fill.as_deref(), Some(max));
+    }
+
+    #[test]
+    fn rejects_invalid_server_fill() {
+        assert!(parse(&["--sfill", "", "127.0.0.1:2112"]).is_err());
+        assert!(parse(&[
+            "--sfill",
+            "0123456789abcdef0123456789abcdefx",
+            "127.0.0.1:2112"
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn maps_dscp_codepoints() {
+        for value in ["0", "46", "63"] {
+            let args = parse(&["--dscp", value, "127.0.0.1:2112"]).unwrap();
+            assert_eq!(args.to_client_config().dscp, value.parse::<u8>().unwrap());
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_dscp_codepoints() {
+        assert!(parse(&["--dscp", "64", "127.0.0.1:2112"]).is_err());
+        assert!(parse(&["--dscp", "-1", "127.0.0.1:2112"]).is_err());
+        assert!(parse(&["--dscp", "abc", "127.0.0.1:2112"]).is_err());
+    }
+
+    #[test]
+    fn maps_loose_negotiation() {
+        let args = parse(&["127.0.0.1:2112"]).unwrap();
+        assert_eq!(
+            args.to_client_config().negotiation_policy,
+            NegotiationPolicy::Strict
+        );
+
+        let args = parse(&["--loose", "127.0.0.1:2112"]).unwrap();
+        assert_eq!(
+            args.to_client_config().negotiation_policy,
+            NegotiationPolicy::Loose
+        );
+    }
+
+    #[test]
+    fn help_lists_m8_compatibility_options() {
+        let help = CliArgs::command().render_help().to_string();
+        assert!(help.contains("--tstamp <MODE>"));
+        assert!(help.contains("--stats <STATS>"));
+        assert!(help.contains("--sfill <STRING>"));
+        assert!(help.contains("--dscp <0..=63>"));
+        assert!(help.contains("--loose"));
+        assert!(help.contains("DSCP codepoint"));
     }
 
     #[test]
