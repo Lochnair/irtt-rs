@@ -854,7 +854,7 @@ mod tests {
     }
 
     #[test]
-    fn help_lists_m8_compatibility_options() {
+    fn help_lists_advanced_protocol_options() {
         let help = CliArgs::command().render_help().to_string();
         assert!(help.contains("--tstamp <MODE>"));
         assert!(help.contains("--stats <STATS>"));
