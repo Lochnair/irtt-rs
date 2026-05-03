@@ -725,24 +725,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_duration() {
-        assert!(parse(&["--duration", "-1s", "127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--duration", "5", "127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--duration", "1h", "127.0.0.1:2112"]).is_err());
-    }
-
-    #[test]
     fn duration_zero_selects_continuous_config() {
         let args = parse(&["--duration", "0", "127.0.0.1:2112"]).unwrap();
         assert!(args.is_continuous());
         assert_eq!(args.duration, Duration::ZERO);
         assert_eq!(args.to_client_config().duration, None);
-    }
-
-    #[test]
-    fn rejects_invalid_interval() {
-        assert!(parse(&["--interval", "0ms", "127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--interval", "-1ms", "127.0.0.1:2112"]).is_err());
     }
 
     #[test]
@@ -844,29 +831,11 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_server_fill() {
-        assert!(parse(&["--sfill", "", "127.0.0.1:2112"]).is_err());
-        assert!(parse(&[
-            "--sfill",
-            "0123456789abcdef0123456789abcdefx",
-            "127.0.0.1:2112"
-        ])
-        .is_err());
-    }
-
-    #[test]
     fn maps_dscp_codepoints() {
         for value in ["0", "46", "63"] {
             let args = parse(&["--dscp", value, "127.0.0.1:2112"]).unwrap();
             assert_eq!(args.to_client_config().dscp, value.parse::<u8>().unwrap());
         }
-    }
-
-    #[test]
-    fn rejects_invalid_dscp_codepoints() {
-        assert!(parse(&["--dscp", "64", "127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--dscp", "-1", "127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--dscp", "abc", "127.0.0.1:2112"]).is_err());
     }
 
     #[test]
@@ -896,9 +865,27 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_length() {
-        assert!(parse(&["--length", "-1", "127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--length", "65508", "127.0.0.1:2112"]).is_err());
+    fn rejects_invalid_argument_values() {
+        for args in [
+            &["--duration", "-1s", "127.0.0.1:2112"][..],
+            &["--duration", "5", "127.0.0.1:2112"],
+            &["--duration", "1h", "127.0.0.1:2112"],
+            &["--interval", "0ms", "127.0.0.1:2112"],
+            &["--interval", "-1ms", "127.0.0.1:2112"],
+            &["--sfill", "", "127.0.0.1:2112"],
+            &[
+                "--sfill",
+                "0123456789abcdef0123456789abcdefx",
+                "127.0.0.1:2112",
+            ],
+            &["--dscp", "64", "127.0.0.1:2112"],
+            &["--dscp", "-1", "127.0.0.1:2112"],
+            &["--dscp", "abc", "127.0.0.1:2112"],
+            &["--length", "-1", "127.0.0.1:2112"],
+            &["--length", "65508", "127.0.0.1:2112"],
+        ] {
+            assert!(parse(args).is_err(), "expected parse failure for {args:?}");
+        }
     }
 
     #[test]
