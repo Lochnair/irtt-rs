@@ -47,11 +47,7 @@ pub(crate) fn validate_negotiated_params(
             received: returned.protocol_version,
         });
     }
-    if returned.duration_ns > requested.duration_ns {
-        return Err(ClientError::NegotiationRejected {
-            reason: "duration increased".to_owned(),
-        });
-    }
+    validate_duration_restriction(requested.duration_ns, returned.duration_ns)?;
     if returned.length > requested.length {
         return Err(ClientError::NegotiationRejected {
             reason: "length increased".to_owned(),
@@ -69,4 +65,121 @@ pub(crate) fn validate_negotiated_params(
         });
     }
     Ok(())
+}
+
+fn validate_duration_restriction(requested: i64, returned: i64) -> Result<(), ClientError> {
+    if returned < 0 {
+        return Err(ClientError::NegotiationRejected {
+            reason: "duration must be non-negative".to_owned(),
+        });
+    }
+
+    if requested > 0 && (returned == 0 || returned > requested) {
+        return Err(ClientError::NegotiationRejected {
+            reason: "duration increased".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use irtt_proto::{Clock, ReceivedStats, ServerFill, StampAt};
+
+    fn default_params() -> Params {
+        Params {
+            protocol_version: PROTOCOL_VERSION,
+            duration_ns: 3_000_000_000,
+            interval_ns: 1_000_000_000,
+            length: 256,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            dscp: 46,
+            server_fill: Some(ServerFill {
+                value: "rand".to_owned(),
+            }),
+        }
+    }
+
+    fn assert_rejected(requested: &Params, returned: &Params, policy: NegotiationPolicy) {
+        assert!(matches!(
+            validate_negotiated_params(requested, returned, policy),
+            Err(ClientError::NegotiationRejected { .. })
+        ));
+    }
+
+    #[test]
+    fn strict_rejects_changed_negotiated_fields() {
+        let requested = default_params();
+
+        let mut returned = requested.clone();
+        returned.length = 128;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+
+        let mut returned = requested.clone();
+        returned.dscp = 8;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+
+        let mut returned = requested.clone();
+        returned.received_stats = ReceivedStats::Count;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+
+        let mut returned = requested.clone();
+        returned.stamp_at = StampAt::Midpoint;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+
+        let mut returned = requested.clone();
+        returned.clock = Clock::Wall;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+
+        let mut returned = requested.clone();
+        returned.server_fill = None;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+    }
+
+    #[test]
+    fn loose_duration_negotiation_uses_run_duration_semantics() {
+        let requested = default_params();
+
+        let mut returned = requested.clone();
+        returned.duration_ns = requested.duration_ns / 2;
+        assert!(
+            validate_negotiated_params(&requested, &returned, NegotiationPolicy::Loose).is_ok()
+        );
+
+        let mut returned = requested.clone();
+        returned.duration_ns = requested.duration_ns + 1;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Loose);
+
+        let mut returned = requested.clone();
+        returned.duration_ns = 0;
+        assert_rejected(&requested, &returned, NegotiationPolicy::Loose);
+
+        let mut continuous_requested = requested.clone();
+        continuous_requested.duration_ns = 0;
+        let mut finite_returned = continuous_requested.clone();
+        finite_returned.duration_ns = 1_000_000_000;
+        assert!(validate_negotiated_params(
+            &continuous_requested,
+            &finite_returned,
+            NegotiationPolicy::Loose
+        )
+        .is_ok());
+
+        assert_rejected(
+            &continuous_requested,
+            &finite_returned,
+            NegotiationPolicy::Strict,
+        );
+
+        assert!(validate_negotiated_params(
+            &continuous_requested,
+            &continuous_requested,
+            NegotiationPolicy::Strict
+        )
+        .is_ok());
+    }
 }
