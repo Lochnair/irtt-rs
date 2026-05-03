@@ -201,6 +201,10 @@ fn read_int(input: &[u8], pos: &mut usize) -> Result<i64> {
 mod tests {
     use super::*;
 
+    fn assert_round_trip(params: Params) {
+        assert_eq!(Params::decode(&params.encode()), Ok(params));
+    }
+
     #[test]
     fn params_round_trip() {
         let params = Params {
@@ -216,7 +220,121 @@ mod tests {
                 value: "pattern:abc".to_owned(),
             }),
         };
-        assert_eq!(Params::decode(&params.encode()), Ok(params));
+        assert_round_trip(params);
+    }
+
+    #[test]
+    fn params_round_trip_received_stats_modes() {
+        for received_stats in [
+            ReceivedStats::None,
+            ReceivedStats::Count,
+            ReceivedStats::Window,
+            ReceivedStats::Both,
+        ] {
+            assert_round_trip(Params {
+                protocol_version: 1,
+                received_stats,
+                ..Params::default()
+            });
+        }
+    }
+
+    #[test]
+    fn params_round_trip_timestamp_modes() {
+        for stamp_at in [
+            StampAt::None,
+            StampAt::Send,
+            StampAt::Receive,
+            StampAt::Both,
+            StampAt::Midpoint,
+        ] {
+            assert_round_trip(Params {
+                protocol_version: 1,
+                stamp_at,
+                clock: Clock::Both,
+                ..Params::default()
+            });
+        }
+    }
+
+    #[test]
+    fn params_round_trip_clock_modes() {
+        for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
+            assert_round_trip(Params {
+                protocol_version: 1,
+                stamp_at: StampAt::Both,
+                clock,
+                ..Params::default()
+            });
+        }
+    }
+
+    #[test]
+    fn params_round_trip_dscp_codepoints_without_shifting() {
+        for dscp in [0, 46, 63] {
+            let params = Params {
+                protocol_version: 1,
+                dscp,
+                ..Params::default()
+            };
+            assert_round_trip(params);
+        }
+
+        let params = Params {
+            protocol_version: 1,
+            dscp: 46,
+            ..Params::default()
+        };
+        let encoded = params.encode();
+        assert!(
+            encoded.windows(2).any(|bytes| bytes == [8, 92]),
+            "DSCP 46 must be encoded as param value 46"
+        );
+        assert!(
+            !encoded.windows(3).any(|bytes| bytes == [8, 0xf0, 0x02]),
+            "DSCP 46 must not be shifted to TOS byte 184 in Params encoding"
+        );
+        assert_eq!(Params::decode(&encoded).unwrap().dscp, 46);
+    }
+
+    #[test]
+    fn server_fill_absent_short_and_max_length_round_trip() {
+        assert_round_trip(Params {
+            protocol_version: 1,
+            server_fill: None,
+            ..Params::default()
+        });
+
+        assert_round_trip(Params {
+            protocol_version: 1,
+            server_fill: Some(ServerFill {
+                value: "rand".to_owned(),
+            }),
+            ..Params::default()
+        });
+
+        assert_round_trip(Params {
+            protocol_version: 1,
+            server_fill: Some(ServerFill {
+                value: "0123456789abcdef0123456789abcdef".to_owned(),
+            }),
+            ..Params::default()
+        });
+    }
+
+    #[test]
+    fn server_fill_tag_and_length_are_encoded_before_utf8_bytes() {
+        let params = Params {
+            protocol_version: 1,
+            server_fill: Some(ServerFill {
+                value: "rand".to_owned(),
+            }),
+            ..Params::default()
+        };
+        let encoded = params.encode();
+        assert!(encoded
+            .windows(6)
+            .any(|bytes| bytes == [9, 4, b'r', b'a', b'n', b'd']));
     }
 
     #[test]
@@ -232,6 +350,36 @@ mod tests {
     }
 
     #[test]
+    fn invalid_received_stats_value_is_rejected() {
+        let mut encoded = Vec::new();
+        varint::encode_uvarint(5, &mut encoded);
+        varint::encode_varint(4, &mut encoded);
+
+        assert_eq!(
+            Params::decode(&encoded),
+            Err(ProtoError::InvalidEnum {
+                name: "ReceivedStats",
+                value: 4,
+            })
+        );
+    }
+
+    #[test]
+    fn invalid_timestamp_value_is_rejected() {
+        let mut encoded = Vec::new();
+        varint::encode_uvarint(6, &mut encoded);
+        varint::encode_varint(5, &mut encoded);
+
+        assert_eq!(
+            Params::decode(&encoded),
+            Err(ProtoError::InvalidEnum {
+                name: "StampAt",
+                value: 5,
+            })
+        );
+    }
+
+    #[test]
     fn explicit_clock_zero_is_rejected() {
         let mut encoded = Vec::new();
         varint::encode_uvarint(7, &mut encoded);
@@ -244,5 +392,29 @@ mod tests {
                 value: 0,
             })
         );
+    }
+
+    #[test]
+    fn malformed_server_fill_is_rejected() {
+        let encoded = [9, 4, b'a', b'b'];
+        assert_eq!(Params::decode(&encoded), Err(ProtoError::MalformedParams));
+    }
+
+    #[test]
+    fn non_utf8_server_fill_is_rejected() {
+        let encoded = [9, 1, 0xff];
+        assert_eq!(Params::decode(&encoded), Err(ProtoError::InvalidUtf8));
+    }
+
+    #[test]
+    fn truncated_varint_parameter_is_rejected() {
+        let encoded = [1, 0x80];
+        assert_eq!(Params::decode(&encoded), Err(ProtoError::TruncatedVarint));
+    }
+
+    #[test]
+    fn truncated_unknown_parameter_value_is_rejected() {
+        let encoded = [99];
+        assert_eq!(Params::decode(&encoded), Err(ProtoError::TruncatedVarint));
     }
 }
