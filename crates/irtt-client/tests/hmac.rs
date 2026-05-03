@@ -9,9 +9,10 @@ use irtt_client::{
 use irtt_proto::{echo_packet_len, ProtoError, TimestampFields};
 
 use support::{
-    config_for_params, default_params, params_for_modes, run_one_probe_with_config,
-    standard_timestamps, start_bad_hmac_echo_reply_server, start_hmac_close_server,
-    start_hmac_required_open_drop_server, ServerObservation, TOKEN,
+    config_for_params, default_params, params_for_modes, require_real_backend,
+    run_one_probe_with_config, standard_timestamps, start_bad_hmac_echo_reply_server,
+    start_hmac_close_server, start_hmac_required_open_drop_server, RealIrtServer,
+    ServerObservation, TOKEN,
 };
 
 #[test]
@@ -293,4 +294,65 @@ fn assert_no_warning_or_error(events: &[ClientEvent]) {
 
 fn assert_no_duplicate_late_or_warning(events: &[ClientEvent]) {
     assert_no_warning_or_error(events);
+}
+
+#[test]
+fn real_hmac_correct_key_succeeds() {
+    if !require_real_backend() {
+        return;
+    }
+    let key = b"compat-secret".to_vec();
+    let server = RealIrtServer::start(Some(&key)).unwrap();
+    let params = default_params();
+    let mut config = config_for_params(server.addr(), &params);
+    config.hmac_key = Some(key);
+
+    let mut client = Client::connect(config).unwrap();
+    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    assert!(matches!(outcome, OpenOutcome::Started { .. }));
+
+    let sent = client.send_probe().unwrap();
+    assert_eq!(sent.len(), 1);
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
+
+    client.close(ClientTimestamp::now()).unwrap();
+}
+
+#[test]
+fn real_hmac_wrong_key_fails() {
+    if !require_real_backend() {
+        return;
+    }
+    let server_key = b"compat-secret".to_vec();
+    let server = RealIrtServer::start(Some(&server_key)).unwrap();
+    let mut config = config_for_params(server.addr(), &default_params());
+    config.open_timeouts = vec![Duration::from_millis(200)];
+    config.hmac_key = Some(b"wrong-secret".to_vec());
+
+    let mut client = Client::connect(config).unwrap();
+    assert!(matches!(
+        client.open(ClientTimestamp::now()),
+        Err(ClientError::OpenTimeout)
+    ));
+}
+
+#[test]
+fn real_hmac_missing_key_fails() {
+    if !require_real_backend() {
+        return;
+    }
+    let server_key = b"compat-secret".to_vec();
+    let server = RealIrtServer::start(Some(&server_key)).unwrap();
+    let mut config = config_for_params(server.addr(), &default_params());
+    config.open_timeouts = vec![Duration::from_millis(200)];
+    config.hmac_key = None;
+
+    let mut client = Client::connect(config).unwrap();
+    assert!(matches!(
+        client.open(ClientTimestamp::now()),
+        Err(ClientError::OpenTimeout)
+    ));
 }

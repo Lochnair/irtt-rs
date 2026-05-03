@@ -1,5 +1,6 @@
 mod support;
 
+use irtt_client::ClientTimestamp;
 use std::time::Duration;
 
 use irtt_client::{
@@ -9,9 +10,9 @@ use irtt_client::{
 use irtt_proto::{echo_packet_len, Clock, Params, ReceivedStats, StampAt, TimestampFields};
 
 use support::{
-    config_for_params, default_params, params_for_modes, run_one_probe, run_one_probe_with_config,
-    server_fill, standard_timestamps, start_open_server, OneProbeRun, ServerObservation,
-    RECV_COUNT, RECV_WINDOW, TOKEN,
+    config_for_params, default_params, params_for_modes, require_real_backend, run_one_probe,
+    run_one_probe_with_config, server_fill, standard_timestamps, start_open_server, OneProbeRun,
+    RealIrtServer, ServerObservation, RECV_COUNT, RECV_WINDOW, TOKEN,
 };
 
 struct ReplyView<'a> {
@@ -370,4 +371,149 @@ fn assert_one_way_presence(
     let sample = sample.unwrap();
     assert_eq!(sample.client_to_server.is_some(), client_to_server);
     assert_eq!(sample.server_to_client.is_some(), server_to_client);
+}
+
+#[test]
+fn real_basic_open_echo_close() {
+    if !require_real_backend() {
+        return;
+    }
+    let server = RealIrtServer::start(None).unwrap();
+    let params = default_params();
+    let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+
+    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
+
+    let sent = client.send_probe().unwrap();
+    assert_eq!(sent.len(), 1);
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
+
+    client.close(ClientTimestamp::now()).unwrap();
+}
+
+#[test]
+fn real_received_stats_smoke() {
+    if !require_real_backend() {
+        return;
+    }
+    for mode in [
+        ReceivedStats::None,
+        ReceivedStats::Count,
+        ReceivedStats::Window,
+        ReceivedStats::Both,
+    ] {
+        let server = RealIrtServer::start(None).unwrap();
+        let params = params_for_modes(mode, StampAt::None, Clock::Both);
+        let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+
+        client.open(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        let events = client.recv_once().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
+
+        client.close(ClientTimestamp::now()).unwrap();
+    }
+}
+
+#[test]
+fn real_timestamp_smoke() {
+    if !require_real_backend() {
+        return;
+    }
+    for mode in [
+        StampAt::None,
+        StampAt::Send,
+        StampAt::Receive,
+        StampAt::Both,
+        StampAt::Midpoint,
+    ] {
+        let server = RealIrtServer::start(None).unwrap();
+        let params = params_for_modes(ReceivedStats::None, mode, Clock::Both);
+        let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+
+        client.open(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        let events = client.recv_once().unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            ClientEvent::EchoReply {
+                server_timing,
+                one_way,
+                ..
+            } => match mode {
+                StampAt::None => {
+                    assert!(server_timing.is_none());
+                    assert!(one_way.is_none());
+                }
+                StampAt::Send => {
+                    let st = server_timing.as_ref().unwrap();
+                    assert!(st.send_wall_ns.is_some() || st.send_mono_ns.is_some());
+                }
+                StampAt::Receive => {
+                    let st = server_timing.as_ref().unwrap();
+                    assert!(st.receive_wall_ns.is_some() || st.receive_mono_ns.is_some());
+                }
+                StampAt::Both => {
+                    let st = server_timing.as_ref().unwrap();
+                    assert!(st.receive_wall_ns.is_some() || st.receive_mono_ns.is_some());
+                    assert!(st.send_wall_ns.is_some() || st.send_mono_ns.is_some());
+                }
+                StampAt::Midpoint => {
+                    let st = server_timing.as_ref().unwrap();
+                    assert!(st.midpoint_wall_ns.is_some() || st.midpoint_mono_ns.is_some());
+                }
+            },
+            other => panic!("expected EchoReply, got {other:?}"),
+        }
+
+        client.close(ClientTimestamp::now()).unwrap();
+    }
+}
+
+#[test]
+fn real_clock_smoke() {
+    if !require_real_backend() {
+        return;
+    }
+    for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
+        let server = RealIrtServer::start(None).unwrap();
+        let params = params_for_modes(ReceivedStats::None, StampAt::Both, clock);
+        let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+
+        client.open(ClientTimestamp::now()).unwrap();
+        client.send_probe().unwrap();
+        let events = client.recv_once().unwrap();
+        assert_eq!(events.len(), 1);
+
+        match &events[0] {
+            ClientEvent::EchoReply { server_timing, .. } => {
+                let st = server_timing.as_ref().unwrap();
+                match clock {
+                    Clock::Wall => {
+                        assert!(st.receive_wall_ns.is_some());
+                        assert!(st.send_wall_ns.is_some());
+                    }
+                    Clock::Monotonic => {
+                        assert!(st.receive_mono_ns.is_some());
+                        assert!(st.send_mono_ns.is_some());
+                    }
+                    Clock::Both => {
+                        assert!(st.receive_wall_ns.is_some());
+                        assert!(st.receive_mono_ns.is_some());
+                        assert!(st.send_wall_ns.is_some());
+                        assert!(st.send_mono_ns.is_some());
+                    }
+                }
+            }
+            other => panic!("expected EchoReply, got {other:?}"),
+        }
+
+        client.close(ClientTimestamp::now()).unwrap();
+    }
 }
