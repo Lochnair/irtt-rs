@@ -11,7 +11,7 @@ use irtt_proto::{
 };
 
 use crate::{
-    config::{ClientConfig, RecvBudget, RunMode},
+    config::{ClientConfig, RecvBudget, RunMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES},
     error::ClientError,
     event::{
         ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
@@ -752,6 +752,7 @@ fn build_received_stats(reply: &EchoReply) -> Option<ReceivedStatsSample> {
 }
 
 fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {
+    validate_protocol_config(config)?;
     Ok(Params {
         protocol_version: PROTOCOL_VERSION,
         duration_ns: duration_to_ns(config.duration.unwrap_or_default())?,
@@ -763,6 +764,25 @@ fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {
         dscp: i64::from(config.dscp),
         server_fill: config.server_fill.clone().map(|value| ServerFill { value }),
     })
+}
+
+fn validate_protocol_config(config: &ClientConfig) -> Result<(), ClientError> {
+    if config.dscp > MAX_DSCP_CODEPOINT {
+        return Err(ClientError::InvalidConfig {
+            reason: format!("dscp must be <= {MAX_DSCP_CODEPOINT}"),
+        });
+    }
+
+    if let Some(fill) = &config.server_fill {
+        let len = fill.len();
+        if len > MAX_SERVER_FILL_BYTES {
+            return Err(ClientError::InvalidConfig {
+                reason: format!("server_fill must be <= {MAX_SERVER_FILL_BYTES} bytes, got {len}"),
+            });
+        }
+    }
+
+    Ok(())
 }
 
 fn duration_to_ns(duration: Duration) -> Result<i64, ClientError> {
@@ -1104,6 +1124,30 @@ mod tests {
             ..ClientConfig::default()
         };
         assert_eq!(params_from_config(&config).unwrap().dscp, 63);
+    }
+
+    #[test]
+    fn params_from_config_rejects_invalid_dscp_codepoint() {
+        let config = ClientConfig {
+            dscp: 64,
+            ..ClientConfig::default()
+        };
+        assert!(matches!(
+            params_from_config(&config),
+            Err(ClientError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn params_from_config_rejects_oversized_server_fill() {
+        let config = ClientConfig {
+            server_fill: Some("0123456789abcdef0123456789abcdefx".to_owned()),
+            ..ClientConfig::default()
+        };
+        assert!(matches!(
+            params_from_config(&config),
+            Err(ClientError::InvalidConfig { .. })
+        ));
     }
 
     #[test]
