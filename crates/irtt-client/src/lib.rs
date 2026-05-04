@@ -8,6 +8,7 @@ mod managed;
 mod probe;
 mod session;
 mod socket;
+mod socket_options;
 mod timing;
 
 pub use client::Client;
