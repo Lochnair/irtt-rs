@@ -20,6 +20,7 @@ use crate::{
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
     session::{validate_negotiated_params, ActiveSession, ClientPhase, NegotiatedParams},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
+    socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
 };
 
@@ -126,6 +127,7 @@ impl Client {
             }
         };
 
+        clear_dscp_on_socket(&self.socket, self.remote)?;
         let packet =
             encode_close_request(&CloseRequest { token }, self.config.hmac_key.as_deref())?;
         self.socket.send(&packet)?;
@@ -543,6 +545,11 @@ impl Client {
         let negotiated = NegotiatedParams {
             params: reply.params.clone(),
         };
+        let negotiated_dscp =
+            u8::try_from(negotiated.params.dscp).map_err(|_| ClientError::InvalidConfig {
+                reason: "negotiated dscp must be in range 0..=63".to_owned(),
+            })?;
+        apply_dscp_to_socket(&self.socket, self.remote, negotiated_dscp)?;
         self.negotiated = Some(negotiated.clone());
         self.phase = ClientPhase::Open { token: reply.token };
 

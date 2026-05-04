@@ -8,6 +8,12 @@ pub enum ClientError {
     Resolve { addr: String },
     #[error("socket error: {0}")]
     Socket(#[from] io::Error),
+    #[error("socket option error while trying to {operation} for {remote}: {source}")]
+    SocketOption {
+        operation: &'static str,
+        remote: std::net::SocketAddr,
+        source: io::Error,
+    },
     #[error("protocol error: {0}")]
     Protocol(#[from] irtt_proto::ProtoError),
     #[error("all open requests timed out")]

@@ -11,6 +11,7 @@ use support::*;
 
 mod close;
 mod config;
+mod dscp;
 mod hmac;
 mod negotiation;
 mod no_test;

@@ -393,6 +393,19 @@ fn backend_basic_open_echo_close() {
 }
 
 #[test]
+fn backend_dscp_smoke() {
+    let mut params = default_params();
+    params.dscp = 46;
+    let server = start_open_server(params.clone(), None);
+    let mut client = Client::connect(config_for_params(server.addr, &params)).unwrap();
+
+    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
 fn backend_received_stats_smoke() {
     for mode in [
         ReceivedStats::None,
