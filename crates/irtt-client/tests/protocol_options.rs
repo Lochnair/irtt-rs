@@ -393,6 +393,27 @@ fn backend_basic_open_echo_close() {
 }
 
 #[test]
+fn backend_ttl_smoke() {
+    let params = default_params();
+    let peer = BackendPeer::start_open_echo(params.clone(), None);
+    let mut config = config_for_params(peer.addr(), &params);
+    config.socket_config.ttl = Some(64);
+    let mut client = Client::connect(config).unwrap();
+
+    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
+
+    let sent = client.send_probe().unwrap();
+    assert_eq!(sent.len(), 1);
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
+
+    client.close(ClientTimestamp::now()).unwrap();
+}
+
+#[test]
 fn dscp_configured_open_close_smoke() {
     let mut params = default_params();
     params.dscp = 46;

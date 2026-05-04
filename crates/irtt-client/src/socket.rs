@@ -8,6 +8,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::{
     config::{ClientConfig, SocketConfig, DEFAULT_PORT, MIN_OPEN_TIMEOUT},
     error::ClientError,
+    socket_options::apply_ttl_to_socket,
 };
 
 pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), ClientError> {
@@ -74,10 +75,6 @@ pub(crate) fn connect_udp_socket(
     if config.ipv6_only && remote.is_ipv6() {
         socket.set_only_v6(true)?;
     }
-    if let Some(ttl) = config.ttl {
-        socket.set_ttl(ttl)?;
-    }
-
     let bind_addr = config.bind_addr.unwrap_or_else(|| {
         if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
@@ -89,6 +86,9 @@ pub(crate) fn connect_udp_socket(
     socket.connect(&remote.into())?;
 
     let socket: UdpSocket = socket.into();
+    if let Some(ttl) = config.ttl {
+        apply_ttl_to_socket(&socket, remote, ttl)?;
+    }
     socket.set_read_timeout(config.recv_timeout)?;
     Ok(socket)
 }

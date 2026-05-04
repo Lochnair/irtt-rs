@@ -3,7 +3,10 @@ use std::{
     net::{SocketAddr, UdpSocket},
 };
 
-use crate::{config::MAX_DSCP_CODEPOINT, error::ClientError};
+use crate::{
+    config::{MAX_DSCP_CODEPOINT, MAX_TTL},
+    error::ClientError,
+};
 
 pub(crate) fn dscp_codepoint_to_traffic_class(dscp: u8) -> Result<u32, ClientError> {
     if dscp > MAX_DSCP_CODEPOINT {
@@ -30,6 +33,28 @@ pub(crate) fn clear_dscp_on_socket(
     set_socket_traffic_class(socket, remote, 0, "clear DSCP before close")
 }
 
+pub(crate) fn validate_ttl(ttl: u32) -> Result<(), ClientError> {
+    if ttl == 0 || ttl > MAX_TTL {
+        return Err(ClientError::InvalidConfig {
+            reason: format!("ttl must be in range 1..={MAX_TTL}"),
+        });
+    }
+    Ok(())
+}
+
+pub(crate) fn apply_ttl_to_socket(
+    socket: &UdpSocket,
+    remote: SocketAddr,
+    ttl: u32,
+) -> Result<(), ClientError> {
+    validate_ttl(ttl)?;
+    set_socket_ttl(socket, remote, ttl).map_err(|source| ClientError::SocketOption {
+        operation: "set TTL/hop limit",
+        remote,
+        source,
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn socket_traffic_class(
     socket: &UdpSocket,
@@ -40,6 +65,32 @@ pub(crate) fn socket_traffic_class(
         remote,
         source,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> Result<u32, ClientError> {
+    get_socket_ttl(socket, remote).map_err(|source| ClientError::SocketOption {
+        operation: "read TTL/hop limit socket option",
+        remote,
+        source,
+    })
+}
+
+fn set_socket_ttl(socket: &UdpSocket, remote: SocketAddr, ttl: u32) -> io::Result<()> {
+    if remote.is_ipv4() {
+        socket2::SockRef::from(socket).set_ttl(ttl)
+    } else {
+        socket2::SockRef::from(socket).set_unicast_hops_v6(ttl)
+    }
+}
+
+#[cfg(test)]
+fn get_socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> io::Result<u32> {
+    if remote.is_ipv4() {
+        socket2::SockRef::from(socket).ttl()
+    } else {
+        socket2::SockRef::from(socket).unicast_hops_v6()
+    }
 }
 
 fn set_socket_traffic_class(
@@ -270,6 +321,47 @@ mod tests {
             dscp_codepoint_to_traffic_class(64),
             Err(ClientError::InvalidConfig { .. })
         ));
+    }
+
+    #[test]
+    fn validates_ttl_range() {
+        assert!(validate_ttl(1).is_ok());
+        assert!(validate_ttl(64).is_ok());
+        assert!(validate_ttl(255).is_ok());
+        assert!(matches!(
+            validate_ttl(0),
+            Err(ClientError::InvalidConfig { .. })
+        ));
+        assert!(matches!(
+            validate_ttl(256),
+            Err(ClientError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn ipv4_socket_option_sets_ttl() {
+        let remote = SocketAddr::from(([127, 0, 0, 1], 9));
+        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        socket.connect(remote).unwrap();
+
+        apply_ttl_to_socket(&socket, remote, 64).unwrap();
+        assert_eq!(socket_ttl(&socket, remote).unwrap(), 64);
+
+        apply_ttl_to_socket(&socket, remote, 1).unwrap();
+        assert_eq!(socket_ttl(&socket, remote).unwrap(), 1);
+    }
+
+    #[test]
+    fn ipv6_socket_option_sets_unicast_hop_limit() {
+        let remote = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9));
+        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0))).unwrap();
+        socket.connect(remote).unwrap();
+
+        apply_ttl_to_socket(&socket, remote, 64).unwrap();
+        assert_eq!(socket_ttl(&socket, remote).unwrap(), 64);
+
+        apply_ttl_to_socket(&socket, remote, 1).unwrap();
+        assert_eq!(socket_ttl(&socket, remote).unwrap(), 1);
     }
 
     #[test]
