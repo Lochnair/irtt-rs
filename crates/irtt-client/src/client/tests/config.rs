@@ -81,6 +81,18 @@ fn params_from_config_rejects_invalid_dscp_codepoint() {
 }
 
 #[test]
+fn params_from_config_rejects_empty_server_fill() {
+    let config = ClientConfig {
+        server_fill: Some("".to_owned()),
+        ..ClientConfig::default()
+    };
+    assert!(matches!(
+        params_from_config(&config),
+        Err(ClientError::InvalidConfig { .. })
+    ));
+}
+
+#[test]
 fn params_from_config_rejects_oversized_server_fill() {
     let config = ClientConfig {
         server_fill: Some("0123456789abcdef0123456789abcdefx".to_owned()),

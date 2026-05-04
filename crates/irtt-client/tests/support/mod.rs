@@ -413,13 +413,13 @@ where
 }
 
 fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
-    let mut buf = [0_u8; 2048];
+    let mut buf = [0_u8; 8192];
     let (size, peer) = socket.recv_from(&mut buf).unwrap();
     (buf[..size].to_vec(), peer)
 }
 
 fn recv_request_timeout(socket: &UdpSocket) -> Option<Vec<u8>> {
-    let mut buf = [0_u8; 2048];
+    let mut buf = [0_u8; 8192];
     match socket.recv_from(&mut buf) {
         Ok((size, _)) => Some(buf[..size].to_vec()),
         Err(_) => None,
