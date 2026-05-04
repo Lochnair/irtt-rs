@@ -393,7 +393,7 @@ fn backend_basic_open_echo_close() {
 }
 
 #[test]
-fn backend_dscp_smoke() {
+fn dscp_configured_open_close_smoke() {
     let mut params = default_params();
     params.dscp = 46;
     let server = start_open_server(params.clone(), None);
