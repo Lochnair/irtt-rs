@@ -60,7 +60,7 @@ pub struct CliArgs {
     #[arg(long = "stats", value_enum, default_value_t = ReceivedStatsArg::Both)]
     pub stats: ReceivedStatsArg,
 
-    /// Server payload fill string to request.
+    /// Server payload fill string to request, up to 32 bytes.
     #[arg(
         long = "sfill",
         visible_alias = "server-fill",
@@ -73,7 +73,7 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 0, value_name = "0..=63", value_parser = parse_dscp)]
     pub dscp: u8,
 
-    /// Outgoing IPv4 TTL or IPv6 unicast hop limit.
+    /// Local outgoing IPv4 TTL or IPv6 unicast hop limit; not negotiated.
     #[arg(long, value_name = "1..=255", value_parser = parse_ttl)]
     pub ttl: Option<u32>,
 
@@ -835,7 +835,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_server_fill_options() {
+    fn maps_sfill_server_fill_options() {
         let args = parse(&["--sfill", "abc", "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.to_client_config().server_fill.as_deref(), Some("abc"));
 
@@ -902,6 +902,8 @@ mod tests {
         assert!(help.contains("--ttl <1..=255>"));
         assert!(help.contains("--loose"));
         assert!(help.contains("DSCP codepoint"));
+        assert!(help.contains("up to 32 bytes"));
+        assert!(help.contains("not negotiated"));
     }
 
     #[test]
