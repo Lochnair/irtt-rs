@@ -354,11 +354,20 @@ mod tests {
     #[test]
     fn ipv6_socket_option_sets_unicast_hop_limit() {
         let remote = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9));
-        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0))).unwrap();
-        socket.connect(remote).unwrap();
+        let Some(socket) = bind_connected_ipv6_loopback(remote) else {
+            return;
+        };
 
         apply_ttl_to_socket(&socket, remote, 64).unwrap();
-        assert_eq!(socket_ttl(&socket, remote).unwrap(), 64);
+        let ttl = match socket_ttl(&socket, remote) {
+            Ok(ttl) => ttl,
+            Err(error) if is_unsupported_socket_readback(&error) => {
+                eprintln!("skipping IPv6 hop-limit readback test: {error}");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        assert_eq!(ttl, 64);
 
         apply_ttl_to_socket(&socket, remote, 1).unwrap();
         assert_eq!(socket_ttl(&socket, remote).unwrap(), 1);
@@ -400,15 +409,57 @@ mod tests {
     ))]
     fn ipv6_socket_option_sets_and_clears_traffic_class() {
         let remote = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9));
-        let socket = UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0))).unwrap();
-        socket.connect(remote).unwrap();
+        let Some(socket) = bind_connected_ipv6_loopback(remote) else {
+            return;
+        };
 
         apply_dscp_to_socket(&socket, remote, 46).unwrap();
-        let traffic_class = socket_traffic_class(&socket, remote).unwrap();
+        let traffic_class = match socket_traffic_class(&socket, remote) {
+            Ok(traffic_class) => traffic_class,
+            Err(error) if is_unsupported_socket_readback(&error) => {
+                eprintln!("skipping IPv6 traffic-class readback test: {error}");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
         assert_eq!(traffic_class & 0xfc, 184);
         assert_eq!(traffic_class & 0b11, 0);
 
         clear_dscp_on_socket(&socket, remote).unwrap();
         assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 0);
+    }
+
+    fn bind_connected_ipv6_loopback(remote: SocketAddr) -> Option<UdpSocket> {
+        let socket = match UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0))) {
+            Ok(socket) => socket,
+            Err(error) if is_unavailable_ipv6_loopback(&error) => {
+                eprintln!("skipping IPv6 socket option test: IPv6 loopback unavailable: {error}");
+                return None;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        match socket.connect(remote) {
+            Ok(()) => Some(socket),
+            Err(error) if is_unavailable_ipv6_loopback(&error) => {
+                eprintln!("skipping IPv6 socket option test: IPv6 loopback unavailable: {error}");
+                None
+            }
+            Err(error) => panic!("{error}"),
+        }
+    }
+
+    fn is_unavailable_ipv6_loopback(error: &io::Error) -> bool {
+        matches!(
+            error.kind(),
+            io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
+        )
+    }
+
+    fn is_unsupported_socket_readback(error: &ClientError) -> bool {
+        matches!(
+            error,
+            ClientError::SocketOption { source, .. }
+                if matches!(source.kind(), io::ErrorKind::Unsupported)
+        )
     }
 }
