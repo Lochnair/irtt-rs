@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 pub struct RealIrtServer {
     addr: SocketAddr,
     child: Child,
+    keepalive_ms: Option<u64>,
 }
 
 impl RealIrtServer {
@@ -19,6 +20,12 @@ impl RealIrtServer {
         let bind = format!("127.0.0.1:{}", port);
 
         let irtt_bin = std::env::var("IRTT_BIN").unwrap_or_else(|_| "irtt".to_string());
+
+        let keepalive_ms = std::env::var("IRTT_TEST_KEEP_SERVER_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok());
+
+        debug_eprintln!("[real_irtt] backend=real irtt_bin={irtt_bin} bind={bind}");
 
         let mut cmd = Command::new(&irtt_bin);
         cmd.arg("server")
@@ -33,18 +40,42 @@ impl RealIrtServer {
             cmd.arg(format!("--hmac=0x{}", hex_key));
         }
 
+        let full_cmd = format!("{cmd:?}");
+        debug_eprintln!("[real_irtt] spawning: {full_cmd}");
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn irtt server: {}", e))?;
 
+        let pid = child.id();
+        debug_eprintln!("[real_irtt] child pid={pid}");
+
         let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
-        let (tx, rx) = mpsc::channel();
+        let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
+
+        let (out_tx, out_rx) = mpsc::channel();
+        let (err_tx, err_rx) = mpsc::channel();
+
         thread::spawn(move || {
             let reader = BufReader::new(stdout);
             for line in reader.lines() {
                 match line {
                     Ok(l) => {
-                        if tx.send(l).is_err() {
+                        if out_tx.send(("stdout", l)).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        thread::spawn(move || {
+            let reader = BufReader::new(stderr);
+            for line in reader.lines() {
+                match line {
+                    Ok(l) => {
+                        if err_tx.send(("stderr", l)).is_err() {
                             break;
                         }
                     }
@@ -55,40 +86,59 @@ impl RealIrtServer {
 
         let timeout = Duration::from_secs(5);
         let start = Instant::now();
-        let mut stdout_lines = Vec::new();
-        loop {
+        let mut captured_lines = Vec::new();
+
+        let ready = loop {
             let remaining = timeout
                 .checked_sub(start.elapsed())
                 .unwrap_or(Duration::ZERO);
-            match rx.recv_timeout(remaining) {
-                Ok(line) => {
-                    stdout_lines.push(line.clone());
-                    if line.contains("[ListenerStart]") {
-                        break;
+
+            let line = select_line(&out_rx, &err_rx, remaining);
+            match line {
+                Some((stream, text)) => {
+                    debug_eprintln!("[real_irtt] {stream}: {text}");
+                    captured_lines.push(format!("{stream}: {text}"));
+                    if text.contains("[ListenerStart]") {
+                        break true;
+                    }
+                    if (text.contains("[ListenerStop]") || text.contains("[ServerStop]"))
+                        && (text.contains("error") || text.contains("Error"))
+                    {
+                        break false;
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    return Err(format!(
-                        "timeout waiting for irtt server to start\nstdout:\n{}",
-                        stdout_lines.join("\n")
-                    ));
-                }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    child.kill().ok();
-                    child.wait().ok();
-                    return Err(format!(
-                        "irtt server exited unexpectedly\nstdout:\n{}",
-                        stdout_lines.join("\n")
-                    ));
+                None => {
+                    break false;
                 }
             }
+        };
+
+        if !ready {
+            let exit_status = child.try_wait().ok().flatten();
+            debug_eprintln!("[real_irtt] startup failed, exit_status={exit_status:?}");
+            child.kill().ok();
+            child.wait().ok();
+
+            let output = captured_lines.join("\n");
+            let extra = match exit_status {
+                Some(status) => format!("\nexit status: {status}"),
+                None => String::new(),
+            };
+            return Err(format!(
+                "irtt server failed to start\noutput:\n{output}{extra}"
+            ));
         }
 
-        drop(rx);
+        debug_eprintln!("[real_irtt] ready on {addr}");
 
-        Ok(Self { addr, child })
+        drop(out_rx);
+        drop(err_rx);
+
+        Ok(Self {
+            addr,
+            child,
+            keepalive_ms,
+        })
     }
 
     pub fn addr(&self) -> SocketAddr {
@@ -109,7 +159,47 @@ impl RealIrtServer {
 
 impl Drop for RealIrtServer {
     fn drop(&mut self) {
+        if let Some(ms) = self.keepalive_ms {
+            debug_eprintln!(
+                "[real_irtt] keepalive: sleeping {ms}ms before kill (pid={})",
+                self.child.id()
+            );
+            thread::sleep(Duration::from_millis(ms));
+        }
+        debug_eprintln!("[real_irtt] killing child pid={}", self.child.id());
         self.child.kill().ok();
         self.child.wait().ok();
     }
 }
+
+fn select_line(
+    out_rx: &mpsc::Receiver<(&str, String)>,
+    err_rx: &mpsc::Receiver<(&str, String)>,
+    timeout: Duration,
+) -> Option<(&'static str, String)> {
+    if let Ok((_, line)) = out_rx.recv_timeout(timeout) {
+        return Some(("stdout", line));
+    }
+    if let Ok((_, line)) = err_rx.recv_timeout(Duration::ZERO) {
+        return Some(("stderr", line));
+    }
+    if timeout > Duration::ZERO {
+        if let Ok((_, line)) = out_rx.recv_timeout(Duration::from_millis(100)) {
+            return Some(("stdout", line));
+        }
+        if let Ok((_, line)) = err_rx.recv_timeout(Duration::from_millis(100)) {
+            return Some(("stderr", line));
+        }
+    }
+    None
+}
+
+macro_rules! debug_eprintln {
+    ($($arg:tt)*) => {
+        if std::env::var("IRTT_TEST_BACKEND_DEBUG").as_deref() == Ok("1") {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
+use debug_eprintln;
