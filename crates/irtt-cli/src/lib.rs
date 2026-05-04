@@ -13,7 +13,7 @@ use clap::{Parser, ValueEnum};
 use irtt_client::{
     ClientConfig, ClientEvent, NegotiatedParams, NegotiationPolicy, OneWayDelaySample, PacketMeta,
     ReceivedStatsSample, RttSample, ServerTiming, SocketConfig, WarningKind, MAX_DSCP_CODEPOINT,
-    MAX_SERVER_FILL_BYTES,
+    MAX_SERVER_FILL_BYTES, MAX_TTL,
 };
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
@@ -73,6 +73,10 @@ pub struct CliArgs {
     #[arg(long, default_value_t = 0, value_name = "0..=63", value_parser = parse_dscp)]
     pub dscp: u8,
 
+    /// Outgoing IPv4 TTL or IPv6 unicast hop limit.
+    #[arg(long, value_name = "1..=255", value_parser = parse_ttl)]
+    pub ttl: Option<u32>,
+
     /// Accept safe server restrictions during negotiation.
     #[arg(long)]
     pub loose: bool,
@@ -100,6 +104,7 @@ impl CliArgs {
                 NegotiationPolicy::Strict
             },
             socket_config: SocketConfig {
+                ttl: self.ttl,
                 recv_timeout: Some(DEFAULT_RECV_TIMEOUT),
                 ..SocketConfig::default()
             },
@@ -275,6 +280,16 @@ pub fn parse_dscp(input: &str) -> Result<u8, String> {
         .map_err(|_| format!("invalid DSCP codepoint {input:?}"))?;
     if value > MAX_DSCP_CODEPOINT {
         return Err(format!("DSCP codepoint must be <= {MAX_DSCP_CODEPOINT}"));
+    }
+    Ok(value)
+}
+
+pub fn parse_ttl(input: &str) -> Result<u32, String> {
+    let value: u32 = input
+        .parse()
+        .map_err(|_| format!("invalid TTL/hop limit {input:?}"))?;
+    if value == 0 || value > MAX_TTL {
+        return Err(format!("TTL/hop limit must be in range 1..={MAX_TTL}"));
     }
     Ok(value)
 }
@@ -695,6 +710,7 @@ mod tests {
         assert_eq!(args.stats, ReceivedStatsArg::Both);
         assert_eq!(args.server_fill, None);
         assert_eq!(args.dscp, 0);
+        assert_eq!(args.ttl, None);
         assert!(!args.loose);
         assert_eq!(args.output, OutputMode::Human);
 
@@ -706,6 +722,7 @@ mod tests {
         assert_eq!(config.stamp_at, StampAt::Both);
         assert_eq!(config.clock, Clock::Both);
         assert_eq!(config.dscp, 0);
+        assert_eq!(config.socket_config.ttl, None);
         assert_eq!(config.server_fill, None);
         assert_eq!(config.negotiation_policy, NegotiationPolicy::Strict);
         assert!(!args.is_continuous());
@@ -839,6 +856,17 @@ mod tests {
     }
 
     #[test]
+    fn maps_ttl_values() {
+        for value in ["1", "64", "255"] {
+            let args = parse(&["--ttl", value, "127.0.0.1:2112"]).unwrap();
+            assert_eq!(
+                args.to_client_config().socket_config.ttl,
+                Some(value.parse::<u32>().unwrap())
+            );
+        }
+    }
+
+    #[test]
     fn maps_length_option() {
         let args = parse(&["--length", "1472", "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.length, 1472);
@@ -871,6 +899,7 @@ mod tests {
         assert!(help.contains("--stats <STATS>"));
         assert!(help.contains("--sfill <STRING>"));
         assert!(help.contains("--dscp <0..=63>"));
+        assert!(help.contains("--ttl <1..=255>"));
         assert!(help.contains("--loose"));
         assert!(help.contains("DSCP codepoint"));
     }
@@ -892,6 +921,10 @@ mod tests {
             &["--dscp", "64", "127.0.0.1:2112"],
             &["--dscp", "-1", "127.0.0.1:2112"],
             &["--dscp", "abc", "127.0.0.1:2112"],
+            &["--ttl", "0", "127.0.0.1:2112"],
+            &["--ttl", "256", "127.0.0.1:2112"],
+            &["--ttl", "-1", "127.0.0.1:2112"],
+            &["--ttl", "abc", "127.0.0.1:2112"],
             &["--length", "-1", "127.0.0.1:2112"],
             &["--length", "65508", "127.0.0.1:2112"],
         ] {
