@@ -12,4 +12,3 @@ thiserror = "2"
 
 [features]
 default = []
-interop = []
