@@ -19,7 +19,9 @@
 
 **Inconsistencies found:**
 - The spec's packet count formula was corrected to `ceil(d/i)` — the spec itself already reflects this correction.
-- DSCP parameter range was corrected to 0–255 (TOS byte) — the spec already reflects this.
+- M8 implementation exposes `--dscp` as a DSCP codepoint in the range 0..=63,
+  encodes that codepoint in protocol parameters, and shifts it left two bits
+  only when applying the local socket TOS/Traffic Class byte.
 - Test vector sizes corrected to 92 bytes — the spec already reflects this.
 - The flags byte in test vector 18.2 is `0x08` (HMAC only, no Reply flag). The spec explicitly notes this is for HMAC/layout verification only and that real packets require Reply flag `0x02`. This is clear and not a problem.
 
@@ -59,7 +61,10 @@
 - **Event-first design:** `irtt-client` emits `ClientEvent` values. It never aggregates statistics. Consumers decide what to do with events.
 - **Stats separation:** `irtt-stats` consumes `ClientEvent` and provides cumulative, rolling, and summary statistics. It is an optional dependency of `irtt-cli`.
 - **CLI output philosophy:** Line-oriented, awk-friendly, delimiter-configurable output. Human, machine, simple, rtt-us, and optional JSONL formats. Default builds include stats; minimal/router builds can omit them.
-- **Interop testing strategy:** `cargo test` runs pure unit tests without external dependencies. `cargo test --features interop` requires `irtt` server in PATH. `tshark` is diagnostic-only, never a CI dependency.
+- **Interop testing strategy:** default `cargo test` runs self-contained tests.
+  Backend-neutral smoke tests use `IRTT_TEST_BACKEND`: unset or `fake` uses the
+  in-process test backend, `real` runs an optional `irtt server` from `IRTT_BIN`
+  or `PATH`. `tshark` is diagnostic-only, never a CI dependency.
 - **Clean-room compliance:** Implementation works only from the four clean artifacts. No upstream source, tests, or contaminated notes.
 - **Router friendliness:** No mandatory async runtime. No busy-spin by default. Feature-gated optional capabilities. Minimal binary possible with `--no-default-features`.
 - **First-class consumers:** `sqm-autorate-rust` (manual `Client` API), `cake-autorate` (CLI machine output), general users (CLI with stats).
@@ -238,7 +243,6 @@ The intended architecture from `RUST_DESIGN.md` is confirmed with no structural 
 - `json = ["dep:serde_json", "irtt-client/serde", "irtt-stats?/serde"]`
 - `tracing = ["irtt-client/tracing"]`
 - `ancillary = ["irtt-client/ancillary"]`
-- `interop = []`
 
 **Dependencies:**
 - `irtt-client`, `irtt-stats` (optional), `clap`, `thiserror`, `ctrlc`
@@ -340,7 +344,8 @@ Deserialize: read tag-value pairs in a loop, match known tags, silently ignore u
 Verified encoding examples from BLACKBOX_VERIFICATION_REPORT:
 - ProtocolVersion=1: tag `01`, value zigzag(1)=2 → `02`
 - Duration=3s: tag `02`, value zigzag(3000000000)=6000000000 → `80 f8 82 ad 16`
-- DSCP=0xb8: tag `08`, value zigzag(184)=368 → `f0 02`
+- DSCP=46: tag `08`, value zigzag(46)=92 → `5c`; the socket TOS/Traffic Class
+  byte derived from this codepoint is `46 << 2 == 184`.
 
 ### Open Request/Reply
 
@@ -455,7 +460,7 @@ Internal struct wrapping `std::net::UdpSocket` (created via `socket2::Socket`).
 Responsibilities:
 - Create socket (IPv4 or IPv6 based on resolved address)
 - Bind to local address (or ephemeral)
-- Set DSCP/TOS via `socket2` (`set_tos` for IPv4, `set_traffic_class_v6` for IPv6) — applied only for echo phase per Finding C
+- Set DSCP/TOS via `socket2` (`set_tos` for IPv4, `set_traffic_class_v6` for IPv6) from the negotiated DSCP codepoint shifted into the TOS/Traffic Class byte; applied only for echo phase per Finding C
 - Set TTL/hop limit if configured
 - Connect to resolved server address
 - `send(&self, buf: &[u8]) -> io::Result<usize>`
@@ -1003,7 +1008,8 @@ The socket is connected via `connect()`. This means:
 - IPv6: `socket2` does not directly expose `IPV6_TCLASS`; may need raw `setsockopt` via `libc` or `socket2`'s `set_traffic_class_v6` (check availability)
 - Applied only before echo phase (after open, before first send_probe)
 - Reset to 0 before close packet (per Finding C)
-- Set from the negotiated DSCP value, which is the full TOS/TC byte (0–255)
+- Set from the negotiated DSCP codepoint (0..=63), shifted left two bits for the
+  local TOS/Traffic Class byte with ECN bits cleared
 
 ### TTL / Hop Limit
 
@@ -1274,15 +1280,15 @@ Use `ctrlc` crate:
 | `json` | No | Deferred | JSONL output |
 | `tracing` | No | Deferred | Pass-through to irtt-client |
 | `ancillary` | No | Deferred | Pass-through to irtt-client |
-| `interop` | No | MVP | Enable interop test compilation |
 
 ### MVP Features
 
 Milestone 1–5: No optional features needed. Core functionality only.
 Milestone 6–8: `stats` feature implemented and default-enabled.
-Post-MVP: `serde`, `json`, `tracing`, `ancillary`, `interop`.
+Post-MVP: `serde`, `json`, `tracing`, `ancillary`.
 
-`interop` is special: it gates `#[cfg(feature = "interop")]` test modules but adds no runtime code.
+Optional real-backend smoke tests are selected by environment variables, not by
+feature flags.
 
 ---
 
@@ -1469,9 +1475,12 @@ From `docs/test-vectors.md` (12 vectors) and protocol spec Section 18 (2 vectors
 - Header line generation
 - Edge cases: missing fields (no server timestamps → "-")
 
-### Interop Tests (feature = "interop")
+### Optional Real-Backend Smoke Tests
 
-Require `irtt` server binary in PATH. Gated behind `--features interop`.
+Backend-neutral smoke tests run against the in-process fake backend by default.
+Set `IRTT_TEST_BACKEND=real` to run them against a real `irtt server`; set
+`IRTT_BIN` to choose a specific binary, otherwise `irtt` is resolved from
+`PATH`.
 
 - Basic connectivity: open, send probes, receive replies, close
 - No-test mode: open+close with zero token
@@ -1490,7 +1499,8 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
 
 ### Black-Box Regression Tests
 
-- Run interop tests and compare packet counts, RTT ranges, error behavior to known-good baseline
+- Run backend-neutral smoke tests with `IRTT_TEST_BACKEND=real` and compare
+  packet counts, RTT ranges, error behavior to known-good baseline
 - Verify close packet is sent at end of session
 
 ### Tests Intentionally Deferred
@@ -1505,7 +1515,8 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
 ### Test Execution Requirements
 
 - `cargo test`: Must pass without `irtt` in PATH. Pure unit tests only.
-- `cargo test --workspace --features interop`: Requires `irtt` in PATH. CI must provide it.
+- `IRTT_TEST_BACKEND=real RUST_TEST_THREADS=1 cargo test -p irtt-client`:
+  optional real-backend smoke; requires `irtt` in `PATH` or `IRTT_BIN`.
 - `tshark`: Diagnostic/manual only. Never a CI or test dependency.
 
 ---
@@ -1789,30 +1800,36 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
 
 ### Milestone 8 — Compatibility Features
 
-**Goal:** Full protocol compatibility: HMAC, all timestamp modes, all received stats modes, server fill, DSCP.
+**Status:** Complete as of M8 cleanup.
+
+**Goal:** Full protocol compatibility: HMAC, all timestamp modes, all received stats modes, server fill, DSCP, TTL/hop limit, and large packets.
 
 **Files/modules:**
 - Updates across irtt-client and irtt-cli
 
 **Tasks:**
-1. HMAC interop testing (correct key, wrong key, no key)
+1. HMAC backend-neutral smoke testing (correct key, wrong key, no key)
 2. All StampAt modes (none, send, receive, both, midpoint)
 3. All Clock modes (wall, mono, both)
 4. All ReceivedStats modes (none, count, window, both)
 5. Server fill
 6. DSCP / Traffic Class setting
-7. TTL / hop limit (if desired)
+7. TTL / hop limit
 8. Large packet sizes
-9. Comprehensive interop test suite
+9. Backend-neutral fake/real smoke coverage
 
 **Tests:**
-- Interop: all timestamp × clock × stats combinations
-- Interop: HMAC authentication
-- Interop: DSCP capture verification
-- Interop: server fill
-- Interop: large packets
+- Self-contained: timestamp, clock, received-stats, HMAC, server-fill, DSCP,
+  TTL/hop-limit, and large-packet behavior
+- Optional real backend: basic open/echo/close, HMAC, received-stats,
+  timestamp, clock, TTL config smoke, and large-packet smoke via
+  `IRTT_TEST_BACKEND=real`
+- DSCP/TTL socket-option unit tests verify local socket configuration only;
+  real-backend smoke does not claim packet marking observation
 
-**Success criteria:** Full compatibility with irtt 0.9.1 server across all parameter combinations.
+**Success criteria:** M8 compatibility behavior is covered by self-contained
+tests, and backend-neutral smoke tests can be explicitly run against a real
+`irtt server`.
 
 **Risks:** Platform-specific socket option issues (IPv6 TC, DF bit).
 
@@ -1980,7 +1997,8 @@ Require `irtt` server binary in PATH. Gated behind `--features interop`.
   - `cargo fmt --check --workspace`
   - `cargo clippy --workspace --all-targets`
   - `cargo test --workspace`
-- Run `cargo test --workspace --features interop` at milestone boundaries (2, 3, 4, 5, 8)
+- At compatibility milestone boundaries, run backend-neutral smoke tests with
+  `IRTT_TEST_BACKEND=real` when a real `irtt` binary is available
 
 ### First work order
 
