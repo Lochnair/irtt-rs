@@ -10,9 +10,9 @@ use irtt_client::{
 use irtt_proto::{echo_packet_len, Clock, Params, ReceivedStats, StampAt, TimestampFields};
 
 use support::{
-    config_for_params, default_params, params_for_modes, require_real_backend, run_one_probe,
-    run_one_probe_with_config, server_fill, standard_timestamps, start_open_server, OneProbeRun,
-    RealIrtServer, ServerObservation, RECV_COUNT, RECV_WINDOW, TOKEN,
+    config_for_params, default_params, params_for_modes, run_one_probe, run_one_probe_with_config,
+    server_fill, standard_timestamps, start_open_server, BackendPeer, OneProbeRun,
+    ServerObservation, RECV_COUNT, RECV_WINDOW, TOKEN,
 };
 
 struct ReplyView<'a> {
@@ -374,13 +374,10 @@ fn assert_one_way_presence(
 }
 
 #[test]
-fn real_basic_open_echo_close() {
-    if !require_real_backend() {
-        return;
-    }
-    let server = RealIrtServer::start(None).unwrap();
+fn backend_basic_open_echo_close() {
     let params = default_params();
-    let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+    let peer = BackendPeer::start_open_echo(params.clone(), None);
+    let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
     let outcome = client.open(ClientTimestamp::now()).unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
@@ -396,19 +393,16 @@ fn real_basic_open_echo_close() {
 }
 
 #[test]
-fn real_received_stats_smoke() {
-    if !require_real_backend() {
-        return;
-    }
+fn backend_received_stats_smoke() {
     for mode in [
         ReceivedStats::None,
         ReceivedStats::Count,
         ReceivedStats::Window,
         ReceivedStats::Both,
     ] {
-        let server = RealIrtServer::start(None).unwrap();
         let params = params_for_modes(mode, StampAt::None, Clock::Both);
-        let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+        let peer = BackendPeer::start_open_echo(params.clone(), None);
+        let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
         client.open(ClientTimestamp::now()).unwrap();
         client.send_probe().unwrap();
@@ -421,10 +415,7 @@ fn real_received_stats_smoke() {
 }
 
 #[test]
-fn real_timestamp_smoke() {
-    if !require_real_backend() {
-        return;
-    }
+fn backend_timestamp_smoke() {
     for mode in [
         StampAt::None,
         StampAt::Send,
@@ -432,9 +423,9 @@ fn real_timestamp_smoke() {
         StampAt::Both,
         StampAt::Midpoint,
     ] {
-        let server = RealIrtServer::start(None).unwrap();
         let params = params_for_modes(ReceivedStats::None, mode, Clock::Both);
-        let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+        let peer = BackendPeer::start_open_echo(params.clone(), None);
+        let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
         client.open(ClientTimestamp::now()).unwrap();
         client.send_probe().unwrap();
@@ -477,14 +468,11 @@ fn real_timestamp_smoke() {
 }
 
 #[test]
-fn real_clock_smoke() {
-    if !require_real_backend() {
-        return;
-    }
+fn backend_clock_smoke() {
     for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
-        let server = RealIrtServer::start(None).unwrap();
         let params = params_for_modes(ReceivedStats::None, StampAt::Both, clock);
-        let mut client = Client::connect(config_for_params(server.addr(), &params)).unwrap();
+        let peer = BackendPeer::start_open_echo(params.clone(), None);
+        let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
         client.open(ClientTimestamp::now()).unwrap();
         client.send_probe().unwrap();

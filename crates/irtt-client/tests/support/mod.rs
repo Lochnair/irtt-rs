@@ -25,17 +25,59 @@ pub const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 pub const RECV_COUNT: u32 = 42;
 pub const RECV_WINDOW: u64 = 0x07;
 
-pub fn require_real_backend() -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TestBackendKind {
+    Fake,
+    Real,
+}
+
+pub fn selected_backend() -> TestBackendKind {
     match std::env::var("IRTT_TEST_BACKEND").as_deref() {
         Ok("real") => {
             let irtt_bin = std::env::var("IRTT_BIN").unwrap_or_else(|_| "irtt".to_string());
             match Command::new(&irtt_bin).arg("version").output() {
-                Ok(output) if output.status.success() => true,
+                Ok(output) if output.status.success() => TestBackendKind::Real,
                 _ => panic!("IRTT_TEST_BACKEND=real but irtt binary not found at '{irtt_bin}'"),
             }
         }
-        Ok("fake") | Err(_) => false,
+        Ok("fake") | Err(_) => TestBackendKind::Fake,
         Ok(other) => panic!("unknown IRTT_TEST_BACKEND value: {other}"),
+    }
+}
+
+pub enum BackendPeer {
+    Fake(FakeServer),
+    Real(RealIrtServer),
+}
+
+impl BackendPeer {
+    pub fn addr(&self) -> SocketAddr {
+        match self {
+            BackendPeer::Fake(s) => s.addr,
+            BackendPeer::Real(s) => s.addr(),
+        }
+    }
+
+    pub fn start_open_echo(params: Params, hmac_key: Option<Vec<u8>>) -> Self {
+        match selected_backend() {
+            TestBackendKind::Fake => {
+                let timestamps = standard_timestamps();
+                BackendPeer::Fake(start_one_probe_server(params, timestamps, hmac_key))
+            }
+            TestBackendKind::Real => {
+                BackendPeer::Real(RealIrtServer::start(hmac_key.as_deref()).unwrap())
+            }
+        }
+    }
+
+    pub fn start_hmac_required(key: Vec<u8>) -> Self {
+        match selected_backend() {
+            TestBackendKind::Fake => BackendPeer::Fake(start_hmac_required_open_drop_server(
+                key,
+                Duration::from_millis(250),
+            )),
+            TestBackendKind::Real => BackendPeer::Real(RealIrtServer::start(Some(&key)).unwrap()),
+        }
     }
 }
 
