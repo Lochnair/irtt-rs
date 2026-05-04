@@ -775,6 +775,11 @@ fn validate_protocol_config(config: &ClientConfig) -> Result<(), ClientError> {
 
     if let Some(fill) = &config.server_fill {
         let len = fill.len();
+        if len == 0 {
+            return Err(ClientError::InvalidConfig {
+                reason: "server_fill must not be empty".to_owned(),
+            });
+        }
         if len > MAX_SERVER_FILL_BYTES {
             return Err(ClientError::InvalidConfig {
                 reason: format!("server_fill must be <= {MAX_SERVER_FILL_BYTES} bytes, got {len}"),

@@ -839,6 +839,17 @@ mod tests {
     }
 
     #[test]
+    fn maps_length_option() {
+        let args = parse(&["--length", "1472", "127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.length, 1472);
+        assert_eq!(args.to_client_config().length, 1472);
+
+        let args = parse(&["127.0.0.1:2112"]).unwrap();
+        assert_eq!(args.length, 0);
+        assert_eq!(args.to_client_config().length, 0);
+    }
+
+    #[test]
     fn maps_loose_negotiation() {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
         assert_eq!(
