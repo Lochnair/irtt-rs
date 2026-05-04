@@ -36,12 +36,24 @@ pub fn selected_backend() -> TestBackendKind {
         Ok("real") => {
             let irtt_bin = std::env::var("IRTT_BIN").unwrap_or_else(|_| "irtt".to_string());
             match Command::new(&irtt_bin).arg("version").output() {
-                Ok(output) if output.status.success() => TestBackendKind::Real,
+                Ok(output) if output.status.success() => {
+                    debug_backend("[backend] selected backend=real");
+                    TestBackendKind::Real
+                }
                 _ => panic!("IRTT_TEST_BACKEND=real but irtt binary not found at '{irtt_bin}'"),
             }
         }
-        Ok("fake") | Err(_) => TestBackendKind::Fake,
+        Ok("fake") | Err(_) => {
+            debug_backend("[backend] selected backend=fake");
+            TestBackendKind::Fake
+        }
         Ok(other) => panic!("unknown IRTT_TEST_BACKEND value: {other}"),
+    }
+}
+
+fn debug_backend(message: &str) {
+    if std::env::var("IRTT_TEST_BACKEND_DEBUG").as_deref() == Ok("1") {
+        eprintln!("{message}");
     }
 }
 
