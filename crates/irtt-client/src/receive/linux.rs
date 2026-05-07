@@ -86,13 +86,16 @@ unsafe fn parse_receive_meta(msg: &libc::msghdr) -> ReceiveMeta {
     let mut cmsg = libc::CMSG_FIRSTHDR(msg);
     while !cmsg.is_null() {
         let cmsg_ref = &*cmsg;
-        if cmsg_ref.cmsg_len >= libc::CMSG_LEN(0) as usize {
-            let data_len = cmsg_ref.cmsg_len - libc::CMSG_LEN(0) as usize;
-            if is_traffic_class_cmsg(cmsg_ref) {
-                meta.traffic_class = read_int_cmsg_low_byte(cmsg, data_len);
-            } else if is_kernel_rx_timestamp_cmsg(cmsg_ref) {
-                meta.kernel_rx_timestamp = read_timespec_cmsg(cmsg, data_len);
-            }
+        let header_len = libc::CMSG_LEN(0) as usize;
+        if cmsg_ref.cmsg_len < header_len {
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+            continue;
+        }
+        let data_len = cmsg_ref.cmsg_len - header_len;
+        if is_traffic_class_cmsg(cmsg_ref) {
+            meta.traffic_class = read_int_cmsg_low_byte(cmsg, data_len);
+        } else if is_kernel_rx_timestamp_cmsg(cmsg_ref) {
+            meta.kernel_rx_timestamp = read_timespec_cmsg(cmsg, data_len);
         }
         cmsg = libc::CMSG_NXTHDR(msg, cmsg);
     }
