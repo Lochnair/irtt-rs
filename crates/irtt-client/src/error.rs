@@ -14,6 +14,8 @@ pub enum ClientError {
         remote: std::net::SocketAddr,
         source: io::Error,
     },
+    #[error("failed to restore configured socket read timeout after open negotiation: {source}")]
+    ReadTimeoutRestore { source: io::Error },
     #[error("protocol error: {0}")]
     Protocol(#[from] irtt_proto::ProtoError),
     #[error("all open requests timed out")]
