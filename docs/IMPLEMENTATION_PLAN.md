@@ -1478,9 +1478,46 @@ From `docs/test-vectors.md` (12 vectors) and protocol spec Section 18 (2 vectors
 ### Optional Real-Backend Smoke Tests
 
 Backend-neutral smoke tests run against the in-process fake backend by default.
-Set `IRTT_TEST_BACKEND=real` to run them against a real `irtt server`; set
-`IRTT_BIN` to choose a specific binary, otherwise `irtt` is resolved from
-`PATH`.
+Normal `cargo test` does not require a local `irtt` binary. Real-backend tests
+are opt-in only and are test infrastructure for black-box compatibility checks.
+
+Run all client tests against a real `irtt server` with:
+
+```sh
+IRTT_TEST_BACKEND=real RUST_TEST_THREADS=1 cargo test -p irtt-client
+```
+
+Focused backend-neutral smoke tests can be run with:
+
+```sh
+IRTT_TEST_BACKEND=real RUST_TEST_THREADS=1 cargo test -p irtt-client backend
+```
+
+`RUST_TEST_THREADS=1` is recommended for real-backend runs to avoid avoidable
+local port/process contention and to keep child-process logs readable. Default
+fake-backend test runs do not need serial execution.
+
+Set `IRTT_BIN=/path/to/irtt` to choose a specific binary. If `IRTT_BIN` is not
+set, the harness resolves `irtt` from `PATH`. The binary is used only as a
+black-box executable; upstream IRTT source code, tests, or implementation
+material must not be inspected or copied.
+
+`IRTT_TEST_BACKEND_DEBUG=1` enables verbose backend selection, startup, retry,
+and child output diagnostics. `IRTT_TEST_KEEP_SERVER_MS=N` keeps the child
+server alive for `N` milliseconds during cleanup/drop before it is killed, which
+can help with local debugging.
+
+The real-backend harness mitigates local startup races with bounded retries. On
+each attempt it chooses a fresh candidate UDP port, starts `irtt server`, and
+waits for readiness. Bounded startup failures such as readiness timeout or early
+child exit are retried. Final failure is loud and includes the attempted bind
+addresses, command, exit status, and captured stdout/stderr where available.
+When `IRTT_TEST_BACKEND=real` is explicitly requested, a missing binary or
+server startup failure fails the tests instead of silently skipping them.
+
+The harness does not currently rely on binding the real server to
+`127.0.0.1:0`, because local black-box behavior did not provide a usable
+assigned-port path.
 
 - Basic connectivity: open, send probes, receive replies, close
 - No-test mode: open+close with zero token
@@ -1516,7 +1553,8 @@ Set `IRTT_TEST_BACKEND=real` to run them against a real `irtt server`; set
 
 - `cargo test`: Must pass without `irtt` in PATH. Pure unit tests only.
 - `IRTT_TEST_BACKEND=real RUST_TEST_THREADS=1 cargo test -p irtt-client`:
-  optional real-backend smoke; requires `irtt` in `PATH` or `IRTT_BIN`.
+  optional real-backend smoke; requires `irtt` in `PATH` or `IRTT_BIN` and
+  fails loudly when explicitly requested but unavailable.
 - `tshark`: Diagnostic/manual only. Never a CI or test dependency.
 
 ---

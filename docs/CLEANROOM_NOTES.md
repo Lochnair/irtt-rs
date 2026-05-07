@@ -62,6 +62,12 @@ expected byte sequences found in the upstream test suite. Only the input
 parameters and resulting byte arrays were used; no test logic or code was
 copied.
 
+Executing a locally installed `irtt` binary is allowed for black-box
+compatibility testing, including optional real-backend tests selected with
+`IRTT_TEST_BACKEND=real`. The binary must be treated only as an executable
+black box; upstream source code, tests, comments, or implementation notes must
+not be inspected or copied.
+
 ## Post-Drafting Audit
 
 After the initial specification was drafted, a clean-room audit was
