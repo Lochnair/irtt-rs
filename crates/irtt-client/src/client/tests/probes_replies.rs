@@ -1057,13 +1057,58 @@ fn matched_reply_with_reversed_monotonic_time_still_emits_event() {
         wall: send_ts.wall + Duration::from_millis(10),
     };
     let reply = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
-    let events = client.process_received_packet(&reply, recv_ts).unwrap();
+    let events = client
+        .process_received_packet(&reply, recv_ts, ReceiveMeta::default())
+        .unwrap();
 
     assert_eq!(events.len(), 1);
     match &events[0] {
         ClientEvent::EchoReply { rtt, .. } => {
             assert_eq!(rtt.raw, Duration::ZERO);
             assert_eq!(rtt.effective, Duration::ZERO);
+        }
+        other => panic!("expected EchoReply, got {other:?}"),
+    }
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+fn process_received_packet_uses_supplied_receive_metadata() {
+    let params = default_params();
+    let server = silent_open_server(params.clone());
+    let config = ClientConfig {
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(50)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+    client.send_probe_at(ClientTimestamp::now()).unwrap();
+    let recv_ts = ClientTimestamp::now();
+    let reply = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
+    let events = client
+        .process_received_packet(
+            &reply,
+            recv_ts,
+            ReceiveMeta {
+                traffic_class: Some(186),
+                kernel_rx_timestamp: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::EchoReply { packet_meta, .. } => {
+            assert_eq!(packet_meta.traffic_class, Some(186));
+            assert_eq!(packet_meta.dscp, Some(46));
+            assert_eq!(packet_meta.ecn, Some(2));
+            assert_eq!(packet_meta.kernel_rx_timestamp, None);
         }
         other => panic!("expected EchoReply, got {other:?}"),
     }
