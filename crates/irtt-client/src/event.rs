@@ -143,10 +143,29 @@ pub struct ReceivedStatsSample {
     pub window: Option<u64>,
 }
 
+/// Receive-side packet metadata observed outside the IRTT wire protocol.
+///
+/// `None` means the metadata was unavailable. `Some(0)` means the metadata was
+/// observed and its value was zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PacketMeta {
     pub traffic_class: Option<u8>,
     pub dscp: Option<u8>,
     pub ecn: Option<u8>,
     pub kernel_rx_timestamp: Option<std::time::SystemTime>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PacketMeta;
+
+    #[test]
+    fn packet_meta_default_is_unavailable() {
+        let meta = PacketMeta::default();
+
+        assert_eq!(meta.traffic_class, None);
+        assert_eq!(meta.dscp, None);
+        assert_eq!(meta.ecn, None);
+        assert_eq!(meta.kernel_rx_timestamp, None);
+    }
 }
