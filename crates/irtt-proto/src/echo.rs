@@ -44,6 +44,14 @@ pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Re
     }
     let layout = PacketLayout::echo(hmac_key.is_some(), &request.params);
     let len = echo_packet_len(hmac_key.is_some(), &request.params);
+    let payload_offset = layout.header_len();
+    let available_payload_len = len.saturating_sub(payload_offset);
+    if request.payload.len() > available_payload_len {
+        return Err(ProtoError::PayloadTooLarge {
+            available: available_payload_len,
+            provided: request.payload.len(),
+        });
+    }
     let mut out = Vec::with_capacity(len);
     write_header(&mut out, flags);
     if hmac_key.is_some() {
@@ -53,13 +61,7 @@ pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Re
     out.extend_from_slice(&request.sequence.to_le_bytes());
     push_zeroed_layout_tail(layout, &mut out);
     out.resize(len, 0);
-    let payload_offset = layout.header_len();
-    let payload_len = out
-        .len()
-        .saturating_sub(payload_offset)
-        .min(request.payload.len());
-    out[payload_offset..payload_offset + payload_len]
-        .copy_from_slice(&request.payload[..payload_len]);
+    out[payload_offset..payload_offset + request.payload.len()].copy_from_slice(&request.payload);
 
     if let Some(key) = hmac_key {
         hmac::compute_hmac_in_place(key, &mut out, hmac::hmac_offset())?;
@@ -161,6 +163,23 @@ mod tests {
         }
     }
 
+    fn params_with_payload_space(payload_space: usize) -> Params {
+        let header_len = PacketLayout::echo(false, &Params::default()).header_len();
+        Params {
+            length: (header_len + payload_space) as i64,
+            ..Params::default()
+        }
+    }
+
+    fn echo_request_with_payload(payload_space: usize, payload: Vec<u8>) -> EchoRequest {
+        EchoRequest {
+            token: 0x7896_b6ab_8771_5213,
+            sequence: 9,
+            params: params_with_payload_space(payload_space),
+            payload,
+        }
+    }
+
     #[test]
     fn echo_request_encodes_default_placeholders() {
         let packet = encode_echo_request(
@@ -177,6 +196,39 @@ mod tests {
         assert_eq!(&packet[..4], &[0x14, 0xa7, 0x5b, 0x00]);
         assert_eq!(&packet[4..12], &0x7896_b6ab_8771_5213u64.to_le_bytes());
         assert!(packet[12..].iter().all(|byte| *byte == 0));
+    }
+
+    #[test]
+    fn echo_request_encodes_exact_fit_payload() {
+        let request = echo_request_with_payload(4, vec![1, 2, 3, 4]);
+        let packet = encode_echo_request(&request, None).unwrap();
+        let payload_offset = PacketLayout::echo(false, &request.params).header_len();
+
+        assert_eq!(&packet[payload_offset..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn echo_request_encodes_shorter_payload_and_zero_fills_remainder() {
+        let request = echo_request_with_payload(4, vec![1, 2]);
+        let packet = encode_echo_request(&request, None).unwrap();
+        let payload_offset = PacketLayout::echo(false, &request.params).header_len();
+
+        assert_eq!(&packet[payload_offset..], &[1, 2, 0, 0]);
+    }
+
+    #[test]
+    fn echo_request_rejects_oversized_payload() {
+        let request = echo_request_with_payload(4, vec![1, 2, 3, 4, 5]);
+        let original = request.clone();
+
+        assert_eq!(
+            encode_echo_request(&request, None),
+            Err(ProtoError::PayloadTooLarge {
+                available: 4,
+                provided: 5,
+            })
+        );
+        assert_eq!(request, original);
     }
 
     #[test]
