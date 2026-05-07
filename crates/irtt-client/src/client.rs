@@ -231,13 +231,22 @@ impl Client {
             logical_seq,
             wire_seq,
             sent_at,
-            timeout_at: sent_at.mono + self.config.probe_timeout,
+            timeout_at: sent_at
+                .mono
+                .checked_add(self.config.probe_timeout)
+                .ok_or(ClientError::DurationOverflow)?,
         };
         session.pending.insert(pending)?;
 
         session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
-        session.next_logical_seq += 1;
-        session.packets_sent += 1;
+        session.next_logical_seq = session
+            .next_logical_seq
+            .checked_add(1)
+            .ok_or(ClientError::DurationOverflow)?;
+        session.packets_sent = session
+            .packets_sent
+            .checked_add(1)
+            .ok_or(ClientError::DurationOverflow)?;
 
         let negotiated = self
             .negotiated
@@ -249,7 +258,7 @@ impl Client {
             .as_mut()
             .expect("session must exist when phase is Open");
         session.next_send_at =
-            session.start_mono + Duration::from_nanos(interval_ns * session.packets_sent);
+            next_probe_deadline(session.start_mono, interval_ns, session.packets_sent)?;
 
         if let Some(end) = session.end_mono {
             if session.next_send_at >= end {
@@ -564,7 +573,12 @@ impl Client {
 
         let duration_ns = negotiated.params.duration_ns;
         let end_mono = if duration_ns > 0 {
-            Some(now.mono + Duration::from_nanos(duration_ns as u64))
+            let duration = Duration::from_nanos(duration_ns as u64);
+            Some(
+                now.mono
+                    .checked_add(duration)
+                    .ok_or(ClientError::DurationOverflow)?,
+            )
         } else {
             None
         };
@@ -645,6 +659,19 @@ fn update_highest_received(session: &mut ActiveSession, wire_seq: u32) {
             h
         }
     }));
+}
+
+fn next_probe_deadline(
+    start: Instant,
+    interval_ns: u64,
+    packets_sent: u64,
+) -> Result<Instant, ClientError> {
+    let offset_ns = interval_ns
+        .checked_mul(packets_sent)
+        .ok_or(ClientError::DurationOverflow)?;
+    start
+        .checked_add(Duration::from_nanos(offset_ns))
+        .ok_or(ClientError::DurationOverflow)
 }
 
 fn sequence_is_after(candidate: u32, current: u32) -> bool {
