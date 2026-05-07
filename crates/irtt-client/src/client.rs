@@ -417,7 +417,9 @@ impl Client {
             let server_timing = build_server_timing(&reply.timestamps);
             let one_way = compute_one_way(&pending.sent_at, &now, &reply.timestamps);
             let received_stats = build_received_stats(&reply);
-            let is_late = session.highest_received_seq.is_some_and(|h| wire_seq < h);
+            let is_late = session
+                .highest_received_seq
+                .is_some_and(|h| sequence_is_before(wire_seq, h));
             let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
 
             update_highest_received(session, wire_seq);
@@ -486,9 +488,10 @@ impl Client {
                 bytes: packet.len(),
                 packet_meta: meta.into(),
             }])
-        } else if session.highest_received_seq.is_some_and(|h| wire_seq < h) {
-            // TODO: u32 ordering is acceptable for finite tests but continuous
-            // probing will eventually require wrap-aware comparison.
+        } else if session
+            .highest_received_seq
+            .is_some_and(|h| sequence_is_before(wire_seq, h))
+        {
             Ok(vec![ClientEvent::LateReply {
                 seq: wire_seq,
                 logical_seq: None,
@@ -635,11 +638,21 @@ impl Client {
 }
 
 fn update_highest_received(session: &mut ActiveSession, wire_seq: u32) {
-    session.highest_received_seq = Some(
-        session
-            .highest_received_seq
-            .map_or(wire_seq, |h| h.max(wire_seq)),
-    );
+    session.highest_received_seq = Some(session.highest_received_seq.map_or(wire_seq, |h| {
+        if sequence_is_after(wire_seq, h) {
+            wire_seq
+        } else {
+            h
+        }
+    }));
+}
+
+fn sequence_is_after(candidate: u32, current: u32) -> bool {
+    candidate != current && candidate.wrapping_sub(current) < (1 << 31)
+}
+
+fn sequence_is_before(candidate: u32, current: u32) -> bool {
+    current != candidate && current.wrapping_sub(candidate) < (1 << 31)
 }
 
 fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
