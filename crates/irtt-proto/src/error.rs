@@ -32,4 +32,6 @@ pub enum ProtoError {
     ZeroToken,
     #[error("trailing or malformed parameter payload")]
     MalformedParams,
+    #[error("payload is too large: {provided} bytes provided, {available} bytes available")]
+    PayloadTooLarge { available: usize, provided: usize },
 }
