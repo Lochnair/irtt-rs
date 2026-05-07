@@ -66,6 +66,12 @@ pub(crate) fn recv_datagram(
     if len < 0 {
         return Err(io::Error::last_os_error());
     }
+    let len = usize::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg returned an unrepresentable datagram length",
+        )
+    })?;
     let received_at = ClientTimestamp::now();
     let meta = unsafe {
         // SAFETY: `msg` was initialized by a successful `recvmsg` call. The
@@ -75,7 +81,7 @@ pub(crate) fn recv_datagram(
     };
 
     Ok(ReceivedDatagram {
-        len: len as usize,
+        len,
         received_at,
         meta,
     })
