@@ -1,6 +1,10 @@
 use std::{
     io::{self, Write},
     process::ExitCode,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -18,7 +22,13 @@ const MAX_SLEEP: Duration = Duration::from_millis(20);
 
 fn main() -> ExitCode {
     let args = CliArgs::parse();
-    match run(args) {
+    let shutdown_requested = Arc::new(AtomicBool::new(false));
+    if let Err(err) = install_signal_handler(Arc::clone(&shutdown_requested)) {
+        eprintln!("irtt-rs: failed to install signal handler: {err}");
+        return ExitCode::FAILURE;
+    }
+
+    match run(args, shutdown_requested.as_ref()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             eprintln!("irtt-rs: {err}");
@@ -27,7 +37,13 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
+fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(), ctrlc::Error> {
+    ctrlc::set_handler(move || {
+        shutdown_requested.store(true, Ordering::Relaxed);
+    })
+}
+
+fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
     let mode = args.output;
     let continuous = args.is_continuous();
     let mut stdout = io::LineWriter::new(io::stdout().lock());
@@ -40,16 +56,23 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         #[cfg(feature = "stats")]
         stats: &mut stats,
     };
+
+    if is_shutdown_requested(shutdown_requested) {
+        return Ok(());
+    }
+
     let mut client = Client::connect(args.to_client_config())?;
+
+    if is_shutdown_requested(shutdown_requested) {
+        return Ok(());
+    }
 
     let open = client.open(ClientTimestamp::now())?;
     output.print_event(open_event(&open))?;
 
-    while continuous || client.next_send_deadline().is_some() {
-        if client
-            .next_send_deadline()
-            .is_some_and(|deadline| deadline <= Instant::now())
-        {
+    let mut interrupted = false;
+    while should_continue_run(continuous, client.next_send_deadline(), shutdown_requested) {
+        if should_send_probe(client.next_send_deadline(), shutdown_requested) {
             let events = client.send_probe()?;
             output.print_events(&events)?;
         }
@@ -60,10 +83,20 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
         let events = client.poll_timeouts(ClientTimestamp::now())?;
         output.print_events(&events)?;
 
+        if is_shutdown_requested(shutdown_requested) {
+            interrupted = true;
+            break;
+        }
+
         sleep_until_next_send(client.next_send_deadline());
     }
+    interrupted |= is_shutdown_requested(shutdown_requested);
 
-    if !continuous {
+    if interrupted {
+        eprintln!("interrupted, closing session...");
+    }
+
+    if should_drain_final(continuous, interrupted) {
         drain_final_replies(&mut client, &mut output)?;
     }
 
@@ -75,6 +108,27 @@ fn run(args: CliArgs) -> Result<(), Box<dyn std::error::Error>> {
     output.print_summary()?;
     output.out.flush()?;
     Ok(())
+}
+
+fn is_shutdown_requested(shutdown_requested: &AtomicBool) -> bool {
+    shutdown_requested.load(Ordering::Relaxed)
+}
+
+fn should_continue_run(
+    continuous: bool,
+    next_send_deadline: Option<Instant>,
+    shutdown_requested: &AtomicBool,
+) -> bool {
+    !is_shutdown_requested(shutdown_requested) && (continuous || next_send_deadline.is_some())
+}
+
+fn should_send_probe(next_send_deadline: Option<Instant>, shutdown_requested: &AtomicBool) -> bool {
+    !is_shutdown_requested(shutdown_requested)
+        && next_send_deadline.is_some_and(|deadline| deadline <= Instant::now())
+}
+
+fn should_drain_final(continuous: bool, interrupted: bool) -> bool {
+    !continuous || interrupted
 }
 
 fn open_event(outcome: &OpenOutcome) -> &ClientEvent {
@@ -177,6 +231,37 @@ fn stats_config(continuous: bool) -> StatsConfig {
 
 fn final_drain_duration(probe_timeout: Duration) -> Duration {
     probe_timeout.min(MAX_FINAL_DRAIN)
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_flag_stops_run_loop() {
+        let shutdown = AtomicBool::new(false);
+        assert!(should_continue_run(true, Some(Instant::now()), &shutdown));
+
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(!should_continue_run(true, Some(Instant::now()), &shutdown));
+    }
+
+    #[test]
+    fn shutdown_flag_suppresses_due_probe_send() {
+        let shutdown = AtomicBool::new(false);
+        let due = Instant::now() - Duration::from_millis(1);
+        assert!(should_send_probe(Some(due), &shutdown));
+
+        shutdown.store(true, Ordering::Relaxed);
+        assert!(!should_send_probe(Some(due), &shutdown));
+    }
+
+    #[test]
+    fn interrupted_continuous_run_uses_final_drain_before_close() {
+        assert!(should_drain_final(true, true));
+        assert!(!should_drain_final(true, false));
+        assert!(should_drain_final(false, false));
+    }
 }
 
 #[cfg(all(test, feature = "stats"))]
