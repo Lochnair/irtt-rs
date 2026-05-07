@@ -11,6 +11,7 @@ stats = ["dep:irtt-stats"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
+ctrlc = "3.4"
 irtt-client = { path = "../irtt-client" }
 irtt-proto = { path = "../irtt-proto" }
 irtt-stats = { path = "../irtt-stats", optional = true }
