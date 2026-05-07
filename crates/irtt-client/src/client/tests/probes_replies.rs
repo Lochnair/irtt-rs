@@ -267,6 +267,51 @@ fn next_send_deadline_advances_by_interval() {
 }
 
 #[test]
+fn next_probe_deadline_reports_overflow() {
+    let start = Instant::now();
+    assert_eq!(
+        next_probe_deadline(start, 1_000_000_000, 2).unwrap(),
+        start + Duration::from_secs(2)
+    );
+    assert!(matches!(
+        next_probe_deadline(start, u64::MAX, 2),
+        Err(ClientError::DurationOverflow)
+    ));
+}
+
+#[test]
+fn send_probe_reports_schedule_overflow() {
+    let params = Params {
+        protocol_version: 1,
+        duration_ns: 0,
+        interval_ns: 1_000_000_000,
+        received_stats: ReceivedStats::Both,
+        stamp_at: StampAt::Both,
+        clock: Clock::Both,
+        ..Params::default()
+    };
+    let server = silent_open_server(params);
+    let config = ClientConfig {
+        duration: None,
+        interval: Duration::from_secs(1),
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    client.session.as_mut().unwrap().packets_sent = u64::MAX;
+
+    assert!(matches!(
+        client.send_probe(),
+        Err(ClientError::DurationOverflow)
+    ));
+    server.join();
+}
+
+#[test]
 fn recv_once_returns_empty_on_timeout() {
     let params = default_params();
     let server = open_success_server(params);
