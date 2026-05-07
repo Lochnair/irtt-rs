@@ -13,6 +13,11 @@ fn metadata_unavailable_skip(test_name: &str) {
     eprintln!("{test_name}: skipping metadata assertion because kernel did not provide traffic class metadata");
 }
 
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+fn kernel_rx_timestamp_unavailable_skip(test_name: &str) {
+    eprintln!("{test_name}: skipping kernel timestamp assertion because kernel did not provide SCM_TIMESTAMPNS");
+}
+
 #[test]
 fn send_probe_fails_before_open() {
     let server = start_fake_server(|_socket, _tx| {});
@@ -329,7 +334,6 @@ fn recv_once_decodes_echo_reply_and_emits_event() {
                     packet_meta.ecn,
                     packet_meta.traffic_class.map(|tc| tc & 0b11)
                 );
-                assert_eq!(packet_meta.kernel_rx_timestamp, None);
             }
         }
         other => panic!("expected EchoReply, got {other:?}"),
@@ -406,7 +410,6 @@ fn echo_reply_metadata_propagates_observed_dscp_with_ancillary() {
             assert_eq!(traffic_class, 184);
             assert_eq!(packet_meta.dscp, Some(46));
             assert_eq!(packet_meta.ecn, Some(0));
-            assert_eq!(packet_meta.kernel_rx_timestamp, None);
         }
         other => panic!("expected EchoReply, got {other:?}"),
     }
@@ -439,7 +442,36 @@ fn echo_reply_metadata_preserves_observed_zero_with_ancillary() {
             assert_eq!(traffic_class, 0);
             assert_eq!(packet_meta.dscp, Some(0));
             assert_eq!(packet_meta.ecn, Some(0));
-            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+        }
+        other => panic!("expected EchoReply, got {other:?}"),
+    }
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+fn echo_reply_metadata_propagates_kernel_rx_timestamp_with_ancillary() {
+    let params = default_params();
+    let (mut client, server) = open_client_with_echo_server(&params);
+
+    client.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::EchoReply { packet_meta, .. } => {
+            let Some(timestamp) = packet_meta.kernel_rx_timestamp else {
+                kernel_rx_timestamp_unavailable_skip(
+                    "echo_reply_metadata_propagates_kernel_rx_timestamp_with_ancillary",
+                );
+                client.close(ClientTimestamp::now()).unwrap();
+                server.join();
+                return;
+            };
+            assert!(timestamp.duration_since(SystemTime::UNIX_EPOCH).is_ok());
         }
         other => panic!("expected EchoReply, got {other:?}"),
     }
@@ -925,7 +957,13 @@ fn late_reply_metadata_propagates_observed_dscp_with_ancillary() {
             assert_eq!(traffic_class, 184);
             assert_eq!(packet_meta.dscp, Some(46));
             assert_eq!(packet_meta.ecn, Some(0));
-            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+            if let Some(timestamp) = packet_meta.kernel_rx_timestamp {
+                assert!(timestamp.duration_since(SystemTime::UNIX_EPOCH).is_ok());
+            } else {
+                kernel_rx_timestamp_unavailable_skip(
+                    "late_reply_metadata_propagates_observed_dscp_with_ancillary",
+                );
+            }
         }
         other => panic!("expected LateReply, got {other:?}"),
     }
@@ -1347,7 +1385,7 @@ fn process_received_packet_uses_supplied_receive_metadata() {
             recv_ts,
             ReceiveMeta {
                 traffic_class: Some(186),
-                kernel_rx_timestamp: None,
+                kernel_rx_timestamp: Some(SystemTime::UNIX_EPOCH + Duration::new(12, 34)),
             },
         )
         .unwrap();
@@ -1358,7 +1396,10 @@ fn process_received_packet_uses_supplied_receive_metadata() {
             assert_eq!(packet_meta.traffic_class, Some(186));
             assert_eq!(packet_meta.dscp, Some(46));
             assert_eq!(packet_meta.ecn, Some(2));
-            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+            assert_eq!(
+                packet_meta.kernel_rx_timestamp,
+                Some(SystemTime::UNIX_EPOCH + Duration::new(12, 34))
+            );
         }
         other => panic!("expected EchoReply, got {other:?}"),
     }
@@ -1395,7 +1436,7 @@ fn process_received_packet_uses_supplied_receive_metadata_for_late_reply() {
             recv_ts,
             ReceiveMeta {
                 traffic_class: Some(0),
-                kernel_rx_timestamp: None,
+                kernel_rx_timestamp: Some(SystemTime::UNIX_EPOCH + Duration::new(56, 78)),
             },
         )
         .unwrap();
@@ -1406,7 +1447,10 @@ fn process_received_packet_uses_supplied_receive_metadata_for_late_reply() {
             assert_eq!(packet_meta.traffic_class, Some(0));
             assert_eq!(packet_meta.dscp, Some(0));
             assert_eq!(packet_meta.ecn, Some(0));
-            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+            assert_eq!(
+                packet_meta.kernel_rx_timestamp,
+                Some(SystemTime::UNIX_EPOCH + Duration::new(56, 78))
+            );
         }
         other => panic!("expected LateReply, got {other:?}"),
     }
