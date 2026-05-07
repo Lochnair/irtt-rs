@@ -79,7 +79,13 @@ fn validate_duration_restriction(requested: i64, returned: i64) -> Result<(), Cl
         });
     }
 
-    if requested > 0 && (returned == 0 || returned > requested) {
+    if requested > 0 && returned == 0 {
+        return Err(ClientError::NegotiationRejected {
+            reason: "server returned continuous duration for finite request".to_owned(),
+        });
+    }
+
+    if requested > 0 && returned > requested {
         return Err(ClientError::NegotiationRejected {
             reason: "duration increased".to_owned(),
         });
@@ -114,6 +120,17 @@ mod tests {
             validate_negotiated_params(requested, returned, policy),
             Err(ClientError::NegotiationRejected { .. })
         ));
+    }
+
+    fn rejection_reason(
+        requested: &Params,
+        returned: &Params,
+        policy: NegotiationPolicy,
+    ) -> String {
+        match validate_negotiated_params(requested, returned, policy) {
+            Err(ClientError::NegotiationRejected { reason }) => reason,
+            other => panic!("expected negotiation rejection, got {other:?}"),
+        }
     }
 
     #[test]
@@ -157,11 +174,17 @@ mod tests {
 
         let mut returned = requested.clone();
         returned.duration_ns = requested.duration_ns + 1;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Loose);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Loose),
+            "duration increased"
+        );
 
         let mut returned = requested.clone();
         returned.duration_ns = 0;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Loose);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Loose),
+            "server returned continuous duration for finite request"
+        );
 
         let mut continuous_requested = requested.clone();
         continuous_requested.duration_ns = 0;
