@@ -7,6 +7,9 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+const STARTUP_ATTEMPTS: usize = 5;
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 pub struct RealIrtServer {
     addr: SocketAddr,
     child: Child,
@@ -17,21 +20,48 @@ pub struct RealIrtServer {
 
 impl RealIrtServer {
     pub fn start(hmac_key: Option<&[u8]>) -> Result<Self, String> {
-        let port = Self::find_free_port()?;
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let bind = format!("127.0.0.1:{port}");
-
         let irtt_bin = std::env::var("IRTT_BIN").unwrap_or_else(|_| "irtt".to_string());
         let keepalive_ms = std::env::var("IRTT_TEST_KEEP_SERVER_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok());
 
-        debug_eprintln!("[real_irtt] selected backend=real irtt_bin={irtt_bin} bind={bind}");
+        let mut failures = Vec::new();
 
-        let mut cmd = Command::new(&irtt_bin);
+        for attempt in 1..=STARTUP_ATTEMPTS {
+            let port = Self::find_free_port()?;
+            let addr = SocketAddr::from(([127, 0, 0, 1], port));
+            let bind = format!("127.0.0.1:{port}");
+
+            debug_eprintln!(
+                "[real_irtt] selected backend=real irtt_bin={irtt_bin} bind={bind} attempt={attempt}/{STARTUP_ATTEMPTS}"
+            );
+
+            match Self::start_attempt(&irtt_bin, keepalive_ms, hmac_key, addr, &bind) {
+                Ok(server) => return Ok(server),
+                Err(failure) => {
+                    debug_eprintln!(
+                        "[real_irtt] startup attempt {attempt}/{STARTUP_ATTEMPTS} failed for {bind}:\n{}",
+                        failure.details()
+                    );
+                    failures.push(failure);
+                }
+            }
+        }
+
+        Err(format_startup_failures(&irtt_bin, &failures))
+    }
+
+    fn start_attempt(
+        irtt_bin: &str,
+        keepalive_ms: Option<u64>,
+        hmac_key: Option<&[u8]>,
+        addr: SocketAddr,
+        bind: &str,
+    ) -> Result<Self, StartupFailure> {
+        let mut cmd = Command::new(irtt_bin);
         cmd.arg("server")
             .arg("-b")
-            .arg(&bind)
+            .arg(bind)
             .arg("--tstamp=dual")
             .stderr(Stdio::piped())
             .stdout(Stdio::piped());
@@ -44,15 +74,31 @@ impl RealIrtServer {
         let full_cmd = format!("{cmd:?}");
         debug_eprintln!("[real_irtt] spawning: {full_cmd}");
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("failed to spawn irtt server: {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| StartupFailure {
+            bind: bind.to_owned(),
+            command: full_cmd.clone(),
+            output: String::new(),
+            exit_status: None,
+            error: Some(format!("failed to spawn irtt server: {e}")),
+        })?;
 
         let pid = child.id();
         debug_eprintln!("[real_irtt] child pid={pid}");
 
-        let stdout = child.stdout.take().ok_or("failed to capture stdout")?;
-        let stderr = child.stderr.take().ok_or("failed to capture stderr")?;
+        let stdout = child.stdout.take().ok_or_else(|| StartupFailure {
+            bind: bind.to_owned(),
+            command: full_cmd.clone(),
+            output: String::new(),
+            exit_status: None,
+            error: Some("failed to capture stdout".to_owned()),
+        })?;
+        let stderr = child.stderr.take().ok_or_else(|| StartupFailure {
+            bind: bind.to_owned(),
+            command: full_cmd.clone(),
+            output: String::new(),
+            exit_status: None,
+            error: Some("failed to capture stderr".to_owned()),
+        })?;
 
         let captured = Arc::new(Mutex::new(Vec::new()));
         let (line_tx, line_rx) = mpsc::channel();
@@ -68,7 +114,7 @@ impl RealIrtServer {
             thread::spawn(move || drain_stream("stderr", stderr, line_tx, captured))
         };
 
-        let ready = wait_for_ready(&line_rx, Duration::from_secs(5));
+        let ready = wait_for_ready(&line_rx, STARTUP_TIMEOUT);
 
         if !ready {
             let exit_status = child.try_wait().ok().flatten();
@@ -79,14 +125,13 @@ impl RealIrtServer {
             stderr_thread.join().ok();
 
             let output = captured.lock().unwrap().join("\n");
-            let extra = match exit_status {
-                Some(status) => format!("\nexit status: {status}"),
-                None => String::new(),
-            };
-            debug_eprintln!("[real_irtt] failure diagnostics:\n{output}{extra}");
-            return Err(format!(
-                "irtt server failed to start\noutput:\n{output}{extra}"
-            ));
+            return Err(StartupFailure {
+                bind: bind.to_owned(),
+                command: full_cmd,
+                output,
+                exit_status,
+                error: Some("readiness timed out or server exited before ready".to_owned()),
+            });
         }
 
         debug_eprintln!("[real_irtt] readiness result=true addr={addr}");
@@ -114,6 +159,48 @@ impl RealIrtServer {
         drop(socket);
         Ok(port)
     }
+}
+
+struct StartupFailure {
+    bind: String,
+    command: String,
+    output: String,
+    exit_status: Option<std::process::ExitStatus>,
+    error: Option<String>,
+}
+
+impl StartupFailure {
+    fn details(&self) -> String {
+        let mut details = format!("bind: {}\ncommand: {}", self.bind, self.command);
+        if let Some(error) = &self.error {
+            details.push_str(&format!("\nerror: {error}"));
+        }
+        if let Some(status) = self.exit_status {
+            details.push_str(&format!("\nexit status: {status}"));
+        }
+        if !self.output.is_empty() {
+            details.push_str(&format!("\noutput:\n{}", self.output));
+        }
+        details
+    }
+}
+
+fn format_startup_failures(irtt_bin: &str, failures: &[StartupFailure]) -> String {
+    let mut message = format!(
+        "irtt server failed to start after {} attempt(s) with binary '{irtt_bin}'",
+        failures.len()
+    );
+
+    for (index, failure) in failures.iter().enumerate() {
+        message.push_str(&format!(
+            "\n\nattempt {}/{}:\n{}",
+            index + 1,
+            failures.len(),
+            failure.details()
+        ));
+    }
+
+    message
 }
 
 impl Drop for RealIrtServer {
@@ -188,3 +275,61 @@ macro_rules! debug_eprintln {
 }
 
 use debug_eprintln;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn startup_failure_details_include_bind_command_status_and_output() {
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("exit 7")
+            .status()
+            .expect("shell exits");
+        let failure = StartupFailure {
+            bind: "127.0.0.1:12345".to_owned(),
+            command: "\"irtt\" \"server\"".to_owned(),
+            output: "stderr: listen udp4 127.0.0.1:12345: bind: address already in use".to_owned(),
+            exit_status: Some(status),
+            error: Some("readiness timed out or server exited before ready".to_owned()),
+        };
+
+        let details = failure.details();
+
+        assert!(details.contains("bind: 127.0.0.1:12345"));
+        assert!(details.contains("command: \"irtt\" \"server\""));
+        assert!(details.contains("exit status:"));
+        assert!(details.contains("address already in use"));
+    }
+
+    #[test]
+    fn startup_failure_summary_includes_attempt_count_and_each_bind() {
+        let failures = vec![
+            StartupFailure {
+                bind: "127.0.0.1:11111".to_owned(),
+                command: "\"irtt\" \"server\" -b 127.0.0.1:11111".to_owned(),
+                output: "stdout: first".to_owned(),
+                exit_status: None,
+                error: Some("readiness timed out or server exited before ready".to_owned()),
+            },
+            StartupFailure {
+                bind: "127.0.0.1:22222".to_owned(),
+                command: "\"irtt\" \"server\" -b 127.0.0.1:22222".to_owned(),
+                output: "stderr: second".to_owned(),
+                exit_status: None,
+                error: Some("readiness timed out or server exited before ready".to_owned()),
+            },
+        ];
+
+        let message = format_startup_failures("irtt", &failures);
+
+        assert!(message.contains("after 2 attempt(s)"));
+        assert!(message.contains("attempt 1/2"));
+        assert!(message.contains("attempt 2/2"));
+        assert!(message.contains("127.0.0.1:11111"));
+        assert!(message.contains("127.0.0.1:22222"));
+        assert!(message.contains("stdout: first"));
+        assert!(message.contains("stderr: second"));
+    }
+}
