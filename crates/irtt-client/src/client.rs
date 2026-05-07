@@ -11,7 +11,10 @@ use irtt_proto::{
 };
 
 use crate::{
-    config::{ClientConfig, RecvBudget, RunMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES},
+    config::{
+        ClientConfig, RecvBudget, RunMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES,
+        MAX_UDP_PAYLOAD_LENGTH,
+    },
     error::ClientError,
     event::{
         ClientEvent, OneWayDelaySample, OpenOutcome, ReceivedStatsSample, RttSample, ServerTiming,
@@ -780,6 +783,11 @@ fn validate_protocol_config(config: &ClientConfig) -> Result<(), ClientError> {
     if config.dscp > MAX_DSCP_CODEPOINT {
         return Err(ClientError::InvalidConfig {
             reason: format!("dscp must be <= {MAX_DSCP_CODEPOINT}"),
+        });
+    }
+    if config.length > MAX_UDP_PAYLOAD_LENGTH {
+        return Err(ClientError::InvalidConfig {
+            reason: format!("packet length must be <= {MAX_UDP_PAYLOAD_LENGTH}"),
         });
     }
 

@@ -13,13 +13,11 @@ use clap::{Parser, ValueEnum};
 use irtt_client::{
     ClientConfig, ClientEvent, NegotiatedParams, NegotiationPolicy, OneWayDelaySample, PacketMeta,
     ReceivedStatsSample, RttSample, ServerTiming, SocketConfig, WarningKind, MAX_DSCP_CODEPOINT,
-    MAX_SERVER_FILL_BYTES, MAX_TTL,
+    MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
 };
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
 const DEFAULT_RECV_TIMEOUT: Duration = Duration::from_millis(20);
-const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
-
 #[derive(Debug, Clone, Parser)]
 #[command(name = "irtt-rs", about = "Minimal IRTT-compatible client")]
 pub struct CliArgs {

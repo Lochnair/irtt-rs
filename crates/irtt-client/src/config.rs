@@ -5,6 +5,7 @@ use irtt_proto::{Clock, ReceivedStats, StampAt};
 pub(crate) const DEFAULT_PORT: u16 = 2112;
 pub const MAX_DSCP_CODEPOINT: u8 = 63;
 pub const MAX_TTL: u32 = 255;
+pub const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 pub const MAX_SERVER_FILL_BYTES: usize = 32;
 pub(crate) const DEFAULT_DURATION: Duration = Duration::from_secs(3);
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
