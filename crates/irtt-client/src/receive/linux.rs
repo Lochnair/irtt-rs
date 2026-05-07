@@ -4,18 +4,41 @@ use std::{
     net::{SocketAddr, UdpSocket},
     os::fd::AsRawFd,
     ptr,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crate::{metadata::ReceiveMeta, receive::ReceivedDatagram, timing::ClientTimestamp};
 
-const CONTROL_LEN: usize = 64;
+const CONTROL_LEN: usize = 128;
 
 pub(crate) fn configure_receive_metadata(socket: &UdpSocket, remote: SocketAddr) -> io::Result<()> {
+    enable_kernel_rx_timestamps(socket)?;
     let socket = socket2::SockRef::from(socket);
     if remote.is_ipv4() {
         socket.set_recv_tos(true)
     } else {
         socket.set_recv_tclass_v6(true)
+    }
+}
+
+fn enable_kernel_rx_timestamps(socket: &UdpSocket) -> io::Result<()> {
+    let enabled: libc::c_int = 1;
+    let result = unsafe {
+        // SAFETY: The file descriptor is borrowed from a valid `UdpSocket`.
+        // `enabled` is a properly aligned `c_int`, and the length matches the
+        // pointed-to value for the `SO_TIMESTAMPNS` boolean socket option.
+        libc::setsockopt(
+            socket.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPNS,
+            (&enabled as *const libc::c_int).cast(),
+            mem::size_of_val(&enabled) as libc::socklen_t,
+        )
+    };
+    if result == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
 }
 
@@ -67,6 +90,8 @@ unsafe fn parse_receive_meta(msg: &libc::msghdr) -> ReceiveMeta {
             let data_len = cmsg_ref.cmsg_len - libc::CMSG_LEN(0) as usize;
             if is_traffic_class_cmsg(cmsg_ref) {
                 meta.traffic_class = read_int_cmsg_low_byte(cmsg, data_len);
+            } else if is_kernel_rx_timestamp_cmsg(cmsg_ref) {
+                meta.kernel_rx_timestamp = read_timespec_cmsg(cmsg, data_len);
             }
         }
         cmsg = libc::CMSG_NXTHDR(msg, cmsg);
@@ -77,6 +102,10 @@ unsafe fn parse_receive_meta(msg: &libc::msghdr) -> ReceiveMeta {
 fn is_traffic_class_cmsg(cmsg: &libc::cmsghdr) -> bool {
     (cmsg.cmsg_level == libc::IPPROTO_IP && cmsg.cmsg_type == libc::IP_TOS)
         || (cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == libc::IPV6_TCLASS)
+}
+
+fn is_kernel_rx_timestamp_cmsg(cmsg: &libc::cmsghdr) -> bool {
+    cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_TIMESTAMPNS
 }
 
 unsafe fn read_u8_cmsg(cmsg: *mut libc::cmsghdr, data_len: usize) -> Option<u8> {
@@ -94,6 +123,23 @@ unsafe fn read_int_cmsg_low_byte(cmsg: *mut libc::cmsghdr, data_len: usize) -> O
     } else {
         read_u8_cmsg(cmsg, data_len)
     }
+}
+
+unsafe fn read_timespec_cmsg(cmsg: *mut libc::cmsghdr, data_len: usize) -> Option<SystemTime> {
+    if data_len < mem::size_of::<libc::timespec>() {
+        return None;
+    }
+    let timespec = ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::timespec>());
+    system_time_from_timespec(timespec)
+}
+
+fn system_time_from_timespec(timespec: libc::timespec) -> Option<SystemTime> {
+    if timespec.tv_sec < 0 || timespec.tv_nsec < 0 || timespec.tv_nsec >= 1_000_000_000 {
+        return None;
+    }
+    let seconds = u64::try_from(timespec.tv_sec).ok()?;
+    let nanos = u32::try_from(timespec.tv_nsec).ok()?;
+    UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
 }
 
 #[repr(align(8))]
@@ -118,7 +164,7 @@ mod tests {
     use std::{
         io,
         net::{SocketAddr, UdpSocket},
-        time::Duration,
+        time::{Duration, UNIX_EPOCH},
     };
 
     use crate::{
@@ -207,6 +253,27 @@ mod tests {
     }
 
     #[test]
+    fn kernel_rx_timestamp_metadata_is_observed_when_kernel_provides_it() {
+        let (sender, receiver) = connected_ipv4_loopback_pair();
+        configure_receive_metadata(&receiver, sender.local_addr().unwrap()).unwrap();
+        sender.send(b"stamp").unwrap();
+
+        let mut buf = [0_u8; 16];
+        let datagram = recv_datagram(&receiver, &mut buf).unwrap();
+        assert_eq!(datagram.len, 5);
+        assert_eq!(&buf[..datagram.len], b"stamp");
+        let Some(timestamp) = datagram.meta.kernel_rx_timestamp else {
+            eprintln!(
+                "skipping kernel timestamp assertion: kernel did not provide SCM_TIMESTAMPNS"
+            );
+            return;
+        };
+
+        let duration = timestamp.duration_since(UNIX_EPOCH).unwrap();
+        assert!(duration.as_nanos() > 0);
+    }
+
+    #[test]
     fn ipv4_traffic_class_metadata_is_observed_when_kernel_provides_it() {
         let (sender, receiver) = connected_ipv4_loopback_pair();
         configure_receive_metadata(&receiver, sender.local_addr().unwrap()).unwrap();
@@ -268,6 +335,45 @@ mod tests {
         assert_eq!(packet_meta.traffic_class, Some(0));
         assert_eq!(packet_meta.dscp, Some(0));
         assert_eq!(packet_meta.ecn, Some(0));
+    }
+
+    #[test]
+    fn timespec_conversion_accepts_valid_unix_timestamp() {
+        let timestamp = super::system_time_from_timespec(libc::timespec {
+            tv_sec: 1,
+            tv_nsec: 2,
+        })
+        .unwrap();
+
+        assert_eq!(
+            timestamp.duration_since(UNIX_EPOCH).unwrap(),
+            Duration::new(1, 2)
+        );
+    }
+
+    #[test]
+    fn timespec_conversion_rejects_negative_or_invalid_values() {
+        assert_eq!(
+            super::system_time_from_timespec(libc::timespec {
+                tv_sec: -1,
+                tv_nsec: 0,
+            }),
+            None
+        );
+        assert_eq!(
+            super::system_time_from_timespec(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: -1,
+            }),
+            None
+        );
+        assert_eq!(
+            super::system_time_from_timespec(libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 1_000_000_000,
+            }),
+            None
+        );
     }
 
     fn is_unavailable_ipv6_loopback(error: &io::Error) -> bool {
