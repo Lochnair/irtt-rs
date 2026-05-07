@@ -48,6 +48,11 @@ pub(crate) fn validate_negotiated_params(
         });
     }
     validate_duration_restriction(requested.duration_ns, returned.duration_ns)?;
+    if returned.length < 0 {
+        return Err(ClientError::NegotiationRejected {
+            reason: "length must be non-negative".to_owned(),
+        });
+    }
     if returned.length > requested.length {
         return Err(ClientError::NegotiationRejected {
             reason: "length increased".to_owned(),
