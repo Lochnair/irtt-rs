@@ -8,6 +8,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::{
     config::{ClientConfig, SocketConfig, DEFAULT_PORT, MIN_OPEN_TIMEOUT},
     error::ClientError,
+    receive::configure_receive_metadata,
     socket_options::apply_ttl_to_socket,
 };
 
@@ -86,6 +87,11 @@ pub(crate) fn connect_udp_socket(
     socket.connect(&remote.into())?;
 
     let socket: UdpSocket = socket.into();
+    configure_receive_metadata(&socket, remote).map_err(|source| ClientError::SocketOption {
+        operation: "enable receive metadata",
+        remote,
+        source,
+    })?;
     if let Some(ttl) = config.ttl {
         apply_ttl_to_socket(&socket, remote, ttl)?;
     }
