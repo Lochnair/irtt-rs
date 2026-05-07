@@ -588,8 +588,9 @@ fn write_packet_meta(out: &mut String, meta: PacketMeta) {
     write_optional_u8(out, "traffic_class", meta.traffic_class);
     write_optional_u8(out, "dscp", meta.dscp);
     write_optional_u8(out, "ecn", meta.ecn);
-    if let Some(timestamp) = meta.kernel_rx_timestamp {
-        write_wall(out, "kernel_rx_ns", timestamp);
+    match meta.kernel_rx_timestamp {
+        Some(timestamp) => write_wall(out, "kernel_rx_ns", timestamp),
+        None => write!(out, " kernel_rx_ns=none").unwrap(),
     }
 }
 
@@ -727,10 +728,24 @@ mod tests {
         }
     }
 
-    fn assert_machine_packet_meta(line: &str, traffic_class: &str, dscp: &str, ecn: &str) {
+    fn packet_meta_with_timestamp(timestamp: Option<SystemTime>) -> PacketMeta {
+        PacketMeta {
+            kernel_rx_timestamp: timestamp,
+            ..PacketMeta::default()
+        }
+    }
+
+    fn assert_machine_packet_meta(
+        line: &str,
+        traffic_class: &str,
+        dscp: &str,
+        ecn: &str,
+        kernel_rx_ns: &str,
+    ) {
         assert!(line.contains(&format!("traffic_class={traffic_class}")));
         assert!(line.contains(&format!("dscp={dscp}")));
         assert!(line.contains(&format!("ecn={ecn}")));
+        assert!(line.contains(&format!("kernel_rx_ns={kernel_rx_ns}")));
     }
 
     #[test]
@@ -1011,7 +1026,7 @@ mod tests {
     fn machine_echo_reply_metadata_unavailable_prints_none() {
         let line = format_event(&reply_event(), OutputMode::Machine).unwrap();
 
-        assert_machine_packet_meta(&line, "none", "none", "none");
+        assert_machine_packet_meta(&line, "none", "none", "none", "none");
     }
 
     #[test]
@@ -1022,7 +1037,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_machine_packet_meta(&line, "0", "0", "0");
+        assert_machine_packet_meta(&line, "0", "0", "0", "none");
     }
 
     #[test]
@@ -1033,7 +1048,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_machine_packet_meta(&line, "184", "46", "0");
+        assert_machine_packet_meta(&line, "184", "46", "0", "none");
     }
 
     #[test]
@@ -1044,7 +1059,20 @@ mod tests {
         )
         .unwrap();
 
-        assert_machine_packet_meta(&line, "186", "46", "2");
+        assert_machine_packet_meta(&line, "186", "46", "2", "none");
+    }
+
+    #[test]
+    fn machine_echo_reply_metadata_kernel_rx_timestamp_prints_ns() {
+        let line = format_event(
+            &reply_event_with_meta(packet_meta_with_timestamp(Some(
+                UNIX_EPOCH + Duration::new(1, 234),
+            ))),
+            OutputMode::Machine,
+        )
+        .unwrap();
+
+        assert_machine_packet_meta(&line, "none", "none", "none", "1000000234");
     }
 
     #[test]
@@ -1056,7 +1084,7 @@ mod tests {
         .unwrap();
 
         assert!(line.starts_with("event=late "));
-        assert_machine_packet_meta(&line, "none", "none", "none");
+        assert_machine_packet_meta(&line, "none", "none", "none", "none");
     }
 
     #[test]
@@ -1068,7 +1096,21 @@ mod tests {
         .unwrap();
 
         assert!(line.starts_with("event=late "));
-        assert_machine_packet_meta(&line, "186", "46", "2");
+        assert_machine_packet_meta(&line, "186", "46", "2", "none");
+    }
+
+    #[test]
+    fn machine_late_reply_metadata_kernel_rx_timestamp_prints_ns() {
+        let line = format_event(
+            &late_event_with_meta(packet_meta_with_timestamp(Some(
+                UNIX_EPOCH + Duration::new(2, 345),
+            ))),
+            OutputMode::Machine,
+        )
+        .unwrap();
+
+        assert!(line.starts_with("event=late "));
+        assert_machine_packet_meta(&line, "none", "none", "none", "2000000345");
     }
 
     #[test]
