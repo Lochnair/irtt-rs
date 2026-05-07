@@ -585,17 +585,18 @@ fn write_received_stats(out: &mut String, stats: Option<ReceivedStatsSample>) {
 }
 
 fn write_packet_meta(out: &mut String, meta: PacketMeta) {
-    if let Some(traffic_class) = meta.traffic_class {
-        write!(out, " traffic_class={traffic_class}").unwrap();
-    }
-    if let Some(dscp) = meta.dscp {
-        write!(out, " dscp={dscp}").unwrap();
-    }
-    if let Some(ecn) = meta.ecn {
-        write!(out, " ecn={ecn}").unwrap();
-    }
+    write_optional_u8(out, "traffic_class", meta.traffic_class);
+    write_optional_u8(out, "dscp", meta.dscp);
+    write_optional_u8(out, "ecn", meta.ecn);
     if let Some(timestamp) = meta.kernel_rx_timestamp {
         write_wall(out, "kernel_rx_ns", timestamp);
+    }
+}
+
+fn write_optional_u8(out: &mut String, key: &str, value: Option<u8>) {
+    match value {
+        Some(value) => write!(out, " {key}={value}").unwrap(),
+        None => write!(out, " {key}=none").unwrap(),
     }
 }
 
@@ -661,6 +662,10 @@ mod tests {
     }
 
     fn reply_event() -> ClientEvent {
+        reply_event_with_meta(PacketMeta::default())
+    }
+
+    fn reply_event_with_meta(packet_meta: PacketMeta) -> ClientEvent {
         ClientEvent::EchoReply {
             seq: 7,
             logical_seq: 8,
@@ -692,8 +697,40 @@ mod tests {
                 window: Some(0x7),
             }),
             bytes: 64,
-            packet_meta: PacketMeta::default(),
+            packet_meta,
         }
+    }
+
+    fn late_event_with_meta(packet_meta: PacketMeta) -> ClientEvent {
+        ClientEvent::LateReply {
+            seq: 4,
+            logical_seq: None,
+            highest_seen: 9,
+            remote: test_remote(),
+            sent_at: None,
+            received_at: test_timestamp(Duration::from_secs(1)),
+            rtt: None,
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta,
+        }
+    }
+
+    fn packet_meta(traffic_class: u8, dscp: u8, ecn: u8) -> PacketMeta {
+        PacketMeta {
+            traffic_class: Some(traffic_class),
+            dscp: Some(dscp),
+            ecn: Some(ecn),
+            kernel_rx_timestamp: None,
+        }
+    }
+
+    fn assert_machine_packet_meta(line: &str, traffic_class: &str, dscp: &str, ecn: &str) {
+        assert!(line.contains(&format!("traffic_class={traffic_class}")));
+        assert!(line.contains(&format!("dscp={dscp}")));
+        assert!(line.contains(&format!("ecn={ecn}")));
     }
 
     #[test]
@@ -968,6 +1005,70 @@ mod tests {
         assert!(line.contains("effective_rtt_us=1200"));
         assert!(line.contains("server_processing_us=300"));
         assert!(line.contains("server_received_count=9"));
+    }
+
+    #[test]
+    fn machine_echo_reply_metadata_unavailable_prints_none() {
+        let line = format_event(&reply_event(), OutputMode::Machine).unwrap();
+
+        assert_machine_packet_meta(&line, "none", "none", "none");
+    }
+
+    #[test]
+    fn machine_echo_reply_metadata_observed_zero_prints_zero() {
+        let line = format_event(
+            &reply_event_with_meta(packet_meta(0, 0, 0)),
+            OutputMode::Machine,
+        )
+        .unwrap();
+
+        assert_machine_packet_meta(&line, "0", "0", "0");
+    }
+
+    #[test]
+    fn machine_echo_reply_metadata_dscp_46_ecn_0_prints_values() {
+        let line = format_event(
+            &reply_event_with_meta(packet_meta(184, 46, 0)),
+            OutputMode::Machine,
+        )
+        .unwrap();
+
+        assert_machine_packet_meta(&line, "184", "46", "0");
+    }
+
+    #[test]
+    fn machine_echo_reply_metadata_dscp_46_ecn_2_prints_values() {
+        let line = format_event(
+            &reply_event_with_meta(packet_meta(186, 46, 2)),
+            OutputMode::Machine,
+        )
+        .unwrap();
+
+        assert_machine_packet_meta(&line, "186", "46", "2");
+    }
+
+    #[test]
+    fn machine_late_reply_metadata_unavailable_prints_none() {
+        let line = format_event(
+            &late_event_with_meta(PacketMeta::default()),
+            OutputMode::Machine,
+        )
+        .unwrap();
+
+        assert!(line.starts_with("event=late "));
+        assert_machine_packet_meta(&line, "none", "none", "none");
+    }
+
+    #[test]
+    fn machine_late_reply_metadata_observed_values_prints_values() {
+        let line = format_event(
+            &late_event_with_meta(packet_meta(186, 46, 2)),
+            OutputMode::Machine,
+        )
+        .unwrap();
+
+        assert!(line.starts_with("event=late "));
+        assert_machine_packet_meta(&line, "186", "46", "2");
     }
 
     #[test]
