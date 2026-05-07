@@ -85,7 +85,7 @@ impl Client {
             .set_read_timeout(self.config.socket_config.recv_timeout);
         match (outcome, restore) {
             (Ok(outcome), Ok(())) => Ok(outcome),
-            (Ok(outcome), Err(_)) => Ok(outcome),
+            (Ok(_), Err(source)) => Err(ClientError::ReadTimeoutRestore { source }),
             (Err(err), Ok(())) => Err(err),
             (Err(err), Err(_)) => Err(err),
         }
