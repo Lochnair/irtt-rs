@@ -1,5 +1,18 @@
 use super::*;
 
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+fn assert_packet_meta_unavailable(packet_meta: &crate::event::PacketMeta) {
+    assert_eq!(packet_meta.traffic_class, None);
+    assert_eq!(packet_meta.dscp, None);
+    assert_eq!(packet_meta.ecn, None);
+    assert_eq!(packet_meta.kernel_rx_timestamp, None);
+}
+
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+fn metadata_unavailable_skip(test_name: &str) {
+    eprintln!("{test_name}: skipping metadata assertion because kernel did not provide traffic class metadata");
+}
+
 #[test]
 fn send_probe_fails_before_open() {
     let server = start_fake_server(|_socket, _tx| {});
@@ -321,6 +334,116 @@ fn recv_once_decodes_echo_reply_and_emits_event() {
         }
         other => panic!("expected EchoReply, got {other:?}"),
     }
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+fn echo_reply_metadata_is_unavailable_without_ancillary() {
+    let params = default_params();
+    let (mut client, server) = open_client_with_echo_server(&params);
+
+    client.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::EchoReply { packet_meta, .. } => {
+            assert_packet_meta_unavailable(packet_meta);
+        }
+        other => panic!("expected EchoReply, got {other:?}"),
+    }
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+fn echo_reply_metadata_propagates_observed_dscp_with_ancillary() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+        socket.send_to(&reply, peer).unwrap();
+
+        let mut buf = [0_u8; 2048];
+        let (size, _) = socket.recv_from(&mut buf).unwrap();
+        tx.send(buf[..size].to_vec()).unwrap();
+        let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        crate::socket_options::apply_dscp_to_socket(&socket, peer, 46).unwrap();
+        let reply_packet =
+            echo_reply_packet(TOKEN, seq, &params, &TimestampFields::default(), None);
+        socket.send_to(&reply_packet, peer).unwrap();
+    });
+    let config = ClientConfig {
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+    client.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::EchoReply { packet_meta, .. } => {
+            let Some(traffic_class) = packet_meta.traffic_class else {
+                metadata_unavailable_skip(
+                    "echo_reply_metadata_propagates_observed_dscp_with_ancillary",
+                );
+                client.close(ClientTimestamp::now()).unwrap();
+                server.join();
+                return;
+            };
+            assert_eq!(traffic_class, 184);
+            assert_eq!(packet_meta.dscp, Some(46));
+            assert_eq!(packet_meta.ecn, Some(0));
+            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+        }
+        other => panic!("expected EchoReply, got {other:?}"),
+    }
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+fn echo_reply_metadata_preserves_observed_zero_with_ancillary() {
+    let params = default_params();
+    let (mut client, server) = open_client_with_echo_server(&params);
+
+    client.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::EchoReply { packet_meta, .. } => {
+            let Some(traffic_class) = packet_meta.traffic_class else {
+                metadata_unavailable_skip(
+                    "echo_reply_metadata_preserves_observed_zero_with_ancillary",
+                );
+                client.close(ClientTimestamp::now()).unwrap();
+                server.join();
+                return;
+            };
+            assert_eq!(traffic_class, 0);
+            assert_eq!(packet_meta.dscp, Some(0));
+            assert_eq!(packet_meta.ecn, Some(0));
+            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+        }
+        other => panic!("expected EchoReply, got {other:?}"),
+    }
+
     client.close(ClientTimestamp::now()).unwrap();
     server.join();
 }
@@ -671,6 +794,7 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
             server_timing,
             one_way,
             bytes,
+            packet_meta,
             ..
         } => {
             assert_eq!(*seq, 0);
@@ -680,6 +804,9 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
             assert!(server_timing.is_some());
             assert!(one_way.is_some());
             assert_eq!(*bytes, echo_packet_len(false, &default_params()));
+            let _ = packet_meta;
+            #[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+            assert_packet_meta_unavailable(packet_meta);
         }
         other => panic!("expected stats-eligible LateReply, got {other:?}"),
     }
@@ -694,6 +821,114 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
             ..
         } if *bytes == echo_packet_len(false, &default_params())
     ));
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+fn late_reply_metadata_is_unavailable_without_ancillary() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+        socket.send_to(&reply, peer).unwrap();
+
+        let mut buf = [0_u8; 2048];
+        let (size, _) = socket.recv_from(&mut buf).unwrap();
+        tx.send(buf[..size].to_vec()).unwrap();
+        let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+
+        thread::sleep(Duration::from_millis(90));
+        let reply_packet =
+            echo_reply_packet(TOKEN, seq, &params, &TimestampFields::default(), None);
+        socket.send_to(&reply_packet, peer).unwrap();
+    });
+    let config = ClientConfig {
+        probe_timeout: Duration::from_millis(40),
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+    client.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(60));
+    let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
+
+    let late = client.recv_once().unwrap();
+    assert_eq!(late.len(), 1);
+    match &late[0] {
+        ClientEvent::LateReply { packet_meta, .. } => {
+            assert_packet_meta_unavailable(packet_meta);
+        }
+        other => panic!("expected LateReply, got {other:?}"),
+    }
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+fn late_reply_metadata_propagates_observed_dscp_with_ancillary() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+        socket.send_to(&reply, peer).unwrap();
+
+        let mut buf = [0_u8; 2048];
+        let (size, _) = socket.recv_from(&mut buf).unwrap();
+        tx.send(buf[..size].to_vec()).unwrap();
+        let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+
+        thread::sleep(Duration::from_millis(90));
+        crate::socket_options::apply_dscp_to_socket(&socket, peer, 46).unwrap();
+        let reply_packet =
+            echo_reply_packet(TOKEN, seq, &params, &TimestampFields::default(), None);
+        socket.send_to(&reply_packet, peer).unwrap();
+    });
+    let config = ClientConfig {
+        probe_timeout: Duration::from_millis(40),
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+    client.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(60));
+    let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
+
+    let events = client.recv_once().unwrap();
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::LateReply { packet_meta, .. } => {
+            let Some(traffic_class) = packet_meta.traffic_class else {
+                metadata_unavailable_skip(
+                    "late_reply_metadata_propagates_observed_dscp_with_ancillary",
+                );
+                client.close(ClientTimestamp::now()).unwrap();
+                server.join();
+                return;
+            };
+            assert_eq!(traffic_class, 184);
+            assert_eq!(packet_meta.dscp, Some(46));
+            assert_eq!(packet_meta.ecn, Some(0));
+            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+        }
+        other => panic!("expected LateReply, got {other:?}"),
+    }
 
     client.close(ClientTimestamp::now()).unwrap();
     server.join();
@@ -1126,6 +1361,92 @@ fn process_received_packet_uses_supplied_receive_metadata() {
             assert_eq!(packet_meta.kernel_rx_timestamp, None);
         }
         other => panic!("expected EchoReply, got {other:?}"),
+    }
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+fn process_received_packet_uses_supplied_receive_metadata_for_late_reply() {
+    let params = default_params();
+    let server = silent_open_server(params.clone());
+    let config = ClientConfig {
+        probe_timeout: Duration::from_millis(40),
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(50)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+    client.send_probe_at(ClientTimestamp::now()).unwrap();
+    thread::sleep(Duration::from_millis(60));
+    let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
+
+    let recv_ts = ClientTimestamp::now();
+    let reply = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
+    let events = client
+        .process_received_packet(
+            &reply,
+            recv_ts,
+            ReceiveMeta {
+                traffic_class: Some(0),
+                kernel_rx_timestamp: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::LateReply { packet_meta, .. } => {
+            assert_eq!(packet_meta.traffic_class, Some(0));
+            assert_eq!(packet_meta.dscp, Some(0));
+            assert_eq!(packet_meta.ecn, Some(0));
+            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+        }
+        other => panic!("expected LateReply, got {other:?}"),
+    }
+
+    client.close(ClientTimestamp::now()).unwrap();
+    server.join();
+}
+
+#[test]
+fn receive_metadata_does_not_broaden_malformed_warning() {
+    let params = default_params();
+    let server = silent_open_server(params);
+    let config = ClientConfig {
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(50)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+
+    let events = client
+        .process_received_packet(
+            b"not an irtt reply",
+            ClientTimestamp::now(),
+            ReceiveMeta {
+                traffic_class: Some(184),
+                kernel_rx_timestamp: None,
+            },
+        )
+        .unwrap();
+
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        ClientEvent::Warning { kind, message } => {
+            assert_eq!(*kind, WarningKind::MalformedOrUnrelatedPacket);
+            assert_eq!(message, "dropped malformed or unrelated packet");
+        }
+        other => panic!("expected Warning, got {other:?}"),
     }
 
     client.close(ClientTimestamp::now()).unwrap();
