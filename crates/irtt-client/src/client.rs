@@ -19,6 +19,7 @@ use crate::{
     },
     metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
+    receive::recv_datagram,
     session::{validate_negotiated_params, ActiveSession, ClientPhase, NegotiatedParams},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
@@ -278,8 +279,8 @@ impl Client {
 
         let buf_size = self.recv_buffer_size();
         let mut buf = vec![0_u8; buf_size];
-        let size = match self.socket.recv(&mut buf) {
-            Ok(size) => size,
+        let datagram = match recv_datagram(&self.socket, &mut buf) {
+            Ok(datagram) => datagram,
             Err(err)
                 if matches!(
                     err.kind(),
@@ -291,8 +292,8 @@ impl Client {
             Err(err) => return Err(ClientError::Socket(err)),
         };
 
-        let now = override_ts.unwrap_or_else(ClientTimestamp::now);
-        self.process_received_packet(&buf[..size], now)
+        let now = override_ts.unwrap_or(datagram.received_at);
+        self.process_received_packet(&buf[..datagram.len], now, datagram.meta)
     }
 
     pub fn recv_available(&mut self, budget: RecvBudget) -> Result<Vec<ClientEvent>, ClientError> {
@@ -372,6 +373,7 @@ impl Client {
         &mut self,
         packet: &[u8],
         now: ClientTimestamp,
+        meta: ReceiveMeta,
     ) -> Result<Vec<ClientEvent>, ClientError> {
         let negotiated = self
             .negotiated
@@ -432,7 +434,7 @@ impl Client {
                     one_way,
                     received_stats,
                     bytes: packet.len(),
-                    packet_meta: ReceiveMeta::default().into(),
+                    packet_meta: meta.into(),
                 });
             } else {
                 events.push(ClientEvent::EchoReply {
@@ -446,7 +448,7 @@ impl Client {
                     one_way,
                     received_stats,
                     bytes: packet.len(),
-                    packet_meta: ReceiveMeta::default().into(),
+                    packet_meta: meta.into(),
                 });
             }
             Ok(events)
@@ -479,7 +481,7 @@ impl Client {
                 one_way,
                 received_stats,
                 bytes: packet.len(),
-                packet_meta: ReceiveMeta::default().into(),
+                packet_meta: meta.into(),
             }])
         } else if session.highest_received_seq.is_some_and(|h| wire_seq < h) {
             // TODO: u32 ordering is acceptable for finite tests but continuous
@@ -496,7 +498,7 @@ impl Client {
                 one_way: None,
                 received_stats: build_received_stats(&reply),
                 bytes: packet.len(),
-                packet_meta: ReceiveMeta::default().into(),
+                packet_meta: meta.into(),
             }])
         } else {
             Ok(vec![ClientEvent::Warning {
