@@ -299,10 +299,25 @@ fn recv_once_decodes_echo_reply_and_emits_event() {
             assert!(server_timing.is_some());
             let st = server_timing.as_ref().unwrap();
             assert!(st.processing.is_some());
-            assert_eq!(packet_meta.traffic_class, None);
-            assert_eq!(packet_meta.dscp, None);
-            assert_eq!(packet_meta.ecn, None);
-            assert_eq!(packet_meta.kernel_rx_timestamp, None);
+            #[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+            {
+                assert_eq!(packet_meta.traffic_class, None);
+                assert_eq!(packet_meta.dscp, None);
+                assert_eq!(packet_meta.ecn, None);
+                assert_eq!(packet_meta.kernel_rx_timestamp, None);
+            }
+            #[cfg(all(target_os = "linux", feature = "ancillary"))]
+            {
+                assert_eq!(
+                    packet_meta.dscp,
+                    packet_meta.traffic_class.map(|tc| tc >> 2)
+                );
+                assert_eq!(
+                    packet_meta.ecn,
+                    packet_meta.traffic_class.map(|tc| tc & 0b11)
+                );
+                assert_eq!(packet_meta.kernel_rx_timestamp, None);
+            }
         }
         other => panic!("expected EchoReply, got {other:?}"),
     }

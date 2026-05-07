@@ -1,6 +1,12 @@
-use std::{io, net::UdpSocket};
+use std::{
+    io,
+    net::{SocketAddr, UdpSocket},
+};
 
 use crate::{metadata::ReceiveMeta, timing::ClientTimestamp};
+
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+mod linux;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ReceivedDatagram {
@@ -9,6 +15,7 @@ pub(crate) struct ReceivedDatagram {
     pub(crate) meta: ReceiveMeta,
 }
 
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
 pub(crate) fn recv_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
@@ -21,6 +28,27 @@ pub(crate) fn recv_datagram(
         received_at,
         meta: ReceiveMeta::default(),
     })
+}
+
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+pub(crate) fn recv_datagram(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagram, io::Error> {
+    linux::recv_datagram(socket, buf)
+}
+
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+pub(crate) fn configure_receive_metadata(
+    _socket: &UdpSocket,
+    _remote: SocketAddr,
+) -> io::Result<()> {
+    Ok(())
+}
+
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+pub(crate) fn configure_receive_metadata(socket: &UdpSocket, remote: SocketAddr) -> io::Result<()> {
+    linux::configure_receive_metadata(socket, remote)
 }
 
 #[cfg(test)]
