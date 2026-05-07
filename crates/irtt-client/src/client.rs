@@ -14,9 +14,10 @@ use crate::{
     config::{ClientConfig, RecvBudget, RunMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES},
     error::ClientError,
     event::{
-        ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
-        ServerTiming, SignedDuration, WarningKind,
+        ClientEvent, OneWayDelaySample, OpenOutcome, ReceivedStatsSample, RttSample, ServerTiming,
+        SignedDuration, WarningKind,
     },
+    metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
     session::{validate_negotiated_params, ActiveSession, ClientPhase, NegotiatedParams},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
@@ -431,7 +432,7 @@ impl Client {
                     one_way,
                     received_stats,
                     bytes: packet.len(),
-                    packet_meta: PacketMeta::default(),
+                    packet_meta: ReceiveMeta::default().into(),
                 });
             } else {
                 events.push(ClientEvent::EchoReply {
@@ -445,7 +446,7 @@ impl Client {
                     one_way,
                     received_stats,
                     bytes: packet.len(),
-                    packet_meta: PacketMeta::default(),
+                    packet_meta: ReceiveMeta::default().into(),
                 });
             }
             Ok(events)
@@ -478,7 +479,7 @@ impl Client {
                 one_way,
                 received_stats,
                 bytes: packet.len(),
-                packet_meta: PacketMeta::default(),
+                packet_meta: ReceiveMeta::default().into(),
             }])
         } else if session.highest_received_seq.is_some_and(|h| wire_seq < h) {
             // TODO: u32 ordering is acceptable for finite tests but continuous
@@ -495,7 +496,7 @@ impl Client {
                 one_way: None,
                 received_stats: build_received_stats(&reply),
                 bytes: packet.len(),
-                packet_meta: PacketMeta::default(),
+                packet_meta: ReceiveMeta::default().into(),
             }])
         } else {
             Ok(vec![ClientEvent::Warning {

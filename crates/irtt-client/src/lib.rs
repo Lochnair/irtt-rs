@@ -5,6 +5,7 @@ mod config;
 mod error;
 mod event;
 mod managed;
+mod metadata;
 mod probe;
 mod session;
 mod socket;
