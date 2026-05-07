@@ -51,6 +51,32 @@ fn params_from_config_maps_compatibility_fields() {
 }
 
 #[test]
+fn params_from_config_accepts_udp_payload_length_boundary_values() {
+    for length in [0, 1, 1472, 4096, MAX_UDP_PAYLOAD_LENGTH] {
+        let config = ClientConfig {
+            length,
+            ..ClientConfig::default()
+        };
+        assert_eq!(
+            params_from_config(&config).unwrap().length,
+            i64::from(length)
+        );
+    }
+}
+
+#[test]
+fn params_from_config_rejects_oversized_udp_payload_length() {
+    let config = ClientConfig {
+        length: MAX_UDP_PAYLOAD_LENGTH + 1,
+        ..ClientConfig::default()
+    };
+    assert!(matches!(
+        params_from_config(&config),
+        Err(ClientError::InvalidConfig { reason }) if reason.contains("packet length")
+    ));
+}
+
+#[test]
 fn params_from_config_encodes_continuous_duration_as_zero() {
     let config = ClientConfig {
         duration: None,
