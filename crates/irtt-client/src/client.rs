@@ -41,6 +41,7 @@ pub struct Client {
     negotiated: Option<NegotiatedParams>,
     phase: ClientPhase,
     session: Option<ActiveSession>,
+    recv_buffer: Vec<u8>,
 }
 
 impl Client {
@@ -68,6 +69,7 @@ impl Client {
             negotiated: None,
             phase: ClientPhase::Connected,
             session: None,
+            recv_buffer: vec![0_u8; MIN_RECV_BUFFER_SIZE],
         })
     }
 
@@ -289,9 +291,7 @@ impl Client {
             ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
 
-        let buf_size = self.recv_buffer_size();
-        let mut buf = vec![0_u8; buf_size];
-        let datagram = match recv_datagram(&self.socket, &mut buf) {
+        let datagram = match recv_datagram(&self.socket, &mut self.recv_buffer) {
             Ok(datagram) => datagram,
             Err(err)
                 if matches!(
@@ -305,7 +305,14 @@ impl Client {
         };
 
         let now = override_ts.unwrap_or(datagram.received_at);
-        self.process_received_packet(&buf[..datagram.len], now, datagram.meta)
+        let packet_len = datagram.len;
+        let Some(reply) = self.decode_received_packet(&self.recv_buffer[..packet_len]) else {
+            return Ok(vec![ClientEvent::Warning {
+                kind: WarningKind::MalformedOrUnrelatedPacket,
+                message: "dropped malformed or unrelated packet".to_owned(),
+            }]);
+        };
+        self.process_echo_reply(reply, packet_len, now, datagram.meta)
     }
 
     pub fn recv_available(&mut self, budget: RecvBudget) -> Result<Vec<ClientEvent>, ClientError> {
@@ -320,15 +327,9 @@ impl Client {
         Ok(all_events)
     }
 
+    #[cfg(test)]
     fn recv_buffer_size(&self) -> usize {
-        match self.negotiated.as_ref() {
-            Some(negotiated) => {
-                let has_hmac = self.config.hmac_key.is_some();
-                let pkt_len = echo_packet_len(has_hmac, &negotiated.params);
-                pkt_len.max(MIN_RECV_BUFFER_SIZE)
-            }
-            None => MIN_RECV_BUFFER_SIZE,
-        }
+        recv_buffer_size(self.config.hmac_key.is_some(), self.negotiated.as_ref())
     }
 
     pub fn poll_timeouts(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
@@ -381,28 +382,39 @@ impl Client {
             .map_or(0, |session| session.packets_sent)
     }
 
+    #[cfg(test)]
     fn process_received_packet(
         &mut self,
         packet: &[u8],
         now: ClientTimestamp,
         meta: ReceiveMeta,
     ) -> Result<Vec<ClientEvent>, ClientError> {
+        let packet_len = packet.len();
+        let Some(reply) = self.decode_received_packet(packet) else {
+            return Ok(vec![ClientEvent::Warning {
+                kind: WarningKind::MalformedOrUnrelatedPacket,
+                message: "dropped malformed or unrelated packet".to_owned(),
+            }]);
+        };
+        self.process_echo_reply(reply, packet_len, now, meta)
+    }
+
+    fn decode_received_packet(&self, packet: &[u8]) -> Option<EchoReply> {
         let negotiated = self
             .negotiated
             .as_ref()
             .expect("negotiated must exist when Open");
 
-        let reply =
-            match decode_echo_reply(packet, &negotiated.params, self.config.hmac_key.as_deref()) {
-                Ok(reply) => reply,
-                Err(_) => {
-                    return Ok(vec![ClientEvent::Warning {
-                        kind: WarningKind::MalformedOrUnrelatedPacket,
-                        message: "dropped malformed or unrelated packet".to_owned(),
-                    }]);
-                }
-            };
+        decode_echo_reply(packet, &negotiated.params, self.config.hmac_key.as_deref()).ok()
+    }
 
+    fn process_echo_reply(
+        &mut self,
+        reply: EchoReply,
+        packet_len: usize,
+        now: ClientTimestamp,
+        meta: ReceiveMeta,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
         let token = match self.phase {
             ClientPhase::Open { token } => token,
             _ => unreachable!(),
@@ -447,7 +459,7 @@ impl Client {
                     server_timing,
                     one_way,
                     received_stats,
-                    bytes: packet.len(),
+                    bytes: packet_len,
                     packet_meta: meta.into(),
                 });
             } else {
@@ -461,7 +473,7 @@ impl Client {
                     server_timing,
                     one_way,
                     received_stats,
-                    bytes: packet.len(),
+                    bytes: packet_len,
                     packet_meta: meta.into(),
                 });
             }
@@ -472,7 +484,7 @@ impl Client {
                 seq: wire_seq,
                 remote: self.remote,
                 received_at: now,
-                bytes: packet.len(),
+                bytes: packet_len,
             }])
         } else if let Some(timed_out) = session.timed_out.remove(wire_seq) {
             let rtt = compute_rtt(&timed_out.sent_at, &now, &reply.timestamps);
@@ -494,7 +506,7 @@ impl Client {
                 server_timing,
                 one_way,
                 received_stats,
-                bytes: packet.len(),
+                bytes: packet_len,
                 packet_meta: meta.into(),
             }])
         } else if session
@@ -512,7 +524,7 @@ impl Client {
                 server_timing: build_server_timing(&reply.timestamps),
                 one_way: None,
                 received_stats: build_received_stats(&reply),
-                bytes: packet.len(),
+                bytes: packet_len,
                 packet_meta: meta.into(),
             }])
         } else {
@@ -563,12 +575,14 @@ impl Client {
         let negotiated = NegotiatedParams {
             params: reply.params.clone(),
         };
+        let recv_buffer_size = recv_buffer_size(self.config.hmac_key.is_some(), Some(&negotiated));
         let negotiated_dscp =
             u8::try_from(negotiated.params.dscp).map_err(|_| ClientError::InvalidConfig {
                 reason: "negotiated dscp must be in range 0..=63".to_owned(),
             })?;
         apply_dscp_to_socket(&self.socket, self.remote, negotiated_dscp)?;
         self.negotiated = Some(negotiated.clone());
+        self.recv_buffer.resize(recv_buffer_size, 0);
         self.phase = ClientPhase::Open { token: reply.token };
 
         let duration_ns = negotiated.params.duration_ns;
@@ -686,6 +700,13 @@ fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
     left.checked_duration_since(right)
         .or_else(|| right.checked_duration_since(left))
         .unwrap_or(Duration::ZERO)
+}
+
+fn recv_buffer_size(has_hmac: bool, negotiated: Option<&NegotiatedParams>) -> usize {
+    match negotiated {
+        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params).max(MIN_RECV_BUFFER_SIZE),
+        None => MIN_RECV_BUFFER_SIZE,
+    }
 }
 
 fn compute_rtt(
