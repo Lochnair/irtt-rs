@@ -1835,28 +1835,54 @@ tests, and backend-neutral smoke tests can be explicitly run against a real
 
 ### Milestone 9 — Advanced Networking
 
+**Status:** Complete as of PG7 cleanup.
+
 **Goal:** Ancillary receive metadata for ECN/DSCP/kernel RX timestamps.
 
 **Files/modules:**
-- `crates/irtt-client/src/ancillary.rs` (feature-gated)
-- Platform-specific code
+- `crates/irtt-client/src/receive.rs`
+- `crates/irtt-client/src/receive/linux.rs` (Linux + `ancillary`)
+- `crates/irtt-client/src/metadata.rs`
+- `crates/irtt-client/src/event.rs`
+- `crates/irtt-cli/src/lib.rs`
 
-**Tasks:**
-1. Implement recvmsg wrapper (Linux)
-2. Extract IP_TOS / IPV6_TCLASS from ancillary data
-3. Extract kernel RX timestamp
-4. Populate PacketMeta
-5. macOS support (if feasible)
-6. Test with `irtt server --ecn`
+**Implemented scope:**
+1. Added internal `ReceiveMeta` and event-facing `PacketMeta` plumbing.
+2. Added a receive abstraction with a connected `UdpSocket::recv` fallback.
+   Unsupported platforms and builds without `ancillary` keep metadata
+   unavailable.
+3. Added a Linux `recvmsg` ancillary path behind the non-default `ancillary`
+   feature.
+4. Extracted inbound IPv4 TOS / IPv6 Traffic Class and exposed
+   `traffic_class`, `dscp`, and `ecn` metadata.
+5. Enabled Linux `SO_TIMESTAMPNS`, parsed `SCM_TIMESTAMPNS`, and exposed
+   kernel RX timestamps as additive metadata while preserving userspace
+   `received_at` semantics.
+6. Exposed M9 metadata in machine output for echo replies and late replies,
+   with `none` for unavailable values and numeric `0` for observed zero.
+7. Completed PG7 audit cleanup: ancillary parser hardening, packet length and
+   negotiated length validation, continuous-mode sequence and scheduling
+   hardening, HMAC helper API cleanup, duration negotiation wording cleanup,
+   and read-timeout restore failure reporting.
 
 **Tests:**
-- Integration: verify ancillary data extraction on Linux
-- Interop: verify ECN behavior with server --ecn
-- Unit: ancillary data parsing
+- Self-contained fallback receive, metadata propagation, machine output, and
+  Linux ancillary tests.
+- Linux + `ancillary` tests cover receive length/payload, inbound Traffic
+  Class/DSCP/ECN when the kernel provides it, kernel RX timestamps when the
+  kernel provides them, and parser edge cases.
 
-**Success criteria:** PacketMeta populated with real values on supported platforms.
+**Out of scope:** SO_TIMESTAMPING, hardware timestamps, TX timestamps,
+receive-side TTL/hop-limit metadata, packet-info/interface metadata, stats
+architecture extraction, JSON, async/Tokio, packet capture integration, and
+production server behavior.
 
-**Risks:** High platform variability. macOS ancillary API differences. ECN behavior not fully verified.
+**Success criteria:** PacketMeta remains unavailable by default/fallback and is
+populated with real values on Linux when `ancillary` is enabled and the kernel
+provides the requested control messages.
+
+**Risks:** High platform variability. macOS ancillary API differences. ECN
+behavior with real servers is not asserted by default tests.
 
 ---
 
