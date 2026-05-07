@@ -2,6 +2,7 @@
     not(all(target_os = "linux", feature = "ancillary")),
     forbid(unsafe_code)
 )]
+#![cfg_attr(all(target_os = "linux", feature = "ancillary"), deny(unsafe_code))]
 
 mod client;
 mod config;

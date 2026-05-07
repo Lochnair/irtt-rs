@@ -1,3 +1,4 @@
+#![allow(unsafe_code)]
 use std::{
     io, mem,
     net::{SocketAddr, UdpSocket},
