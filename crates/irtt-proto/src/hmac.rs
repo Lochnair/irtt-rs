@@ -2,7 +2,7 @@ use hmac::{Hmac, Mac};
 use md5::Md5;
 use subtle::ConstantTimeEq;
 
-use crate::{flags::FLAG_HMAC, ProtoError, Result, HEADER_SIZE, HMAC_SIZE};
+use crate::{ProtoError, Result, HEADER_SIZE, HMAC_SIZE};
 
 type HmacMd5 = Hmac<Md5>;
 
@@ -24,7 +24,6 @@ pub fn compute_hmac_in_place(key: &[u8], packet: &mut [u8], hmac_offset: usize) 
     if packet.len().saturating_sub(hmac_offset) < HMAC_SIZE {
         return Err(ProtoError::InvalidHmacOffset);
     }
-    packet[3] |= FLAG_HMAC;
     packet[hmac_offset..hmac_offset + HMAC_SIZE].fill(0);
     let digest = compute_hmac(key, packet, hmac_offset)?;
     packet[hmac_offset..hmac_offset + HMAC_SIZE].copy_from_slice(&digest);
@@ -51,7 +50,10 @@ pub(crate) fn hmac_offset() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{flags::FLAG_OPEN, MAGIC};
+    use crate::{
+        flags::{FLAG_HMAC, FLAG_OPEN},
+        MAGIC,
+    };
 
     #[test]
     fn compute_and_verify_hmac() {
@@ -67,5 +69,22 @@ mod tests {
             verify_hmac(b"wrong", &packet, hmac_offset()),
             Err(ProtoError::BadHmac)
         );
+    }
+
+    #[test]
+    fn compute_hmac_in_place_does_not_set_hmac_flag() {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&MAGIC);
+        packet.push(FLAG_OPEN);
+        packet.extend_from_slice(&[0; HMAC_SIZE]);
+        packet.extend_from_slice(&[1, 2, 3, 4]);
+
+        compute_hmac_in_place(b"testkey", &mut packet, hmac_offset()).unwrap();
+
+        assert_eq!(packet[3], FLAG_OPEN);
+        assert!(packet[hmac_offset()..hmac_offset() + HMAC_SIZE]
+            .iter()
+            .any(|byte| *byte != 0));
+        assert_eq!(&packet[hmac_offset() + HMAC_SIZE..], &[1, 2, 3, 4]);
     }
 }
