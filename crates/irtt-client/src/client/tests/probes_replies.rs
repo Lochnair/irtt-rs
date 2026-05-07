@@ -1585,6 +1585,66 @@ fn send_probe_wraps_wire_sequence_at_u32_max() {
 }
 
 #[test]
+fn wrapped_reply_after_u32_max_is_not_late() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+        socket.send_to(&reply, peer).unwrap();
+
+        socket
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let mut seqs = Vec::new();
+        for _ in 0..2 {
+            let mut buf = [0_u8; 2048];
+            let (size, _) = socket.recv_from(&mut buf).unwrap();
+            tx.send(buf[..size].to_vec()).unwrap();
+            seqs.push(u32::from_le_bytes(buf[12..16].try_into().unwrap()));
+        }
+        assert_eq!(seqs, vec![u32::MAX, 0]);
+
+        let ts = TimestampFields::default();
+        let reply_max = echo_reply_packet(TOKEN, u32::MAX, &params, &ts, None);
+        socket.send_to(&reply_max, peer).unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let reply_zero = echo_reply_packet(TOKEN, 0, &params, &ts, None);
+        socket.send_to(&reply_zero, peer).unwrap();
+    });
+    let config = ClientConfig {
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    let session = client.session.as_mut().unwrap();
+    session.next_wire_seq = u32::MAX;
+    session.next_logical_seq = 41;
+
+    client.send_probe().unwrap();
+    client.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(50));
+
+    let first = client.recv_once().unwrap();
+    assert!(matches!(
+        &first[0],
+        ClientEvent::EchoReply { seq: u32::MAX, .. }
+    ));
+
+    thread::sleep(Duration::from_millis(30));
+    let second = client.recv_once().unwrap();
+    assert!(
+        matches!(&second[0], ClientEvent::EchoReply { seq: 0, .. }),
+        "freshly wrapped reply should not be late, got {:?}",
+        second[0]
+    );
+    server.join();
+}
+
+#[test]
 fn send_probe_after_sending_done_is_noop() {
     let params = default_params();
     let server = silent_open_server(params);
