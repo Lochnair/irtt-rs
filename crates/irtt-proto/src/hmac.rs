@@ -10,10 +10,12 @@ pub fn compute_hmac(key: &[u8], packet: &[u8], hmac_offset: usize) -> Result<[u8
     if packet.len().saturating_sub(hmac_offset) < HMAC_SIZE {
         return Err(ProtoError::InvalidHmacOffset);
     }
-    let mut copy = packet.to_vec();
-    copy[hmac_offset..hmac_offset + HMAC_SIZE].fill(0);
+    let hmac_end = hmac_offset + HMAC_SIZE;
+    let zero_hmac = [0u8; HMAC_SIZE];
     let mut mac = HmacMd5::new_from_slice(key).expect("HMAC accepts keys of any size");
-    mac.update(&copy);
+    mac.update(&packet[..hmac_offset]);
+    mac.update(&zero_hmac);
+    mac.update(&packet[hmac_end..]);
     let bytes = mac.finalize().into_bytes();
     let mut out = [0u8; HMAC_SIZE];
     out.copy_from_slice(&bytes);
@@ -24,7 +26,6 @@ pub fn compute_hmac_in_place(key: &[u8], packet: &mut [u8], hmac_offset: usize) 
     if packet.len().saturating_sub(hmac_offset) < HMAC_SIZE {
         return Err(ProtoError::InvalidHmacOffset);
     }
-    packet[hmac_offset..hmac_offset + HMAC_SIZE].fill(0);
     let digest = compute_hmac(key, packet, hmac_offset)?;
     packet[hmac_offset..hmac_offset + HMAC_SIZE].copy_from_slice(&digest);
     Ok(())
@@ -55,13 +56,36 @@ mod tests {
         MAGIC,
     };
 
-    #[test]
-    fn compute_and_verify_hmac() {
+    fn reference_copy_zero_hmac(
+        key: &[u8],
+        packet: &[u8],
+        hmac_offset: usize,
+    ) -> Result<[u8; HMAC_SIZE]> {
+        if packet.len().saturating_sub(hmac_offset) < HMAC_SIZE {
+            return Err(ProtoError::InvalidHmacOffset);
+        }
+        let mut copy = packet.to_vec();
+        copy[hmac_offset..hmac_offset + HMAC_SIZE].fill(0);
+        let mut mac = HmacMd5::new_from_slice(key).expect("HMAC accepts keys of any size");
+        mac.update(&copy);
+        let bytes = mac.finalize().into_bytes();
+        let mut out = [0u8; HMAC_SIZE];
+        out.copy_from_slice(&bytes);
+        Ok(out)
+    }
+
+    fn packet_with_hmac_field(hmac_bytes: [u8; HMAC_SIZE]) -> Vec<u8> {
         let mut packet = Vec::new();
         packet.extend_from_slice(&MAGIC);
         packet.push(FLAG_OPEN | FLAG_HMAC);
-        packet.extend_from_slice(&[0; HMAC_SIZE]);
+        packet.extend_from_slice(&hmac_bytes);
         packet.extend_from_slice(&[1, 2, 3, 4]);
+        packet
+    }
+
+    #[test]
+    fn compute_and_verify_hmac() {
+        let mut packet = packet_with_hmac_field([0; HMAC_SIZE]);
 
         compute_hmac_in_place(b"testkey", &mut packet, hmac_offset()).unwrap();
         verify_hmac(b"testkey", &packet, hmac_offset()).unwrap();
@@ -69,6 +93,27 @@ mod tests {
             verify_hmac(b"wrong", &packet, hmac_offset()),
             Err(ProtoError::BadHmac)
         );
+    }
+
+    #[test]
+    fn compute_hmac_does_not_mutate_input() {
+        let packet = packet_with_hmac_field([0xa5; HMAC_SIZE]);
+        let original = packet.clone();
+
+        let _digest = compute_hmac(b"testkey", &packet, hmac_offset()).unwrap();
+
+        assert_eq!(packet, original);
+    }
+
+    #[test]
+    fn compute_hmac_matches_copy_and_zero_semantics() {
+        let mut packet = packet_with_hmac_field([0xa5; HMAC_SIZE]);
+        packet.extend_from_slice(&[5, 6, 7, 8, 9]);
+
+        let digest = compute_hmac(b"testkey", &packet, hmac_offset()).unwrap();
+        let reference = reference_copy_zero_hmac(b"testkey", &packet, hmac_offset()).unwrap();
+
+        assert_eq!(digest, reference);
     }
 
     #[test]
@@ -86,5 +131,38 @@ mod tests {
             .iter()
             .any(|byte| *byte != 0));
         assert_eq!(&packet[hmac_offset() + HMAC_SIZE..], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn compute_hmac_in_place_only_writes_hmac_field() {
+        let mut packet = packet_with_hmac_field([0xa5; HMAC_SIZE]);
+        packet.extend_from_slice(&[5, 6, 7, 8, 9]);
+        let original = packet.clone();
+
+        compute_hmac_in_place(b"testkey", &mut packet, hmac_offset()).unwrap();
+
+        assert_eq!(&packet[..hmac_offset()], &original[..hmac_offset()]);
+        assert_ne!(
+            &packet[hmac_offset()..hmac_offset() + HMAC_SIZE],
+            &original[hmac_offset()..hmac_offset() + HMAC_SIZE]
+        );
+        assert_eq!(
+            &packet[hmac_offset() + HMAC_SIZE..],
+            &original[hmac_offset() + HMAC_SIZE..]
+        );
+    }
+
+    #[test]
+    fn verify_hmac_rejects_modified_authenticated_byte() {
+        let mut packet = packet_with_hmac_field([0; HMAC_SIZE]);
+        compute_hmac_in_place(b"testkey", &mut packet, hmac_offset()).unwrap();
+
+        verify_hmac(b"testkey", &packet, hmac_offset()).unwrap();
+        packet[hmac_offset() + HMAC_SIZE + 1] ^= 0x01;
+
+        assert_eq!(
+            verify_hmac(b"testkey", &packet, hmac_offset()),
+            Err(ProtoError::BadHmac)
+        );
     }
 }
