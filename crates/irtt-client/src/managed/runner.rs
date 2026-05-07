@@ -25,6 +25,13 @@ const MAX_SLEEP: Duration = Duration::from_millis(20);
 #[derive(Debug)]
 pub struct ManagedClient;
 
+/// Running managed client session.
+///
+/// [`ManagedClientSession::join`] waits for the worker and returns the session
+/// outcome or client error. Dropping the session requests cooperative
+/// cancellation; callers that need the outcome should explicitly join instead
+/// of relying on drop.
+#[must_use = "dropping the session cancels the managed client; call join() to wait for completion"]
 #[derive(Debug)]
 pub struct ManagedClientSession {
     hub: EventHub,
@@ -32,6 +39,12 @@ pub struct ManagedClientSession {
     worker: Option<JoinHandle<Result<SessionOutcome, ClientError>>>,
 }
 
+/// Outcome returned by a completed managed client session.
+///
+/// These are runner-level lifecycle counters, not statistical summaries. Use
+/// `irtt-stats` with emitted `ClientEvent` values for RTT, loss, IPDV, and
+/// related summaries.
+#[must_use = "managed session outcomes contain completion status and counters"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOutcome {
     pub end_reason: SessionEndReason,
@@ -111,7 +124,10 @@ impl ManagedClientSession {
     }
 
     pub fn join(mut self) -> Result<SessionOutcome, ClientError> {
-        let worker = self.worker.take().expect("worker handle must be present");
+        let worker = self
+            .worker
+            .take()
+            .expect("ManagedClientSession invariant violated: worker handle missing before join");
         match worker.join() {
             Ok(outcome) => {
                 self.hub.disconnect_all();

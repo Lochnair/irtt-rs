@@ -17,6 +17,7 @@ impl CancellationToken {
         self.cancelled.store(true, Ordering::SeqCst);
     }
 
+    #[must_use]
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
@@ -32,12 +33,14 @@ mod tests {
     }
 
     #[test]
-    fn cancel_is_visible_through_clones() {
+    fn cancel_is_idempotent_and_visible_through_clones() {
         let token = CancellationToken::new();
         let clone = token.clone();
 
         token.cancel();
+        token.cancel();
 
+        assert!(token.is_cancelled());
         assert!(clone.is_cancelled());
     }
 }

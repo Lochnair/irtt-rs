@@ -23,10 +23,17 @@ impl Default for SubscriberConfig {
     }
 }
 
+/// Overflow behavior for a bounded event subscription queue.
+///
+/// These policies are applied independently per subscriber when that
+/// subscriber's queue is full.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubscriberOverflow {
+    /// Leave the existing queue unchanged and discard the newly published event.
     DropNewest,
+    /// Remove the oldest queued event and enqueue the newly published event.
     DropOldest,
+    /// Disconnect the subscriber and clear its queue.
     Disconnect,
 }
 
@@ -41,6 +48,12 @@ struct HubInner {
     subscribers: Mutex<HashMap<u64, Arc<SubscriberInner>>>,
 }
 
+/// Handle for receiving managed client events.
+///
+/// Each subscription has its own bounded queue configured by
+/// [`SubscriberConfig`]. The configured [`SubscriberOverflow`] policy applies
+/// when that queue is full. Dropping the handle unregisters the subscriber.
+#[must_use = "dropping the subscription unregisters it"]
 #[derive(Debug)]
 pub struct EventSubscription {
     id: u64,
@@ -115,6 +128,8 @@ impl EventHub {
 
         let mut disconnected = Vec::new();
         for (id, subscriber) in subscribers {
+            // Events are cloned per subscriber; bounded queues keep slow
+            // consumers from causing unbounded memory growth.
             if !subscriber.publish(event.clone()) {
                 disconnected.push(id);
             }
@@ -166,6 +181,11 @@ impl Default for EventHub {
 }
 
 impl EventSubscription {
+    /// Block until the next queued event is available.
+    ///
+    /// If the subscription is disconnected, this returns
+    /// [`EventSubscriptionError::Disconnected`] after any already queued events
+    /// have been drained.
     pub fn recv(&self) -> Result<ClientEvent, EventSubscriptionError> {
         let mut state = self.inner.state.lock().expect("subscriber mutex poisoned");
         loop {
@@ -183,6 +203,12 @@ impl EventSubscription {
         }
     }
 
+    /// Try to receive one queued event without blocking.
+    ///
+    /// Returns `Ok(None)` when the subscription is still connected but no event
+    /// is queued. If the subscription is disconnected, this returns
+    /// [`EventSubscriptionError::Disconnected`] after any already queued events
+    /// have been drained.
     pub fn try_recv(&self) -> Result<Option<ClientEvent>, EventSubscriptionError> {
         let mut state = self.inner.state.lock().expect("subscriber mutex poisoned");
         if let Some(event) = state.queue.pop_front() {
