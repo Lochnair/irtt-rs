@@ -1,9 +1,15 @@
 [package]
 name = "irtt-proto"
 version = "0.1.0"
+description = "IRTT protocol encoding and decoding primitives"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["irtt", "networking", "latency", "protocol"]
+categories = ["network-programming"]
 
 [dependencies]
 hmac = "0.12"

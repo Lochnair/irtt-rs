@@ -1,9 +1,15 @@
 [package]
 name = "irtt-cli"
 version = "0.1.0"
+description = "Command-line IRTT-compatible client"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["irtt", "networking", "latency", "rtt"]
+categories = ["command-line-utilities", "network-programming"]
 
 [features]
 default = ["stats"]
