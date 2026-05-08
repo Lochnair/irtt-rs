@@ -6,4 +6,4 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-irtt-client = { path = "../irtt-client" }
+irtt-client.workspace = true
