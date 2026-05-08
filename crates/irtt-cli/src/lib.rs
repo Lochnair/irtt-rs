@@ -87,6 +87,10 @@ pub struct CliArgs {
     /// Output format: human, simple, machine, or rtt-us.
     #[arg(long, value_enum, default_value_t = OutputMode::Human)]
     pub output: OutputMode,
+
+    /// Include extra fields in human output.
+    #[arg(long)]
+    pub verbose: bool,
 }
 
 impl CliArgs {
@@ -322,6 +326,11 @@ pub struct HumanEventStats {
     pub receive_ipdv: Option<Duration>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HumanOutputOptions {
+    pub verbose: bool,
+}
+
 #[cfg(feature = "stats")]
 impl From<irtt_stats::EventStatsUpdate> for HumanEventStats {
     fn from(value: irtt_stats::EventStatsUpdate) -> Self {
@@ -335,6 +344,14 @@ impl From<irtt_stats::EventStatsUpdate> for HumanEventStats {
 }
 
 pub fn format_human_event(event: &ClientEvent, stats: Option<HumanEventStats>) -> String {
+    format_human_event_with_options(event, stats, HumanOutputOptions::default())
+}
+
+pub fn format_human_event_with_options(
+    event: &ClientEvent,
+    stats: Option<HumanEventStats>,
+    options: HumanOutputOptions,
+) -> String {
     match event {
         ClientEvent::SessionStarted { remote, token, .. } => {
             format!("session started  remote={remote}  token={token:#x}")
@@ -355,16 +372,19 @@ pub fn format_human_event(event: &ClientEvent, stats: Option<HumanEventStats>) -
             received_stats,
             ..
         } => {
-            let mut out = format!(
-                "seq={seq}  logical_seq={logical_seq}  rtt={}",
-                format_duration(rtt.effective)
-            );
+            let mut out = format!("seq={seq}");
+            if options.verbose {
+                write!(out, "  logical_seq={logical_seq}").unwrap();
+            }
+            write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
             write_human_one_way(&mut out, *one_way);
             write!(out, "  ipdv={}", format_human_ipdv(stats)).unwrap();
             if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
                 write!(out, "  proc={}", format_duration(processing)).unwrap();
             }
-            write_human_received_stats(&mut out, *received_stats);
+            if options.verbose {
+                write_human_received_stats(&mut out, *received_stats);
+            }
             out
         }
         ClientEvent::EchoLoss {
@@ -1277,11 +1297,14 @@ mod tests {
     #[test]
     fn human_uses_readable_per_event_lines() {
         let line = format_event(&reply_event(), OutputMode::Human).unwrap();
-        assert!(line.starts_with("seq=7  logical_seq=8  rtt=1.2ms"));
+        assert!(line.starts_with("seq=7  rtt=1.2ms"));
         assert!(line.contains("rd=500.0µs"));
         assert!(line.contains("sd=400.0µs"));
         assert!(line.contains("ipdv=n/a"));
         assert!(line.contains("proc=300.0µs"));
+        assert!(!line.contains("logical_seq="));
+        assert!(!line.contains("server_received="));
+        assert!(!line.contains("server_window="));
         assert!(!line.contains("rtt_us="));
         assert_ne!(
             line,
@@ -1291,6 +1314,19 @@ mod tests {
         assert!(!OutputMode::Simple.prints_summary());
         assert!(!OutputMode::Machine.prints_summary());
         assert!(!OutputMode::RttUs.prints_summary());
+    }
+
+    #[test]
+    fn verbose_human_reply_includes_extra_fields() {
+        let line = format_human_event_with_options(
+            &reply_event(),
+            None,
+            HumanOutputOptions { verbose: true },
+        );
+
+        assert!(line.contains("logical_seq=8"));
+        assert!(line.contains("server_received=9"));
+        assert!(line.contains("server_window=0x7"));
     }
 
     #[test]

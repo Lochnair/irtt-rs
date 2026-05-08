@@ -10,7 +10,9 @@ use std::{
 };
 
 use clap::Parser;
-use irtt_cli::{format_event, format_human_event, CliArgs, OutputMode};
+use irtt_cli::{
+    format_event, format_human_event_with_options, CliArgs, HumanOutputOptions, OutputMode,
+};
 use irtt_client::{Client, ClientEvent, ClientTimestamp, OpenOutcome, RecvBudget};
 #[cfg(feature = "stats")]
 use irtt_stats::{StatsCollector, StatsConfig};
@@ -51,6 +53,9 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
     let mut stats = StatsCollector::new(stats_config(continuous));
     let mut output = EventOutput {
         mode,
+        human_options: HumanOutputOptions {
+            verbose: args.verbose,
+        },
         print_finite_summary: !continuous,
         out: &mut stdout,
         #[cfg(feature = "stats")]
@@ -178,6 +183,7 @@ fn sleep_until_next_send(deadline: Option<Instant>) {
 
 struct EventOutput<'a, W: Write> {
     mode: irtt_cli::OutputMode,
+    human_options: HumanOutputOptions,
     print_finite_summary: bool,
     out: &'a mut W,
     #[cfg(feature = "stats")]
@@ -201,7 +207,11 @@ impl<W: Write> EventOutput<'_, W> {
 
         let line =
             if self.mode == OutputMode::Human && !matches!(event, ClientEvent::EchoSent { .. }) {
-                Some(format_human_event(event, Some(stats_update.into())))
+                Some(format_human_event_with_options(
+                    event,
+                    Some(stats_update.into()),
+                    self.human_options,
+                ))
             } else {
                 format_event(event, self.mode)
             };
@@ -222,7 +232,12 @@ impl<W: Write> EventOutput<'_, W> {
             write!(
                 self.out,
                 "{}",
-                irtt_cli::summary::format_summary(&self.stats.summary())
+                irtt_cli::summary::format_summary_with_options(
+                    &self.stats.summary(),
+                    irtt_cli::summary::SummaryFormatOptions {
+                        verbose: self.human_options.verbose,
+                    },
+                )
             )?;
         }
 
@@ -364,6 +379,7 @@ mod tests {
         {
             let mut output = EventOutput {
                 mode: irtt_cli::OutputMode::RttUs,
+                human_options: HumanOutputOptions::default(),
                 print_finite_summary: true,
                 out: &mut out,
                 stats: &mut stats,
@@ -386,6 +402,7 @@ mod tests {
         {
             let mut output = EventOutput {
                 mode: irtt_cli::OutputMode::Human,
+                human_options: HumanOutputOptions::default(),
                 print_finite_summary: false,
                 out: &mut out,
                 stats: &mut stats,
@@ -404,6 +421,7 @@ mod tests {
         {
             let mut output = EventOutput {
                 mode: irtt_cli::OutputMode::Human,
+                human_options: HumanOutputOptions::default(),
                 print_finite_summary: false,
                 out: &mut out,
                 stats: &mut stats,
