@@ -1,7 +1,7 @@
 use crate::{
     flags::{has, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY},
     hmac,
-    layout::{echo_packet_len, PacketLayout},
+    layout::{try_echo_packet_len, PacketLayout},
     open::{check_hmac_presence, reject},
     params::Params,
     validate_header, write_header, ProtoError, Result, HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE,
@@ -43,7 +43,7 @@ pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Re
         flags |= FLAG_HMAC;
     }
     let layout = PacketLayout::echo(hmac_key.is_some(), &request.params);
-    let len = echo_packet_len(hmac_key.is_some(), &request.params);
+    let len = try_echo_packet_len(hmac_key.is_some(), &request.params)?;
     let payload_offset = layout.header_len();
     let available_payload_len = len.saturating_sub(payload_offset);
     if request.payload.len() > available_payload_len {
@@ -229,6 +229,17 @@ mod tests {
             })
         );
         assert_eq!(request, original);
+    }
+
+    #[test]
+    fn echo_request_rejects_negative_requested_length() {
+        let mut request = echo_request_with_payload(0, Vec::new());
+        request.params.length = -1;
+
+        assert_eq!(
+            encode_echo_request(&request, None),
+            Err(ProtoError::NegativePacketLength { length: -1 })
+        );
     }
 
     #[test]

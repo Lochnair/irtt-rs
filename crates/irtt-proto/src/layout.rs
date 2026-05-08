@@ -1,7 +1,7 @@
 use crate::{
     params::{Params, StampAt},
-    HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE,
-    TOKEN_SIZE,
+    ProtoError, Result, HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE,
+    TIMESTAMP_SIZE, TOKEN_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,6 +115,15 @@ pub fn echo_packet_len(hmac: bool, params: &Params) -> usize {
     let header_len = echo_header_len(hmac, params);
     let requested = usize::try_from(params.length).unwrap_or(0);
     header_len.max(requested)
+}
+
+pub fn try_echo_packet_len(hmac: bool, params: &Params) -> Result<usize> {
+    let header_len = echo_header_len(hmac, params);
+    let requested =
+        usize::try_from(params.length).map_err(|_| ProtoError::NegativePacketLength {
+            length: params.length,
+        })?;
+    Ok(header_len.max(requested))
 }
 
 #[cfg(test)]
@@ -294,5 +303,26 @@ mod tests {
         assert_eq!(echo_packet_len(false, &p), 60);
         p.length = 92;
         assert_eq!(echo_packet_len(false, &p), 92);
+    }
+
+    #[test]
+    fn checked_packet_len_rejects_negative_requested_length() {
+        let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
+        p.length = -1;
+
+        assert_eq!(
+            try_echo_packet_len(false, &p),
+            Err(ProtoError::NegativePacketLength { length: -1 })
+        );
+    }
+
+    #[test]
+    fn checked_packet_len_preserves_non_negative_header_floor() {
+        let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
+        p.length = 0;
+        assert_eq!(try_echo_packet_len(false, &p), Ok(60));
+
+        p.length = 92;
+        assert_eq!(try_echo_packet_len(false, &p), Ok(92));
     }
 }
