@@ -5,6 +5,18 @@ use irtt_stats::{
 };
 
 pub fn format_summary(summary: &FiniteSummary) -> String {
+    format_summary_with_options(summary, SummaryFormatOptions::default())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SummaryFormatOptions {
+    pub verbose: bool,
+}
+
+pub fn format_summary_with_options(
+    summary: &FiniteSummary,
+    options: SummaryFormatOptions,
+) -> String {
     let mut out = String::new();
     let packets = summary.packets;
     let loss = summary.loss;
@@ -21,8 +33,10 @@ pub fn format_summary(summary: &FiniteSummary) -> String {
     writeln!(out, "  {}", "-".repeat(82)).unwrap();
 
     write_signed_duration_row(&mut out, "RTT", &summary.rtt.primary);
-    write_duration_row(&mut out, "raw RTT", &summary.rtt.raw);
-    write_signed_duration_row(&mut out, "adjusted RTT", &summary.rtt.adjusted);
+    if options.verbose {
+        write_duration_row(&mut out, "raw RTT", &summary.rtt.raw);
+        write_signed_duration_row(&mut out, "adjusted RTT", &summary.rtt.adjusted);
+    }
     write_duration_row(&mut out, "IPDV/jitter", &summary.ipdv.round_trip);
     write_duration_row(&mut out, "send IPDV", &summary.ipdv.send);
     write_duration_row(&mut out, "receive IPDV", &summary.ipdv.receive);
@@ -257,12 +271,47 @@ mod tests {
         assert!(output.contains("bytes: sent=64 received=64"));
         assert!(output.contains("RTT"));
         assert!(output.contains("1.2ms"));
+        assert!(!output.contains("raw RTT"));
+        assert!(!output.contains("adjusted RTT"));
         assert!(output.contains("server processing"));
         assert!(output.contains("300.0µs"));
         assert!(output.contains("send call"));
         assert!(output.contains("10.0µs"));
         assert!(output.contains("timer error"));
         assert!(output.contains("2.0µs"));
+    }
+
+    #[test]
+    fn verbose_summary_includes_raw_and_adjusted_rtt_rows() {
+        let mut collector = StatsCollector::new(StatsConfig::finite());
+        let received_at = test_timestamp(Duration::from_secs(1) + Duration::from_micros(1500));
+        collector.process(&ClientEvent::EchoReply {
+            seq: 1,
+            logical_seq: 1,
+            remote: test_remote(),
+            sent_at: test_timestamp(Duration::from_secs(1)),
+            received_at,
+            rtt: RttSample {
+                raw: Duration::from_micros(1500),
+                adjusted: Some(Duration::from_micros(1200)),
+                effective: Duration::from_micros(1200),
+                adjusted_signed: Some(SignedDuration { ns: 1_200_000 }),
+                effective_signed: SignedDuration { ns: 1_200_000 },
+            },
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
+        });
+
+        let output = format_summary_with_options(
+            &collector.summary(),
+            SummaryFormatOptions { verbose: true },
+        );
+
+        assert!(output.contains("raw RTT"));
+        assert!(output.contains("adjusted RTT"));
     }
 
     #[test]
