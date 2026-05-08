@@ -318,10 +318,17 @@ pub fn format_event(event: &ClientEvent, mode: OutputMode) -> Option<String> {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct HumanEventStats {
     pub contributed_sample: bool,
-    pub rtt_ipdv: Option<Duration>,
+    pub ipdv_pairs: Vec<HumanIpdvPair>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HumanIpdvPair {
+    pub previous_logical_seq: u64,
+    pub current_logical_seq: u64,
+    pub rtt_ipdv: Duration,
     pub send_ipdv: Option<Duration>,
     pub receive_ipdv: Option<Duration>,
 }
@@ -336,6 +343,17 @@ impl From<irtt_stats::EventStatsUpdate> for HumanEventStats {
     fn from(value: irtt_stats::EventStatsUpdate) -> Self {
         Self {
             contributed_sample: value.contributed_sample,
+            ipdv_pairs: value.ipdv_pairs.into_iter().map(Into::into).collect(),
+        }
+    }
+}
+
+#[cfg(feature = "stats")]
+impl From<irtt_stats::IpdvPairUpdate> for HumanIpdvPair {
+    fn from(value: irtt_stats::IpdvPairUpdate) -> Self {
+        Self {
+            previous_logical_seq: value.previous_logical_seq,
+            current_logical_seq: value.current_logical_seq,
             rtt_ipdv: value.rtt_ipdv,
             send_ipdv: value.send_ipdv,
             receive_ipdv: value.receive_ipdv,
@@ -352,6 +370,8 @@ pub fn format_human_event_with_options(
     stats: Option<HumanEventStats>,
     options: HumanOutputOptions,
 ) -> String {
+    let stats = stats.as_ref();
+
     match event {
         ClientEvent::SessionStarted { remote, token, .. } => {
             format!("session started  remote={remote}  token={token:#x}")
@@ -378,7 +398,12 @@ pub fn format_human_event_with_options(
             }
             write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
             write_human_one_way(&mut out, *one_way);
-            write!(out, "  ipdv={}", format_human_ipdv(stats)).unwrap();
+            write!(
+                out,
+                "  ipdv={}",
+                format_human_ipdv(stats, Some(*logical_seq))
+            )
+            .unwrap();
             if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
                 write!(out, "  proc={}", format_duration(processing)).unwrap();
             }
@@ -412,7 +437,7 @@ pub fn format_human_event_with_options(
             if let Some(rtt) = rtt {
                 write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
                 write_human_one_way(&mut out, *one_way);
-                write!(out, "  ipdv={}", format_human_ipdv(stats)).unwrap();
+                write!(out, "  ipdv={}", format_human_ipdv(stats, *logical_seq)).unwrap();
             }
             write_human_received_stats(&mut out, *received_stats);
             out
@@ -737,11 +762,22 @@ fn write_human_received_stats(out: &mut String, stats: Option<ReceivedStatsSampl
     }
 }
 
-fn format_human_ipdv(stats: Option<HumanEventStats>) -> String {
-    match stats.and_then(|stats| stats.rtt_ipdv) {
-        Some(ipdv) => format_duration(ipdv),
-        None => "n/a".to_owned(),
-    }
+fn format_human_ipdv(stats: Option<&HumanEventStats>, logical_seq: Option<u64>) -> String {
+    let Some(stats) = stats else {
+        return "n/a".to_owned();
+    };
+
+    let pair = logical_seq
+        .and_then(|seq| {
+            stats
+                .ipdv_pairs
+                .iter()
+                .find(|pair| pair.current_logical_seq == seq)
+        })
+        .or_else(|| stats.ipdv_pairs.last());
+
+    pair.map(|pair| format_duration(pair.rtt_ipdv))
+        .unwrap_or_else(|| "n/a".to_owned())
 }
 
 fn write_optional_u8(out: &mut String, key: &str, value: Option<u8>) {
@@ -1335,9 +1371,13 @@ mod tests {
             &reply_event(),
             Some(HumanEventStats {
                 contributed_sample: true,
-                rtt_ipdv: Some(Duration::from_micros(47)),
-                send_ipdv: None,
-                receive_ipdv: None,
+                ipdv_pairs: vec![HumanIpdvPair {
+                    previous_logical_seq: 7,
+                    current_logical_seq: 8,
+                    rtt_ipdv: Duration::from_micros(47),
+                    send_ipdv: None,
+                    receive_ipdv: None,
+                }],
             }),
         );
 
