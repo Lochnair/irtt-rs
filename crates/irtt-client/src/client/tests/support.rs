@@ -81,12 +81,23 @@ pub(super) fn echo_reply_packet(
     timestamps: &TimestampFields,
     hmac_key: Option<&[u8]>,
 ) -> Vec<u8> {
+    echo_reply_packet_with_flags(token, seq, params, timestamps, hmac_key, FLAG_REPLY)
+}
+
+pub(super) fn echo_reply_packet_with_flags(
+    token: u64,
+    seq: u32,
+    params: &Params,
+    timestamps: &TimestampFields,
+    hmac_key: Option<&[u8]>,
+    flags: u8,
+) -> Vec<u8> {
     let has_hmac = hmac_key.is_some();
     let layout = PacketLayout::echo(has_hmac, params);
     let packet_len = echo_packet_len(has_hmac, params);
     let mut packet = Vec::with_capacity(packet_len);
 
-    let mut flags = FLAG_REPLY;
+    let mut flags = flags;
     if has_hmac {
         flags |= FLAG_HMAC;
     }
