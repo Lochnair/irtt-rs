@@ -707,7 +707,9 @@ fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
 
 fn recv_buffer_size(has_hmac: bool, negotiated: Option<&NegotiatedParams>) -> usize {
     match negotiated {
-        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params).max(MIN_RECV_BUFFER_SIZE),
+        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)
+            .saturating_add(1)
+            .max(MIN_RECV_BUFFER_SIZE),
         None => MIN_RECV_BUFFER_SIZE,
     }
 }
