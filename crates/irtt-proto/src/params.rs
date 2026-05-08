@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn params_round_trip_dscp_codepoints_without_shifting() {
-        for dscp in [0, 46, 63] {
+        for dscp in [0, 46, 63, 64, 184, -1] {
             let params = Params {
                 protocol_version: 1,
                 dscp,

@@ -52,3 +52,19 @@ fn strict_negotiation_rejects_negative_returned_length() {
         Err(ClientError::NegotiationRejected { reason }) if reason == "length must be non-negative"
     ));
 }
+
+#[test]
+fn loose_negotiation_rejects_runtime_invalid_returned_dscp() {
+    let config = ClientConfig::default();
+    let requested = params_from_config(&config).unwrap();
+
+    for dscp in [-1, 64] {
+        let mut returned = requested.clone();
+        returned.dscp = dscp;
+        assert!(matches!(
+            validate_negotiated_params(&requested, &returned, NegotiationPolicy::Loose),
+            Err(ClientError::NegotiationRejected { reason })
+                if reason == "dscp must be in range 0..=63"
+        ));
+    }
+}
