@@ -55,7 +55,12 @@ pub struct CliArgs {
     pub tstamp: TimestampArg,
 
     /// Received-stats mode to request.
-    #[arg(long = "stats", value_enum, default_value_t = ReceivedStatsArg::Both)]
+    #[arg(
+        long = "stats",
+        value_enum,
+        default_value_t = ReceivedStatsArg::Both,
+        help = "Server received-stats negotiation mode"
+    )]
     pub stats: ReceivedStatsArg,
 
     /// Server payload fill string to request, up to 32 bytes.
@@ -79,6 +84,7 @@ pub struct CliArgs {
     #[arg(long)]
     pub loose: bool,
 
+    /// Output format: human, simple, machine, or rtt-us.
     #[arg(long, value_enum, default_value_t = OutputMode::Human)]
     pub output: OutputMode,
 }
@@ -178,9 +184,13 @@ impl From<ReceivedStatsArg> for ReceivedStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum OutputMode {
+    /// Readable terminal output with a final summary.
     Human,
+    /// Parseable full event fields.
     Machine,
+    /// Simple key=value-ish event stream.
     Simple,
+    /// RTT microseconds only.
     RttUs,
 }
 
@@ -298,9 +308,98 @@ pub fn format_event(event: &ClientEvent, mode: OutputMode) -> Option<String> {
     }
     match mode {
         OutputMode::RttUs => format_rtt_us(event),
-        OutputMode::Human => Some(format_simple(event)),
+        OutputMode::Human => Some(format_human_event(event, None)),
         OutputMode::Machine => Some(format_machine(event)),
         OutputMode::Simple => Some(format_simple(event)),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct HumanEventStats {
+    pub contributed_sample: bool,
+    pub rtt_ipdv: Option<Duration>,
+    pub send_ipdv: Option<Duration>,
+    pub receive_ipdv: Option<Duration>,
+}
+
+#[cfg(feature = "stats")]
+impl From<irtt_stats::EventStatsUpdate> for HumanEventStats {
+    fn from(value: irtt_stats::EventStatsUpdate) -> Self {
+        Self {
+            contributed_sample: value.contributed_sample,
+            rtt_ipdv: value.rtt_ipdv,
+            send_ipdv: value.send_ipdv,
+            receive_ipdv: value.receive_ipdv,
+        }
+    }
+}
+
+pub fn format_human_event(event: &ClientEvent, stats: Option<HumanEventStats>) -> String {
+    match event {
+        ClientEvent::SessionStarted { remote, token, .. } => {
+            format!("session started  remote={remote}  token={token:#x}")
+        }
+        ClientEvent::NoTestCompleted { remote, .. } => {
+            format!("no-test completed  remote={remote}")
+        }
+        ClientEvent::SessionClosed { remote, token, .. } => {
+            format!("session closed  remote={remote}  token={token:#x}")
+        }
+        ClientEvent::EchoSent { .. } => String::new(),
+        ClientEvent::EchoReply {
+            seq,
+            logical_seq,
+            rtt,
+            server_timing,
+            one_way,
+            received_stats,
+            ..
+        } => {
+            let mut out = format!(
+                "seq={seq}  logical_seq={logical_seq}  rtt={}",
+                format_duration(rtt.effective)
+            );
+            write_human_one_way(&mut out, *one_way);
+            write!(out, "  ipdv={}", format_human_ipdv(stats)).unwrap();
+            if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
+                write!(out, "  proc={}", format_duration(processing)).unwrap();
+            }
+            write_human_received_stats(&mut out, *received_stats);
+            out
+        }
+        ClientEvent::EchoLoss {
+            seq, logical_seq, ..
+        } => {
+            format!("loss  seq={seq}  logical_seq={logical_seq}")
+        }
+        ClientEvent::DuplicateReply { seq, remote, .. } => {
+            format!("duplicate  seq={seq}  remote={remote}")
+        }
+        ClientEvent::LateReply {
+            seq,
+            logical_seq,
+            highest_seen,
+            remote,
+            rtt,
+            one_way,
+            received_stats,
+            ..
+        } => {
+            let mut out = format!(
+                "late  seq={seq}  logical_seq={}  highest_seen={highest_seen}  remote={remote}",
+                optional_u64(*logical_seq)
+            );
+            if let Some(rtt) = rtt {
+                write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
+                write_human_one_way(&mut out, *one_way);
+                write!(out, "  ipdv={}", format_human_ipdv(stats)).unwrap();
+            }
+            write_human_received_stats(&mut out, *received_stats);
+            out
+        }
+        ClientEvent::Warning { kind, message } => {
+            format!("warning  kind={}  message={message}", warning_kind(*kind))
+        }
     }
 }
 
@@ -592,6 +691,39 @@ fn write_packet_meta(out: &mut String, meta: PacketMeta) {
     }
 }
 
+fn write_human_one_way(out: &mut String, one_way: Option<OneWayDelaySample>) {
+    match one_way {
+        Some(one_way) => {
+            write!(
+                out,
+                "  rd={}  sd={}",
+                format_optional_duration(one_way.server_to_client),
+                format_optional_duration(one_way.client_to_server)
+            )
+            .unwrap();
+        }
+        None => out.push_str("  rd=n/a  sd=n/a"),
+    }
+}
+
+fn write_human_received_stats(out: &mut String, stats: Option<ReceivedStatsSample>) {
+    if let Some(stats) = stats {
+        if let Some(count) = stats.count {
+            write!(out, "  server_received={count}").unwrap();
+        }
+        if let Some(window) = stats.window {
+            write!(out, "  server_window={window:#x}").unwrap();
+        }
+    }
+}
+
+fn format_human_ipdv(stats: Option<HumanEventStats>) -> String {
+    match stats.and_then(|stats| stats.rtt_ipdv) {
+        Some(ipdv) => format_duration(ipdv),
+        None => "n/a".to_owned(),
+    }
+}
+
 fn write_optional_u8(out: &mut String, key: &str, value: Option<u8>) {
     match value {
         Some(value) => write!(out, " {key}={value}").unwrap(),
@@ -607,6 +739,28 @@ fn write_optional_i64(out: &mut String, key: &str, value: Option<i64>) {
 
 fn duration_us(duration: Duration) -> u128 {
     duration.as_micros()
+}
+
+fn format_optional_duration(duration: Option<Duration>) -> String {
+    duration
+        .map(format_duration)
+        .unwrap_or_else(|| "n/a".to_owned())
+}
+
+fn format_duration(duration: Duration) -> String {
+    format_ns(duration.as_nanos() as f64)
+}
+
+fn format_ns(ns: f64) -> String {
+    if ns < 1_000.0 {
+        format!("{ns:.0}ns")
+    } else if ns < 1_000_000.0 {
+        format!("{:.1}µs", ns / 1_000.0)
+    } else if ns < 1_000_000_000.0 {
+        format!("{:.1}ms", ns / 1_000_000.0)
+    } else {
+        format!("{:.3}s", ns / 1_000_000_000.0)
+    }
 }
 
 fn optional_u64(value: Option<u64>) -> String {
@@ -1123,14 +1277,73 @@ mod tests {
     #[test]
     fn human_uses_readable_per_event_lines() {
         let line = format_event(&reply_event(), OutputMode::Human).unwrap();
-        assert_eq!(
+        assert!(line.starts_with("seq=7  logical_seq=8  rtt=1.2ms"));
+        assert!(line.contains("rd=500.0µs"));
+        assert!(line.contains("sd=400.0µs"));
+        assert!(line.contains("ipdv=n/a"));
+        assert!(line.contains("proc=300.0µs"));
+        assert!(!line.contains("rtt_us="));
+        assert_ne!(
             line,
-            "reply seq=7 logical_seq=8 remote=127.0.0.1:2112 rtt_us=1200 raw_rtt_us=1500 server_processing_us=300"
+            format_event(&reply_event(), OutputMode::Simple).unwrap()
         );
         assert!(OutputMode::Human.prints_summary());
         assert!(!OutputMode::Simple.prints_summary());
         assert!(!OutputMode::Machine.prints_summary());
         assert!(!OutputMode::RttUs.prints_summary());
+    }
+
+    #[test]
+    fn human_reply_uses_supplied_ipdv_update() {
+        let line = format_human_event(
+            &reply_event(),
+            Some(HumanEventStats {
+                contributed_sample: true,
+                rtt_ipdv: Some(Duration::from_micros(47)),
+                send_ipdv: None,
+                receive_ipdv: None,
+            }),
+        );
+
+        assert!(line.contains("ipdv=47.0µs"));
+    }
+
+    #[test]
+    fn human_reply_marks_missing_one_way_delay_unavailable() {
+        let ClientEvent::EchoReply {
+            seq,
+            logical_seq,
+            remote,
+            sent_at,
+            received_at,
+            rtt,
+            server_timing,
+            received_stats,
+            bytes,
+            packet_meta,
+            ..
+        } = reply_event()
+        else {
+            unreachable!();
+        };
+        let event = ClientEvent::EchoReply {
+            seq,
+            logical_seq,
+            remote,
+            sent_at,
+            received_at,
+            rtt,
+            server_timing,
+            one_way: None,
+            received_stats,
+            bytes,
+            packet_meta,
+        };
+
+        let line = format_human_event(&event, None);
+
+        assert!(line.contains("rd=n/a"));
+        assert!(line.contains("sd=n/a"));
     }
 
     #[test]

@@ -10,7 +10,7 @@ use std::{
 };
 
 use clap::Parser;
-use irtt_cli::{format_event, CliArgs};
+use irtt_cli::{format_event, format_human_event, CliArgs, OutputMode};
 use irtt_client::{Client, ClientEvent, ClientTimestamp, OpenOutcome, RecvBudget};
 #[cfg(feature = "stats")]
 use irtt_stats::{StatsCollector, StatsConfig};
@@ -194,9 +194,19 @@ impl<W: Write> EventOutput<'_, W> {
 
     fn print_event(&mut self, event: &ClientEvent) -> io::Result<()> {
         #[cfg(feature = "stats")]
-        self.stats.process(event);
+        let stats_update = self.stats.process(event);
 
-        if let Some(line) = format_event(event, self.mode) {
+        #[cfg(not(feature = "stats"))]
+        let stats_update = irtt_cli::HumanEventStats::default();
+
+        let line =
+            if self.mode == OutputMode::Human && !matches!(event, ClientEvent::EchoSent { .. }) {
+                Some(format_human_event(event, Some(stats_update.into())))
+            } else {
+                format_event(event, self.mode)
+            };
+
+        if let Some(line) = line {
             writeln!(self.out, "{line}")?;
         }
         Ok(())
@@ -284,6 +294,35 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112)
     }
 
+    fn reply_event(logical_seq: u64, rtt_us: u64) -> ClientEvent {
+        let sent_at = test_timestamp(Duration::from_millis(logical_seq));
+        let received_at = ClientTimestamp {
+            wall: sent_at.wall + Duration::from_micros(rtt_us),
+            mono: sent_at.mono + Duration::from_micros(rtt_us),
+        };
+        ClientEvent::EchoReply {
+            seq: logical_seq as u32,
+            logical_seq,
+            remote: test_remote(),
+            sent_at,
+            received_at,
+            rtt: RttSample {
+                raw: Duration::from_micros(rtt_us),
+                adjusted: None,
+                effective: Duration::from_micros(rtt_us),
+                adjusted_signed: None,
+                effective_signed: SignedDuration {
+                    ns: i128::from(rtt_us) * 1_000,
+                },
+            },
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
+        }
+    }
+
     #[test]
     fn output_helper_streams_and_collects_events() {
         let sent_at = test_timestamp(Duration::from_secs(1));
@@ -355,6 +394,27 @@ mod tests {
         }
 
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn human_output_prints_ipdv_from_stats_update() {
+        let events = [reply_event(0, 1200), reply_event(1, 1250)];
+        let mut stats = StatsCollector::new(StatsConfig::finite());
+        let mut out = Vec::new();
+        {
+            let mut output = EventOutput {
+                mode: irtt_cli::OutputMode::Human,
+                print_finite_summary: false,
+                out: &mut out,
+                stats: &mut stats,
+            };
+            output.print_events(&events).unwrap();
+        }
+
+        let rendered = String::from_utf8(out).unwrap();
+        let mut lines = rendered.lines();
+        assert!(lines.next().unwrap().contains("ipdv=n/a"));
+        assert!(lines.next().unwrap().contains("ipdv=50.0µs"));
     }
 
     #[test]
