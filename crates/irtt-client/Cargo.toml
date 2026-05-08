@@ -6,7 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-irtt-proto = { path = "../irtt-proto" }
+irtt-proto.workspace = true
 libc = { version = "0.2", optional = true }
 socket2 = { version = "0.5", features = ["all"] }
 thiserror = "2"
