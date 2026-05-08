@@ -3,7 +3,7 @@ use std::time::Instant;
 use irtt_proto::{Params, PROTOCOL_VERSION};
 
 use crate::{
-    config::NegotiationPolicy,
+    config::{NegotiationPolicy, MAX_DSCP_CODEPOINT},
     error::ClientError,
     probe::{CompletedSet, PendingMap, TimedOutMap},
 };
@@ -63,6 +63,7 @@ pub(crate) fn validate_negotiated_params(
             reason: "interval must be positive".to_owned(),
         });
     }
+    validate_dscp_restriction(returned.dscp)?;
 
     if policy == NegotiationPolicy::Strict && returned != requested {
         return Err(ClientError::NegotiationRejected {
@@ -88,6 +89,16 @@ fn validate_duration_restriction(requested: i64, returned: i64) -> Result<(), Cl
     if requested > 0 && returned > requested {
         return Err(ClientError::NegotiationRejected {
             reason: "duration increased".to_owned(),
+        });
+    }
+
+    Ok(())
+}
+
+fn validate_dscp_restriction(returned: i64) -> Result<(), ClientError> {
+    if !(0..=i64::from(MAX_DSCP_CODEPOINT)).contains(&returned) {
+        return Err(ClientError::NegotiationRejected {
+            reason: format!("dscp must be in range 0..={MAX_DSCP_CODEPOINT}"),
         });
     }
 
