@@ -73,12 +73,16 @@ impl StatsCollector {
         }
     }
 
-    pub fn process(&mut self, event: &ClientEvent) {
+    pub fn process(&mut self, event: &ClientEvent) -> EventStatsUpdate {
+        self.process_with_update(event)
+    }
+
+    pub fn process_with_update(&mut self, event: &ClientEvent) -> EventStatsUpdate {
         let Some(window_event) = WindowEvent::from_client_event(event) else {
-            return;
+            return EventStatsUpdate::default();
         };
 
-        self.cumulative.apply(window_event.clone());
+        let update = self.cumulative.apply(window_event.clone());
 
         if let (Some(limit), Some(window)) =
             (self.config.rolling_count, self.rolling_count.as_mut())
@@ -100,6 +104,8 @@ impl StatsCollector {
                 }
             }
         }
+
+        update
     }
 
     pub fn cumulative(&self) -> CumulativeSnapshot {
@@ -131,6 +137,22 @@ impl StatsCollector {
 
 pub type RollingSnapshot = CumulativeSnapshot;
 pub type FiniteSummary = CumulativeSnapshot;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct EventStatsUpdate {
+    pub contributed_sample: bool,
+    pub rtt_ipdv: Option<Duration>,
+    pub send_ipdv: Option<Duration>,
+    pub receive_ipdv: Option<Duration>,
+}
+
+impl EventStatsUpdate {
+    fn merge_ipdv(&mut self, other: Self) {
+        self.rtt_ipdv = self.rtt_ipdv.or(other.rtt_ipdv);
+        self.send_ipdv = self.send_ipdv.or(other.send_ipdv);
+        self.receive_ipdv = self.receive_ipdv.or(other.receive_ipdv);
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct CumulativeSnapshot {
@@ -313,7 +335,8 @@ impl CoreStats {
         }
     }
 
-    fn apply(&mut self, event: WindowEvent) {
+    fn apply(&mut self, event: WindowEvent) -> EventStatsUpdate {
+        let mut update = EventStatsUpdate::default();
         match event {
             WindowEvent::Sent {
                 bytes,
@@ -340,6 +363,7 @@ impl CoreStats {
                     .packets
                     .bytes_received
                     .saturating_add(sample.bytes as u64);
+                update.contributed_sample = true;
                 if let Some(count) = sample.received_count {
                     self.packets.server_packets_received = Some(u64::from(count));
                 }
@@ -366,9 +390,9 @@ impl CoreStats {
                 if self.samples.insert(seq, sample).is_none() {
                     self.sample_order.push_back(seq);
                     self.enforce_sequence_limit();
-                    self.try_ipdv_pair(seq);
+                    update.merge_ipdv(self.try_ipdv_pair(seq));
                     if let Some(next) = seq.checked_add(1) {
-                        self.try_ipdv_pair(next);
+                        update.merge_ipdv(self.try_ipdv_pair(next));
                     }
                 }
             }
@@ -387,6 +411,7 @@ impl CoreStats {
                 self.events.untracked_late_replies += 1;
             }
         }
+        update
     }
 
     fn enforce_sequence_limit(&mut self) {
@@ -406,31 +431,39 @@ impl CoreStats {
         }
     }
 
-    fn try_ipdv_pair(&mut self, current_seq: u64) {
+    fn try_ipdv_pair(&mut self, current_seq: u64) -> EventStatsUpdate {
         let Some(previous_seq) = current_seq.checked_sub(1) else {
-            return;
+            return EventStatsUpdate::default();
         };
         if !self.ipdv_pairs.insert(current_seq) {
-            return;
+            return EventStatsUpdate::default();
         }
         let Some(previous) = self.samples.get(&previous_seq) else {
             self.ipdv_pairs.remove(&current_seq);
-            return;
+            return EventStatsUpdate::default();
         };
         let Some(current) = self.samples.get(&current_seq) else {
             self.ipdv_pairs.remove(&current_seq);
-            return;
+            return EventStatsUpdate::default();
         };
 
-        self.ipdv_round_trip.push(abs_i128_to_u64(
-            current.rtt_primary_ns - previous.rtt_primary_ns,
-        ));
+        let rtt_ipdv = abs_i128_to_u64(current.rtt_primary_ns - previous.rtt_primary_ns);
+        self.ipdv_round_trip.push(rtt_ipdv);
+        let mut update = EventStatsUpdate {
+            rtt_ipdv: Some(Duration::from_nanos(rtt_ipdv)),
+            ..EventStatsUpdate::default()
+        };
         if let Some(send_ipdv) = send_ipdv_ns(previous, current) {
-            self.ipdv_send.push(abs_i128_to_u64(send_ipdv));
+            let send_ipdv = abs_i128_to_u64(send_ipdv);
+            self.ipdv_send.push(send_ipdv);
+            update.send_ipdv = Some(Duration::from_nanos(send_ipdv));
         }
         if let Some(receive_ipdv) = receive_ipdv_ns(previous, current) {
-            self.ipdv_receive.push(abs_i128_to_u64(receive_ipdv));
+            let receive_ipdv = abs_i128_to_u64(receive_ipdv);
+            self.ipdv_receive.push(receive_ipdv);
+            update.receive_ipdv = Some(Duration::from_nanos(receive_ipdv));
         }
+        update
     }
 
     fn snapshot(&self) -> CumulativeSnapshot {
@@ -1221,11 +1254,16 @@ mod tests {
     #[test]
     fn ipdv_is_sequence_adjacent_and_gap_preserving() {
         let mut collector = StatsCollector::new(StatsConfig::finite());
-        collector.process(&reply(0, 10, 10));
-        collector.process(&reply(2, 15, 15));
-        collector.process(&reply(3, 12, 12));
+        let first = collector.process(&reply(0, 10, 10));
+        let gap = collector.process(&reply(2, 15, 15));
+        let adjacent = collector.process(&reply(3, 12, 12));
 
         let snapshot = collector.cumulative();
+        assert!(first.contributed_sample);
+        assert_eq!(first.rtt_ipdv, None);
+        assert!(gap.contributed_sample);
+        assert_eq!(gap.rtt_ipdv, None);
+        assert_eq!(adjacent.rtt_ipdv, Some(Duration::from_millis(3)));
         assert_eq!(snapshot.ipdv.round_trip.stats.count, 1);
         assert_eq!(snapshot.ipdv.round_trip.stats.total_ns, 3_000_000);
     }
@@ -1234,11 +1272,24 @@ mod tests {
     fn late_reply_can_complete_ipdv_pair() {
         let mut collector = StatsCollector::new(StatsConfig::finite());
         collector.process(&reply(1, 20, 20));
-        collector.process(&late_reply(0, 10, 10));
+        let update = collector.process(&late_reply(0, 10, 10));
 
         let snapshot = collector.cumulative();
+        assert!(update.contributed_sample);
+        assert_eq!(update.rtt_ipdv, Some(Duration::from_millis(10)));
         assert_eq!(snapshot.ipdv.round_trip.stats.count, 1);
         assert_eq!(snapshot.ipdv.round_trip.stats.total_ns, 10_000_000);
+    }
+
+    #[test]
+    fn update_exposes_directional_ipdv_when_available() {
+        let mut collector = StatsCollector::new(StatsConfig::finite());
+        collector.process(&reply(0, 10, 10));
+        let update = collector.process(&reply(1, 13, 13));
+
+        assert_eq!(update.rtt_ipdv, Some(Duration::from_millis(3)));
+        assert!(update.send_ipdv.is_some());
+        assert!(update.receive_ipdv.is_some());
     }
 
     #[test]
