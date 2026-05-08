@@ -10,26 +10,58 @@ pub fn format_summary(summary: &FiniteSummary) -> String {
     let loss = summary.loss;
 
     writeln!(out).unwrap();
-    writeln!(out, "--- irtt-rs statistics ---").unwrap();
+    writeln!(out, "irtt-rs summary").unwrap();
+    writeln!(out).unwrap();
     writeln!(
         out,
-        "packets: sent={} received={} lost={} loss={}",
+        "  {:<18} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Metric", "Count", "Min", "Mean", "Median", "Max", "Stddev"
+    )
+    .unwrap();
+    writeln!(out, "  {}", "-".repeat(82)).unwrap();
+
+    write_signed_duration_row(&mut out, "RTT", &summary.rtt.primary);
+    write_duration_row(&mut out, "raw RTT", &summary.rtt.raw);
+    write_signed_duration_row(&mut out, "adjusted RTT", &summary.rtt.adjusted);
+    write_duration_row(&mut out, "IPDV/jitter", &summary.ipdv.round_trip);
+    write_duration_row(&mut out, "send IPDV", &summary.ipdv.send);
+    write_duration_row(&mut out, "receive IPDV", &summary.ipdv.receive);
+    write_duration_row(&mut out, "send delay", &summary.one_way_delay.send_delay);
+    write_duration_row(
+        &mut out,
+        "receive delay",
+        &summary.one_way_delay.receive_delay,
+    );
+    write_duration_row_no_median(
+        &mut out,
+        "server processing",
+        &summary.server_processing.processing,
+    );
+    write_duration_row_no_median(&mut out, "send call", &summary.send_call);
+    write_duration_row_no_median(&mut out, "timer error", &summary.timer_error);
+
+    writeln!(out).unwrap();
+    writeln!(
+        out,
+        "packets: sent={} received={} unique={} lost={} loss={}",
         packets.packets_sent,
         packets.packets_received,
+        packets.unique_replies,
         loss.lost_packets,
         format_percent(loss.packet_loss_percent)
     )
     .unwrap();
-    writeln!(
-        out,
-        "replies: unique={} duplicates={} ({}) late={} ({})",
-        packets.unique_replies,
-        packets.duplicates,
-        format_percent(loss.duplicate_percent),
-        packets.late_packets,
-        format_percent(loss.late_packets_percent)
-    )
-    .unwrap();
+    if packets.duplicates != 0 || packets.late_packets != 0 {
+        writeln!(
+            out,
+            "replies: duplicates={} ({}) late={} ({})",
+            packets.duplicates,
+            format_percent(loss.duplicate_percent),
+            packets.late_packets,
+            format_percent(loss.late_packets_percent)
+        )
+        .unwrap();
+    }
     writeln!(
         out,
         "bytes: sent={} received={}",
@@ -37,101 +69,69 @@ pub fn format_summary(summary: &FiniteSummary) -> String {
     )
     .unwrap();
 
-    if let Some(count) = packets.server_packets_received {
-        writeln!(out, "server_received_count: {count}").unwrap();
-    }
-    if let Some(window) = packets.server_received_window {
-        writeln!(out, "server_received_window: {window:#x}").unwrap();
-    }
-
-    if let Some(line) = format_signed_duration_stats("rtt", &summary.rtt.primary) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats("raw_rtt", &summary.rtt.raw) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_signed_duration_stats("adjusted_rtt", &summary.rtt.adjusted) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats("ipdv", &summary.ipdv.round_trip) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats("send_ipdv", &summary.ipdv.send) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats("receive_ipdv", &summary.ipdv.receive) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats("send_delay", &summary.one_way_delay.send_delay) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats("receive_delay", &summary.one_way_delay.receive_delay)
-    {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) =
-        format_duration_stats_no_median("server_processing", &summary.server_processing.processing)
-    {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats_no_median("send_call", &summary.send_call) {
-        writeln!(out, "{line}").unwrap();
-    }
-    if let Some(line) = format_duration_stats_no_median("timer_error", &summary.timer_error) {
-        writeln!(out, "{line}").unwrap();
+    if packets.server_packets_received.is_some() || packets.server_received_window.is_some() {
+        write!(out, "server:").unwrap();
+        if let Some(count) = packets.server_packets_received {
+            write!(out, " received={count}").unwrap();
+        }
+        if let Some(window) = packets.server_received_window {
+            write!(out, " window={window:#x}").unwrap();
+        }
+        writeln!(out).unwrap();
     }
 
     out
 }
 
-fn format_duration_stats(label: &str, value: &DurationStatsWithMedian) -> Option<String> {
+fn write_duration_row(out: &mut String, label: &str, value: &DurationStatsWithMedian) {
     if value.stats.count == 0 {
-        return None;
+        return;
     }
-    Some(format!(
-        "{}: n={} min={} mean={} median={} max={} stddev={}",
-        label,
+    writeln!(
+        out,
+        "  {label:<18} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
         value.stats.count,
         format_ns_u64(value.stats.min_ns),
         format_ns_f64(value.stats.mean_ns),
         format_ns_f64_opt(value.median_ns),
         format_ns_u64(value.stats.max_ns),
         format_ns_f64(value.stddev_ns())
-    ))
+    )
+    .unwrap();
 }
 
-fn format_duration_stats_no_median(label: &str, value: &DurationStats) -> Option<String> {
+fn write_duration_row_no_median(out: &mut String, label: &str, value: &DurationStats) {
     if value.count == 0 {
-        return None;
+        return;
     }
-    Some(format!(
-        "{}: n={} min={} mean={} max={} stddev={}",
-        label,
+    writeln!(
+        out,
+        "  {label:<18} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
         value.count,
         format_ns_u64(value.min_ns),
         format_ns_f64(value.mean_ns),
+        "-",
         format_ns_u64(value.max_ns),
         format_ns_f64(value.stddev_ns())
-    ))
+    )
+    .unwrap();
 }
 
-fn format_signed_duration_stats(
-    label: &str,
-    value: &SignedDurationStatsWithMedian,
-) -> Option<String> {
+fn write_signed_duration_row(out: &mut String, label: &str, value: &SignedDurationStatsWithMedian) {
     if value.stats.count == 0 {
-        return None;
+        return;
     }
-    Some(format!(
-        "{}: n={} min={} mean={} median={} max={} stddev={}",
-        label,
+    writeln!(
+        out,
+        "  {label:<18} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
         value.stats.count,
         format_ns_i128(value.stats.min_ns),
         format_ns_f64(value.stats.mean_ns),
         format_ns_f64_opt(value.median_ns),
         format_ns_i128(value.stats.max_ns),
         format_ns_f64(value.stddev_ns())
-    ))
+    )
+    .unwrap();
 }
 
 fn format_percent(value: f64) -> String {
@@ -155,8 +155,17 @@ fn format_ns_f64_opt(value: Option<f64>) -> String {
 }
 
 fn format_ns_f64(value: f64) -> String {
-    let us = value / 1_000.0;
-    format!("{us:.3} us")
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    let value = value.abs();
+    if value < 1_000.0 {
+        format!("{sign}{value:.0}ns")
+    } else if value < 1_000_000.0 {
+        format!("{sign}{:.1}µs", value / 1_000.0)
+    } else if value < 1_000_000_000.0 {
+        format!("{sign}{:.1}ms", value / 1_000_000.0)
+    } else {
+        format!("{sign}{:.3}s", value / 1_000_000_000.0)
+    }
 }
 
 #[cfg(test)]
@@ -187,9 +196,15 @@ mod tests {
         let summary = StatsCollector::new(StatsConfig::finite()).summary();
         let output = format_summary(&summary);
 
-        assert!(output.contains("packets: sent=0 received=0 lost=0"));
-        assert!(!output.contains("rtt: n="));
-        assert!(!output.contains("server_processing: n="));
+        assert!(output.contains("Metric"));
+        assert!(output.contains("Min"));
+        assert!(output.contains("Mean"));
+        assert!(output.contains("Median"));
+        assert!(output.contains("Max"));
+        assert!(output.contains("Stddev"));
+        assert!(output.contains("packets: sent=0 received=0 unique=0 lost=0"));
+        assert!(!output.contains("RTT                  0"));
+        assert!(!output.contains("server processing"));
     }
 
     #[test]
@@ -238,12 +253,16 @@ mod tests {
 
         let output = format_summary(&collector.summary());
 
-        assert!(output.contains("packets: sent=1 received=1 lost=0 loss=0.00%"));
+        assert!(output.contains("packets: sent=1 received=1 unique=1 lost=0 loss=0.00%"));
         assert!(output.contains("bytes: sent=64 received=64"));
-        assert!(output.contains("rtt: n=1 min=1200.000 us"));
-        assert!(output.contains("server_processing: n=1 min=300.000 us"));
-        assert!(output.contains("send_call: n=1 min=10.000 us"));
-        assert!(output.contains("timer_error: n=1 min=2.000 us"));
+        assert!(output.contains("RTT"));
+        assert!(output.contains("1.2ms"));
+        assert!(output.contains("server processing"));
+        assert!(output.contains("300.0µs"));
+        assert!(output.contains("send call"));
+        assert!(output.contains("10.0µs"));
+        assert!(output.contains("timer error"));
+        assert!(output.contains("2.0µs"));
     }
 
     #[test]
@@ -260,9 +279,8 @@ mod tests {
             median_ns: Some(-500.0),
         };
 
-        let line = format_signed_duration_stats("rtt", &stats).unwrap();
-        assert!(line.contains("min=-0.500 us"));
-        assert!(line.contains("mean=-0.500 us"));
-        assert!(line.contains("median=-0.500 us"));
+        let mut out = String::new();
+        write_signed_duration_row(&mut out, "RTT", &stats);
+        assert!(out.contains("-500ns"));
     }
 }
