@@ -302,11 +302,59 @@ fn send_probe_reports_schedule_overflow() {
     };
     let mut client = Client::connect(config).unwrap();
     assert_open_started(client.open(ClientTimestamp::now()).unwrap());
-    client.session.as_mut().unwrap().packets_sent = u64::MAX;
+    client.session.as_mut().unwrap().packets_sent = u64::MAX - 1;
 
     assert!(matches!(
         client.send_probe(),
         Err(ClientError::DurationOverflow)
+    ));
+    server.join();
+}
+
+#[test]
+fn send_probe_reports_logical_sequence_counter_overflow() {
+    let params = default_params();
+    let server = silent_open_server(params);
+    let config = ClientConfig {
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    client.session.as_mut().unwrap().next_logical_seq = u64::MAX;
+
+    assert!(matches!(
+        client.send_probe(),
+        Err(ClientError::CounterOverflow {
+            counter: "next_logical_seq"
+        })
+    ));
+    server.join();
+}
+
+#[test]
+fn send_probe_reports_packets_sent_counter_overflow() {
+    let params = default_params();
+    let server = silent_open_server(params);
+    let config = ClientConfig {
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    client.session.as_mut().unwrap().packets_sent = u64::MAX;
+
+    assert!(matches!(
+        client.send_probe(),
+        Err(ClientError::CounterOverflow {
+            counter: "packets_sent"
+        })
     ));
     server.join();
 }

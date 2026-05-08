@@ -49,6 +49,8 @@ pub enum ClientError {
     AlreadyClosed,
     #[error("duration is too large to encode as nanoseconds")]
     DurationOverflow,
+    #[error("counter {counter} overflowed")]
+    CounterOverflow { counter: &'static str },
     #[error("pending probe limit exceeded ({limit})")]
     PendingLimitExceeded { limit: usize },
     #[error("invalid configuration: {reason}")]

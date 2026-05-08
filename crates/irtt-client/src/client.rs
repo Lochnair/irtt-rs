@@ -241,14 +241,20 @@ impl Client {
         session.pending.insert(pending)?;
 
         session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
-        session.next_logical_seq = session
-            .next_logical_seq
-            .checked_add(1)
-            .ok_or(ClientError::DurationOverflow)?;
-        session.packets_sent = session
-            .packets_sent
-            .checked_add(1)
-            .ok_or(ClientError::DurationOverflow)?;
+        session.next_logical_seq =
+            session
+                .next_logical_seq
+                .checked_add(1)
+                .ok_or(ClientError::CounterOverflow {
+                    counter: "next_logical_seq",
+                })?;
+        session.packets_sent =
+            session
+                .packets_sent
+                .checked_add(1)
+                .ok_or(ClientError::CounterOverflow {
+                    counter: "packets_sent",
+                })?;
 
         let negotiated = self
             .negotiated
