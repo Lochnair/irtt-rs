@@ -483,6 +483,9 @@ impl Client {
                     packet_meta: meta.into(),
                 });
             }
+            if flags::has(reply.flags, flags::FLAG_CLOSE) {
+                self.close_from_peer(token, now, &mut events)?;
+            }
             Ok(events)
         } else if session.completed.contains(wire_seq) {
             update_highest_received(session, wire_seq);
@@ -501,7 +504,7 @@ impl Client {
             update_highest_received(session, wire_seq);
             session.completed.insert(wire_seq, timed_out.logical_seq);
 
-            Ok(vec![ClientEvent::LateReply {
+            let mut events = vec![ClientEvent::LateReply {
                 seq: wire_seq,
                 logical_seq: Some(timed_out.logical_seq),
                 highest_seen,
@@ -514,7 +517,11 @@ impl Client {
                 received_stats,
                 bytes: packet_len,
                 packet_meta: meta.into(),
-            }])
+            }];
+            if flags::has(reply.flags, flags::FLAG_CLOSE) {
+                self.close_from_peer(token, now, &mut events)?;
+            }
+            Ok(events)
         } else if session
             .highest_received_seq
             .is_some_and(|h| sequence_is_before(wire_seq, h))
@@ -541,6 +548,26 @@ impl Client {
                 ),
             }])
         }
+    }
+
+    fn close_from_peer(
+        &mut self,
+        token: u64,
+        now: ClientTimestamp,
+        events: &mut Vec<ClientEvent>,
+    ) -> Result<(), ClientError> {
+        clear_dscp_on_socket(&self.socket, self.remote)?;
+        self.phase = ClientPhase::Closed;
+        if let Some(session) = self.session.as_mut() {
+            session.timed_out.clear();
+        }
+        self.session = None;
+        events.push(ClientEvent::SessionClosed {
+            remote: self.remote,
+            token,
+            at: now,
+        });
+        Ok(())
     }
 
     fn accept_open_reply(
