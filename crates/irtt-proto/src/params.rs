@@ -57,7 +57,8 @@ impl Params {
                 9 => {
                     let (len, used) = varint::decode_uvarint(&input[pos..])?;
                     pos += used;
-                    let len = len as usize;
+                    let len = usize::try_from(len)
+                        .map_err(|_| ProtoError::ParameterLengthTooLarge { tag, length: len })?;
                     if input.len().saturating_sub(pos) < len {
                         return Err(ProtoError::MalformedParams);
                     }
@@ -404,6 +405,22 @@ mod tests {
     fn non_utf8_server_fill_is_rejected() {
         let encoded = [9, 1, 0xff];
         assert_eq!(Params::decode(&encoded), Err(ProtoError::InvalidUtf8));
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn server_fill_length_too_large_for_usize_is_rejected() {
+        let mut encoded = Vec::new();
+        varint::encode_uvarint(9, &mut encoded);
+        varint::encode_uvarint(u64::from(u32::MAX) + 1, &mut encoded);
+
+        assert_eq!(
+            Params::decode(&encoded),
+            Err(ProtoError::ParameterLengthTooLarge {
+                tag: 9,
+                length: u64::from(u32::MAX) + 1,
+            })
+        );
     }
 
     #[test]

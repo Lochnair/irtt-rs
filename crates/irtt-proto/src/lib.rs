@@ -15,7 +15,7 @@ pub use echo::{decode_echo_reply, encode_echo_request, EchoReply, EchoRequest, T
 pub use error::{ProtoError, Result};
 pub use flags::*;
 pub use hmac::{compute_hmac, compute_hmac_in_place, verify_hmac};
-pub use layout::{echo_header_len, echo_packet_len, PacketLayout};
+pub use layout::{echo_header_len, echo_packet_len, try_echo_packet_len, PacketLayout};
 pub use open::{decode_open_reply, encode_open_request, OpenReply, OpenRequest};
 pub use params::{Clock, Params, ReceivedStats, ServerFill, StampAt};
 
