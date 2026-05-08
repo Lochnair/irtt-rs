@@ -585,14 +585,11 @@ impl Client {
         self.recv_buffer.resize(recv_buffer_size, 0);
         self.phase = ClientPhase::Open { token: reply.token };
 
-        let duration_ns = negotiated.params.duration_ns;
-        let end_mono = if duration_ns > 0 {
-            let duration = Duration::from_nanos(duration_ns as u64);
-            Some(
-                now.mono
-                    .checked_add(duration)
-                    .ok_or(ClientError::DurationOverflow)?,
-            )
+        let end_mono = if negotiated.params.duration_ns > 0 {
+            Some(negotiated_end_mono(
+                now.mono,
+                negotiated.params.duration_ns,
+            )?)
         } else {
             None
         };
@@ -829,8 +826,11 @@ fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {
     validate_protocol_config(config)?;
     Ok(Params {
         protocol_version: PROTOCOL_VERSION,
-        duration_ns: duration_to_ns(config.duration.unwrap_or_default())?,
-        interval_ns: duration_to_ns(config.interval)?,
+        duration_ns: match config.duration {
+            Some(duration) => config_duration_to_ns("duration", duration)?,
+            None => 0,
+        },
+        interval_ns: config_duration_to_ns("interval", config.interval)?,
         length: i64::from(config.length),
         received_stats: config.received_stats,
         stamp_at: config.stamp_at,
@@ -841,6 +841,16 @@ fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {
 }
 
 fn validate_protocol_config(config: &ClientConfig) -> Result<(), ClientError> {
+    if config.duration == Some(Duration::ZERO) {
+        return Err(ClientError::InvalidConfig {
+            reason: "duration must be greater than zero; use None for continuous mode".to_owned(),
+        });
+    }
+    if config.interval == Duration::ZERO {
+        return Err(ClientError::InvalidConfig {
+            reason: "interval must be greater than zero".to_owned(),
+        });
+    }
     if config.dscp > MAX_DSCP_CODEPOINT {
         return Err(ClientError::InvalidConfig {
             reason: format!("dscp must be <= {MAX_DSCP_CODEPOINT}"),
@@ -869,8 +879,19 @@ fn validate_protocol_config(config: &ClientConfig) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn duration_to_ns(duration: Duration) -> Result<i64, ClientError> {
-    i64::try_from(duration.as_nanos()).map_err(|_| ClientError::DurationOverflow)
+fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientError> {
+    i64::try_from(duration.as_nanos()).map_err(|_| ClientError::InvalidConfig {
+        reason: format!("{field} is too large to encode as nanoseconds"),
+    })
+}
+
+fn negotiated_end_mono(start: Instant, duration_ns: i64) -> Result<Instant, ClientError> {
+    debug_assert!(duration_ns > 0);
+    start
+        .checked_add(Duration::from_nanos(duration_ns as u64))
+        .ok_or_else(|| ClientError::NegotiationRejected {
+            reason: "duration is too large to schedule".to_owned(),
+        })
 }
 
 #[cfg(test)]
