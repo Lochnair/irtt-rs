@@ -4,6 +4,9 @@ use subtle::ConstantTimeEq;
 
 use crate::{ProtoError, Result, HEADER_SIZE, HMAC_SIZE};
 
+// HMAC-MD5 is used for compatibility with the IRTT wire protocol, not as a
+// new cryptographic recommendation. Verification uses HMAC with constant-time
+// comparison; do not swap digests unless protocol negotiation supports it.
 type HmacMd5 = Hmac<Md5>;
 
 pub fn compute_hmac(key: &[u8], packet: &[u8], hmac_offset: usize) -> Result<[u8; HMAC_SIZE]> {
