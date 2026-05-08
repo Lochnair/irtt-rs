@@ -6,6 +6,8 @@ pub type Result<T> = std::result::Result<T, ProtoError>;
 pub enum ProtoError {
     #[error("packet is too short: needed {needed} bytes, got {actual}")]
     PacketTooShort { needed: usize, actual: usize },
+    #[error("bad packet length: expected {expected} bytes, got {actual}")]
+    PacketLengthMismatch { expected: usize, actual: usize },
     #[error("bad magic bytes")]
     BadMagic,
     #[error("reserved flag bits are set: 0x{0:02x}")]

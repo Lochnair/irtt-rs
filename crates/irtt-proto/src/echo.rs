@@ -78,9 +78,6 @@ pub fn decode_echo_reply(
     reject(flags, FLAG_OPEN)?;
     crate::open::require(flags, FLAG_REPLY)?;
     check_hmac_presence(flags, hmac_key)?;
-    if let Some(key) = hmac_key {
-        hmac::verify_hmac(key, packet, hmac::hmac_offset())?;
-    }
 
     let layout = PacketLayout::echo(has(flags, FLAG_HMAC), params);
     let header_len = layout.header_len();
@@ -89,6 +86,17 @@ pub fn decode_echo_reply(
             needed: header_len,
             actual: packet.len(),
         });
+    }
+    let expected_len = try_echo_packet_len(has(flags, FLAG_HMAC), params)?;
+    if packet.len() != expected_len {
+        return Err(ProtoError::PacketLengthMismatch {
+            expected: expected_len,
+            actual: packet.len(),
+        });
+    }
+
+    if let Some(key) = hmac_key {
+        hmac::verify_hmac(key, packet, hmac::hmac_offset())?;
     }
 
     let mut pos = HEADER_SIZE;
@@ -287,6 +295,54 @@ mod tests {
     }
 
     #[test]
+    fn echo_reply_decodes_exact_negotiated_length_with_payload() {
+        let params = params_with_payload_space(4);
+        let mut packet = Vec::new();
+        write_header(&mut packet, FLAG_REPLY);
+        packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
+        packet.extend_from_slice(&2_u32.to_le_bytes());
+        packet.extend_from_slice(&[1, 2, 3, 4]);
+
+        let reply = decode_echo_reply(&packet, &params, None).unwrap();
+        assert_eq!(reply.payload, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn echo_reply_rejects_shorter_than_negotiated_length() {
+        let params = params_with_payload_space(4);
+        let mut packet = Vec::new();
+        write_header(&mut packet, FLAG_REPLY);
+        packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
+        packet.extend_from_slice(&2_u32.to_le_bytes());
+
+        assert_eq!(
+            decode_echo_reply(&packet, &params, None),
+            Err(ProtoError::PacketLengthMismatch {
+                expected: 20,
+                actual: 16,
+            })
+        );
+    }
+
+    #[test]
+    fn echo_reply_rejects_longer_than_negotiated_length() {
+        let params = Params::default();
+        let mut packet = Vec::new();
+        write_header(&mut packet, FLAG_REPLY);
+        packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
+        packet.extend_from_slice(&2_u32.to_le_bytes());
+        packet.push(0);
+
+        assert_eq!(
+            decode_echo_reply(&packet, &params, None),
+            Err(ProtoError::PacketLengthMismatch {
+                expected: 16,
+                actual: 17,
+            })
+        );
+    }
+
+    #[test]
     fn hmac_echo_reply_decodes_default_fields_after_hmac() {
         let params = default_params();
         let layout = PacketLayout::echo(true, &params);
@@ -305,5 +361,46 @@ mod tests {
         assert_eq!(reply.recv_count, Some(0));
         assert_eq!(reply.recv_window, Some(0));
         assert_eq!(reply.payload.len(), 0);
+    }
+
+    #[test]
+    fn hmac_echo_reply_decodes_exact_negotiated_length_with_payload() {
+        let mut params = Params {
+            length: 48,
+            ..Params::default()
+        };
+        params.received_stats = ReceivedStats::Both;
+        let layout = PacketLayout::echo(true, &params);
+        let mut packet = Vec::with_capacity(try_echo_packet_len(true, &params).unwrap());
+        write_header(&mut packet, FLAG_REPLY | FLAG_HMAC);
+        packet.extend_from_slice(&[0; HMAC_SIZE]);
+        packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
+        packet.extend_from_slice(&2_u32.to_le_bytes());
+        push_zeroed_layout_tail(layout, &mut packet);
+        packet.extend_from_slice(&[1, 2, 3, 4]);
+        hmac::compute_hmac_in_place(b"testkey", &mut packet, hmac::hmac_offset()).unwrap();
+
+        let reply = decode_echo_reply(&packet, &params, Some(b"testkey")).unwrap();
+        assert_eq!(reply.payload, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn hmac_echo_reply_rejects_length_mismatch_before_hmac_verification() {
+        let params = Params::default();
+        let mut packet = Vec::new();
+        write_header(&mut packet, FLAG_REPLY | FLAG_HMAC);
+        packet.extend_from_slice(&[0; HMAC_SIZE]);
+        packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());
+        packet.extend_from_slice(&2_u32.to_le_bytes());
+        hmac::compute_hmac_in_place(b"testkey", &mut packet, hmac::hmac_offset()).unwrap();
+        packet.push(0);
+
+        assert_eq!(
+            decode_echo_reply(&packet, &params, Some(b"testkey")),
+            Err(ProtoError::PacketLengthMismatch {
+                expected: 32,
+                actual: 33,
+            })
+        );
     }
 }
