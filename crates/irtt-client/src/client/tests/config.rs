@@ -86,6 +86,54 @@ fn params_from_config_encodes_continuous_duration_as_zero() {
 }
 
 #[test]
+fn params_from_config_rejects_zero_finite_duration() {
+    let config = ClientConfig {
+        duration: Some(Duration::ZERO),
+        ..ClientConfig::default()
+    };
+    assert!(matches!(
+        params_from_config(&config),
+        Err(ClientError::InvalidConfig { reason })
+            if reason == "duration must be greater than zero; use None for continuous mode"
+    ));
+}
+
+#[test]
+fn params_from_config_rejects_zero_interval() {
+    let config = ClientConfig {
+        interval: Duration::ZERO,
+        ..ClientConfig::default()
+    };
+    assert!(matches!(
+        params_from_config(&config),
+        Err(ClientError::InvalidConfig { reason }) if reason == "interval must be greater than zero"
+    ));
+}
+
+#[test]
+fn params_from_config_rejects_nanosecond_encoding_overflow_as_invalid_config() {
+    let config = ClientConfig {
+        duration: Some(Duration::from_nanos(i64::MAX as u64) + Duration::from_nanos(1)),
+        ..ClientConfig::default()
+    };
+    assert!(matches!(
+        params_from_config(&config),
+        Err(ClientError::InvalidConfig { reason })
+            if reason == "duration is too large to encode as nanoseconds"
+    ));
+
+    let config = ClientConfig {
+        interval: Duration::from_nanos(i64::MAX as u64) + Duration::from_nanos(1),
+        ..ClientConfig::default()
+    };
+    assert!(matches!(
+        params_from_config(&config),
+        Err(ClientError::InvalidConfig { reason })
+            if reason == "interval is too large to encode as nanoseconds"
+    ));
+}
+
+#[test]
 fn params_from_config_accepts_max_dscp_codepoint() {
     let config = ClientConfig {
         dscp: 63,
