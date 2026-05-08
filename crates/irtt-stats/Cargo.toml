@@ -1,9 +1,15 @@
 [package]
 name = "irtt-stats"
 version = "0.1.0"
+description = "Statistics aggregation for irtt-client events"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme.workspace = true
+keywords = ["irtt", "networking", "latency", "statistics"]
+categories = ["network-programming"]
 
 [dependencies]
 irtt-client.workspace = true
