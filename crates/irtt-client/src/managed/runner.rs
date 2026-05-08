@@ -343,8 +343,8 @@ mod tests {
     fn test_params(duration: Option<Duration>, interval: Duration) -> Params {
         Params {
             protocol_version: PROTOCOL_VERSION,
-            duration_ns: duration.map_or(0, |d| d.as_nanos() as i64),
-            interval_ns: interval.as_nanos() as i64,
+            duration_ns: duration.map_or(0, test_duration_ns_i64),
+            interval_ns: test_duration_ns_i64(interval),
             length: 0,
             received_stats: ReceivedStats::Both,
             stamp_at: StampAt::Both,
@@ -352,6 +352,10 @@ mod tests {
             dscp: 0,
             server_fill: None,
         }
+    }
+
+    fn test_duration_ns_i64(duration: Duration) -> i64 {
+        i64::try_from(duration.as_nanos()).expect("test duration fits i64 nanoseconds")
     }
 
     fn config(addr: SocketAddr, duration: Option<Duration>) -> ClientConfig {

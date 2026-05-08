@@ -165,9 +165,13 @@ pub fn config_for_params(addr: SocketAddr, params: &Params) -> ClientConfig {
         duration: if params.duration_ns == 0 {
             None
         } else {
-            Some(Duration::from_nanos(params.duration_ns as u64))
+            Some(Duration::from_nanos(
+                u64::try_from(params.duration_ns).expect("test duration must be non-negative"),
+            ))
         },
-        interval: Duration::from_nanos(params.interval_ns as u64),
+        interval: Duration::from_nanos(
+            u64::try_from(params.interval_ns).expect("test interval must be non-negative"),
+        ),
         length: u32::try_from(params.length).unwrap(),
         received_stats: params.received_stats,
         stamp_at: params.stamp_at,
@@ -571,10 +575,12 @@ fn echo_reply_packet(
 }
 
 fn materialize_wall_timestamps(mut timestamps: TimestampFields) -> TimestampFields {
-    let now_ns = SystemTime::now()
+    let now_ns: i64 = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap()
-        .as_nanos() as i64;
+        .as_nanos()
+        .try_into()
+        .expect("current wall-clock time fits i64 nanoseconds");
     if let Some(offset) = timestamps.recv_wall {
         timestamps.recv_wall = Some(now_ns + offset);
     }

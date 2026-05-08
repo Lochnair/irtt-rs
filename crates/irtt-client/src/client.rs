@@ -1,7 +1,7 @@
 use std::{
     io,
     net::{SocketAddr, UdpSocket},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use irtt_proto::{
@@ -260,7 +260,8 @@ impl Client {
             .negotiated
             .as_ref()
             .expect("negotiated must exist when Open");
-        let interval_ns = negotiated.params.interval_ns as u64;
+        let interval_ns = u64::try_from(negotiated.params.interval_ns)
+            .expect("validated positive negotiated interval");
         let session = self
             .session
             .as_mut()
@@ -817,16 +818,8 @@ fn compute_one_way(
     let server_recv_wall = ts.recv_wall.or(ts.midpoint_wall);
     let server_send_wall = ts.send_wall.or(ts.midpoint_wall);
 
-    let client_send_ns = sent_at
-        .wall
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_nanos() as i64);
-    let client_recv_ns = received_at
-        .wall
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_nanos() as i64);
+    let client_send_ns = unix_epoch_ns_i64(sent_at.wall);
+    let client_recv_ns = unix_epoch_ns_i64(received_at.wall);
 
     let c2s = server_recv_wall
         .zip(client_send_ns)
@@ -845,6 +838,12 @@ fn compute_one_way(
         client_to_server: c2s,
         server_to_client: s2c,
     })
+}
+
+fn unix_epoch_ns_i64(time: SystemTime) -> Option<i64> {
+    time.duration_since(UNIX_EPOCH)
+        .ok()
+        .and_then(|duration| i64::try_from(duration.as_nanos()).ok())
 }
 
 fn build_received_stats(reply: &EchoReply) -> Option<ReceivedStatsSample> {
@@ -922,8 +921,9 @@ fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientE
 
 fn negotiated_end_mono(start: Instant, duration_ns: i64) -> Result<Instant, ClientError> {
     debug_assert!(duration_ns > 0);
+    let duration_ns = u64::try_from(duration_ns).expect("validated positive negotiated duration");
     start
-        .checked_add(Duration::from_nanos(duration_ns as u64))
+        .checked_add(Duration::from_nanos(duration_ns))
         .ok_or_else(|| ClientError::NegotiationRejected {
             reason: "duration is too large to schedule".to_owned(),
         })
