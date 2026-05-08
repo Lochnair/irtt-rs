@@ -112,8 +112,9 @@ fn params_from_config_rejects_zero_interval() {
 
 #[test]
 fn params_from_config_rejects_nanosecond_encoding_overflow_as_invalid_config() {
+    let i64_max_ns = u64::try_from(i64::MAX).unwrap();
     let config = ClientConfig {
-        duration: Some(Duration::from_nanos(i64::MAX as u64) + Duration::from_nanos(1)),
+        duration: Some(Duration::from_nanos(i64_max_ns) + Duration::from_nanos(1)),
         ..ClientConfig::default()
     };
     assert!(matches!(
@@ -123,7 +124,7 @@ fn params_from_config_rejects_nanosecond_encoding_overflow_as_invalid_config() {
     ));
 
     let config = ClientConfig {
-        interval: Duration::from_nanos(i64::MAX as u64) + Duration::from_nanos(1),
+        interval: Duration::from_nanos(i64_max_ns) + Duration::from_nanos(1),
         ..ClientConfig::default()
     };
     assert!(matches!(
