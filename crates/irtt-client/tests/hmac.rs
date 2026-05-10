@@ -101,7 +101,7 @@ fn hmac_close_success_sends_authenticated_close_and_closes_session() {
     let outcome = client.open().unwrap();
     assert_started(outcome, &params);
 
-    let events = client.close(ClientTimestamp::now()).unwrap();
+    let events = client.close().unwrap();
     assert!(matches!(
         events.as_slice(),
         [ClientEvent::SessionClosed { token: TOKEN, .. }]
@@ -131,10 +131,7 @@ fn missing_client_key_against_hmac_required_server_times_out() {
     config.hmac_key = None;
 
     let mut client = Client::connect(config).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::OpenTimeout)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
 
     let observations = server.observations(1);
     assert!(matches!(
@@ -156,10 +153,7 @@ fn wrong_client_key_against_hmac_required_server_times_out() {
     config.hmac_key = Some(b"wrong-secret".to_vec());
 
     let mut client = Client::connect(config).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::OpenTimeout)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
 
     let observations = server.observations(1);
     assert!(matches!(
@@ -314,7 +308,7 @@ fn backend_hmac_correct_key_succeeds() {
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
 }
 
 #[test]
@@ -326,10 +320,7 @@ fn backend_hmac_wrong_key_fails() {
     config.hmac_key = Some(b"wrong-secret".to_vec());
 
     let mut client = Client::connect(config).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::OpenTimeout)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
 }
 
 #[test]
@@ -341,8 +332,5 @@ fn backend_hmac_missing_key_fails() {
     config.hmac_key = None;
 
     let mut client = Client::connect(config).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::OpenTimeout)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
 }

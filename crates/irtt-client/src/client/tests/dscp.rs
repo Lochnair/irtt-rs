@@ -32,7 +32,7 @@ fn normal_open_applies_negotiated_dscp_after_open_and_close_clears_it() {
         184
     );
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     assert_eq!(
         socket_traffic_class(&client.socket, client.remote).unwrap(),
         0

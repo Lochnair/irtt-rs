@@ -77,7 +77,7 @@ fn hmac_close_packet_includes_valid_hmac() {
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert_open_started(client.open().unwrap());
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     let packets: Vec<_> = server.rx.iter().take(2).collect();
     let close = &packets[1];
     assert_eq!(close[3], flags::FLAG_CLOSE | FLAG_HMAC);

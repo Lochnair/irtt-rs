@@ -69,7 +69,7 @@ fn send_probe_sends_valid_echo_request() {
     assert_eq!(req_token, TOKEN);
     let seq = u32::from_le_bytes(echo_req[12..16].try_into().unwrap());
     assert_eq!(seq, 0);
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -115,7 +115,7 @@ fn echo_sent_reports_schedule_and_timer_error() {
         other => panic!("expected EchoSent, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -146,7 +146,7 @@ fn send_probe_starts_seq_at_zero_and_increments() {
         let seq = u32::from_le_bytes(pkt[12..16].try_into().unwrap());
         assert_eq!(seq, i as u32);
     }
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -199,7 +199,7 @@ fn send_probe_respects_finite_duration_exclusive_end() {
     assert!(client.session.as_ref().unwrap().sending_done);
     assert!(client.next_send_deadline().is_none());
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -240,7 +240,7 @@ fn continuous_duration_keeps_generating_send_deadlines() {
         assert!(!client.session.as_ref().unwrap().sending_done);
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -262,7 +262,7 @@ fn next_send_deadline_advances_by_interval() {
     let deadline2 = client.next_send_deadline().unwrap();
     assert_eq!(deadline2, start + Duration::from_secs(2));
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -431,7 +431,7 @@ fn recv_once_decodes_echo_reply_and_emits_event() {
         }
         other => panic!("expected EchoReply, got {other:?}"),
     }
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -520,7 +520,7 @@ fn echo_reply_metadata_is_unavailable_without_ancillary() {
         other => panic!("expected EchoReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -563,7 +563,7 @@ fn echo_reply_metadata_propagates_observed_dscp_with_ancillary() {
                 metadata_unavailable_skip(
                     "echo_reply_metadata_propagates_observed_dscp_with_ancillary",
                 );
-                client.close(ClientTimestamp::now()).unwrap();
+                client.close().unwrap();
                 server.join();
                 return;
             };
@@ -574,7 +574,7 @@ fn echo_reply_metadata_propagates_observed_dscp_with_ancillary() {
         other => panic!("expected EchoReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -595,7 +595,7 @@ fn echo_reply_metadata_preserves_observed_zero_with_ancillary() {
                 metadata_unavailable_skip(
                     "echo_reply_metadata_preserves_observed_zero_with_ancillary",
                 );
-                client.close(ClientTimestamp::now()).unwrap();
+                client.close().unwrap();
                 server.join();
                 return;
             };
@@ -606,7 +606,7 @@ fn echo_reply_metadata_preserves_observed_zero_with_ancillary() {
         other => panic!("expected EchoReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -627,7 +627,7 @@ fn echo_reply_metadata_propagates_kernel_rx_timestamp_with_ancillary() {
                 kernel_rx_timestamp_unavailable_skip(
                     "echo_reply_metadata_propagates_kernel_rx_timestamp_with_ancillary",
                 );
-                client.close(ClientTimestamp::now()).unwrap();
+                client.close().unwrap();
                 server.join();
                 return;
             };
@@ -636,7 +636,7 @@ fn echo_reply_metadata_propagates_kernel_rx_timestamp_with_ancillary() {
         other => panic!("expected EchoReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -654,7 +654,7 @@ fn echo_reply_rtt_uses_client_monotonic() {
     } else {
         panic!("expected EchoReply");
     }
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -679,7 +679,7 @@ fn server_processing_subtracted_when_valid() {
     } else {
         panic!("expected EchoReply");
     }
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -724,7 +724,7 @@ fn received_stats_parsed_into_sample() {
     } else {
         panic!("expected EchoReply");
     }
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1014,7 +1014,7 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
         } if *bytes == echo_packet_len(false, &default_params())
     ));
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1062,7 +1062,7 @@ fn late_reply_metadata_is_unavailable_without_ancillary() {
         other => panic!("expected LateReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1110,7 +1110,7 @@ fn late_reply_metadata_propagates_observed_dscp_with_ancillary() {
                 metadata_unavailable_skip(
                     "late_reply_metadata_propagates_observed_dscp_with_ancillary",
                 );
-                client.close(ClientTimestamp::now()).unwrap();
+                client.close().unwrap();
                 server.join();
                 return;
             };
@@ -1128,7 +1128,7 @@ fn late_reply_metadata_propagates_observed_dscp_with_ancillary() {
         other => panic!("expected LateReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1157,7 +1157,7 @@ fn pending_map_bounded() {
         client.send_probe(),
         Err(ClientError::PendingLimitExceeded { limit: 3 })
     ));
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1326,7 +1326,7 @@ fn pending_full_does_not_send_packet() {
         "no packet should be sent when pending is full"
     );
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1550,7 +1550,7 @@ fn matched_reply_with_reversed_monotonic_time_still_emits_event() {
         other => panic!("expected EchoReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1596,7 +1596,7 @@ fn process_received_packet_uses_supplied_receive_metadata() {
         other => panic!("expected EchoReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1647,7 +1647,7 @@ fn process_received_packet_uses_supplied_receive_metadata_for_late_reply() {
         other => panic!("expected LateReply, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1685,7 +1685,7 @@ fn receive_metadata_does_not_broaden_malformed_warning() {
         other => panic!("expected Warning, got {other:?}"),
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1713,7 +1713,7 @@ fn recv_available_drains_burst_replies() {
         ));
     }
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1738,7 +1738,7 @@ fn recv_available_respects_packet_budget() {
     assert_eq!(second.len(), 1);
     assert!(matches!(&second[0], ClientEvent::EchoReply { seq: 1, .. }));
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1772,7 +1772,7 @@ fn send_probe_wraps_wire_sequence_at_u32_max() {
         .collect();
     assert_eq!(seqs, vec![u32::MAX, 0]);
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1863,7 +1863,7 @@ fn send_probe_after_sending_done_is_noop() {
         .count();
     assert_eq!(echo_count, 0);
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1934,7 +1934,7 @@ fn recv_buffer_uses_negotiated_packet_length() {
     );
     assert_eq!(buf_size, 4097);
     assert_eq!(client.recv_buffer.len(), buf_size);
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -1970,7 +1970,7 @@ fn short_echo_reply_does_not_emit_echo_reply() {
             ..
         }]
     ));
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -2002,7 +2002,7 @@ fn overlong_echo_reply_does_not_emit_echo_reply() {
             ..
         }]
     ));
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -2051,7 +2051,7 @@ fn overlong_datagram_detection_uses_extra_receive_byte() {
             ..
         }]
     ));
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -2091,7 +2091,7 @@ fn exact_length_echo_reply_still_emits_echo_reply() {
         events.as_slice(),
         [ClientEvent::EchoReply { bytes, .. }] if *bytes == echo_packet_len(false, &params)
     ));
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -2113,6 +2113,6 @@ fn recv_once_at_test_helper_provides_deterministic_timestamp() {
     } else {
         panic!("expected EchoReply");
     }
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }

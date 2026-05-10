@@ -108,7 +108,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
     let events = client.poll_timeouts(ClientTimestamp::now())?;
     output.print_events(&events)?;
 
-    let events = client.close(ClientTimestamp::now())?;
+    let events = client.close()?;
     output.print_events(&events)?;
     output.print_summary()?;
     output.out.flush()?;

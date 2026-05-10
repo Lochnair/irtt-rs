@@ -32,7 +32,7 @@ fn connect_applies_configured_ipv4_ttl_before_open_and_close_preserves_it() {
     client.open().unwrap();
     server.join();
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     assert_eq!(socket_ttl(&client.socket, client.remote).unwrap(), 64);
 }
 

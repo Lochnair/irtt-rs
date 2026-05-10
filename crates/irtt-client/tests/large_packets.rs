@@ -136,5 +136,5 @@ fn backend_large_packet_smoke() {
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
 }

@@ -389,7 +389,7 @@ fn backend_basic_open_echo_close() {
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
 }
 
 #[test]
@@ -410,7 +410,7 @@ fn backend_ttl_smoke() {
     assert_eq!(events.len(), 1);
     assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
 }
 
 #[test]
@@ -422,7 +422,7 @@ fn dscp_configured_open_close_smoke() {
 
     let outcome = client.open().unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }
 
@@ -444,7 +444,7 @@ fn backend_received_stats_smoke() {
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], ClientEvent::EchoReply { .. }));
 
-        client.close(ClientTimestamp::now()).unwrap();
+        client.close().unwrap();
     }
 }
 
@@ -497,7 +497,7 @@ fn backend_timestamp_smoke() {
             other => panic!("expected EchoReply, got {other:?}"),
         }
 
-        client.close(ClientTimestamp::now()).unwrap();
+        client.close().unwrap();
     }
 }
 
@@ -536,6 +536,6 @@ fn backend_clock_smoke() {
             other => panic!("expected EchoReply, got {other:?}"),
         }
 
-        client.close(ClientTimestamp::now()).unwrap();
+        client.close().unwrap();
     }
 }

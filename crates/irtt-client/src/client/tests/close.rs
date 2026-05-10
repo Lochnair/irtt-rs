@@ -12,11 +12,8 @@ fn open_fails_after_close() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
-    client.close(ClientTimestamp::now()).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::AlreadyClosed)
-    ));
+    client.close().unwrap();
+    assert!(matches!(client.open(), Err(ClientError::AlreadyClosed)));
     server.join();
 }
 
@@ -32,7 +29,7 @@ fn close_sends_one_close_packet_with_negotiated_token() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
-    let events = client.close(ClientTimestamp::now()).unwrap();
+    let events = client.close().unwrap();
     assert_eq!(events.len(), 1);
     let packets: Vec<_> = server.rx.iter().take(2).collect();
     let close = &packets[1];
@@ -63,7 +60,7 @@ fn send_probe_fails_after_close() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     assert!(matches!(
         client.send_probe(),
         Err(ClientError::AlreadyClosed)
@@ -91,7 +88,7 @@ fn close_clears_timed_out_metadata() {
     client.poll_timeouts(ClientTimestamp::now()).unwrap();
     assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     assert!(client.session.is_none());
     server.join();
 }
@@ -170,6 +167,6 @@ fn normal_echo_reply_does_not_close_session() {
     assert!(client.next_send_deadline().is_some());
     assert!(client.send_probe().is_ok());
 
-    client.close(ClientTimestamp::now()).unwrap();
+    client.close().unwrap();
     server.join();
 }

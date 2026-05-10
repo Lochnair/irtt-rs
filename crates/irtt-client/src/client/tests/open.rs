@@ -31,10 +31,7 @@ fn open_fails_when_already_open() {
     let server = open_success_server(params);
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::AlreadyOpen)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::AlreadyOpen)));
     server.join();
 }
 
@@ -67,10 +64,7 @@ fn open_timeout_after_all_timeouts() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::OpenTimeout)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
     assert_eq!(server.rx.iter().take(2).count(), 2);
     server.join();
 }
@@ -87,10 +81,7 @@ fn open_restores_configured_read_timeout_after_timeout() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::OpenTimeout)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
 
     let start = std::time::Instant::now();
     let mut buf = [0_u8; 1];
@@ -124,9 +115,6 @@ fn server_rejection_fails_in_normal_mode() {
         socket.send_to(&reply, peer).unwrap();
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::ServerRejected)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::ServerRejected)));
     server.join();
 }

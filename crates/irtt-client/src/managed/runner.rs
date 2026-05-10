@@ -223,7 +223,7 @@ fn run_client(
     }
 
     let packets_sent = client.packets_sent();
-    let close_events = client.close(ClientTimestamp::now())?;
+    let close_events = client.close()?;
     publish_events(&hub, &mut counters, close_events);
 
     Ok(SessionOutcome {

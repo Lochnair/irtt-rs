@@ -127,7 +127,7 @@ impl Client {
         }
     }
 
-    pub fn close(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+    pub fn close(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         let token = match self.phase {
             ClientPhase::Open { token } => token,
             ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
@@ -149,7 +149,7 @@ impl Client {
         Ok(vec![ClientEvent::SessionClosed {
             remote: self.remote,
             token,
-            at: now,
+            at: ClientTimestamp::now(),
         }])
     }
 

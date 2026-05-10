@@ -11,10 +11,7 @@ fn no_test_open_close_succeeds_on_open_reply_close() {
     let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
     assert_eq!(client.negotiated.as_ref(), Some(&negotiated));
-    assert!(matches!(
-        client.close(ClientTimestamp::now()),
-        Err(ClientError::NotOpen)
-    ));
+    assert!(matches!(client.close(), Err(ClientError::NotOpen)));
     server.join();
 }
 
@@ -117,9 +114,6 @@ fn open_fails_after_no_test_completed() {
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert_no_test_completed(client.open().unwrap());
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::AlreadyCompleted)
-    ));
+    assert!(matches!(client.open(), Err(ClientError::AlreadyCompleted)));
     server.join();
 }
