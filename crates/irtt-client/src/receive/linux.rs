@@ -15,7 +15,7 @@ pub(crate) fn configure_receive_metadata(socket: &UdpSocket, remote: SocketAddr)
     enable_kernel_rx_timestamps(socket)?;
     let socket = socket2::SockRef::from(socket);
     if remote.is_ipv4() {
-        socket.set_recv_tos(true)
+        socket.set_recv_tos_v4(true)
     } else {
         socket.set_recv_tclass_v6(true)
     }
