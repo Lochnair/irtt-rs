@@ -17,7 +17,7 @@ stats = ["dep:irtt-stats"]
 
 [dependencies]
 clap = { version = "4.5", features = ["derive"] }
-ctrlc = "3.5"
+ctrlc = "3.5.2"
 irtt-client.workspace = true
 irtt-proto.workspace = true
 irtt-stats = { workspace = true, optional = true }
