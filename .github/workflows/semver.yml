@@ -1,0 +1,27 @@
+name: Semver
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  semver:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Check semver compatibility
+        uses: obi1kenobi/cargo-semver-checks-action@v2
+        with:
+          feature-group: all-features
