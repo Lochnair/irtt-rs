@@ -1,14 +1,10 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
 
-  "extends": [
-    "config:recommended"
-  ],
+  "extends": ["config:recommended", "helpers:pinGitHubActionDigests"],
 
   "timezone": "Asia/Jakarta",
-  "schedule": [
-    "before 10am on monday"
-  ],
+  "schedule": ["before 10am on monday"],
 
   "dependencyDashboard": true,
   "dependencyDashboardTitle": "Renovate Dashboard",
@@ -23,15 +19,11 @@
   "rebaseWhen": "conflicted",
   "rangeStrategy": "bump",
 
-  "labels": [
-    "dependencies"
-  ],
+  "labels": ["dependencies"],
 
   "lockFileMaintenance": {
     "enabled": true,
-    "schedule": [
-      "before 10am on monday"
-    ],
+    "schedule": ["before 10am on monday"],
     "commitMessageAction": "maintain",
     "commitMessageTopic": "Cargo lockfile"
   },
@@ -39,60 +31,39 @@
   "packageRules": [
     {
       "description": "Never automerge Cargo updates by default",
-      "matchManagers": [
-        "cargo"
-      ],
+      "matchManagers": ["cargo"],
       "automerge": false
     },
     {
       "description": "Group RustCrypto updates together",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchPackageNames": [
-        "hmac",
-        "md-5"
-      ],
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["hmac", "md-5"],
       "groupName": "RustCrypto dependencies",
       "commitMessageTopic": "RustCrypto dependencies"
     },
     {
       "description": "Keep socket/platform dependencies together but reviewed",
-      "matchManagers": [
-        "cargo"
-      ],
-      "matchPackageNames": [
-        "socket2",
-        "libc"
-      ],
+      "matchManagers": ["cargo"],
+      "matchPackageNames": ["socket2", "libc"],
       "groupName": "socket dependencies",
       "commitMessageTopic": "socket dependencies"
     },
     {
       "description": "Group GitHub Actions updates",
-      "matchManagers": [
-        "github-actions"
-      ],
+      "matchManagers": ["github-actions"],
       "groupName": "GitHub Actions",
       "commitMessageTopic": "GitHub Actions"
     },
     {
       "description": "Automerge patch and minor GitHub Actions updates",
-      "matchManagers": [
-        "github-actions"
-      ],
-      "matchUpdateTypes": [
-        "patch",
-        "minor"
-      ],
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["patch", "minor"],
       "automerge": true,
       "platformAutomerge": true
     },
     {
       "description": "Never automerge major updates",
-      "matchUpdateTypes": [
-        "major"
-      ],
+      "matchUpdateTypes": ["major"],
       "automerge": false
     }
   ]
