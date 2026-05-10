@@ -1,0 +1,115 @@
+name: Rust CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: cargo fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt
+          cache-key: fmt
+
+      - name: Check formatting
+        uses: actions-rust-lang/rustfmt@v1
+
+  clippy:
+    name: cargo clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: clippy
+          cache-key: clippy
+
+      - name: Run clippy
+        run: |
+          cargo clippy \
+            --workspace \
+            --all-targets \
+            --all-features \
+            --locked \
+            -- -D warnings
+
+  test:
+    name: cargo test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-key: test
+
+      - name: Run tests
+        run: |
+          cargo test \
+            --workspace \
+            --all-targets \
+            --all-features \
+            --locked
+
+  docs:
+    name: cargo doc
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      RUSTDOCFLAGS: "-D warnings"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          cache-key: docs
+
+      - name: Check docs
+        run: |
+          cargo doc \
+            --workspace \
+            --all-features \
+            --no-deps \
+            --locked
