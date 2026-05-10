@@ -78,7 +78,7 @@ pub(crate) fn socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> Result<u32, 
 
 fn set_socket_ttl(socket: &UdpSocket, remote: SocketAddr, ttl: u32) -> io::Result<()> {
     if remote.is_ipv4() {
-        socket2::SockRef::from(socket).set_ttl(ttl)
+        socket2::SockRef::from(socket).set_ttl_v4(ttl)
     } else {
         socket2::SockRef::from(socket).set_unicast_hops_v6(ttl)
     }
@@ -87,7 +87,7 @@ fn set_socket_ttl(socket: &UdpSocket, remote: SocketAddr, ttl: u32) -> io::Resul
 #[cfg(test)]
 fn get_socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> io::Result<u32> {
     if remote.is_ipv4() {
-        socket2::SockRef::from(socket).ttl()
+        socket2::SockRef::from(socket).ttl_v4()
     } else {
         socket2::SockRef::from(socket).unicast_hops_v6()
     }
@@ -128,7 +128,7 @@ fn set_socket_traffic_class_io(
     target_os = "haiku",
 )))]
 fn set_ipv4_traffic_class(socket: &UdpSocket, traffic_class: u32) -> io::Result<()> {
-    socket2::SockRef::from(socket).set_tos(traffic_class)
+    socket2::SockRef::from(socket).set_tos_v4(traffic_class)
 }
 
 #[cfg(any(
@@ -212,7 +212,7 @@ fn unsupported_traffic_class(traffic_class: u32, feature: &'static str) -> io::R
     ))
 ))]
 fn get_ipv4_traffic_class(socket: &UdpSocket) -> io::Result<u32> {
-    socket2::SockRef::from(socket).tos()
+    socket2::SockRef::from(socket).tos_v4()
 }
 
 #[cfg(all(
