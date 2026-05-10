@@ -1,6 +1,6 @@
 [package]
 name = "irtt-client"
-version = "0.1.0"
+version = "0.1.1"
 description = "IRTT-compatible Rust client library"
 edition.workspace = true
 license.workspace = true

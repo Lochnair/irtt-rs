@@ -225,7 +225,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "ctrlc",
@@ -236,7 +236,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-client"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "irtt-proto",
  "libc",
@@ -246,7 +246,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-proto"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "hmac",
  "md-5",
@@ -256,7 +256,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-stats"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "irtt-client",
 ]
