@@ -73,7 +73,7 @@ impl Client {
         })
     }
 
-    pub fn open(&mut self, now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
+    pub fn open(&mut self) -> Result<OpenOutcome, ClientError> {
         match self.phase {
             ClientPhase::Connected => {}
             ClientPhase::Open { .. } => return Err(ClientError::AlreadyOpen),
@@ -81,48 +81,50 @@ impl Client {
             ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
 
-        let outcome = self.open_inner(now);
+        let outcome = (|| -> Result<OpenOutcome, ClientError> {
+            let request = OpenRequest {
+                params: self.requested.clone(),
+                close: self.config.run_mode == RunMode::NoTest,
+            };
+
+            let packet = encode_open_request(&request, self.config.hmac_key.as_deref())?;
+            let mut buf = [0_u8; MAX_OPEN_PACKET_SIZE];
+
+            for timeout in &self.config.open_timeouts {
+                self.socket.set_read_timeout(Some(*timeout))?;
+                self.socket.send(&packet)?;
+
+                match self.socket.recv(&mut buf) {
+                    Ok(size) => {
+                        let reply = irtt_proto::decode_open_reply(
+                            &buf[..size],
+                            self.config.hmac_key.as_deref(),
+                        )?;
+
+                        return self.accept_open_reply(reply, ClientTimestamp::now());
+                    }
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) => {}
+                    Err(err) => return Err(ClientError::Socket(err)),
+                }
+            }
+
+            Err(ClientError::OpenTimeout)
+        })();
+
         let restore = self
             .socket
             .set_read_timeout(self.config.socket_config.recv_timeout);
+
         match (outcome, restore) {
             (Ok(outcome), Ok(())) => Ok(outcome),
             (Ok(_), Err(source)) => Err(ClientError::ReadTimeoutRestore { source }),
             (Err(err), Ok(())) => Err(err),
             (Err(err), Err(_)) => Err(err),
         }
-    }
-
-    fn open_inner(&mut self, _now: ClientTimestamp) -> Result<OpenOutcome, ClientError> {
-        let request = OpenRequest {
-            params: self.requested.clone(),
-            close: self.config.run_mode == RunMode::NoTest,
-        };
-        let packet = encode_open_request(&request, self.config.hmac_key.as_deref())?;
-        let mut buf = [0_u8; MAX_OPEN_PACKET_SIZE];
-
-        for timeout in &self.config.open_timeouts {
-            self.socket.set_read_timeout(Some(*timeout))?;
-            self.socket.send(&packet)?;
-
-            match self.socket.recv(&mut buf) {
-                Ok(size) => {
-                    let reply = irtt_proto::decode_open_reply(
-                        &buf[..size],
-                        self.config.hmac_key.as_deref(),
-                    )?;
-                    return self.accept_open_reply(reply, ClientTimestamp::now());
-                }
-                Err(err)
-                    if matches!(
-                        err.kind(),
-                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                    ) => {}
-                Err(err) => return Err(ClientError::Socket(err)),
-            }
-        }
-
-        Err(ClientError::OpenTimeout)
     }
 
     pub fn close(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {

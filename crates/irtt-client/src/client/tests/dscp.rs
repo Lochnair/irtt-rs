@@ -26,7 +26,7 @@ fn normal_open_applies_negotiated_dscp_after_open_and_close_clears_it() {
         socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
         0
     );
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     assert_eq!(
         socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
         184
@@ -58,7 +58,7 @@ fn normal_open_uses_negotiated_dscp_not_requested_dscp() {
     config.negotiation_policy = NegotiationPolicy::Loose;
     let mut client = Client::connect(config).unwrap();
 
-    let negotiated = assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    let negotiated = assert_open_started(client.open().unwrap());
     assert_eq!(negotiated.params.dscp, 0);
     assert_eq!(
         socket_traffic_class(&client.socket, client.remote).unwrap(),

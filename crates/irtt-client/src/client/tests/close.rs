@@ -11,10 +11,10 @@ fn open_fails_after_close() {
         let _ = recv_request(&socket, &tx);
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.close(ClientTimestamp::now()).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::AlreadyClosed)
     ));
     server.join();
@@ -31,7 +31,7 @@ fn close_sends_one_close_packet_with_negotiated_token() {
         let _ = recv_request(&socket, &tx);
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     let events = client.close(ClientTimestamp::now()).unwrap();
     assert_eq!(events.len(), 1);
     let packets: Vec<_> = server.rx.iter().take(2).collect();
@@ -62,7 +62,7 @@ fn send_probe_fails_after_close() {
         }
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.close(ClientTimestamp::now()).unwrap();
     assert!(matches!(
         client.send_probe(),
@@ -84,7 +84,7 @@ fn close_clears_timed_out_metadata() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
@@ -132,7 +132,7 @@ fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
     let events = client.recv_once().unwrap();

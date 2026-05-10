@@ -14,7 +14,7 @@ fn hmac_open_success() {
     });
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     server.join();
 }
 
@@ -32,7 +32,7 @@ fn hmac_open_rejects_missing_hmac() {
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::Protocol(
             irtt_proto::ProtoError::HmacPresenceMismatch
         ))
@@ -55,7 +55,7 @@ fn hmac_open_rejects_bad_hmac() {
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::Protocol(irtt_proto::ProtoError::BadHmac))
     ));
     server.join();
@@ -76,7 +76,7 @@ fn hmac_close_packet_includes_valid_hmac() {
     });
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.close(ClientTimestamp::now()).unwrap();
     let packets: Vec<_> = server.rx.iter().take(2).collect();
     let close = &packets[1];
@@ -125,7 +125,7 @@ fn bad_hmac_reply_is_dropped() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(30));
     let events = client.recv_once().unwrap();
@@ -174,7 +174,7 @@ fn hmac_echo_request_reply_works() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(50));
     let events = client.recv_once().unwrap();

@@ -38,7 +38,7 @@ fn send_probe_sends_valid_echo_request() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     let events = client.send_probe().unwrap();
     assert_eq!(events.len(), 1);
     match &events[0] {
@@ -89,7 +89,7 @@ fn echo_sent_reports_schedule_and_timer_error() {
         mono: Instant::now(),
         wall: SystemTime::now(),
     };
-    assert_open_started(client.open(start).unwrap());
+    assert_open_started(client.open().unwrap());
     let session_start = client.session.as_ref().unwrap().start_mono;
     assert!(
         session_start >= start.mono,
@@ -131,7 +131,7 @@ fn send_probe_starts_seq_at_zero_and_increments() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     client.send_probe().unwrap();
     client.send_probe().unwrap();
@@ -172,7 +172,7 @@ fn send_probe_respects_finite_duration_exclusive_end() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     let session = client.session.as_ref().unwrap();
     let start = session.start_mono;
@@ -225,7 +225,7 @@ fn continuous_duration_keeps_generating_send_deadlines() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     let start = client.session.as_ref().unwrap().start_mono;
     let interval = Duration::from_millis(500);
@@ -301,7 +301,7 @@ fn send_probe_reports_schedule_overflow() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.session.as_mut().unwrap().packets_sent = u64::MAX - 1;
 
     assert!(matches!(
@@ -323,7 +323,7 @@ fn send_probe_reports_logical_sequence_counter_overflow() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.session.as_mut().unwrap().next_logical_seq = u64::MAX;
 
     assert!(matches!(
@@ -347,7 +347,7 @@ fn send_probe_reports_packets_sent_counter_overflow() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.session.as_mut().unwrap().packets_sent = u64::MAX;
 
     assert!(matches!(
@@ -371,7 +371,7 @@ fn recv_once_returns_empty_on_timeout() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     let events = client.recv_once().unwrap();
     assert!(events.is_empty());
     server.join();
@@ -477,7 +477,7 @@ fn recv_once_decodes_only_received_bytes_after_longer_datagram() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     client.send_probe().unwrap();
@@ -550,7 +550,7 @@ fn echo_reply_metadata_propagates_observed_dscp_with_ancillary() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(50));
@@ -757,7 +757,7 @@ fn wrong_token_reply_is_dropped() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(30));
     let events = client.recv_once().unwrap();
@@ -796,7 +796,7 @@ fn duplicate_reply_emits_duplicate_event() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(50));
 
@@ -850,7 +850,7 @@ fn out_of_order_reply_emits_late_event() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(50));
@@ -891,7 +891,7 @@ fn poll_timeouts_emits_echo_loss() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     client.send_probe().unwrap();
@@ -921,7 +921,7 @@ fn poll_timeouts_removes_expired_pending() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(150));
@@ -967,7 +967,7 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
@@ -1046,7 +1046,7 @@ fn late_reply_metadata_is_unavailable_without_ancillary() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
@@ -1095,7 +1095,7 @@ fn late_reply_metadata_propagates_observed_dscp_with_ancillary() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
@@ -1149,7 +1149,7 @@ fn pending_map_bounded() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     client.send_probe().unwrap();
     client.send_probe().unwrap();
@@ -1199,7 +1199,7 @@ fn minimal_negotiated_layout_works() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(30));
     let events = client.recv_once().unwrap();
@@ -1253,7 +1253,7 @@ fn late_reply_with_pending_preserves_rtt() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     client.send_probe().unwrap();
     client.send_probe().unwrap();
@@ -1296,7 +1296,7 @@ fn pending_full_does_not_send_packet() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
     client.send_probe().unwrap();
@@ -1361,7 +1361,7 @@ fn unmatched_future_reply_emits_warning_not_late() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(50));
 
@@ -1419,7 +1419,7 @@ fn unmatched_future_reply_does_not_update_highest_received_seq() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(50));
@@ -1523,7 +1523,7 @@ fn matched_reply_with_reversed_monotonic_time_still_emits_event() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     let base = Instant::now() + Duration::from_secs(1);
     let send_ts = ClientTimestamp {
@@ -1566,7 +1566,7 @@ fn process_received_packet_uses_supplied_receive_metadata() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe_at(ClientTimestamp::now()).unwrap();
     let recv_ts = ClientTimestamp::now();
@@ -1613,7 +1613,7 @@ fn process_received_packet_uses_supplied_receive_metadata_for_late_reply() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.send_probe_at(ClientTimestamp::now()).unwrap();
     thread::sleep(Duration::from_millis(60));
@@ -1663,7 +1663,7 @@ fn receive_metadata_does_not_broaden_malformed_warning() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     let events = client
         .process_received_packet(
@@ -1754,7 +1754,7 @@ fn send_probe_wraps_wire_sequence_at_u32_max() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     let session = client.session.as_mut().unwrap();
     session.next_wire_seq = u32::MAX;
@@ -1811,7 +1811,7 @@ fn wrapped_reply_after_u32_max_is_not_late() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     let session = client.session.as_mut().unwrap();
     session.next_wire_seq = u32::MAX;
     session.next_logical_seq = 41;
@@ -1848,7 +1848,7 @@ fn send_probe_after_sending_done_is_noop() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
 
     client.session.as_mut().unwrap().sending_done = true;
     let events = client.send_probe().unwrap();
@@ -1926,7 +1926,7 @@ fn recv_buffer_uses_negotiated_packet_length() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     let buf_size = client.recv_buffer_size();
     assert!(
         buf_size > 4096,
@@ -1954,7 +1954,7 @@ fn short_echo_reply_does_not_emit_echo_reply() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
     let mut packet = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
@@ -1986,7 +1986,7 @@ fn overlong_echo_reply_does_not_emit_echo_reply() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
     let mut packet = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
@@ -2036,7 +2036,7 @@ fn overlong_datagram_detection_uses_extra_receive_byte() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     assert_eq!(
         client.recv_buffer.len(),
         echo_packet_len(false, &params) + 1
@@ -2083,7 +2083,7 @@ fn exact_length_echo_reply_still_emits_echo_reply() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
     let events = client.recv_once().unwrap();

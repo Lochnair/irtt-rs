@@ -94,7 +94,7 @@ impl ManagedClient {
             .transpose()?;
 
         let mut client = Client::connect(config)?;
-        let outcome = client.open(ClientTimestamp::now())?;
+        let outcome = client.open()?;
         publish_open_outcome(&hub, &outcome);
 
         let cancellation = CancellationToken::new();

@@ -72,7 +72,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
         return Ok(());
     }
 
-    let open = client.open(ClientTimestamp::now())?;
+    let open = client.open()?;
     output.print_event(open_event(&open))?;
 
     let mut interrupted = false;

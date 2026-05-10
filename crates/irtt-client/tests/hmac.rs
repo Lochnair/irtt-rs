@@ -98,7 +98,7 @@ fn hmac_close_success_sends_authenticated_close_and_closes_session() {
     config.hmac_key = Some(key);
 
     let mut client = Client::connect(config).unwrap();
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert_started(outcome, &params);
 
     let events = client.close(ClientTimestamp::now()).unwrap();
@@ -132,7 +132,7 @@ fn missing_client_key_against_hmac_required_server_times_out() {
 
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::OpenTimeout)
     ));
 
@@ -157,7 +157,7 @@ fn wrong_client_key_against_hmac_required_server_times_out() {
 
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::OpenTimeout)
     ));
 
@@ -185,7 +185,7 @@ fn bad_hmac_echo_reply_is_rejected_without_echo_reply_event() {
     };
 
     let mut client = Client::connect(config).unwrap();
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert_started(outcome, &params);
 
     let sent = client.send_probe().unwrap();
@@ -229,7 +229,7 @@ fn hmac_open_reply_with_bad_hmac_fails_with_protocol_error() {
 
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::Protocol(ProtoError::BadHmac))
     ));
     server.join();
@@ -247,7 +247,7 @@ fn non_hmac_client_open_does_not_set_hmac_flag() {
     config.hmac_key = None;
 
     let mut client = Client::connect(config).unwrap();
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert_started(outcome, &params);
 
     let observations = server.observations(1);
@@ -304,7 +304,7 @@ fn backend_hmac_correct_key_succeeds() {
     config.hmac_key = Some(key);
 
     let mut client = Client::connect(config).unwrap();
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert!(matches!(outcome, OpenOutcome::Started { .. }));
 
     let sent = client.send_probe().unwrap();
@@ -327,7 +327,7 @@ fn backend_hmac_wrong_key_fails() {
 
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::OpenTimeout)
     ));
 }
@@ -342,7 +342,7 @@ fn backend_hmac_missing_key_fails() {
 
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::OpenTimeout)
     ));
 }

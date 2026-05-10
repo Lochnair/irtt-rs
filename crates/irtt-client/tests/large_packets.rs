@@ -128,7 +128,7 @@ fn backend_large_packet_smoke() {
     })
     .unwrap();
 
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
 
     client.send_probe().unwrap();

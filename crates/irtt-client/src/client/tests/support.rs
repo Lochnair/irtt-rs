@@ -283,7 +283,7 @@ pub(super) fn open_client_with_echo_server(params: &Params) -> (Client, FakeServ
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     (client, server)
 }
 

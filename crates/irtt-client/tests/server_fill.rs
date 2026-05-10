@@ -112,7 +112,7 @@ fn server_fill_strict_rejects_removed_fill() {
     let server = start_open_server(returned, None);
     let mut client = Client::connect(config_for_params(server.addr, &requested)).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::NegotiationRejected { .. })
     ));
     server.join();
@@ -129,7 +129,7 @@ fn server_fill_strict_rejects_different_fill_value() {
     let server = start_open_server(returned, None);
     let mut client = Client::connect(config_for_params(server.addr, &requested)).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::NegotiationRejected { .. })
     ));
     server.join();
@@ -145,7 +145,7 @@ fn server_fill_strict_rejects_unexpected_fill_from_server() {
     let server = start_open_server(returned, None);
     let mut client = Client::connect(config_for_params(server.addr, &requested)).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::NegotiationRejected { .. })
     ));
     server.join();

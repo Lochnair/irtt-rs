@@ -8,7 +8,7 @@ fn no_test_open_close_succeeds_on_open_reply_close() {
     let server = no_test_server(params.clone(), 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
-    let negotiated = assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
+    let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
     assert_eq!(client.negotiated.as_ref(), Some(&negotiated));
     assert!(matches!(
@@ -26,7 +26,7 @@ fn no_test_success_validates_params() {
     let server = no_test_server(params.clone(), 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
-    let negotiated = assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
+    let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
     server.join();
 }
@@ -40,7 +40,7 @@ fn no_test_rejects_non_close_open_reply() {
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::UnexpectedNoTestReply)
     ));
     server.join();
@@ -55,7 +55,7 @@ fn no_test_rejects_non_zero_token_with_close_reply() {
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::NonZeroNoTestToken { token: TOKEN })
     ));
     server.join();
@@ -71,7 +71,7 @@ fn no_test_strict_negotiation_rejects_changed_params() {
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::NegotiationRejected { .. })
     ));
     server.join();
@@ -87,7 +87,7 @@ fn no_test_loose_negotiation_accepts_restricted_params() {
     let server = no_test_server(params.clone(), 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
-    let negotiated = assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
+    let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
     server.join();
 }
@@ -100,7 +100,7 @@ fn send_probe_fails_after_no_test_completed() {
     let server = no_test_server(params, 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
-    assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
+    assert_no_test_completed(client.open().unwrap());
     assert!(matches!(
         client.send_probe(),
         Err(ClientError::AlreadyCompleted)
@@ -116,9 +116,9 @@ fn open_fails_after_no_test_completed() {
     let server = no_test_server(params, 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
-    assert_no_test_completed(client.open(ClientTimestamp::now()).unwrap());
+    assert_no_test_completed(client.open().unwrap());
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::AlreadyCompleted)
     ));
     server.join();

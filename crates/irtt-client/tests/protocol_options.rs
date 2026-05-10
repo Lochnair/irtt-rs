@@ -167,7 +167,7 @@ fn strict_open_rejects_changed_compatibility_params_from_server() {
         config.server_addr = server.addr.to_string();
         let mut client = Client::connect(config).unwrap();
         assert!(matches!(
-            client.open(irtt_client::ClientTimestamp::now()),
+            client.open(),
             Err(ClientError::NegotiationRejected { .. })
         ));
         server.join();
@@ -379,7 +379,7 @@ fn backend_basic_open_echo_close() {
     let peer = BackendPeer::start_open_echo(params.clone(), None);
     let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
 
     let sent = client.send_probe().unwrap();
@@ -400,7 +400,7 @@ fn backend_ttl_smoke() {
     config.socket_config.ttl = Some(64);
     let mut client = Client::connect(config).unwrap();
 
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
 
     let sent = client.send_probe().unwrap();
@@ -420,7 +420,7 @@ fn dscp_configured_open_close_smoke() {
     let server = start_open_server(params.clone(), None);
     let mut client = Client::connect(config_for_params(server.addr, &params)).unwrap();
 
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
     client.close(ClientTimestamp::now()).unwrap();
     server.join();
@@ -438,7 +438,7 @@ fn backend_received_stats_smoke() {
         let peer = BackendPeer::start_open_echo(params.clone(), None);
         let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
-        client.open(ClientTimestamp::now()).unwrap();
+        client.open().unwrap();
         client.send_probe().unwrap();
         let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);
@@ -461,7 +461,7 @@ fn backend_timestamp_smoke() {
         let peer = BackendPeer::start_open_echo(params.clone(), None);
         let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
-        client.open(ClientTimestamp::now()).unwrap();
+        client.open().unwrap();
         client.send_probe().unwrap();
         let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);
@@ -508,7 +508,7 @@ fn backend_clock_smoke() {
         let peer = BackendPeer::start_open_echo(params.clone(), None);
         let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
-        client.open(ClientTimestamp::now()).unwrap();
+        client.open().unwrap();
         client.send_probe().unwrap();
         let events = client.recv_once().unwrap();
         assert_eq!(events.len(), 1);

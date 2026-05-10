@@ -216,7 +216,7 @@ where
 {
     let server = start_one_probe_server(server_params, timestamps, hmac_key);
     let mut client = Client::connect(build_config(server.addr)).unwrap();
-    let negotiated = assert_started(client.open(ClientTimestamp::now()).unwrap());
+    let negotiated = assert_started(client.open().unwrap());
 
     let sent_events = client.send_probe().unwrap();
     assert_eq!(sent_events.len(), 1);

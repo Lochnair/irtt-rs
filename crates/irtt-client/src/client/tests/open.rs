@@ -18,7 +18,7 @@ fn successful_open_handshake() {
     let server = open_success_server(params.clone());
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
 
-    let negotiated = assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    let negotiated = assert_open_started(client.open().unwrap());
     assert_eq!(negotiated.params, params);
     assert!(matches!(client.phase, ClientPhase::Open { token: TOKEN }));
     server.join();
@@ -30,9 +30,9 @@ fn open_fails_when_already_open() {
     let params = params_from_config(&config).unwrap();
     let server = open_success_server(params);
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-    assert_open_started(client.open(ClientTimestamp::now()).unwrap());
+    assert_open_started(client.open().unwrap());
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::AlreadyOpen)
     ));
     server.join();
@@ -53,7 +53,7 @@ fn open_retries_after_first_timeout() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
-    let outcome = client.open(ClientTimestamp::now()).unwrap();
+    let outcome = client.open().unwrap();
     assert_open_started(outcome);
     assert_eq!(server.rx.iter().take(2).count(), 2);
     server.join();
@@ -68,7 +68,7 @@ fn open_timeout_after_all_timeouts() {
     };
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::OpenTimeout)
     ));
     assert_eq!(server.rx.iter().take(2).count(), 2);
@@ -88,7 +88,7 @@ fn open_restores_configured_read_timeout_after_timeout() {
     };
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::OpenTimeout)
     ));
 
@@ -108,7 +108,7 @@ fn protocol_version_mismatch_fails() {
     let server = open_success_server(params);
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::ProtocolVersionMismatch { received: 2, .. })
     ));
     server.join();
@@ -125,7 +125,7 @@ fn server_rejection_fails_in_normal_mode() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert!(matches!(
-        client.open(ClientTimestamp::now()),
+        client.open(),
         Err(ClientError::ServerRejected)
     ));
     server.join();
