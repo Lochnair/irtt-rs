@@ -13,8 +13,8 @@ categories = ["network-programming"]
 
 [dependencies]
 irtt-proto.workspace = true
-libc = { version = "0.2", optional = true }
-socket2 = { version = "0.6", features = ["all"] }
+libc = { version = "0.2.186", optional = true }
+socket2 = { version = "0.6.3", features = ["all"] }
 thiserror = "2.0.18"
 
 [features]
