@@ -12,7 +12,7 @@ keywords = ["irtt", "networking", "latency", "protocol"]
 categories = ["network-programming"]
 
 [dependencies]
-hmac = "0.12"
-md-5 = "0.10"
+hmac = "0.13.0"
+md-5 = "0.11.0"
 subtle = "2"
 thiserror = "2"
