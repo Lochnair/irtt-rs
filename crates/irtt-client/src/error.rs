@@ -3,6 +3,7 @@ use std::{io, time::Duration};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("failed to resolve server address {addr:?}")]
     Resolve { addr: String },

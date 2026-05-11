@@ -831,6 +831,7 @@ fn warning_kind(kind: WarningKind) -> &'static str {
         WarningKind::MalformedOrUnrelatedPacket => "malformed_or_unrelated_packet",
         WarningKind::WrongToken => "wrong_token",
         WarningKind::UntrackedReply => "untracked_reply",
+        _ => "unknown",
     }
 }
 
