@@ -74,10 +74,6 @@ impl StatsCollector {
     }
 
     pub fn process(&mut self, event: &ClientEvent) -> EventStatsUpdate {
-        self.process_with_update(event)
-    }
-
-    pub fn process_with_update(&mut self, event: &ClientEvent) -> EventStatsUpdate {
         let Some(window_event) = WindowEvent::from_client_event(event) else {
             return EventStatsUpdate::default();
         };
