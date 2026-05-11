@@ -19,3 +19,10 @@ readme = "README.md"
 irtt-proto = { version = "0.1.1", path = "crates/irtt-proto" }
 irtt-client = { version = "0.1.1", path = "crates/irtt-client" }
 irtt-stats = { version = "0.1.1", path = "crates/irtt-stats" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
