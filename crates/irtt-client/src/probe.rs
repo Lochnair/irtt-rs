@@ -63,7 +63,6 @@ impl PendingMap {
         expired
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -115,7 +114,6 @@ impl TimedOutMap {
         self.insertion_order.clear();
     }
 
-    #[allow(dead_code)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
