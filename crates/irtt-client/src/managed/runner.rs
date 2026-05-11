@@ -594,19 +594,13 @@ mod tests {
         server.join();
 
         assert_eq!(outcome.end_reason, SessionEndReason::TestComplete);
-        assert!(events.iter().any(|event| matches!(
-            event,
-            ClientEvent::EchoLoss {
-                seq: 0,
-                logical_seq: 0,
-                ..
-            }
-        )));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::EchoLoss { seq: 0, .. })));
         assert!(events.iter().any(|event| matches!(
             event,
             ClientEvent::LateReply {
                 seq: 0,
-                logical_seq: Some(0),
                 sent_at: Some(_),
                 rtt: Some(_),
                 ..

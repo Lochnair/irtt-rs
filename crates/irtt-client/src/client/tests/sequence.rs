@@ -26,7 +26,6 @@ fn sequence_ordering_handles_normal_and_wrapped_values() {
 fn highest_received_seq_updates_across_wrap() {
     let mut session = ActiveSession {
         next_wire_seq: 0,
-        next_logical_seq: 0,
         highest_received_seq: Some(u32::MAX),
         packets_sent: 0,
         start_mono: Instant::now(),

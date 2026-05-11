@@ -313,15 +313,14 @@ mod tests {
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112)
     }
 
-    fn reply_event(logical_seq: u64, rtt_us: u64) -> ClientEvent {
-        let sent_at = test_timestamp(Duration::from_millis(logical_seq));
+    fn reply_event(seq: u32, rtt_us: u64) -> ClientEvent {
+        let sent_at = test_timestamp(Duration::from_millis(seq as u64));
         let received_at = ClientTimestamp {
             wall: sent_at.wall + Duration::from_micros(rtt_us),
             mono: sent_at.mono + Duration::from_micros(rtt_us),
         };
         ClientEvent::EchoReply {
-            seq: logical_seq as u32,
-            logical_seq,
+            seq,
             remote: test_remote(),
             sent_at,
             received_at,
@@ -349,7 +348,6 @@ mod tests {
         let events = [
             ClientEvent::EchoSent {
                 seq: 1,
-                logical_seq: 1,
                 remote: test_remote(),
                 scheduled_at: sent_at.mono,
                 sent_at,
@@ -359,7 +357,6 @@ mod tests {
             },
             ClientEvent::EchoReply {
                 seq: 1,
-                logical_seq: 1,
                 remote: test_remote(),
                 sent_at,
                 received_at,
@@ -442,12 +439,11 @@ mod tests {
     #[test]
     fn continuous_mode_uses_continuous_stats_config() {
         let mut collector = StatsCollector::new(stats_config(true));
-        for seq in 0..5000 {
-            let sent_at = test_timestamp(Duration::from_micros(seq));
-            let received_at = test_timestamp(Duration::from_micros(seq + 1));
+        for seq in 0..5000_u32 {
+            let sent_at = test_timestamp(Duration::from_micros(seq as u64));
+            let received_at = test_timestamp(Duration::from_micros(seq as u64 + 1));
             collector.process(&ClientEvent::EchoReply {
-                seq: seq as u32,
-                logical_seq: seq,
+                seq,
                 remote: test_remote(),
                 sent_at,
                 received_at,

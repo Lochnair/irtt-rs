@@ -229,7 +229,6 @@ mod tests {
 
         collector.process(&ClientEvent::EchoSent {
             seq: 1,
-            logical_seq: 1,
             remote: test_remote(),
             scheduled_at: sent_at.mono,
             sent_at,
@@ -239,7 +238,6 @@ mod tests {
         });
         collector.process(&ClientEvent::EchoReply {
             seq: 1,
-            logical_seq: 1,
             remote: test_remote(),
             sent_at,
             received_at,
@@ -287,7 +285,6 @@ mod tests {
         let received_at = test_timestamp(Duration::from_secs(1) + Duration::from_micros(1500));
         collector.process(&ClientEvent::EchoReply {
             seq: 1,
-            logical_seq: 1,
             remote: test_remote(),
             sent_at: test_timestamp(Duration::from_secs(1)),
             received_at,

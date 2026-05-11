@@ -326,8 +326,8 @@ pub struct HumanEventStats {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HumanIpdvPair {
-    pub previous_logical_seq: u64,
-    pub current_logical_seq: u64,
+    pub previous_seq: u32,
+    pub current_seq: u32,
     pub rtt_ipdv: Duration,
     pub send_ipdv: Option<Duration>,
     pub receive_ipdv: Option<Duration>,
@@ -352,8 +352,8 @@ impl From<irtt_stats::EventStatsUpdate> for HumanEventStats {
 impl From<irtt_stats::IpdvPairUpdate> for HumanIpdvPair {
     fn from(value: irtt_stats::IpdvPairUpdate) -> Self {
         Self {
-            previous_logical_seq: value.previous_logical_seq,
-            current_logical_seq: value.current_logical_seq,
+            previous_seq: value.previous_seq,
+            current_seq: value.current_seq,
             rtt_ipdv: value.rtt_ipdv,
             send_ipdv: value.send_ipdv,
             receive_ipdv: value.receive_ipdv,
@@ -385,7 +385,6 @@ pub fn format_human_event_with_options(
         ClientEvent::EchoSent { .. } => String::new(),
         ClientEvent::EchoReply {
             seq,
-            logical_seq,
             rtt,
             server_timing,
             one_way,
@@ -393,17 +392,9 @@ pub fn format_human_event_with_options(
             ..
         } => {
             let mut out = format!("seq={seq}");
-            if options.verbose {
-                write!(out, "  logical_seq={logical_seq}").unwrap();
-            }
             write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
             write_human_one_way(&mut out, *one_way);
-            write!(
-                out,
-                "  ipdv={}",
-                format_human_ipdv(stats, Some(*logical_seq))
-            )
-            .unwrap();
+            write!(out, "  ipdv={}", format_human_ipdv(stats, *seq)).unwrap();
             if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
                 write!(out, "  proc={}", format_duration(processing)).unwrap();
             }
@@ -412,17 +403,14 @@ pub fn format_human_event_with_options(
             }
             out
         }
-        ClientEvent::EchoLoss {
-            seq, logical_seq, ..
-        } => {
-            format!("loss  seq={seq}  logical_seq={logical_seq}")
+        ClientEvent::EchoLoss { seq, .. } => {
+            format!("loss  seq={seq}")
         }
         ClientEvent::DuplicateReply { seq, remote, .. } => {
             format!("duplicate  seq={seq}  remote={remote}")
         }
         ClientEvent::LateReply {
             seq,
-            logical_seq,
             highest_seen,
             remote,
             rtt,
@@ -430,14 +418,11 @@ pub fn format_human_event_with_options(
             received_stats,
             ..
         } => {
-            let mut out = format!(
-                "late  seq={seq}  logical_seq={}  highest_seen={highest_seen}  remote={remote}",
-                optional_u64(*logical_seq)
-            );
+            let mut out = format!("late  seq={seq}  highest_seen={highest_seen}  remote={remote}",);
             if let Some(rtt) = rtt {
                 write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
                 write_human_one_way(&mut out, *one_way);
-                write!(out, "  ipdv={}", format_human_ipdv(stats, *logical_seq)).unwrap();
+                write!(out, "  ipdv={}", format_human_ipdv(stats, *seq)).unwrap();
             }
             write_human_received_stats(&mut out, *received_stats);
             out
@@ -489,7 +474,6 @@ fn format_machine(event: &ClientEvent) -> String {
         ClientEvent::EchoSent { .. } => {}
         ClientEvent::EchoReply {
             seq,
-            logical_seq,
             remote,
             sent_at,
             received_at,
@@ -501,7 +485,7 @@ fn format_machine(event: &ClientEvent) -> String {
             packet_meta,
         } => {
             write_common(&mut out, "echo_reply");
-            write_seq(&mut out, *seq, Some(*logical_seq));
+            write_seq(&mut out, *seq);
             write_remote(&mut out, *remote);
             write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
             write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
@@ -511,14 +495,9 @@ fn format_machine(event: &ClientEvent) -> String {
             write_received_stats(&mut out, *received_stats);
             write_packet_meta(&mut out, *packet_meta);
         }
-        ClientEvent::EchoLoss {
-            seq,
-            logical_seq,
-            sent_at,
-            ..
-        } => {
+        ClientEvent::EchoLoss { seq, sent_at, .. } => {
             write_common(&mut out, "loss");
-            write_seq(&mut out, *seq, Some(*logical_seq));
+            write_seq(&mut out, *seq);
             write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
             out.push_str(" warning=loss");
         }
@@ -529,14 +508,13 @@ fn format_machine(event: &ClientEvent) -> String {
             bytes: _,
         } => {
             write_common(&mut out, "duplicate");
-            write_seq(&mut out, *seq, None);
+            write_seq(&mut out, *seq);
             write_remote(&mut out, *remote);
             write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
             out.push_str(" warning=duplicate");
         }
         ClientEvent::LateReply {
             seq,
-            logical_seq,
             highest_seen,
             remote,
             sent_at,
@@ -549,7 +527,7 @@ fn format_machine(event: &ClientEvent) -> String {
             packet_meta,
         } => {
             write_common(&mut out, "late");
-            write_seq(&mut out, *seq, *logical_seq);
+            write_seq(&mut out, *seq);
             write_remote(&mut out, *remote);
             write!(out, " highest_seen={highest_seen}").unwrap();
             if let Some(sent_at) = sent_at {
@@ -594,7 +572,6 @@ fn format_simple(event: &ClientEvent) -> String {
         ClientEvent::EchoSent { .. } => String::new(),
         ClientEvent::EchoReply {
             seq,
-            logical_seq,
             remote,
             rtt,
             server_timing,
@@ -602,7 +579,7 @@ fn format_simple(event: &ClientEvent) -> String {
             ..
         } => {
             let mut out = format!(
-                "reply seq={seq} logical_seq={logical_seq} remote={remote} rtt_us={}",
+                "reply seq={seq} remote={remote} rtt_us={}",
                 duration_us(rtt.effective)
             );
             if let Some(raw) = rtt.adjusted.map(|_| rtt.raw) {
@@ -613,26 +590,20 @@ fn format_simple(event: &ClientEvent) -> String {
             }
             out
         }
-        ClientEvent::EchoLoss {
-            seq, logical_seq, ..
-        } => {
-            format!("loss seq={seq} logical_seq={logical_seq}")
+        ClientEvent::EchoLoss { seq, .. } => {
+            format!("loss seq={seq}")
         }
         ClientEvent::DuplicateReply { seq, remote, .. } => {
             format!("duplicate seq={seq} remote={remote}")
         }
         ClientEvent::LateReply {
             seq,
-            logical_seq,
             highest_seen,
             remote,
             rtt,
             ..
         } => {
-            let mut out = format!(
-                "late seq={seq} logical_seq={} highest_seen={highest_seen} remote={remote}",
-                optional_u64(*logical_seq)
-            );
+            let mut out = format!("late seq={seq} highest_seen={highest_seen} remote={remote}",);
             if let Some(rtt) = rtt {
                 write!(out, " rtt_us={}", duration_us(rtt.effective)).unwrap();
             }
@@ -648,11 +619,8 @@ fn write_common(out: &mut String, event: &str) {
     write!(out, "event={event}").unwrap();
 }
 
-fn write_seq(out: &mut String, seq: u32, logical_seq: Option<u64>) {
+fn write_seq(out: &mut String, seq: u32) {
     write!(out, " seq={seq}").unwrap();
-    if let Some(logical_seq) = logical_seq {
-        write!(out, " logical_seq={logical_seq}").unwrap();
-    }
 }
 
 fn write_remote(out: &mut String, remote: SocketAddr) {
@@ -763,19 +731,21 @@ fn write_human_received_stats(out: &mut String, stats: Option<ReceivedStatsSampl
     }
 }
 
-fn format_human_ipdv(stats: Option<&HumanEventStats>, logical_seq: Option<u64>) -> String {
+fn format_human_ipdv(stats: Option<&HumanEventStats>, seq: u32) -> String {
     let Some(stats) = stats else {
         return "n/a".to_owned();
     };
 
-    let pair = logical_seq
-        .and_then(|seq| {
+    let pair = stats
+        .ipdv_pairs
+        .iter()
+        .find(|pair| pair.current_seq == seq)
+        .or_else(|| {
             stats
                 .ipdv_pairs
                 .iter()
-                .find(|pair| pair.current_logical_seq == seq)
-        })
-        .or_else(|| stats.ipdv_pairs.last());
+                .find(|pair| pair.previous_seq == seq)
+        });
 
     pair.map(|pair| format_duration(pair.rtt_ipdv))
         .unwrap_or_else(|| "n/a".to_owned())
@@ -818,12 +788,6 @@ fn format_ns(ns: f64) -> String {
     } else {
         format!("{:.3}s", ns / 1_000_000_000.0)
     }
-}
-
-fn optional_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| value.to_string())
-        .unwrap_or_else(|| "none".to_owned())
 }
 
 fn warning_kind(kind: WarningKind) -> &'static str {
@@ -879,7 +843,6 @@ mod tests {
     fn reply_event_with_meta(packet_meta: PacketMeta) -> ClientEvent {
         ClientEvent::EchoReply {
             seq: 7,
-            logical_seq: 8,
             remote: test_remote(),
             sent_at: test_timestamp(Duration::from_secs(1)),
             received_at: test_timestamp(Duration::from_secs(1) + Duration::from_micros(1500)),
@@ -915,7 +878,6 @@ mod tests {
     fn late_event_with_meta(packet_meta: PacketMeta) -> ClientEvent {
         ClientEvent::LateReply {
             seq: 4,
-            logical_seq: None,
             highest_seen: 9,
             remote: test_remote(),
             sent_at: None,
@@ -1220,7 +1182,6 @@ mod tests {
         let line = format_event(&reply_event(), OutputMode::Machine).unwrap();
         assert!(line.starts_with("event=echo_reply "));
         assert!(line.contains("seq=7"));
-        assert!(line.contains("logical_seq=8"));
         assert!(line.contains("remote=127.0.0.1:2112"));
         assert!(line.contains("client_send_wall_ns=1000000000"));
         assert!(line.contains("client_receive_wall_ns=1001500000"));
@@ -1329,7 +1290,7 @@ mod tests {
         let line = format_event(&reply_event(), OutputMode::Simple).unwrap();
         assert_eq!(
             line,
-            "reply seq=7 logical_seq=8 remote=127.0.0.1:2112 rtt_us=1200 raw_rtt_us=1500 server_processing_us=300"
+            "reply seq=7 remote=127.0.0.1:2112 rtt_us=1200 raw_rtt_us=1500 server_processing_us=300"
         );
     }
 
@@ -1341,7 +1302,6 @@ mod tests {
         assert!(line.contains("sd=400.0µs"));
         assert!(line.contains("ipdv=n/a"));
         assert!(line.contains("proc=300.0µs"));
-        assert!(!line.contains("logical_seq="));
         assert!(!line.contains("server_received="));
         assert!(!line.contains("server_window="));
         assert!(!line.contains("rtt_us="));
@@ -1363,7 +1323,6 @@ mod tests {
             HumanOutputOptions { verbose: true },
         );
 
-        assert!(line.contains("logical_seq=8"));
         assert!(line.contains("server_received=9"));
         assert!(line.contains("server_window=0x7"));
     }
@@ -1375,8 +1334,8 @@ mod tests {
             Some(HumanEventStats {
                 contributed_sample: true,
                 ipdv_pairs: vec![HumanIpdvPair {
-                    previous_logical_seq: 7,
-                    current_logical_seq: 8,
+                    previous_seq: 7,
+                    current_seq: 8,
                     rtt_ipdv: Duration::from_micros(47),
                     send_ipdv: None,
                     receive_ipdv: None,
@@ -1391,7 +1350,6 @@ mod tests {
     fn human_reply_marks_missing_one_way_delay_unavailable() {
         let ClientEvent::EchoReply {
             seq,
-            logical_seq,
             remote,
             sent_at,
             received_at,
@@ -1407,7 +1365,6 @@ mod tests {
         };
         let event = ClientEvent::EchoReply {
             seq,
-            logical_seq,
             remote,
             sent_at,
             received_at,
@@ -1430,7 +1387,6 @@ mod tests {
         let ts = test_timestamp(Duration::from_secs(1));
         let event = ClientEvent::EchoSent {
             seq: 1,
-            logical_seq: 2,
             remote: test_remote(),
             scheduled_at: ts.mono,
             sent_at: ts,
@@ -1451,7 +1407,6 @@ mod tests {
         let events = [
             ClientEvent::EchoLoss {
                 seq: 1,
-                logical_seq: 2,
                 sent_at: ts,
                 timeout_at: ts.mono + Duration::from_secs(1),
             },
@@ -1463,7 +1418,6 @@ mod tests {
             },
             ClientEvent::LateReply {
                 seq: 4,
-                logical_seq: None,
                 highest_seen: 9,
                 remote: test_remote(),
                 sent_at: None,
