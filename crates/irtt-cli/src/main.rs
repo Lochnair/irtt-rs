@@ -13,7 +13,11 @@ use clap::Parser;
 use irtt_cli::{
     format_event, format_human_event_with_options, CliArgs, HumanOutputOptions, OutputMode,
 };
-use irtt_client::{Client, ClientEvent, ClientTimestamp, OpenOutcome, RecvBudget};
+use irtt_client::{Client, ClientEvent, OpenOutcome, RecvBudget};
+
+#[cfg(test)]
+use irtt_client::ClientTimestamp;
+
 #[cfg(feature = "stats")]
 use irtt_stats::{StatsCollector, StatsConfig};
 
@@ -85,7 +89,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
         let events = client.recv_available(RECV_BUDGET)?;
         output.print_events(&events)?;
 
-        let events = client.poll_timeouts(ClientTimestamp::now())?;
+        let events = client.poll_timeouts()?;
         output.print_events(&events)?;
 
         if is_shutdown_requested(shutdown_requested) {
@@ -105,7 +109,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
         drain_final_replies(&mut client, &mut output)?;
     }
 
-    let events = client.poll_timeouts(ClientTimestamp::now())?;
+    let events = client.poll_timeouts()?;
     output.print_events(&events)?;
 
     let events = client.close()?;
@@ -154,7 +158,7 @@ fn drain_final_replies<W: Write>(
         printed |= !events.is_empty();
         output.print_events(&events)?;
 
-        let events = client.poll_timeouts(ClientTimestamp::now())?;
+        let events = client.poll_timeouts()?;
         printed |= !events.is_empty();
         output.print_events(&events)?;
 

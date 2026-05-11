@@ -1,6 +1,6 @@
 mod support;
 
-use irtt_client::{Client, ClientConfig, ClientEvent, ClientTimestamp, NegotiationPolicy};
+use irtt_client::{Client, ClientConfig, ClientEvent, NegotiationPolicy};
 use irtt_proto::{echo_header_len, echo_packet_len, Params, TimestampFields};
 
 use support::{config_for_params, default_params, run_one_probe, BackendPeer, ServerObservation};

@@ -7,7 +7,6 @@ use crate::{
     config::{ClientConfig, RecvBudget},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
-    timing::ClientTimestamp,
     Client,
 };
 
@@ -182,11 +181,7 @@ fn run_client(
                 &mut counters,
                 client.recv_available(MANAGED_RECV_BUDGET)?,
             );
-            publish_events(
-                &hub,
-                &mut counters,
-                client.poll_timeouts(ClientTimestamp::now())?,
-            );
+            publish_events(&hub, &mut counters, client.poll_timeouts()?);
             break;
         }
 
@@ -205,11 +200,7 @@ fn run_client(
             &mut counters,
             client.recv_available(MANAGED_RECV_BUDGET)?,
         );
-        publish_events(
-            &hub,
-            &mut counters,
-            client.poll_timeouts(ClientTimestamp::now())?,
-        );
+        publish_events(&hub, &mut counters, client.poll_timeouts()?);
 
         if client.is_run_complete() {
             break;
@@ -267,7 +258,7 @@ fn drain_final_late_replies(
         published |= !events.is_empty();
         publish_events(hub, counters, events);
 
-        let events = client.poll_timeouts(ClientTimestamp::now())?;
+        let events = client.poll_timeouts()?;
         published |= !events.is_empty();
         publish_events(hub, counters, events);
 

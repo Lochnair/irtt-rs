@@ -341,7 +341,19 @@ impl Client {
         recv_buffer_size(self.config.hmac_key.is_some(), self.negotiated.as_ref())
     }
 
-    pub fn poll_timeouts(&mut self, now: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
+    /// Polls for probes that have timed out as of the current monotonic time.
+    pub fn poll_timeouts(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+        self.poll_timeouts_at(Instant::now())
+    }
+
+    /// Polls for probes that have timed out as of `now`.
+    ///
+    /// This is useful for callers that drive `Client` from their own event loop and
+    /// want timeout decisions to use the same sampled `Instant` as their scheduling
+    /// logic.
+    ///
+    /// `now` is monotonic time only; wall-clock time is not used for timeout expiry.
+    pub fn poll_timeouts_at(&mut self, now: Instant) -> Result<Vec<ClientEvent>, ClientError> {
         match self.phase {
             ClientPhase::Open { .. } => {}
             ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
@@ -354,7 +366,7 @@ impl Client {
             .as_mut()
             .expect("session must exist when phase is Open");
 
-        let expired = session.pending.drain_expired(now.mono);
+        let expired = session.pending.drain_expired(now);
         let mut events = Vec::with_capacity(expired.len());
         for probe in expired {
             events.push(ClientEvent::EchoLoss {

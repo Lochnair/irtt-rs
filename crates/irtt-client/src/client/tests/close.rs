@@ -85,7 +85,7 @@ fn close_clears_timed_out_metadata() {
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
-    client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    client.poll_timeouts().unwrap();
     assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
 
     client.close().unwrap();

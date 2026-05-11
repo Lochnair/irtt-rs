@@ -3,7 +3,7 @@ mod support;
 use std::time::Duration;
 
 use irtt_client::{
-    Client, ClientConfig, ClientError, ClientEvent, ClientTimestamp, OpenOutcome, SocketConfig,
+    Client, ClientConfig, ClientError, ClientEvent, OpenOutcome, SocketConfig,
     WarningKind,
 };
 use irtt_proto::{echo_packet_len, ProtoError, TimestampFields};

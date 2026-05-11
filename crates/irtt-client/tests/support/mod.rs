@@ -11,7 +11,7 @@ use std::{
 };
 
 use irtt_client::{
-    Client, ClientConfig, ClientEvent, ClientTimestamp, NegotiatedParams, OpenOutcome, SocketConfig,
+    Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, SocketConfig,
 };
 use irtt_proto::{
     compute_hmac_in_place, echo_packet_len, flags, verify_hmac, Clock, Params, ProtoError,

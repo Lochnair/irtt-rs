@@ -1,6 +1,5 @@
 mod support;
 
-use irtt_client::ClientTimestamp;
 use std::time::Duration;
 
 use irtt_client::{

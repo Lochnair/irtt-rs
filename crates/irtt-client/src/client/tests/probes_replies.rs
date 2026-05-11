@@ -896,11 +896,11 @@ fn poll_timeouts_emits_echo_loss() {
     client.send_probe().unwrap();
     client.send_probe().unwrap();
 
-    let no_loss = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    let no_loss = client.poll_timeouts().unwrap();
     assert!(no_loss.is_empty());
 
     thread::sleep(Duration::from_millis(150));
-    let events = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    let events = client.poll_timeouts().unwrap();
     assert_eq!(events.len(), 2);
     for event in &events {
         assert!(matches!(event, ClientEvent::EchoLoss { .. }));
@@ -925,7 +925,7 @@ fn poll_timeouts_removes_expired_pending() {
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(150));
-    client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    client.poll_timeouts().unwrap();
 
     let session = client.session.as_ref().unwrap();
     assert_eq!(session.pending.len(), 0);
@@ -971,7 +971,7 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
-    let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    let losses = client.poll_timeouts().unwrap();
     assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
     assert_eq!(client.session.as_ref().unwrap().pending.len(), 0);
     assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
@@ -1050,7 +1050,7 @@ fn late_reply_metadata_is_unavailable_without_ancillary() {
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
-    let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    let losses = client.poll_timeouts().unwrap();
     assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
 
     let late = client.recv_once().unwrap();
@@ -1099,7 +1099,7 @@ fn late_reply_metadata_propagates_observed_dscp_with_ancillary() {
 
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(60));
-    let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    let losses = client.poll_timeouts().unwrap();
     assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
 
     let events = client.recv_once().unwrap();
@@ -1617,7 +1617,7 @@ fn process_received_packet_uses_supplied_receive_metadata_for_late_reply() {
 
     client.send_probe_at(ClientTimestamp::now()).unwrap();
     thread::sleep(Duration::from_millis(60));
-    let losses = client.poll_timeouts(ClientTimestamp::now()).unwrap();
+    let losses = client.poll_timeouts().unwrap();
     assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
 
     let recv_ts = ClientTimestamp::now();
