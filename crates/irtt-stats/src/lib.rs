@@ -142,8 +142,8 @@ pub struct EventStatsUpdate {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IpdvPairUpdate {
-    pub previous_logical_seq: u64,
-    pub current_logical_seq: u64,
+    pub previous_seq: u32,
+    pub current_seq: u32,
     pub rtt_ipdv: Duration,
     pub send_ipdv: Option<Duration>,
     pub receive_ipdv: Option<Duration>,
@@ -297,9 +297,9 @@ struct CoreStats {
     send_delay: MetricU64,
     receive_delay: MetricU64,
     server_processing: MetricU64,
-    samples: HashMap<u64, UniqueSample>,
-    sample_order: VecDeque<u64>,
-    ipdv_pairs: HashSet<u64>,
+    samples: HashMap<u32, UniqueSample>,
+    sample_order: VecDeque<u32>,
+    ipdv_pairs: HashSet<u32>,
 }
 
 impl CoreStats {
@@ -381,7 +381,7 @@ impl CoreStats {
                     self.receive_delay.push(delay);
                 }
 
-                let seq = sample.logical_seq;
+                let seq = sample.seq;
                 if self.samples.insert(seq, sample).is_none() {
                     self.sample_order.push_back(seq);
                     self.enforce_sequence_limit();
@@ -430,7 +430,7 @@ impl CoreStats {
         }
     }
 
-    fn try_ipdv_pair(&mut self, current_seq: u64) -> Option<IpdvPairUpdate> {
+    fn try_ipdv_pair(&mut self, current_seq: u32) -> Option<IpdvPairUpdate> {
         let previous_seq = current_seq.checked_sub(1)?;
 
         if !self.ipdv_pairs.insert(current_seq) {
@@ -464,8 +464,8 @@ impl CoreStats {
         }
 
         Some(IpdvPairUpdate {
-            previous_logical_seq: previous_seq,
-            current_logical_seq: current_seq,
+            previous_seq,
+            current_seq,
             rtt_ipdv: Duration::from_nanos(rtt_ipdv),
             send_ipdv: send_ipdv.map(Duration::from_nanos),
             receive_ipdv: receive_ipdv.map(Duration::from_nanos),
@@ -561,7 +561,7 @@ impl WindowEvent {
                 timer_error_ns: duration_ns_u64(*timer_error),
             }),
             ClientEvent::EchoReply {
-                logical_seq,
+                seq,
                 sent_at,
                 received_at,
                 rtt,
@@ -574,7 +574,7 @@ impl WindowEvent {
                 at: received_at.mono,
                 is_late: false,
                 sample: Box::new(UniqueSample::new(
-                    *logical_seq,
+                    *seq,
                     *sent_at,
                     *received_at,
                     *rtt,
@@ -585,7 +585,7 @@ impl WindowEvent {
                 )),
             }),
             ClientEvent::LateReply {
-                logical_seq: Some(logical_seq),
+                seq,
                 sent_at: Some(sent_at),
                 received_at,
                 rtt: Some(rtt),
@@ -598,7 +598,7 @@ impl WindowEvent {
                 at: received_at.mono,
                 is_late: true,
                 sample: Box::new(UniqueSample::new(
-                    *logical_seq,
+                    *seq,
                     *sent_at,
                     *received_at,
                     *rtt,
@@ -636,7 +636,7 @@ impl WindowEvent {
 
 #[derive(Debug, Clone, PartialEq)]
 struct UniqueSample {
-    logical_seq: u64,
+    seq: u32,
     bytes: usize,
     rtt_primary_ns: i128,
     rtt_raw_ns: u64,
@@ -659,7 +659,7 @@ struct UniqueSample {
 impl UniqueSample {
     #[allow(clippy::too_many_arguments)]
     fn new(
-        logical_seq: u64,
+        seq: u32,
         sent_at: ClientTimestamp,
         received_at: ClientTimestamp,
         rtt: RttSample,
@@ -669,7 +669,7 @@ impl UniqueSample {
         bytes: usize,
     ) -> Self {
         Self {
-            logical_seq,
+            seq,
             bytes,
             rtt_primary_ns: signed_duration_ns(rtt.effective_signed),
             rtt_raw_ns: duration_ns_u64(rtt.raw),
@@ -1070,10 +1070,9 @@ mod tests {
         }
     }
 
-    fn sent(seq: u32, logical_seq: u64, sent_at: ClientTimestamp) -> ClientEvent {
+    fn sent(seq: u32, sent_at: ClientTimestamp) -> ClientEvent {
         ClientEvent::EchoSent {
             seq,
-            logical_seq,
             remote: "127.0.0.1:2112".parse().unwrap(),
             scheduled_at: sent_at.mono,
             sent_at,
@@ -1083,24 +1082,23 @@ mod tests {
         }
     }
 
-    fn reply(logical_seq: u64, raw_ms: u64, effective_ms: i128) -> ClientEvent {
-        let sent_at = ts(logical_seq * 10);
+    fn reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
+        let sent_at = ts(seq as u64 * 10);
         let received_at = ClientTimestamp {
             mono: sent_at.mono + Duration::from_millis(raw_ms),
             wall: sent_at.wall + Duration::from_millis(raw_ms),
         };
         ClientEvent::EchoReply {
-            seq: logical_seq as u32,
-            logical_seq,
+            seq,
             remote: "127.0.0.1:2112".parse().unwrap(),
             sent_at,
             received_at,
             rtt: rtt(raw_ms, effective_ms),
             server_timing: Some(ServerTiming {
                 receive_wall_ns: Some(system_time_ns(sent_at.wall).unwrap() as i64 + 1_000_000),
-                receive_mono_ns: Some(logical_seq as i64 * 10_000_000 + 1_000_000),
+                receive_mono_ns: Some(seq as i64 * 10_000_000 + 1_000_000),
                 send_wall_ns: Some(system_time_ns(sent_at.wall).unwrap() as i64 + 2_000_000),
-                send_mono_ns: Some(logical_seq as i64 * 10_000_000 + 2_000_000),
+                send_mono_ns: Some(seq as i64 * 10_000_000 + 2_000_000),
                 midpoint_wall_ns: None,
                 midpoint_mono_ns: None,
                 processing: Some(Duration::from_millis(1)),
@@ -1110,7 +1108,7 @@ mod tests {
                 server_to_client: Some(Duration::from_millis(2)),
             }),
             received_stats: Some(ReceivedStatsSample {
-                count: Some((logical_seq + 1) as u32),
+                count: Some(seq + 1),
                 window: Some(0xff),
             }),
             bytes: 64,
@@ -1118,7 +1116,7 @@ mod tests {
         }
     }
 
-    fn late_reply(logical_seq: u64, raw_ms: u64, effective_ms: i128) -> ClientEvent {
+    fn late_reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
         let ClientEvent::EchoReply {
             seq,
             remote,
@@ -1131,13 +1129,12 @@ mod tests {
             bytes,
             packet_meta,
             ..
-        } = reply(logical_seq, raw_ms, effective_ms)
+        } = reply(seq, raw_ms, effective_ms)
         else {
             unreachable!();
         };
         ClientEvent::LateReply {
             seq,
-            logical_seq: Some(logical_seq),
             highest_seen: seq + 1,
             remote,
             sent_at: Some(sent_at),
@@ -1187,7 +1184,7 @@ mod tests {
     #[test]
     fn continuous_mode_bounds_sequence_tracking() {
         let mut collector = StatsCollector::new(StatsConfig::continuous());
-        for seq in 0..(CONTINUOUS_SEQUENCE_LIMIT as u64 + 8) {
+        for seq in 0..(CONTINUOUS_SEQUENCE_LIMIT as u32 + 8) {
             collector.process(&reply(seq, 10, 10));
         }
 
@@ -1215,8 +1212,8 @@ mod tests {
     #[test]
     fn late_unique_counts_and_duplicates_do_not_update_measurements() {
         let mut collector = StatsCollector::new(StatsConfig::finite());
-        collector.process(&sent(0, 0, ts(0)));
-        collector.process(&sent(1, 1, ts(10)));
+        collector.process(&sent(0, ts(0)));
+        collector.process(&sent(1, ts(10)));
         collector.process(&reply(1, 10, 9));
         collector.process(&late_reply(0, 20, 19));
         collector.process(&ClientEvent::DuplicateReply {
@@ -1240,11 +1237,10 @@ mod tests {
     #[test]
     fn final_loss_uses_sent_minus_unique_replies_not_echo_loss_events() {
         let mut collector = StatsCollector::new(StatsConfig::finite());
-        collector.process(&sent(0, 0, ts(0)));
-        collector.process(&sent(1, 1, ts(10)));
+        collector.process(&sent(0, ts(0)));
+        collector.process(&sent(1, ts(10)));
         collector.process(&ClientEvent::EchoLoss {
             seq: 0,
-            logical_seq: 0,
             sent_at: ts(0),
             timeout_at: Instant::now(),
         });
@@ -1263,14 +1259,14 @@ mod tests {
 
     fn assert_one_ipdv_pair(
         update: &EventStatsUpdate,
-        previous_logical_seq: u64,
-        current_logical_seq: u64,
+        previous_seq: u32,
+        current_seq: u32,
         rtt_ipdv: Duration,
     ) -> &IpdvPairUpdate {
         assert_eq!(update.ipdv_pairs.len(), 1, "{update:?}");
         let pair = &update.ipdv_pairs[0];
-        assert_eq!(pair.previous_logical_seq, previous_logical_seq);
-        assert_eq!(pair.current_logical_seq, current_logical_seq);
+        assert_eq!(pair.previous_seq, previous_seq);
+        assert_eq!(pair.current_seq, current_seq);
         assert_eq!(pair.rtt_ipdv, rtt_ipdv);
         pair
     }
@@ -1340,12 +1336,12 @@ mod tests {
         assert!(fill.contributed_sample);
         assert_eq!(fill.ipdv_pairs.len(), 2);
 
-        assert_eq!(fill.ipdv_pairs[0].previous_logical_seq, 0);
-        assert_eq!(fill.ipdv_pairs[0].current_logical_seq, 1);
+        assert_eq!(fill.ipdv_pairs[0].previous_seq, 0);
+        assert_eq!(fill.ipdv_pairs[0].current_seq, 1);
         assert_eq!(fill.ipdv_pairs[0].rtt_ipdv, Duration::from_millis(3));
 
-        assert_eq!(fill.ipdv_pairs[1].previous_logical_seq, 1);
-        assert_eq!(fill.ipdv_pairs[1].current_logical_seq, 2);
+        assert_eq!(fill.ipdv_pairs[1].previous_seq, 1);
+        assert_eq!(fill.ipdv_pairs[1].current_seq, 2);
         assert_eq!(fill.ipdv_pairs[1].rtt_ipdv, Duration::from_millis(7));
 
         let snapshot = collector.cumulative();
@@ -1359,7 +1355,6 @@ mod tests {
         collector.process(&reply(0, 10, 9));
         collector.process(&ClientEvent::LateReply {
             seq: 9,
-            logical_seq: None,
             highest_seen: 10,
             remote: "127.0.0.1:2112".parse().unwrap(),
             sent_at: None,
@@ -1385,7 +1380,7 @@ mod tests {
             rolling_count: Some(2),
             rolling_time: None,
         });
-        collector.process(&sent(0, 0, ts(0)));
+        collector.process(&sent(0, ts(0)));
         collector.process(&reply(0, 10, 10));
         collector.process(&reply(1, 20, 20));
 
@@ -1402,9 +1397,9 @@ mod tests {
             rolling_count: None,
             rolling_time: Some(Duration::from_millis(15)),
         });
-        collector.process(&sent(0, 0, ts(0)));
-        collector.process(&sent(1, 1, ts(10)));
-        collector.process(&sent(2, 2, ts(30)));
+        collector.process(&sent(0, ts(0)));
+        collector.process(&sent(1, ts(10)));
+        collector.process(&sent(2, ts(30)));
 
         let rolling = collector.rolling_time().unwrap();
         assert_eq!(rolling.packets.packets_sent, 1);
@@ -1416,7 +1411,7 @@ mod tests {
         assert_eq!(empty.loss.packet_loss_percent, 0.0);
 
         let mut collector = StatsCollector::new(StatsConfig::finite());
-        collector.process(&sent(0, 0, ts(0)));
+        collector.process(&sent(0, ts(0)));
         let all_lost = collector.summary();
         assert_eq!(all_lost.loss.lost_packets, 1);
         assert_eq!(all_lost.loss.packet_loss_percent, 100.0);
@@ -1425,8 +1420,8 @@ mod tests {
     #[test]
     fn directional_loss_uses_server_received_count_when_available() {
         let mut collector = StatsCollector::new(StatsConfig::finite());
-        collector.process(&sent(0, 0, ts(0)));
-        collector.process(&sent(1, 1, ts(10)));
+        collector.process(&sent(0, ts(0)));
+        collector.process(&sent(1, ts(10)));
         collector.process(&reply(0, 10, 10));
 
         let loss = collector.summary().loss;

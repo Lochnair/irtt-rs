@@ -41,7 +41,6 @@ pub enum ClientEvent {
 
     EchoSent {
         seq: u32,
-        logical_seq: u64,
         remote: SocketAddr,
         scheduled_at: Instant,
         sent_at: ClientTimestamp,
@@ -52,7 +51,6 @@ pub enum ClientEvent {
 
     EchoReply {
         seq: u32,
-        logical_seq: u64,
         remote: SocketAddr,
         sent_at: ClientTimestamp,
         received_at: ClientTimestamp,
@@ -66,7 +64,6 @@ pub enum ClientEvent {
 
     EchoLoss {
         seq: u32,
-        logical_seq: u64,
         sent_at: ClientTimestamp,
         timeout_at: std::time::Instant,
     },
@@ -80,7 +77,6 @@ pub enum ClientEvent {
 
     LateReply {
         seq: u32,
-        logical_seq: Option<u64>,
         highest_seen: u32,
         remote: SocketAddr,
         sent_at: Option<ClientTimestamp>,

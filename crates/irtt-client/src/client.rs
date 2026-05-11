@@ -210,7 +210,6 @@ impl Client {
             .expect("negotiated must exist when Open");
 
         let wire_seq = session.next_wire_seq;
-        let logical_seq = session.next_logical_seq;
         let scheduled_at = session.next_send_at;
 
         let request = EchoRequest {
@@ -232,7 +231,6 @@ impl Client {
             .expect("session must exist when phase is Open");
 
         let pending = PendingProbe {
-            logical_seq,
             wire_seq,
             sent_at,
             timeout_at: sent_at
@@ -243,13 +241,6 @@ impl Client {
         session.pending.insert(pending)?;
 
         session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
-        session.next_logical_seq =
-            session
-                .next_logical_seq
-                .checked_add(1)
-                .ok_or(ClientError::CounterOverflow {
-                    counter: "next_logical_seq",
-                })?;
         session.packets_sent =
             session
                 .packets_sent
@@ -279,7 +270,6 @@ impl Client {
 
         Ok(vec![ClientEvent::EchoSent {
             seq: wire_seq,
-            logical_seq,
             remote: self.remote,
             scheduled_at,
             sent_at,
@@ -372,7 +362,6 @@ impl Client {
         for probe in expired {
             events.push(ClientEvent::EchoLoss {
                 seq: probe.wire_seq,
-                logical_seq: probe.logical_seq,
                 sent_at: probe.sent_at,
                 timeout_at: probe.timeout_at,
             });
@@ -468,13 +457,12 @@ impl Client {
             let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
 
             update_highest_received(session, wire_seq);
-            session.completed.insert(wire_seq, pending.logical_seq);
+            session.completed.insert(wire_seq);
 
             let mut events = Vec::new();
             if is_late {
                 events.push(ClientEvent::LateReply {
                     seq: wire_seq,
-                    logical_seq: Some(pending.logical_seq),
                     highest_seen,
                     remote: self.remote,
                     sent_at: Some(pending.sent_at),
@@ -489,7 +477,6 @@ impl Client {
             } else {
                 events.push(ClientEvent::EchoReply {
                     seq: wire_seq,
-                    logical_seq: pending.logical_seq,
                     remote: self.remote,
                     sent_at: pending.sent_at,
                     received_at: now,
@@ -520,11 +507,10 @@ impl Client {
             let received_stats = build_received_stats(&reply);
             let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
             update_highest_received(session, wire_seq);
-            session.completed.insert(wire_seq, timed_out.logical_seq);
+            session.completed.insert(wire_seq);
 
             let mut events = vec![ClientEvent::LateReply {
                 seq: wire_seq,
-                logical_seq: Some(timed_out.logical_seq),
                 highest_seen,
                 remote: self.remote,
                 sent_at: Some(timed_out.sent_at),
@@ -546,7 +532,6 @@ impl Client {
         {
             Ok(vec![ClientEvent::LateReply {
                 seq: wire_seq,
-                logical_seq: None,
                 highest_seen: session.highest_received_seq.unwrap(),
                 remote: self.remote,
                 sent_at: None,
@@ -648,7 +633,6 @@ impl Client {
 
         self.session = Some(ActiveSession {
             next_wire_seq: 0,
-            next_logical_seq: 0,
             highest_received_seq: None,
             packets_sent: 0,
             start_mono: now.mono,

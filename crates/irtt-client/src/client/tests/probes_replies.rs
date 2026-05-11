@@ -43,14 +43,9 @@ fn send_probe_sends_valid_echo_request() {
     assert_eq!(events.len(), 1);
     match &events[0] {
         ClientEvent::EchoSent {
-            seq,
-            logical_seq,
-            remote,
-            bytes,
-            ..
+            seq, remote, bytes, ..
         } => {
             assert_eq!(*seq, 0);
-            assert_eq!(*logical_seq, 0);
             assert_eq!(*remote, server.addr);
             assert_eq!(*bytes, echo_packet_len(false, &params));
         }
@@ -312,30 +307,6 @@ fn send_probe_reports_schedule_overflow() {
 }
 
 #[test]
-fn send_probe_reports_logical_sequence_counter_overflow() {
-    let params = default_params();
-    let server = silent_open_server(params);
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-    client.session.as_mut().unwrap().next_logical_seq = u64::MAX;
-
-    assert!(matches!(
-        client.send_probe(),
-        Err(ClientError::CounterOverflow {
-            counter: "next_logical_seq"
-        })
-    ));
-    server.join();
-}
-
-#[test]
 fn send_probe_reports_packets_sent_counter_overflow() {
     let params = default_params();
     let server = silent_open_server(params);
@@ -390,7 +361,6 @@ fn recv_once_decodes_echo_reply_and_emits_event() {
     match &events[0] {
         ClientEvent::EchoReply {
             seq,
-            logical_seq,
             rtt,
             received_stats,
             server_timing,
@@ -399,7 +369,6 @@ fn recv_once_decodes_echo_reply_and_emits_event() {
             ..
         } => {
             assert_eq!(*seq, 0);
-            assert_eq!(*logical_seq, 0);
             assert_eq!(*bytes, echo_packet_len(false, &params));
             assert!(rtt.raw > Duration::ZERO);
             assert_eq!(rtt.effective, rtt.adjusted.unwrap_or(rtt.raw));
@@ -487,14 +456,8 @@ fn recv_once_decodes_only_received_bytes_after_longer_datagram() {
     let events = client.recv_once().unwrap();
     assert_eq!(events.len(), 1);
     match &events[0] {
-        ClientEvent::EchoReply {
-            seq,
-            logical_seq,
-            bytes,
-            ..
-        } => {
+        ClientEvent::EchoReply { seq, bytes, .. } => {
             assert_eq!(*seq, 1);
-            assert_eq!(*logical_seq, 1);
             assert_eq!(*bytes, echo_packet_len(false, &params));
         }
         other => panic!("expected EchoReply after shorter datagram, got {other:?}"),
@@ -980,7 +943,6 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
     match &late[0] {
         ClientEvent::LateReply {
             seq,
-            logical_seq,
             sent_at,
             rtt,
             server_timing,
@@ -990,7 +952,6 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
             ..
         } => {
             assert_eq!(*seq, 0);
-            assert_eq!(*logical_seq, Some(0));
             assert!(sent_at.is_some());
             assert!(rtt.is_some());
             assert!(server_timing.is_some());
@@ -1758,7 +1719,6 @@ fn send_probe_wraps_wire_sequence_at_u32_max() {
 
     let session = client.session.as_mut().unwrap();
     session.next_wire_seq = u32::MAX;
-    session.next_logical_seq = 41;
 
     client.send_probe().unwrap();
     client.send_probe().unwrap();
@@ -1814,7 +1774,6 @@ fn wrapped_reply_after_u32_max_is_not_late() {
     assert_open_started(client.open().unwrap());
     let session = client.session.as_mut().unwrap();
     session.next_wire_seq = u32::MAX;
-    session.next_logical_seq = 41;
 
     client.send_probe().unwrap();
     client.send_probe().unwrap();

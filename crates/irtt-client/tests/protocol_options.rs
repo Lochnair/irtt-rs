@@ -16,7 +16,6 @@ use support::{
 
 struct ReplyView<'a> {
     seq: u32,
-    logical_seq: u64,
     rtt: &'a RttSample,
     server_timing: Option<&'a ServerTiming>,
     one_way: Option<&'a OneWayDelaySample>,
@@ -38,7 +37,6 @@ fn received_stats_modes_drive_negotiated_echo_and_reply_events() {
 
         let reply = expect_echo_reply(&run.reply);
         assert_eq!(reply.seq, 0);
-        assert_eq!(reply.logical_seq, 0);
         assert_eq!(reply.bytes, echo_packet_len(false, &params));
         assert!(reply.server_timing.is_none());
         assert!(reply.one_way.is_none());
@@ -251,14 +249,8 @@ fn assert_echo_uses_params(run: &OneProbeRun, params: &Params, hmac: bool) {
     assert_eq!(sequence, 0);
 
     match &run.sent {
-        ClientEvent::EchoSent {
-            seq,
-            logical_seq,
-            bytes,
-            ..
-        } => {
+        ClientEvent::EchoSent { seq, bytes, .. } => {
             assert_eq!(*seq, 0);
-            assert_eq!(*logical_seq, 0);
             assert_eq!(*bytes, echo_packet_len(hmac, params));
         }
         other => panic!("expected EchoSent, got {other:?}"),
@@ -288,7 +280,6 @@ fn expect_echo_reply(event: &ClientEvent) -> ReplyView<'_> {
     match event {
         ClientEvent::EchoReply {
             seq,
-            logical_seq,
             rtt,
             server_timing,
             one_way,
@@ -297,7 +288,6 @@ fn expect_echo_reply(event: &ClientEvent) -> ReplyView<'_> {
             ..
         } => ReplyView {
             seq: *seq,
-            logical_seq: *logical_seq,
             rtt,
             server_timing: server_timing.as_ref(),
             one_way: one_way.as_ref(),

@@ -24,7 +24,6 @@ pub(crate) enum ClientPhase {
 #[derive(Debug)]
 pub(crate) struct ActiveSession {
     pub next_wire_seq: u32,
-    pub next_logical_seq: u64,
     pub highest_received_seq: Option<u32>,
     pub packets_sent: u64,
     pub start_mono: Instant,

@@ -73,13 +73,11 @@ fn hmac_echo_success_verifies_request_and_accepts_reply() {
     match &run.reply {
         ClientEvent::EchoReply {
             seq,
-            logical_seq,
             bytes,
             server_timing,
             ..
         } => {
             assert_eq!(*seq, 0);
-            assert_eq!(*logical_seq, 0);
             assert_eq!(*bytes, echo_packet_len(true, &params));
             assert!(server_timing.is_some());
         }

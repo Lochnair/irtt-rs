@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::Instant,
 };
 
@@ -7,7 +7,6 @@ use crate::{error::ClientError, timing::ClientTimestamp};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PendingProbe {
-    pub logical_seq: u64,
     pub wire_seq: u32,
     pub sent_at: ClientTimestamp,
     pub timeout_at: Instant,
@@ -59,7 +58,7 @@ impl PendingMap {
                 expired.push(probe);
             }
         }
-        expired.sort_by_key(|p| p.logical_seq);
+        expired.sort_by_key(|p| p.sent_at.mono);
         expired
     }
 
@@ -134,7 +133,7 @@ impl TimedOutMap {
 
 #[derive(Debug)]
 pub(crate) struct CompletedSet {
-    set: HashMap<u32, u64>,
+    set: HashSet<u32>,
     insertion_order: VecDeque<u32>,
     max_capacity: usize,
 }
@@ -142,31 +141,32 @@ pub(crate) struct CompletedSet {
 impl CompletedSet {
     pub fn new(max_capacity: usize) -> Self {
         Self {
-            set: HashMap::new(),
+            set: HashSet::new(),
             insertion_order: VecDeque::new(),
             max_capacity,
         }
     }
 
-    pub fn insert(&mut self, wire_seq: u32, logical_seq: u64) {
-        if let Some(existing) = self.set.get_mut(&wire_seq) {
-            *existing = logical_seq;
+    pub fn insert(&mut self, seq: u32) {
+        if self.set.contains(&seq) {
             return;
         }
+
         if self.set.len() >= self.max_capacity {
             self.evict_oldest();
         }
-        self.insertion_order.push_back(wire_seq);
-        self.set.insert(wire_seq, logical_seq);
+
+        self.insertion_order.push_back(seq);
+        self.set.insert(seq);
     }
 
-    pub fn contains(&self, wire_seq: u32) -> bool {
-        self.set.contains_key(&wire_seq)
+    pub fn contains(&self, seq: u32) -> bool {
+        self.set.contains(&seq)
     }
 
     fn evict_oldest(&mut self) {
-        while let Some(oldest_key) = self.insertion_order.pop_front() {
-            if self.set.remove(&oldest_key).is_some() {
+        while let Some(oldest_seq) = self.insertion_order.pop_front() {
+            if self.set.remove(&oldest_seq) {
                 break;
             }
         }
@@ -185,9 +185,8 @@ mod tests {
         }
     }
 
-    fn pending(seq: u32, logical: u64, timeout_at: Instant) -> PendingProbe {
+    fn pending(seq: u32, timeout_at: Instant) -> PendingProbe {
         PendingProbe {
-            logical_seq: logical,
             wire_seq: seq,
             sent_at: ts(timeout_at - Duration::from_secs(1)),
             timeout_at,
@@ -198,7 +197,7 @@ mod tests {
     fn pending_map_insert_and_remove() {
         let mut map = PendingMap::new(10);
         let now = Instant::now();
-        let probe = pending(0, 0, now + Duration::from_secs(4));
+        let probe = pending(0, now + Duration::from_secs(4));
         map.insert(probe).unwrap();
         assert_eq!(map.len(), 1);
         assert!(map.remove(0).is_some());
@@ -210,42 +209,26 @@ mod tests {
     fn pending_map_rejects_over_capacity() {
         let mut map = PendingMap::new(2);
         let now = Instant::now();
-        map.insert(pending(0, 0, now + Duration::from_secs(4)))
+        map.insert(pending(0, now + Duration::from_secs(4)))
             .unwrap();
-        map.insert(pending(1, 1, now + Duration::from_secs(4)))
+        map.insert(pending(1, now + Duration::from_secs(4)))
             .unwrap();
         assert!(matches!(
-            map.insert(pending(2, 2, now + Duration::from_secs(4))),
+            map.insert(pending(2, now + Duration::from_secs(4))),
             Err(ClientError::PendingLimitExceeded { limit: 2 })
         ));
     }
 
     #[test]
-    fn drain_expired_returns_in_logical_order() {
-        let mut map = PendingMap::new(10);
-        let now = Instant::now();
-        let past = now - Duration::from_secs(1);
-        map.insert(pending(5, 5, past)).unwrap();
-        map.insert(pending(2, 2, past)).unwrap();
-        map.insert(pending(8, 8, now + Duration::from_secs(10)))
-            .unwrap();
-        let expired = map.drain_expired(now);
-        assert_eq!(expired.len(), 2);
-        assert_eq!(expired[0].wire_seq, 2);
-        assert_eq!(expired[1].wire_seq, 5);
-        assert_eq!(map.len(), 1);
-    }
-
-    #[test]
     fn completed_set_tracks_and_evicts() {
         let mut set = CompletedSet::new(3);
-        set.insert(0, 0);
-        set.insert(1, 1);
-        set.insert(2, 2);
+        set.insert(0);
+        set.insert(1);
+        set.insert(2);
         assert!(set.contains(0));
         assert!(set.contains(1));
         assert!(set.contains(2));
-        set.insert(3, 3);
+        set.insert(3);
         assert_eq!(set.set.len(), 3);
         assert!(!set.contains(0));
         assert!(set.contains(3));
@@ -255,9 +238,9 @@ mod tests {
     fn timed_out_map_tracks_and_evicts() {
         let mut map = TimedOutMap::new(2);
         let now = Instant::now();
-        map.insert(pending(0, 0, now));
-        map.insert(pending(1, 1, now));
-        map.insert(pending(2, 2, now));
+        map.insert(pending(0, now));
+        map.insert(pending(1, now));
+        map.insert(pending(2, now));
 
         assert_eq!(map.len(), 2);
         assert!(map.remove(0).is_none());
@@ -271,7 +254,7 @@ mod tests {
         let now = Instant::now();
 
         for i in 0..20 {
-            map.insert(pending(i, u64::from(i), now));
+            map.insert(pending(i, now));
             assert!(map.remove(i).is_some());
             assert_eq!(map.len(), 0);
             assert_eq!(map.insertion_order_len(), 0);
