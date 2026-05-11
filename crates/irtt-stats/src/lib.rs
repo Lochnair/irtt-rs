@@ -619,7 +619,7 @@ impl WindowEvent {
                 at: received_at.mono,
             }),
             ClientEvent::EchoLoss { timeout_at, .. } => Some(Self::Loss { at: *timeout_at }),
-            ClientEvent::Warning { .. } => Some(Self::Warning { at: Instant::now() }),
+            ClientEvent::Warning { at, .. } => Some(Self::Warning { at: at.mono }),
             ClientEvent::SessionStarted { .. }
             | ClientEvent::NoTestCompleted { .. }
             | ClientEvent::SessionClosed { .. } => None,
