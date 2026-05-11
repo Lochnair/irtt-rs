@@ -10,9 +10,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use irtt_client::{
-    Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, SocketConfig,
-};
+use irtt_client::{Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, SocketConfig};
 use irtt_proto::{
     compute_hmac_in_place, echo_packet_len, flags, verify_hmac, Clock, Params, ProtoError,
     ReceivedStats, ServerFill, StampAt, TimestampFields, HMAC_SIZE, MAGIC, PROTOCOL_VERSION,

@@ -1,8 +1,6 @@
 mod support;
 
-use irtt_client::{
-    Client, ClientConfig, ClientError, ClientEvent, NegotiationPolicy,
-};
+use irtt_client::{Client, ClientConfig, ClientError, ClientEvent, NegotiationPolicy};
 use irtt_proto::{echo_packet_len, Params, TimestampFields};
 
 use support::{
