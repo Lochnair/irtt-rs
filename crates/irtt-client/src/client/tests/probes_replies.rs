@@ -1678,7 +1678,7 @@ fn receive_metadata_does_not_broaden_malformed_warning() {
 
     assert_eq!(events.len(), 1);
     match &events[0] {
-        ClientEvent::Warning { kind, message } => {
+        ClientEvent::Warning { kind, message, .. } => {
             assert_eq!(*kind, WarningKind::MalformedOrUnrelatedPacket);
             assert_eq!(message, "dropped malformed or unrelated packet");
         }

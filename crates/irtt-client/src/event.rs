@@ -96,6 +96,7 @@ pub enum ClientEvent {
     Warning {
         kind: WarningKind,
         message: String,
+        at: ClientTimestamp,
     },
 }
 

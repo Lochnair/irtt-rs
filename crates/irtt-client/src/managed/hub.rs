@@ -279,6 +279,7 @@ mod tests {
         ClientEvent::Warning {
             kind: WarningKind::UntrackedReply,
             message: format!("event-{n}"),
+            at: ClientTimestamp::now(),
         }
     }
 

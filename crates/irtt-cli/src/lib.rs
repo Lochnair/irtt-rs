@@ -442,7 +442,7 @@ pub fn format_human_event_with_options(
             write_human_received_stats(&mut out, *received_stats);
             out
         }
-        ClientEvent::Warning { kind, message } => {
+        ClientEvent::Warning { kind, message, .. } => {
             format!("warning  kind={}  message={message}", warning_kind(*kind))
         }
     }
@@ -565,8 +565,9 @@ fn format_machine(event: &ClientEvent) -> String {
             write_packet_meta(&mut out, *packet_meta);
             out.push_str(" warning=late");
         }
-        ClientEvent::Warning { kind, message } => {
+        ClientEvent::Warning { kind, message, at } => {
             write_common(&mut out, "warning");
+            write_wall(&mut out, "at", at.wall);
             write!(
                 out,
                 " warning_kind={} message={}",
@@ -637,7 +638,7 @@ fn format_simple(event: &ClientEvent) -> String {
             }
             out
         }
-        ClientEvent::Warning { kind, message } => {
+        ClientEvent::Warning { kind, message, .. } => {
             format!("warning kind={} message={message}", warning_kind(*kind))
         }
     }
@@ -1205,6 +1206,7 @@ mod tests {
                 &ClientEvent::Warning {
                     kind: WarningKind::WrongToken,
                     message: "bad".to_owned(),
+                    at: ClientTimestamp::now()
                 },
                 OutputMode::RttUs
             ),
@@ -1475,6 +1477,7 @@ mod tests {
             ClientEvent::Warning {
                 kind: WarningKind::UntrackedReply,
                 message: "untracked reply".to_owned(),
+                at: ClientTimestamp::now(),
             },
         ];
 

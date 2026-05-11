@@ -319,6 +319,7 @@ impl Client {
             return Ok(vec![ClientEvent::Warning {
                 kind: WarningKind::MalformedOrUnrelatedPacket,
                 message: "dropped malformed or unrelated packet".to_owned(),
+                at: now,
             }]);
         };
         self.process_echo_reply(reply, packet_len, now, datagram.meta)
@@ -415,6 +416,7 @@ impl Client {
             return Ok(vec![ClientEvent::Warning {
                 kind: WarningKind::MalformedOrUnrelatedPacket,
                 message: "dropped malformed or unrelated packet".to_owned(),
+                at: now,
             }]);
         };
         self.process_echo_reply(reply, packet_len, now, meta)
@@ -447,6 +449,7 @@ impl Client {
                     "dropped reply with wrong token: expected {token:#x}, got {:#x}",
                     reply.token
                 ),
+                at: now,
             }]);
         }
 
@@ -561,6 +564,7 @@ impl Client {
                 message: format!(
                     "dropped reply with untracked seq {wire_seq} (no pending or completed entry)"
                 ),
+                at: now,
             }])
         }
     }
