@@ -79,13 +79,21 @@ fn no_test_loose_negotiation_accepts_restricted_params() {
     let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
     config.run_mode = RunMode::NoTest;
     config.negotiation_policy = NegotiationPolicy::Loose;
-    let mut params = params_from_config(&config).unwrap();
+    let requested = params_from_config(&config).unwrap();
+    let mut params = requested.clone();
     params.duration_ns /= 2;
     let server = no_test_server(params.clone(), 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
+    assert_eq!(
+        negotiated.restrictions,
+        vec![crate::NegotiationRestriction::DurationReduced {
+            requested_ns: requested.duration_ns,
+            negotiated_ns: params.duration_ns,
+        }]
+    );
     server.join();
 }
 

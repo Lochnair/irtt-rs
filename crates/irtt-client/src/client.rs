@@ -23,7 +23,7 @@ use crate::{
     metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
     receive::recv_datagram,
-    session::{validate_negotiated_params, ActiveSession, ClientPhase, NegotiatedParams},
+    session::{negotiate_params, ActiveSession, ClientPhase, NegotiatedParams},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
@@ -605,14 +605,12 @@ impl Client {
         reply: OpenReply,
         now: ClientTimestamp,
     ) -> Result<OpenOutcome, ClientError> {
-        validate_negotiated_params(
+        let token = reply.token;
+        let negotiated = negotiate_params(
             &self.requested,
-            &reply.params,
+            reply.params,
             self.config.negotiation_policy,
         )?;
-        let negotiated = NegotiatedParams {
-            params: reply.params.clone(),
-        };
         let recv_buffer_size = recv_buffer_size(self.config.hmac_key.is_some(), Some(&negotiated))?;
         let negotiated_dscp =
             u8::try_from(negotiated.params.dscp).map_err(|_| ClientError::InvalidConfig {
@@ -621,7 +619,7 @@ impl Client {
         apply_dscp_to_socket(&self.socket, self.remote, negotiated_dscp)?;
         self.negotiated = Some(negotiated.clone());
         self.recv_buffer.resize(recv_buffer_size, 0);
-        self.phase = ClientPhase::Open { token: reply.token };
+        self.phase = ClientPhase::Open { token };
 
         let end_mono = if negotiated.params.duration_ns > 0 {
             Some(negotiated_end_mono(
@@ -647,14 +645,14 @@ impl Client {
 
         let event = ClientEvent::SessionStarted {
             remote: self.remote,
-            token: reply.token,
+            token,
             negotiated: negotiated.clone(),
             at: now,
         };
 
         Ok(OpenOutcome::Started {
             remote: self.remote,
-            token: reply.token,
+            token,
             negotiated,
             event,
         })
@@ -665,14 +663,11 @@ impl Client {
         reply: OpenReply,
         now: ClientTimestamp,
     ) -> Result<OpenOutcome, ClientError> {
-        validate_negotiated_params(
+        let negotiated = negotiate_params(
             &self.requested,
-            &reply.params,
+            reply.params,
             self.config.negotiation_policy,
         )?;
-        let negotiated = NegotiatedParams {
-            params: reply.params.clone(),
-        };
         self.negotiated = Some(negotiated.clone());
         self.phase = ClientPhase::NoTestCompleted;
         let event = ClientEvent::NoTestCompleted {

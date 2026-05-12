@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use irtt_proto::{Params, PROTOCOL_VERSION};
+use irtt_proto::{Clock, Params, ReceivedStats, StampAt, PROTOCOL_VERSION};
 
 use crate::{
     config::{NegotiationPolicy, MAX_DSCP_CODEPOINT},
@@ -11,6 +11,106 @@ use crate::{
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiatedParams {
     pub params: Params,
+    pub restrictions: Vec<NegotiationRestriction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NegotiationRestriction {
+    DurationReduced {
+        requested_ns: i64,
+        negotiated_ns: i64,
+    },
+    IntervalIncreased {
+        requested_ns: i64,
+        negotiated_ns: i64,
+    },
+    IntervalReduced {
+        requested_ns: i64,
+        negotiated_ns: i64,
+    },
+    LengthReduced {
+        requested: i64,
+        negotiated: i64,
+    },
+    ReceivedStatsChanged {
+        requested: ReceivedStats,
+        negotiated: ReceivedStats,
+    },
+    StampAtChanged {
+        requested: StampAt,
+        negotiated: StampAt,
+    },
+    ClockChanged {
+        requested: Clock,
+        negotiated: Clock,
+    },
+    DscpChanged {
+        requested: i64,
+        negotiated: i64,
+    },
+    ServerFillChanged,
+}
+
+impl NegotiationRestriction {
+    pub fn message(&self) -> String {
+        match self {
+            Self::DurationReduced {
+                requested_ns: 0,
+                negotiated_ns,
+            } => {
+                format!("server limited continuous duration to {negotiated_ns} ns")
+            }
+            Self::DurationReduced {
+                requested_ns,
+                negotiated_ns,
+            } => {
+                format!("server reduced duration from {requested_ns} ns to {negotiated_ns} ns")
+            }
+            Self::IntervalIncreased {
+                requested_ns,
+                negotiated_ns,
+            } => {
+                format!("server increased interval from {requested_ns} ns to {negotiated_ns} ns")
+            }
+            Self::IntervalReduced {
+                requested_ns,
+                negotiated_ns,
+            } => {
+                format!("server reduced interval from {requested_ns} ns to {negotiated_ns} ns")
+            }
+            Self::LengthReduced {
+                requested,
+                negotiated,
+            } => {
+                format!("server reduced packet length from {requested} bytes to {negotiated} bytes")
+            }
+            Self::ReceivedStatsChanged {
+                requested,
+                negotiated,
+            } => {
+                format!("server changed received-stats from {requested:?} to {negotiated:?}")
+            }
+            Self::StampAtChanged {
+                requested,
+                negotiated,
+            } => {
+                format!("server changed stamp-at from {requested:?} to {negotiated:?}")
+            }
+            Self::ClockChanged {
+                requested,
+                negotiated,
+            } => {
+                format!("server changed clock from {requested:?} to {negotiated:?}")
+            }
+            Self::DscpChanged {
+                requested,
+                negotiated,
+            } => {
+                format!("server changed dscp from {requested} to {negotiated}")
+            }
+            Self::ServerFillChanged => "server changed payload fill behavior".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,17 +135,19 @@ pub(crate) struct ActiveSession {
     pub sending_done: bool,
 }
 
-pub(crate) fn validate_negotiated_params(
+pub(crate) fn negotiate_params(
     requested: &Params,
-    returned: &Params,
+    returned: Params,
     policy: NegotiationPolicy,
-) -> Result<(), ClientError> {
+) -> Result<NegotiatedParams, ClientError> {
     if returned.protocol_version != PROTOCOL_VERSION {
         return Err(ClientError::ProtocolVersionMismatch {
             requested: PROTOCOL_VERSION,
             received: returned.protocol_version,
         });
     }
+    let mut restrictions = Vec::new();
+
     validate_duration_restriction(requested.duration_ns, returned.duration_ns)?;
     if returned.length < 0 {
         return Err(ClientError::NegotiationRejected {
@@ -64,12 +166,100 @@ pub(crate) fn validate_negotiated_params(
     }
     validate_dscp_restriction(returned.dscp)?;
 
-    if policy == NegotiationPolicy::Strict && returned != requested {
-        return Err(ClientError::NegotiationRejected {
-            reason: "returned params differ from requested params".to_owned(),
-        });
+    if returned.duration_ns < requested.duration_ns
+        || (requested.duration_ns == 0 && returned.duration_ns > 0)
+    {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::DurationReduced {
+                requested_ns: requested.duration_ns,
+                negotiated_ns: returned.duration_ns,
+            },
+        )?;
     }
-    Ok(())
+    if returned.interval_ns > requested.interval_ns {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::IntervalIncreased {
+                requested_ns: requested.interval_ns,
+                negotiated_ns: returned.interval_ns,
+            },
+        )?;
+    }
+    if returned.interval_ns < requested.interval_ns {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::IntervalReduced {
+                requested_ns: requested.interval_ns,
+                negotiated_ns: returned.interval_ns,
+            },
+        )?;
+    }
+    if returned.length < requested.length {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::LengthReduced {
+                requested: requested.length,
+                negotiated: returned.length,
+            },
+        )?;
+    }
+    if returned.received_stats != requested.received_stats {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::ReceivedStatsChanged {
+                requested: requested.received_stats,
+                negotiated: returned.received_stats,
+            },
+        )?;
+    }
+    if returned.stamp_at != requested.stamp_at {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::StampAtChanged {
+                requested: requested.stamp_at,
+                negotiated: returned.stamp_at,
+            },
+        )?;
+    }
+    if returned.clock != requested.clock {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::ClockChanged {
+                requested: requested.clock,
+                negotiated: returned.clock,
+            },
+        )?;
+    }
+    if returned.dscp != requested.dscp {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::DscpChanged {
+                requested: requested.dscp,
+                negotiated: returned.dscp,
+            },
+        )?;
+    }
+    if returned.server_fill != requested.server_fill {
+        record_restriction(
+            policy,
+            &mut restrictions,
+            NegotiationRestriction::ServerFillChanged,
+        )?;
+    }
+
+    Ok(NegotiatedParams {
+        params: returned,
+        restrictions,
+    })
 }
 
 fn validate_duration_restriction(requested: i64, returned: i64) -> Result<(), ClientError> {
@@ -104,6 +294,21 @@ fn validate_dscp_restriction(returned: i64) -> Result<(), ClientError> {
     Ok(())
 }
 
+fn record_restriction(
+    policy: NegotiationPolicy,
+    restrictions: &mut Vec<NegotiationRestriction>,
+    restriction: NegotiationRestriction,
+) -> Result<(), ClientError> {
+    if policy == NegotiationPolicy::Strict {
+        return Err(ClientError::NegotiationRejected {
+            reason: restriction.message(),
+        });
+    }
+
+    restrictions.push(restriction);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,9 +332,18 @@ mod tests {
 
     fn assert_rejected(requested: &Params, returned: &Params, policy: NegotiationPolicy) {
         assert!(matches!(
-            validate_negotiated_params(requested, returned, policy),
+            negotiate_params(requested, returned.clone(), policy),
             Err(ClientError::NegotiationRejected { .. })
         ));
+    }
+
+    fn assert_negotiates(
+        requested: &Params,
+        returned: &Params,
+        policy: NegotiationPolicy,
+    ) -> NegotiatedParams {
+        negotiate_params(requested, returned.clone(), policy)
+            .unwrap_or_else(|err| panic!("expected negotiation success, got {err:?}"))
     }
 
     fn rejection_reason(
@@ -137,7 +351,7 @@ mod tests {
         returned: &Params,
         policy: NegotiationPolicy,
     ) -> String {
-        match validate_negotiated_params(requested, returned, policy) {
+        match negotiate_params(requested, returned.clone(), policy) {
             Err(ClientError::NegotiationRejected { reason }) => reason,
             other => panic!("expected negotiation rejection, got {other:?}"),
         }
@@ -149,27 +363,65 @@ mod tests {
 
         let mut returned = requested.clone();
         returned.length = 128;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+            NegotiationRestriction::LengthReduced {
+                requested: requested.length,
+                negotiated: returned.length,
+            }
+            .message()
+        );
 
         let mut returned = requested.clone();
         returned.dscp = 8;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+            NegotiationRestriction::DscpChanged {
+                requested: requested.dscp,
+                negotiated: returned.dscp,
+            }
+            .message()
+        );
 
         let mut returned = requested.clone();
         returned.received_stats = ReceivedStats::Count;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+            NegotiationRestriction::ReceivedStatsChanged {
+                requested: requested.received_stats,
+                negotiated: returned.received_stats,
+            }
+            .message()
+        );
 
         let mut returned = requested.clone();
         returned.stamp_at = StampAt::Midpoint;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+            NegotiationRestriction::StampAtChanged {
+                requested: requested.stamp_at,
+                negotiated: returned.stamp_at,
+            }
+            .message()
+        );
 
         let mut returned = requested.clone();
         returned.clock = Clock::Wall;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+            NegotiationRestriction::ClockChanged {
+                requested: requested.clock,
+                negotiated: returned.clock,
+            }
+            .message()
+        );
 
         let mut returned = requested.clone();
         returned.server_fill = None;
-        assert_rejected(&requested, &returned, NegotiationPolicy::Strict);
+        assert_eq!(
+            rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+            NegotiationRestriction::ServerFillChanged.message()
+        );
     }
 
     #[test]
@@ -178,8 +430,13 @@ mod tests {
 
         let mut returned = requested.clone();
         returned.duration_ns = requested.duration_ns / 2;
-        assert!(
-            validate_negotiated_params(&requested, &returned, NegotiationPolicy::Loose).is_ok()
+        let negotiated = assert_negotiates(&requested, &returned, NegotiationPolicy::Loose);
+        assert_eq!(
+            negotiated.restrictions,
+            vec![NegotiationRestriction::DurationReduced {
+                requested_ns: requested.duration_ns,
+                negotiated_ns: returned.duration_ns,
+            }]
         );
 
         let mut returned = requested.clone();
@@ -200,12 +457,18 @@ mod tests {
         continuous_requested.duration_ns = 0;
         let mut finite_returned = continuous_requested.clone();
         finite_returned.duration_ns = 1_000_000_000;
-        assert!(validate_negotiated_params(
+        let negotiated = assert_negotiates(
             &continuous_requested,
             &finite_returned,
-            NegotiationPolicy::Loose
-        )
-        .is_ok());
+            NegotiationPolicy::Loose,
+        );
+        assert_eq!(
+            negotiated.restrictions,
+            vec![NegotiationRestriction::DurationReduced {
+                requested_ns: 0,
+                negotiated_ns: finite_returned.duration_ns,
+            }]
+        );
 
         assert_rejected(
             &continuous_requested,
@@ -213,9 +476,9 @@ mod tests {
             NegotiationPolicy::Strict,
         );
 
-        assert!(validate_negotiated_params(
+        assert!(negotiate_params(
             &continuous_requested,
-            &continuous_requested,
+            continuous_requested.clone(),
             NegotiationPolicy::Strict
         )
         .is_ok());

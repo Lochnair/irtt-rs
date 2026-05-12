@@ -61,6 +61,13 @@ fn normal_open_uses_negotiated_dscp_not_requested_dscp() {
     let negotiated = assert_open_started(client.open().unwrap());
     assert_eq!(negotiated.params.dscp, 0);
     assert_eq!(
+        negotiated.restrictions,
+        vec![crate::NegotiationRestriction::DscpChanged {
+            requested: 46,
+            negotiated: 0,
+        }]
+    );
+    assert_eq!(
         socket_traffic_class(&client.socket, client.remote).unwrap(),
         0
     );

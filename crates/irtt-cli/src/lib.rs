@@ -1456,6 +1456,7 @@ mod tests {
                     interval_ns: 1_000_000_000,
                     ..Params::default()
                 },
+                restrictions: vec![],
             },
             at: test_timestamp(Duration::from_secs(1)),
         };

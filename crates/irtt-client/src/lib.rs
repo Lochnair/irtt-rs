@@ -31,5 +31,5 @@ pub use managed::{
     CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientSession,
     SessionEndReason, SessionOutcome, SubscriberConfig, SubscriberOverflow,
 };
-pub use session::NegotiatedParams;
+pub use session::{NegotiatedParams, NegotiationRestriction};
 pub use timing::ClientTimestamp;
