@@ -1,4 +1,4 @@
-use std::time::Instant;
+use std::{fmt, time::Instant};
 
 use irtt_proto::{Clock, Params, ReceivedStats, StampAt, PROTOCOL_VERSION};
 
@@ -14,101 +14,136 @@ pub struct NegotiatedParams {
     pub restrictions: Vec<NegotiationRestriction>,
 }
 
+/// A server-side restriction applied during session parameter negotiation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NegotiationRestriction {
+    /// Run duration was reduced.
+    ///
+    /// A requested duration of `0` means the client requested continuous mode.
+    /// When `requested_ns == 0` and `negotiated_ns > 0`, the server limited
+    /// that continuous request to a finite duration.
     DurationReduced {
         requested_ns: i64,
         negotiated_ns: i64,
     },
+    /// Probe interval was increased.
     IntervalIncreased {
         requested_ns: i64,
         negotiated_ns: i64,
     },
+    /// Probe interval was reduced.
     IntervalReduced {
         requested_ns: i64,
         negotiated_ns: i64,
     },
-    LengthReduced {
-        requested: i64,
-        negotiated: i64,
-    },
+    /// Packet length was reduced.
+    LengthReduced { requested: i64, negotiated: i64 },
+    /// Returned received-statistics mode differs from the request.
     ReceivedStatsChanged {
         requested: ReceivedStats,
         negotiated: ReceivedStats,
     },
+    /// Returned timestamp placement differs from the request.
     StampAtChanged {
         requested: StampAt,
         negotiated: StampAt,
     },
-    ClockChanged {
-        requested: Clock,
-        negotiated: Clock,
-    },
-    DscpChanged {
-        requested: i64,
-        negotiated: i64,
-    },
+    /// Returned clock source differs from the request.
+    ClockChanged { requested: Clock, negotiated: Clock },
+    /// Returned DSCP codepoint differs from the request.
+    DscpChanged { requested: i64, negotiated: i64 },
+    /// Returned server payload fill behavior differs from the request.
     ServerFillChanged,
 }
 
 impl NegotiationRestriction {
     pub fn message(&self) -> String {
+        self.to_string()
+    }
+}
+
+impl fmt::Display for NegotiationRestriction {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DurationReduced {
                 requested_ns: 0,
                 negotiated_ns,
             } => {
-                format!("server limited continuous duration to {negotiated_ns} ns")
+                write!(
+                    f,
+                    "server limited continuous duration to {negotiated_ns} ns"
+                )
             }
             Self::DurationReduced {
                 requested_ns,
                 negotiated_ns,
             } => {
-                format!("server reduced duration from {requested_ns} ns to {negotiated_ns} ns")
+                write!(
+                    f,
+                    "server reduced duration from {requested_ns} ns to {negotiated_ns} ns"
+                )
             }
             Self::IntervalIncreased {
                 requested_ns,
                 negotiated_ns,
             } => {
-                format!("server increased interval from {requested_ns} ns to {negotiated_ns} ns")
+                write!(
+                    f,
+                    "server increased interval from {requested_ns} ns to {negotiated_ns} ns"
+                )
             }
             Self::IntervalReduced {
                 requested_ns,
                 negotiated_ns,
             } => {
-                format!("server reduced interval from {requested_ns} ns to {negotiated_ns} ns")
+                write!(
+                    f,
+                    "server reduced interval from {requested_ns} ns to {negotiated_ns} ns"
+                )
             }
             Self::LengthReduced {
                 requested,
                 negotiated,
             } => {
-                format!("server reduced packet length from {requested} bytes to {negotiated} bytes")
+                write!(
+                    f,
+                    "server reduced packet length from {requested} bytes to {negotiated} bytes"
+                )
             }
             Self::ReceivedStatsChanged {
                 requested,
                 negotiated,
             } => {
-                format!("server changed received-stats from {requested:?} to {negotiated:?}")
+                write!(
+                    f,
+                    "server changed received-stats from {requested:?} to {negotiated:?}"
+                )
             }
             Self::StampAtChanged {
                 requested,
                 negotiated,
             } => {
-                format!("server changed stamp-at from {requested:?} to {negotiated:?}")
+                write!(
+                    f,
+                    "server changed stamp-at from {requested:?} to {negotiated:?}"
+                )
             }
             Self::ClockChanged {
                 requested,
                 negotiated,
             } => {
-                format!("server changed clock from {requested:?} to {negotiated:?}")
+                write!(
+                    f,
+                    "server changed clock from {requested:?} to {negotiated:?}"
+                )
             }
             Self::DscpChanged {
                 requested,
                 negotiated,
             } => {
-                format!("server changed dscp from {requested} to {negotiated}")
+                write!(f, "server changed DSCP from {requested} to {negotiated}")
             }
-            Self::ServerFillChanged => "server changed payload fill behavior".to_owned(),
+            Self::ServerFillChanged => write!(f, "server changed payload fill behavior"),
         }
     }
 }
