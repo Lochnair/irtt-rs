@@ -6,7 +6,7 @@ use irtt_client::{
     Client, ClientConfig, ClientError, ClientEvent, OneWayDelaySample, ReceivedStatsSample,
     RttSample, ServerTiming,
 };
-use irtt_proto::{echo_packet_len, Clock, Params, ReceivedStats, StampAt, TimestampFields};
+use irtt_proto::{Clock, Params, ReceivedStats, StampAt, TimestampFields};
 
 use support::{
     config_for_params, default_params, params_for_modes, run_one_probe, run_one_probe_with_config,
@@ -39,7 +39,7 @@ fn received_stats_modes_drive_negotiated_echo_and_reply_events() {
 
         let reply = expect_echo_reply(&run.reply);
         assert_eq!(reply.seq, 0);
-        assert_eq!(reply.bytes, echo_packet_len(false, &params));
+        assert_eq!(reply.bytes, test_echo_packet_len(false, &params));
         assert!(reply.server_timing.is_none());
         assert!(reply.one_way.is_none());
         assert_received_stats(reply.received_stats, expected_count, expected_window);
@@ -148,7 +148,7 @@ fn hmac_rich_mode_uses_negotiated_echo_layout_and_decodes_reply() {
     assert_negotiated_echo_use(&run, &params, true);
 
     let reply = expect_echo_reply(&run.reply);
-    assert_eq!(reply.bytes, echo_packet_len(true, &params));
+    assert_eq!(reply.bytes, test_echo_packet_len(true, &params));
     assert_received_stats(reply.received_stats, Some(RECV_COUNT), Some(RECV_WINDOW));
     assert_timing_fields(reply.server_timing, true, true, false, false, true, true);
 }
@@ -245,7 +245,7 @@ fn assert_negotiated_echo_use(run: &OneProbeRun, params: &Params, hmac: bool) {
 
 fn assert_echo_uses_params(run: &OneProbeRun, params: &Params, hmac: bool) {
     let (echo_len, echo_hmac, token, sequence) = echo_observation(run);
-    assert_eq!(echo_len, echo_packet_len(hmac, params));
+    assert_eq!(echo_len, test_echo_packet_len(hmac, params));
     assert_eq!(echo_hmac, hmac);
     assert_eq!(token, TOKEN);
     assert_eq!(sequence, 0);
@@ -253,7 +253,7 @@ fn assert_echo_uses_params(run: &OneProbeRun, params: &Params, hmac: bool) {
     match &run.sent {
         ClientEvent::EchoSent { seq, bytes, .. } => {
             assert_eq!(*seq, 0);
-            assert_eq!(*bytes, echo_packet_len(hmac, params));
+            assert_eq!(*bytes, test_echo_packet_len(hmac, params));
         }
         other => panic!("expected EchoSent, got {other:?}"),
     }

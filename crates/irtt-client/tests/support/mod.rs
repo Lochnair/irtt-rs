@@ -534,7 +534,7 @@ fn echo_reply_packet(
 ) -> Vec<u8> {
     let has_hmac = hmac_key.is_some();
     let layout = irtt_proto::PacketLayout::echo(has_hmac, params);
-    let packet_len = echo_packet_len(has_hmac, params);
+    let packet_len = test_echo_packet_len(has_hmac, params);
     let mut packet = Vec::with_capacity(packet_len);
 
     packet.extend_from_slice(&MAGIC);

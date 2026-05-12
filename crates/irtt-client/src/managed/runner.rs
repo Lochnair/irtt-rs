@@ -468,7 +468,7 @@ mod tests {
         timestamps: &TimestampFields,
     ) -> Vec<u8> {
         let layout = PacketLayout::echo(false, params);
-        let packet_len = echo_packet_len(false, params);
+        let packet_len = test_echo_packet_len(false, params);
         let mut packet = Vec::with_capacity(packet_len);
 
         packet.extend_from_slice(&MAGIC);

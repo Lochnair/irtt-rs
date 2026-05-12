@@ -204,11 +204,11 @@ fn server_fill_does_not_affect_client_side_packet_layout() {
     let (echo_len_without, _, _, _) = echo_observation(&run_without);
     assert_eq!(echo_len_with, echo_len_without);
     assert_eq!(
-        echo_packet_len(false, &run_with.negotiated.params),
+        test_echo_packet_len(false, &run_with.negotiated.params),
         echo_len_with
     );
     assert_eq!(
-        echo_packet_len(false, &run_without.negotiated.params),
+        test_echo_packet_len(false, &run_without.negotiated.params),
         echo_len_without
     );
 }

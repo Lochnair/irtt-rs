@@ -5,7 +5,7 @@ use std::time::Duration;
 use irtt_client::{
     Client, ClientConfig, ClientError, ClientEvent, OpenOutcome, SocketConfig, WarningKind,
 };
-use irtt_proto::{echo_packet_len, ProtoError, TimestampFields};
+use irtt_proto::{ProtoError, TimestampFields};
 
 use support::{
     config_for_params, default_params, params_for_modes, run_one_probe_with_config,
@@ -64,7 +64,7 @@ fn hmac_echo_success_verifies_request_and_accepts_reply() {
             token,
             sequence,
         } => {
-            assert_eq!(*len, echo_packet_len(true, &params));
+            assert_eq!(*len, test_echo_packet_len(true, &params));
             assert!(*hmac);
             assert_eq!(*token, TOKEN);
             assert_eq!(*sequence, 0);
@@ -80,7 +80,7 @@ fn hmac_echo_success_verifies_request_and_accepts_reply() {
             ..
         } => {
             assert_eq!(*seq, 0);
-            assert_eq!(*bytes, echo_packet_len(true, &params));
+            assert_eq!(*bytes, test_echo_packet_len(true, &params));
             assert!(server_timing.is_some());
         }
         other => panic!("expected EchoReply, got {other:?}"),
