@@ -328,8 +328,9 @@ impl Client {
     }
 
     #[cfg(test)]
-    fn recv_buffer_size(&self) -> usize {
+    pub(crate) fn recv_buffer_size(&self) -> usize {
         recv_buffer_size(self.config.hmac_key.is_some(), self.negotiated.as_ref())
+            .expect("test params must have a non-negative packet length")
     }
 
     /// Polls for probes that have timed out as of the current monotonic time.
@@ -612,7 +613,7 @@ impl Client {
         let negotiated = NegotiatedParams {
             params: reply.params.clone(),
         };
-        let recv_buffer_size = recv_buffer_size(self.config.hmac_key.is_some(), Some(&negotiated));
+        let recv_buffer_size = recv_buffer_size(self.config.hmac_key.is_some(), Some(&negotiated))?;
         let negotiated_dscp =
             u8::try_from(negotiated.params.dscp).map_err(|_| ClientError::InvalidConfig {
                 reason: "negotiated dscp must be in range 0..=63".to_owned(),
@@ -735,13 +736,16 @@ fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
         .unwrap_or(Duration::ZERO)
 }
 
-fn recv_buffer_size(has_hmac: bool, negotiated: Option<&NegotiatedParams>) -> usize {
-    match negotiated {
-        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)
+pub(crate) fn recv_buffer_size(
+    has_hmac: bool,
+    negotiated: Option<&NegotiatedParams>,
+) -> Result<usize, ClientError> {
+    Ok(match negotiated {
+        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)?
             .saturating_add(1)
             .max(MIN_RECV_BUFFER_SIZE),
         None => MIN_RECV_BUFFER_SIZE,
-    }
+    })
 }
 
 fn compute_rtt(
