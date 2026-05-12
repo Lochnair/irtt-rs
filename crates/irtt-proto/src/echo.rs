@@ -1,7 +1,7 @@
 use crate::{
     flags::{has, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY},
     hmac,
-    layout::{try_echo_packet_len, PacketLayout},
+    layout::{echo_packet_len, PacketLayout},
     open::{check_hmac_presence, reject},
     params::Params,
     validate_header, write_header, ProtoError, Result, HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE,
@@ -43,7 +43,7 @@ pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Re
         flags |= FLAG_HMAC;
     }
     let layout = PacketLayout::echo(hmac_key.is_some(), &request.params);
-    let len = try_echo_packet_len(hmac_key.is_some(), &request.params)?;
+    let len = echo_packet_len(hmac_key.is_some(), &request.params)?;
     let payload_offset = layout.header_len();
     let available_payload_len = len.saturating_sub(payload_offset);
     if request.payload.len() > available_payload_len {
@@ -87,7 +87,7 @@ pub fn decode_echo_reply(
             actual: packet.len(),
         });
     }
-    let expected_len = try_echo_packet_len(has(flags, FLAG_HMAC), params)?;
+    let expected_len = echo_packet_len(has(flags, FLAG_HMAC), params)?;
     if packet.len() != expected_len {
         return Err(ProtoError::PacketLengthMismatch {
             expected: expected_len,
@@ -371,7 +371,7 @@ mod tests {
         };
         params.received_stats = ReceivedStats::Both;
         let layout = PacketLayout::echo(true, &params);
-        let mut packet = Vec::with_capacity(try_echo_packet_len(true, &params).unwrap());
+        let mut packet = Vec::with_capacity(echo_packet_len(true, &params).unwrap());
         write_header(&mut packet, FLAG_REPLY | FLAG_HMAC);
         packet.extend_from_slice(&[0; HMAC_SIZE]);
         packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());

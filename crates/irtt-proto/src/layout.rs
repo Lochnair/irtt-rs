@@ -111,13 +111,7 @@ pub fn echo_header_len(hmac: bool, params: &Params) -> usize {
     PacketLayout::echo(hmac, params).header_len()
 }
 
-pub fn echo_packet_len(hmac: bool, params: &Params) -> usize {
-    let header_len = echo_header_len(hmac, params);
-    let requested = usize::try_from(params.length).unwrap_or(0);
-    header_len.max(requested)
-}
-
-pub fn try_echo_packet_len(hmac: bool, params: &Params) -> Result<usize> {
+pub fn echo_packet_len(hmac: bool, params: &Params) -> Result<usize> {
     let header_len = echo_header_len(hmac, params);
     let requested =
         usize::try_from(params.length).map_err(|_| ProtoError::NegativePacketLength {
@@ -300,9 +294,9 @@ mod tests {
     fn negotiated_length_never_smaller_than_header() {
         let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
         p.length = 20;
-        assert_eq!(echo_packet_len(false, &p), 60);
+        assert_eq!(echo_packet_len(false, &p).unwrap(), 60);
         p.length = 92;
-        assert_eq!(echo_packet_len(false, &p), 92);
+        assert_eq!(echo_packet_len(false, &p).unwrap(), 92);
     }
 
     #[test]
@@ -311,7 +305,7 @@ mod tests {
         p.length = -1;
 
         assert_eq!(
-            try_echo_packet_len(false, &p),
+            echo_packet_len(false, &p),
             Err(ProtoError::NegativePacketLength { length: -1 })
         );
     }
@@ -320,9 +314,9 @@ mod tests {
     fn checked_packet_len_preserves_non_negative_header_floor() {
         let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
         p.length = 0;
-        assert_eq!(try_echo_packet_len(false, &p), Ok(60));
+        assert_eq!(echo_packet_len(false, &p), Ok(60));
 
         p.length = 92;
-        assert_eq!(try_echo_packet_len(false, &p), Ok(92));
+        assert_eq!(echo_packet_len(false, &p), Ok(92));
     }
 }
