@@ -28,10 +28,13 @@ fn strict_negotiation_accepts_identical_params() {
 
 #[test]
 fn strict_negotiation_rejects_changed_params() {
-    let config = ClientConfig::default();
+    let config = ClientConfig {
+        dscp: 46,
+        ..ClientConfig::default()
+    };
     let requested = params_from_config(&config).unwrap();
     let mut returned = requested.clone();
-    returned.dscp = 1;
+    returned.dscp = 0;
     assert_eq!(
         rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
         NegotiationRestriction::DscpChanged {
@@ -191,4 +194,75 @@ fn loose_negotiation_rejects_runtime_invalid_returned_dscp() {
             "dscp must be in range 0..=63"
         );
     }
+}
+
+#[test]
+fn loose_negotiation_records_dscp_disabled_by_server() {
+    let config = ClientConfig {
+        dscp: 46,
+        ..ClientConfig::default()
+    };
+    let requested = params_from_config(&config).unwrap();
+    let mut returned = requested.clone();
+    returned.dscp = 0;
+
+    let negotiated = assert_negotiates(&requested, &returned, NegotiationPolicy::Loose);
+
+    assert_eq!(
+        negotiated.restrictions,
+        vec![NegotiationRestriction::DscpChanged {
+            requested: 46,
+            negotiated: 0,
+        }]
+    );
+}
+
+#[test]
+fn strict_negotiation_rejects_dscp_disabled_by_server_as_specific_restriction() {
+    let config = ClientConfig {
+        dscp: 46,
+        ..ClientConfig::default()
+    };
+    let requested = params_from_config(&config).unwrap();
+    let mut returned = requested.clone();
+    returned.dscp = 0;
+
+    assert_eq!(
+        rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+        NegotiationRestriction::DscpChanged {
+            requested: 46,
+            negotiated: 0,
+        }
+        .message()
+    );
+}
+
+#[test]
+fn negotiation_rejects_unsupported_dscp_changes() {
+    let config = ClientConfig {
+        dscp: 46,
+        ..ClientConfig::default()
+    };
+    let requested = params_from_config(&config).unwrap();
+    let mut returned = requested.clone();
+    returned.dscp = 8;
+
+    assert_eq!(
+        rejection_reason(&requested, &returned, NegotiationPolicy::Loose),
+        "server returned unsupported DSCP change"
+    );
+    assert_eq!(
+        rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
+        "server returned unsupported DSCP change"
+    );
+
+    let zero_config = ClientConfig::default();
+    let zero_requested = params_from_config(&zero_config).unwrap();
+    let mut returned = zero_requested.clone();
+    returned.dscp = 46;
+
+    assert_eq!(
+        rejection_reason(&zero_requested, &returned, NegotiationPolicy::Loose),
+        "server returned unsupported DSCP change"
+    );
 }

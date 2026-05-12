@@ -413,7 +413,7 @@ mod tests {
         );
 
         let mut returned = requested.clone();
-        returned.dscp = 8;
+        returned.dscp = 0;
         assert_eq!(
             rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
             NegotiationRestriction::DscpChanged {

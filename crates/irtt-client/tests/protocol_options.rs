@@ -185,7 +185,7 @@ fn loose_open_uses_returned_params_for_echo_layout_and_reply_parsing() {
     returned.received_stats = ReceivedStats::Count;
     returned.stamp_at = StampAt::Receive;
     returned.clock = Clock::Wall;
-    returned.dscp = 8;
+    returned.dscp = 0;
     returned.server_fill = None;
 
     let requested_for_config = requested.clone();
