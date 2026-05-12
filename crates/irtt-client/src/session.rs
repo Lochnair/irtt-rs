@@ -273,7 +273,12 @@ pub(crate) fn negotiate_params(
             },
         )?;
     }
-    if returned.dscp != requested.dscp {
+    if returned.dscp != requested.dscp && returned.dscp != 0 {
+        return Err(ClientError::NegotiationRejected {
+            reason: "server returned unsupported DSCP change".to_owned(),
+        });
+    }
+    if returned.dscp == 0 && requested.dscp != 0 {
         record_restriction(
             policy,
             &mut restrictions,
