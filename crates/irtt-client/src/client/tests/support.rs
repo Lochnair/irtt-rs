@@ -1,7 +1,8 @@
 use super::*;
 use irtt_proto::{
-    compute_hmac_in_place, echo_packet_len, flags::FLAG_HMAC, flags::FLAG_OPEN, flags::FLAG_REPLY,
-    layout::PacketLayout, Clock, ReceivedStats, StampAt, HMAC_SIZE, MAGIC,
+    compute_hmac_in_place, echo_packet_len as checked_echo_packet_len, flags::FLAG_HMAC,
+    flags::FLAG_OPEN, flags::FLAG_REPLY, layout::PacketLayout, Clock, ReceivedStats, StampAt,
+    HMAC_SIZE, MAGIC,
 };
 use std::{
     net::UdpSocket,
@@ -72,6 +73,11 @@ pub(super) fn open_reply(
         compute_hmac_in_place(key, &mut packet, HMAC_OFFSET).unwrap();
     }
     packet
+}
+
+pub(crate) fn echo_packet_len(hmac: bool, params: &Params) -> usize {
+    checked_echo_packet_len(hmac, params)
+        .expect("test params must have a non-negative packet length")
 }
 
 pub(super) fn echo_reply_packet(

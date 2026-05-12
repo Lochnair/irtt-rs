@@ -13,6 +13,8 @@ use support::{
     start_hmac_required_open_drop_server, BackendPeer, ServerObservation, TOKEN,
 };
 
+use crate::support::test_echo_packet_len;
+
 #[test]
 fn hmac_open_success_negotiates_without_warnings() {
     let key = b"compat-secret".to_vec();

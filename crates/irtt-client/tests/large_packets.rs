@@ -1,9 +1,11 @@
 mod support;
 
 use irtt_client::{Client, ClientConfig, ClientEvent, NegotiationPolicy};
-use irtt_proto::{echo_header_len, echo_packet_len, Params, TimestampFields};
+use irtt_proto::{echo_header_len, Params, TimestampFields};
 
 use support::{config_for_params, default_params, run_one_probe, BackendPeer, ServerObservation};
+
+use crate::support::test_echo_packet_len;
 
 fn params_with_length(length: i64) -> Params {
     Params {

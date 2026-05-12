@@ -14,6 +14,8 @@ use support::{
     ServerObservation, RECV_COUNT, RECV_WINDOW, TOKEN,
 };
 
+use crate::support::test_echo_packet_len;
+
 struct ReplyView<'a> {
     seq: u32,
     rtt: &'a RttSample,

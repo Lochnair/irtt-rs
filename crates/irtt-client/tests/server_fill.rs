@@ -1,12 +1,14 @@
 mod support;
 
 use irtt_client::{Client, ClientConfig, ClientError, ClientEvent, NegotiationPolicy};
-use irtt_proto::{echo_packet_len, Params, TimestampFields};
+use irtt_proto::{Params, TimestampFields};
 
 use support::{
     config_for_params, default_params, run_one_probe, run_one_probe_with_config, server_fill,
     start_open_server, OneProbeRun, ServerObservation,
 };
+
+use crate::support::test_echo_packet_len;
 
 fn open_observation_params(run: &OneProbeRun) -> &Params {
     match &run.observations[0] {

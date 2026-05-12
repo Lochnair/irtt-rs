@@ -311,8 +311,10 @@ mod tests {
     use super::*;
     use crate::{config::NegotiationPolicy, SubscriberOverflow};
     use irtt_proto::{
-        echo_packet_len, flags, flags::FLAG_OPEN, flags::FLAG_REPLY, layout::PacketLayout, Clock,
-        Params, ReceivedStats, StampAt, TimestampFields, MAGIC, PROTOCOL_VERSION,
+        echo_packet_len,
+        flags::{self, FLAG_OPEN, FLAG_REPLY},
+        layout::PacketLayout,
+        Clock, Params, ReceivedStats, StampAt, TimestampFields, MAGIC, PROTOCOL_VERSION,
     };
     use std::{
         net::{SocketAddr, UdpSocket},
@@ -329,6 +331,11 @@ mod tests {
         fn join(self) {
             self.done.join().unwrap();
         }
+    }
+
+    fn test_echo_packet_len(hmac: bool, params: &Params) -> usize {
+        echo_packet_len(hmac, params)
+            .expect("managed runner test params must have a non-negative packet length")
     }
 
     fn test_params(duration: Option<Duration>, interval: Duration) -> Params {

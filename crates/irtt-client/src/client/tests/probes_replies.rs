@@ -1,4 +1,5 @@
 use super::*;
+use support::echo_packet_len;
 
 #[cfg(not(all(target_os = "linux", feature = "ancillary")))]
 fn assert_packet_meta_unavailable(packet_meta: &crate::event::PacketMeta) {
