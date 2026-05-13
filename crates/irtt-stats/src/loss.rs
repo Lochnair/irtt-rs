@@ -7,10 +7,8 @@ use crate::PacketCounts;
 /// Directional upstream and downstream loss can be negative when
 /// server-reported counts exceed local expectations.
 pub struct LossStats {
-    /// Locally inferred lost packets.
+    /// Locally inferred total lost packets.
     pub lost_packets: u64,
-    /// Loss not attributed to a direction.
-    pub unknown_loss_packets: u64,
     /// Server-assisted upstream loss estimate, when server counts are available.
     pub upstream_loss_packets: Option<i128>,
     /// Server-assisted downstream loss estimate, when server counts are available.
@@ -67,7 +65,6 @@ pub(crate) fn loss_stats(packets: PacketCounts) -> LossStats {
 
     LossStats {
         lost_packets: lost,
-        unknown_loss_packets: lost,
         upstream_loss_packets,
         downstream_loss_packets,
         packet_loss_percent,

@@ -264,7 +264,9 @@ fn directional_loss_uses_server_received_count_when_available() {
     collector.process(&reply(0, 10, 10));
 
     let loss = collector.snapshot().loss;
+    assert_eq!(loss.lost_packets, 1);
     assert_eq!(loss.upstream_loss_packets, Some(1));
     assert_eq!(loss.downstream_loss_packets, Some(0));
+    assert_eq!(loss.packet_loss_percent, 50.0);
     assert_eq!(loss.upstream_loss_percent, 50.0);
 }
