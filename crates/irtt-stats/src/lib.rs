@@ -401,6 +401,10 @@ impl CoreStats {
         let send_ipdv = send_ipdv_ns(previous, current).map(abs_i128_ns);
         let receive_ipdv = receive_ipdv_ns(previous, current).map(abs_i128_ns);
 
+        let rtt_ipdv_duration = duration_from_non_negative_i128_ns(rtt_ipdv)?;
+        let send_ipdv_duration = send_ipdv.and_then(duration_from_non_negative_i128_ns);
+        let receive_ipdv_duration = receive_ipdv.and_then(duration_from_non_negative_i128_ns);
+
         self.ipdv_round_trip.push_ns(rtt_ipdv);
 
         if let Some(value) = send_ipdv {
@@ -414,9 +418,9 @@ impl CoreStats {
         Some(IpdvPairUpdate {
             previous_seq,
             current_seq,
-            rtt_ipdv: duration_from_non_negative_i128_ns(rtt_ipdv)?,
-            send_ipdv: send_ipdv.map(duration_from_non_negative_i128_ns)?,
-            receive_ipdv: receive_ipdv.map(duration_from_non_negative_i128_ns)?,
+            rtt_ipdv: rtt_ipdv_duration,
+            send_ipdv: send_ipdv_duration,
+            receive_ipdv: receive_ipdv_duration,
         })
     }
 
