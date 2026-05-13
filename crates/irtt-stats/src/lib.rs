@@ -59,8 +59,8 @@ pub enum SampleMode {
 pub struct StatsCollector {
     config: StatsConfig,
     cumulative: CoreStats,
-    rolling_count: Option<VecDeque<WindowEvent>>,
-    rolling_time: Option<VecDeque<WindowEvent>>,
+    rolling_count: Option<VecDeque<StatsEvent>>,
+    rolling_time: Option<VecDeque<StatsEvent>>,
 }
 
 impl StatsCollector {
@@ -74,16 +74,16 @@ impl StatsCollector {
     }
 
     pub fn process(&mut self, event: &ClientEvent) -> EventStatsUpdate {
-        let Some(window_event) = WindowEvent::from_client_event(event) else {
+        let Some(stats_event) = StatsEvent::from_client_event(event) else {
             return EventStatsUpdate::default();
         };
 
-        let update = self.cumulative.apply(window_event.clone());
+        let update = self.cumulative.apply(stats_event.clone());
 
         if let (Some(limit), Some(window)) =
             (self.config.rolling_count, self.rolling_count.as_mut())
         {
-            window.push_back(window_event.clone());
+            window.push_back(stats_event.clone());
             while window.len() > limit {
                 window.pop_front();
             }
@@ -92,8 +92,8 @@ impl StatsCollector {
         if let (Some(duration), Some(window)) =
             (self.config.rolling_time, self.rolling_time.as_mut())
         {
-            let cutoff = window_event.at().checked_sub(duration);
-            window.push_back(window_event);
+            let cutoff = stats_event.at().checked_sub(duration);
+            window.push_back(stats_event);
             if let Some(cutoff) = cutoff {
                 while window.front().is_some_and(|event| event.at() < cutoff) {
                     window.pop_front();
@@ -278,10 +278,10 @@ impl CoreStats {
         }
     }
 
-    fn apply(&mut self, event: WindowEvent) -> EventStatsUpdate {
+    fn apply(&mut self, event: StatsEvent) -> EventStatsUpdate {
         let mut update = EventStatsUpdate::default();
         match event {
-            WindowEvent::Sent {
+            StatsEvent::Sent {
                 bytes,
                 send_call_ns,
                 timer_error_ns,
@@ -293,7 +293,7 @@ impl CoreStats {
                 self.send_call.push_ns(send_call_ns);
                 self.timer_error.push_ns(timer_error_ns);
             }
-            WindowEvent::UniqueReply {
+            StatsEvent::UniqueReply {
                 is_late, sample, ..
             } => {
                 let sample = *sample;
@@ -343,18 +343,18 @@ impl CoreStats {
                     }
                 }
             }
-            WindowEvent::DuplicateReply { .. } => {
+            StatsEvent::DuplicateReply { .. } => {
                 self.events.duplicate_replies += 1;
                 self.packets.packets_received += 1;
                 self.packets.duplicates += 1;
             }
-            WindowEvent::Loss { .. } => {
+            StatsEvent::Loss { .. } => {
                 self.events.loss_events += 1;
             }
-            WindowEvent::Warning { .. } => {
+            StatsEvent::Warning { .. } => {
                 self.events.warning_events += 1;
             }
-            WindowEvent::UntrackedLate { .. } => {
+            StatsEvent::UntrackedLate { .. } => {
                 self.events.untracked_late_replies += 1;
             }
         }
@@ -454,7 +454,7 @@ impl CoreStats {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-enum WindowEvent {
+enum StatsEvent {
     Sent {
         at: Instant,
         bytes: usize,
@@ -480,7 +480,7 @@ enum WindowEvent {
     },
 }
 
-impl WindowEvent {
+impl StatsEvent {
     fn from_client_event(event: &ClientEvent) -> Option<Self> {
         match event {
             ClientEvent::EchoSent {
@@ -695,7 +695,7 @@ impl RunningStats {
     }
 }
 
-fn snapshot_window(events: &VecDeque<WindowEvent>) -> Snapshot {
+fn snapshot_window(events: &VecDeque<StatsEvent>) -> Snapshot {
     let mut core = CoreStats::new(SampleMode::RunningOnly);
     for event in events {
         core.apply(event.clone());
