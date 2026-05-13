@@ -24,8 +24,13 @@ pub struct CliArgs {
     /// Server address or host, with optional port.
     pub server: String,
 
-    /// Test duration; use 0 for continuous mode.
-    #[arg(long, default_value = "10s", value_parser = parse_test_duration)]
+    #[arg(
+        long,
+        default_value = "10s",
+        value_parser = parse_test_duration,
+        help = "Test duration; use 0 for continuous mode",
+        long_help = "Test duration; use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and does not print a finite summary."
+    )]
     pub duration: Duration,
 
     /// Probe interval.
