@@ -71,7 +71,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     #[cfg(feature = "stats")]
     let mut stats = StatsCollector::new(stats_config(continuous));
-    let mut output = EventOutput {
+    let mut stream_output = StreamOutput {
         mode,
         human_options: HumanOutputOptions {
             verbose: args.verbose,
@@ -94,20 +94,20 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
     }
 
     let open = client.open()?;
-    output.print_event(open_event(&open))?;
+    stream_output.print_event(open_event(&open))?;
 
     let mut interrupted = false;
     while should_continue_run(continuous, client.next_send_deadline(), shutdown_requested) {
         if should_send_probe(client.next_send_deadline(), shutdown_requested) {
             let events = client.send_probe()?;
-            output.print_events(&events)?;
+            stream_output.print_events(&events)?;
         }
 
         let events = client.recv_available(RECV_BUDGET)?;
-        output.print_events(&events)?;
+        stream_output.print_events(&events)?;
 
         let events = client.poll_timeouts()?;
-        output.print_events(&events)?;
+        stream_output.print_events(&events)?;
 
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
@@ -123,19 +123,19 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
     }
 
     if should_drain_final(continuous, interrupted) {
-        drain_final_replies(&mut client, &mut output)?;
+        drain_final_replies(&mut client, &mut stream_output)?;
     }
 
     let events = client.poll_timeouts()?;
-    output.print_events(&events)?;
+    stream_output.print_events(&events)?;
 
     let events = client.close()?;
-    output.print_events(&events)?;
+    stream_output.print_events(&events)?;
     let print_final_summary = should_print_final_summary(continuous, interrupted);
-    output.print_final_summary = print_final_summary;
-    output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
-    output.print_summary()?;
-    output.out.flush()?;
+    stream_output.print_final_summary = print_final_summary;
+    stream_output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
+    stream_output.print_summary()?;
+    stream_output.out.flush()?;
     Ok(())
 }
 
@@ -172,7 +172,7 @@ fn open_event(outcome: &OpenOutcome) -> &ClientEvent {
 
 fn drain_final_replies<W: Write>(
     client: &mut Client,
-    output: &mut EventOutput<'_, W>,
+    stream_output: &mut StreamOutput<'_, W>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let deadline = Instant::now() + final_drain_duration(client.probe_timeout());
     loop {
@@ -180,11 +180,11 @@ fn drain_final_replies<W: Write>(
 
         let events = client.recv_available(RECV_BUDGET)?;
         printed |= !events.is_empty();
-        output.print_events(&events)?;
+        stream_output.print_events(&events)?;
 
         let events = client.poll_timeouts()?;
         printed |= !events.is_empty();
-        output.print_events(&events)?;
+        stream_output.print_events(&events)?;
 
         if client.is_run_complete() || Instant::now() >= deadline {
             break;
@@ -209,7 +209,7 @@ fn sleep_until_next_send(deadline: Option<Instant>) {
     }
 }
 
-struct EventOutput<'a, W: Write> {
+struct StreamOutput<'a, W: Write> {
     mode: irtt_cli::OutputMode,
     human_options: HumanOutputOptions,
     print_final_summary: bool,
@@ -219,7 +219,7 @@ struct EventOutput<'a, W: Write> {
     stats: &'a mut StatsCollector,
 }
 
-impl<W: Write> EventOutput<'_, W> {
+impl<W: Write> StreamOutput<'_, W> {
     fn print_events(&mut self, events: &[ClientEvent]) -> io::Result<()> {
         for event in events {
             self.print_event(event)?;
@@ -472,7 +472,7 @@ mod tests {
         let mut stats = StatsCollector::new(StatsConfig::finite());
         let mut out = Vec::new();
         {
-            let mut output = EventOutput {
+            let mut stream_output = StreamOutput {
                 mode: irtt_cli::OutputMode::RttUs,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: true,
@@ -480,8 +480,8 @@ mod tests {
                 out: &mut out,
                 stats: &mut stats,
             };
-            output.print_events(&events).unwrap();
-            output.print_summary().unwrap();
+            stream_output.print_events(&events).unwrap();
+            stream_output.print_summary().unwrap();
         }
 
         let rendered = String::from_utf8(out).unwrap();
@@ -496,7 +496,7 @@ mod tests {
         let mut stats = StatsCollector::new(StatsConfig::continuous());
         let mut out = Vec::new();
         {
-            let mut output = EventOutput {
+            let mut stream_output = StreamOutput {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: false,
@@ -504,7 +504,7 @@ mod tests {
                 out: &mut out,
                 stats: &mut stats,
             };
-            output.print_summary().unwrap();
+            stream_output.print_summary().unwrap();
         }
 
         assert!(out.is_empty());
@@ -515,7 +515,7 @@ mod tests {
         let mut stats = StatsCollector::new(StatsConfig::continuous());
         let mut out = Vec::new();
         {
-            let mut output = EventOutput {
+            let mut stream_output = StreamOutput {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: true,
@@ -523,8 +523,8 @@ mod tests {
                 out: &mut out,
                 stats: &mut stats,
             };
-            output.print_event(&reply_event(1, 1200)).unwrap();
-            output.print_summary().unwrap();
+            stream_output.print_event(&reply_event(1, 1200)).unwrap();
+            stream_output.print_summary().unwrap();
         }
 
         let rendered = String::from_utf8(out).unwrap();
@@ -541,7 +541,7 @@ mod tests {
         let mut stats = StatsCollector::new(StatsConfig::finite());
         let mut out = Vec::new();
         {
-            let mut output = EventOutput {
+            let mut stream_output = StreamOutput {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: false,
@@ -549,7 +549,7 @@ mod tests {
                 out: &mut out,
                 stats: &mut stats,
             };
-            output.print_events(&events).unwrap();
+            stream_output.print_events(&events).unwrap();
         }
 
         let rendered = String::from_utf8(out).unwrap();
