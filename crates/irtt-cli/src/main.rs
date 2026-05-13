@@ -366,6 +366,14 @@ mod shutdown_tests {
         assert!(!should_drain_final(true, false));
         assert!(should_drain_final(false, false));
     }
+
+    #[test]
+    fn final_summary_gate_prints_finite_or_interrupted_continuous() {
+        assert!(should_print_final_summary(false, false));
+        assert!(should_print_final_summary(false, true));
+        assert!(!should_print_final_summary(true, false));
+        assert!(should_print_final_summary(true, true));
+    }
 }
 
 #[cfg(all(test, feature = "stats"))]
@@ -493,6 +501,28 @@ mod tests {
         }
 
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn continuous_interrupted_output_prints_bounded_summary_when_enabled() {
+        let mut stats = StatsCollector::new(StatsConfig::continuous());
+        let mut out = Vec::new();
+        {
+            let mut output = EventOutput {
+                mode: irtt_cli::OutputMode::Human,
+                human_options: HumanOutputOptions::default(),
+                print_final_summary: true,
+                out: &mut out,
+                stats: &mut stats,
+            };
+            output.print_event(&reply_event(1, 1200)).unwrap();
+            output.print_summary().unwrap();
+        }
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert!(rendered.contains("irtt-rs summary"));
+        assert!(rendered.contains("packets:"));
+        assert!(rendered.contains("received=1"));
     }
 
     #[test]
