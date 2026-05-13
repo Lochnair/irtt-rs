@@ -1,6 +1,6 @@
 use std::{collections::VecDeque, time::Duration};
 
-use crate::{normalization::StatsEvent, CoreStats, SampleMode, Snapshot, StatsConfig};
+use crate::{core::CoreStats, normalization::StatsEvent, SampleMode, Snapshot, StatsConfig};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RollingEvents {
