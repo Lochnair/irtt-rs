@@ -13,9 +13,12 @@ use irtt_client::{
 };
 
 mod ipdv;
+mod loss;
 mod time_stats;
 
 use ipdv::{IpdvSample, IpdvTracker};
+use loss::loss_stats;
+pub use loss::LossStats;
 use time_stats::TimeMetric;
 pub use time_stats::TimeStats;
 
@@ -195,19 +198,6 @@ pub struct PacketCounts {
     pub bytes_received: u64,
     pub server_packets_received: Option<u64>,
     pub server_received_window: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct LossStats {
-    pub lost_packets: u64,
-    pub unknown_loss_packets: u64,
-    pub upstream_loss_packets: Option<i128>,
-    pub downstream_loss_packets: Option<i128>,
-    pub packet_loss_percent: f64,
-    pub upstream_loss_percent: f64,
-    pub downstream_loss_percent: f64,
-    pub duplicate_percent: f64,
-    pub late_packets_percent: f64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -647,69 +637,6 @@ fn snapshot_window(events: &VecDeque<StatsEvent>) -> Snapshot {
         core.apply(event.clone());
     }
     core.snapshot()
-}
-
-fn loss_stats(packets: PacketCounts) -> LossStats {
-    let lost = packets.packets_sent.saturating_sub(packets.unique_replies);
-    let packet_loss_percent = if packets.packets_sent == 0 {
-        0.0
-    } else if packets.unique_replies == 0 {
-        100.0
-    } else {
-        percent(lost as f64, packets.packets_sent as f64)
-    };
-
-    let (
-        upstream_loss_packets,
-        upstream_loss_percent,
-        downstream_loss_packets,
-        downstream_loss_percent,
-    ) = if let Some(server_received) = packets.server_packets_received {
-        let upstream = i128::from(packets.packets_sent) - i128::from(server_received);
-        let downstream = i128::from(server_received) - i128::from(packets.packets_received);
-        let upstream_percent = if packets.packets_sent == 0 {
-            0.0
-        } else {
-            percent(upstream as f64, packets.packets_sent as f64)
-        };
-        let downstream_percent = if server_received == 0 {
-            0.0
-        } else {
-            percent(downstream as f64, server_received as f64)
-        };
-        (
-            Some(upstream),
-            upstream_percent,
-            Some(downstream),
-            downstream_percent,
-        )
-    } else {
-        (None, 0.0, None, 0.0)
-    };
-
-    LossStats {
-        lost_packets: lost,
-        unknown_loss_packets: lost,
-        upstream_loss_packets,
-        downstream_loss_packets,
-        packet_loss_percent,
-        upstream_loss_percent,
-        downstream_loss_percent,
-        duplicate_percent: if packets.packets_received == 0 {
-            0.0
-        } else {
-            percent(packets.duplicates as f64, packets.packets_received as f64)
-        },
-        late_packets_percent: if packets.packets_received == 0 {
-            0.0
-        } else {
-            percent(packets.late_packets as f64, packets.packets_received as f64)
-        },
-    }
-}
-
-fn percent(numerator: f64, denominator: f64) -> f64 {
-    100.0 * numerator / denominator
 }
 
 fn system_time_ns(time: SystemTime) -> Option<i128> {
