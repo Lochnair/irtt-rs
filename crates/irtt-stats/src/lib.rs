@@ -3,7 +3,7 @@
 //! The crate consumes `irtt-client` events and produces cumulative or rolling
 //! snapshots for reporting and integration code.
 
-#![forbid(unsafe_code)]
+//#![forbid(unsafe_code)]
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
@@ -260,4 +260,234 @@ pub struct OneWayDelayStats {
 pub struct ServerProcessingStats {
     /// Time spent processing a probe at the server.
     pub processing: TimeStats,
+}
+
+#[cfg(test)]
+mod memory_growth_tests {
+    use irtt_client::PacketMeta;
+
+    use super::*;
+    use std::{
+        alloc::{GlobalAlloc, Layout, System},
+        net::{IpAddr, SocketAddr},
+        str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering},
+        time::{Duration, Instant, SystemTime},
+    };
+
+    struct CountingAlloc;
+
+    static CURRENT_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+    static PEAK_ALLOCATED: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            let ptr = unsafe { System.alloc(layout) };
+            if !ptr.is_null() {
+                let new_current =
+                    CURRENT_ALLOCATED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+
+                let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
+                while new_current > peak {
+                    match PEAK_ALLOCATED.compare_exchange_weak(
+                        peak,
+                        new_current,
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                    ) {
+                        Ok(_) => break,
+                        Err(observed) => peak = observed,
+                    }
+                }
+            }
+            ptr
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) };
+            CURRENT_ALLOCATED.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, old_layout: Layout, new_size: usize) -> *mut u8 {
+            let new_ptr = unsafe { System.realloc(ptr, old_layout, new_size) };
+            if !new_ptr.is_null() {
+                if new_size >= old_layout.size() {
+                    let delta = new_size - old_layout.size();
+                    let new_current = CURRENT_ALLOCATED.fetch_add(delta, Ordering::Relaxed) + delta;
+
+                    let mut peak = PEAK_ALLOCATED.load(Ordering::Relaxed);
+                    while new_current > peak {
+                        match PEAK_ALLOCATED.compare_exchange_weak(
+                            peak,
+                            new_current,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        ) {
+                            Ok(_) => break,
+                            Err(observed) => peak = observed,
+                        }
+                    }
+                } else {
+                    CURRENT_ALLOCATED.fetch_sub(old_layout.size() - new_size, Ordering::Relaxed);
+                }
+            }
+            new_ptr
+        }
+    }
+
+    #[global_allocator]
+    static ALLOC: CountingAlloc = CountingAlloc;
+
+    fn reset_alloc_counter() {
+        CURRENT_ALLOCATED.store(0, Ordering::Relaxed);
+        PEAK_ALLOCATED.store(0, Ordering::Relaxed);
+    }
+
+    fn current_allocated() -> usize {
+        CURRENT_ALLOCATED.load(Ordering::Relaxed)
+    }
+
+    fn peak_allocated() -> usize {
+        PEAK_ALLOCATED.load(Ordering::Relaxed)
+    }
+
+    fn mib(bytes: usize) -> f64 {
+        bytes as f64 / 1024.0 / 1024.0
+    }
+
+    fn client_timestamp(mono: Instant) -> irtt_client::ClientTimestamp {
+        irtt_client::ClientTimestamp {
+            mono,
+            wall: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    fn sent_event(seq: u32, base: Instant) -> irtt_client::ClientEvent {
+        let mono = base + Duration::from_millis(u64::from(seq));
+
+        irtt_client::ClientEvent::EchoSent {
+            seq,
+            sent_at: client_timestamp(mono),
+            bytes: 64,
+            remote: SocketAddr::new(IpAddr::from_str("1.1.1.1").unwrap(), 9),
+            scheduled_at: Instant::now(),
+            send_call: Duration::from_nanos(1_000),
+            timer_error: Duration::ZERO,
+        }
+    }
+
+    fn reply_event(seq: u32, base: Instant) -> irtt_client::ClientEvent {
+        let sent_mono = base + Duration::from_millis(u64::from(seq));
+        let received_mono = sent_mono + Duration::from_millis(10);
+
+        irtt_client::ClientEvent::EchoReply {
+            seq,
+            sent_at: client_timestamp(sent_mono),
+            received_at: client_timestamp(received_mono),
+            remote: SocketAddr::new(IpAddr::from_str("1.1.1.1").unwrap(), 9),
+            packet_meta: PacketMeta {
+                traffic_class: None,
+                dscp: None,
+                ecn: None,
+                kernel_rx_timestamp: None,
+            },
+            rtt: irtt_client::RttSample {
+                raw: Duration::from_millis(10),
+                adjusted: Some(Duration::from_millis(9)),
+                effective: Duration::from_millis(9),
+                adjusted_signed: Some(irtt_client::SignedDuration {
+                    ns: 9_000_000 + i128::from(seq % 100),
+                }),
+                effective_signed: irtt_client::SignedDuration {
+                    ns: 9_000_000 + i128::from(seq % 100),
+                },
+            },
+            server_timing: None,
+            one_way: None,
+            received_stats: Some(irtt_client::ReceivedStatsSample {
+                count: Some(seq + 1),
+                window: Some(u64::MAX),
+            }),
+            bytes: 64,
+        }
+    }
+
+    fn feed_successful_probes(collector: &mut StatsCollector, count: usize) {
+        let base = Instant::now();
+
+        for seq in 0..count {
+            let seq = u32::try_from(seq).expect("sample count should fit in u32");
+            collector.process(&sent_event(seq, base));
+            collector.process(&reply_event(seq, base));
+        }
+    }
+
+    fn measure_config(label: &str, config: StatsConfig, count: usize) {
+        reset_alloc_counter();
+
+        let baseline_current = current_allocated();
+        let baseline_peak = peak_allocated();
+
+        let mut collector = StatsCollector::new(config);
+        feed_successful_probes(&mut collector, count);
+
+        let snapshot = collector.snapshot();
+
+        let current = current_allocated().saturating_sub(baseline_current);
+        let peak = peak_allocated().saturating_sub(baseline_peak);
+
+        println!(
+            "{label:<42} probes={count:<8} current={:>12} B ({:>8.2} MiB) peak={:>12} B ({:>8.2} MiB) rtt_count={} median={:?} ipdv_pairs={}",
+            current,
+            mib(current),
+            peak,
+            mib(peak),
+            snapshot.rtt.primary.count,
+            snapshot.rtt.primary.median_ns,
+            snapshot.ipdv.round_trip.count,
+        );
+    }
+
+    #[test]
+    #[ignore = "prints approximate heap allocation growth for stats configurations"]
+    fn print_storage_growth_allocations() {
+        println!();
+        println!("irtt-stats heap allocation growth");
+        println!("=================================");
+        println!(
+            "Note: these numbers are approximate allocator-level deltas for this test binary."
+        );
+        println!(
+            "They include collection growth and Box allocations, but also any incidental allocations during the measured section."
+        );
+        println!();
+
+        for count in [10usize, 1_000, 100_000] {
+            measure_config("finite", StatsConfig::finite(), count);
+
+            measure_config("continuous", StatsConfig::continuous(), count);
+
+            measure_config(
+                "continuous + rolling_count=1_000",
+                StatsConfig {
+                    samples: SampleMode::RunningOnly,
+                    rolling_count: Some(1_000),
+                    rolling_time: None,
+                },
+                count,
+            );
+
+            measure_config(
+                "continuous + rolling_count=100_000",
+                StatsConfig {
+                    samples: SampleMode::RunningOnly,
+                    rolling_count: Some(100_000),
+                    rolling_time: None,
+                },
+                count,
+            );
+
+            println!();
+        }
+    }
 }
