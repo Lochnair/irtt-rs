@@ -18,6 +18,11 @@ use irtt_client::{Client, ClientEvent, OpenOutcome, RecvBudget};
 #[cfg(all(test, feature = "stats"))]
 use irtt_client::ClientTimestamp;
 
+#[cfg(feature = "tui")]
+mod tui;
+#[cfg(feature = "tui")]
+use tui::run_tui;
+
 #[cfg(feature = "stats")]
 use irtt_stats::{StatsCollector, StatsConfig};
 
@@ -66,6 +71,8 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
         OutputMode::Human | OutputMode::Machine | OutputMode::Simple | OutputMode::RttUs => {
             run_stream(args, shutdown_requested)
         }
+        #[cfg(feature = "tui")]
+        OutputMode::Tui => run_tui(args, shutdown_requested),
     }
 }
 

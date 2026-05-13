@@ -13,7 +13,7 @@ This repository currently provides:
 - `irtt-cli`, a command-line IRTT-compatible client
 - `irtt-client`, a Rust library for running client sessions and consuming events
 - finite and continuous probe runs
-- human, simple, machine-readable, and RTT-only output modes
+- human, simple, machine-readable, RTT-only, and optional TUI output modes
 - optional local summary statistics
 
 Server support is not implemented.
@@ -63,6 +63,14 @@ irtt-cli <server> --output human
 irtt-cli <server> --output simple
 irtt-cli <server> --output machine
 irtt-cli <server> --output rtt-us
+```
+
+With the optional TUI feature, `--output tui` opens a live cumulative and
+rolling dashboard for interactive probing. Quit with `q` or `Ctrl-C`; the client
+will drain and close the session gracefully.
+
+```sh
+cargo run -p irtt-cli --features tui -- <server> --output tui
 ```
 
 For available options:
