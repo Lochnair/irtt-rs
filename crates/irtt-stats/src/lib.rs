@@ -649,11 +649,6 @@ impl TimeMetric {
         }
     }
 
-    #[allow(dead_code)]
-    fn push_duration(&mut self, duration: Duration) {
-        self.push_ns(duration_ns_i128(duration));
-    }
-
     fn stats(&self) -> TimeStats {
         self.running
             .stats(self.samples.as_ref().and_then(|samples| median_ns(samples)))
