@@ -57,19 +57,15 @@ pub enum SampleMode {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatsCollector {
-    config: StatsConfig,
     cumulative: CoreStats,
-    rolling_count: Option<VecDeque<StatsEvent>>,
-    rolling_time: Option<VecDeque<StatsEvent>>,
+    rolling: RollingEvents,
 }
 
 impl StatsCollector {
     pub fn new(config: StatsConfig) -> Self {
         Self {
-            config,
             cumulative: CoreStats::new(config.samples),
-            rolling_count: config.rolling_count.map(|_| VecDeque::new()),
-            rolling_time: config.rolling_time.map(|_| VecDeque::new()),
+            rolling: RollingEvents::new(config),
         }
     }
 
@@ -79,28 +75,7 @@ impl StatsCollector {
         };
 
         let update = self.cumulative.apply(stats_event.clone());
-
-        if let (Some(limit), Some(window)) =
-            (self.config.rolling_count, self.rolling_count.as_mut())
-        {
-            window.push_back(stats_event.clone());
-            while window.len() > limit {
-                window.pop_front();
-            }
-        }
-
-        if let (Some(duration), Some(window)) =
-            (self.config.rolling_time, self.rolling_time.as_mut())
-        {
-            let cutoff = stats_event.at().checked_sub(duration);
-            window.push_back(stats_event);
-            if let Some(cutoff) = cutoff {
-                while window.front().is_some_and(|event| event.at() < cutoff) {
-                    window.pop_front();
-                }
-            }
-        }
-
+        self.rolling.push(stats_event);
         update
     }
 
@@ -109,11 +84,57 @@ impl StatsCollector {
     }
 
     pub fn rolling_count(&self) -> Option<Snapshot> {
-        self.rolling_count.as_ref().map(snapshot_window)
+        self.rolling.count_snapshot()
     }
 
     pub fn rolling_time(&self) -> Option<Snapshot> {
-        self.rolling_time.as_ref().map(snapshot_window)
+        self.rolling.time_snapshot()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct RollingEvents {
+    count_limit: Option<usize>,
+    time_limit: Option<Duration>,
+    count_events: Option<VecDeque<StatsEvent>>,
+    time_events: Option<VecDeque<StatsEvent>>,
+}
+
+impl RollingEvents {
+    fn new(config: StatsConfig) -> Self {
+        Self {
+            count_limit: config.rolling_count,
+            time_limit: config.rolling_time,
+            count_events: config.rolling_count.map(|_| VecDeque::new()),
+            time_events: config.rolling_time.map(|_| VecDeque::new()),
+        }
+    }
+
+    fn push(&mut self, event: StatsEvent) {
+        if let (Some(limit), Some(window)) = (self.count_limit, self.count_events.as_mut()) {
+            window.push_back(event.clone());
+            while window.len() > limit {
+                window.pop_front();
+            }
+        }
+
+        if let (Some(duration), Some(window)) = (self.time_limit, self.time_events.as_mut()) {
+            let cutoff = event.at().checked_sub(duration);
+            window.push_back(event);
+            if let Some(cutoff) = cutoff {
+                while window.front().is_some_and(|event| event.at() < cutoff) {
+                    window.pop_front();
+                }
+            }
+        }
+    }
+
+    fn count_snapshot(&self) -> Option<Snapshot> {
+        self.count_events.as_ref().map(snapshot_window)
+    }
+
+    fn time_snapshot(&self) -> Option<Snapshot> {
+        self.time_events.as_ref().map(snapshot_window)
     }
 }
 
