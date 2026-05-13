@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 
-use irtt_stats::{DurationStats, DurationStatsWithMedian, SignedDurationStatsWithMedian, Snapshot};
+use irtt_stats::{Snapshot, TimeStats};
 
 pub fn format_summary(summary: &Snapshot) -> String {
     format_summary_with_options(summary, SummaryFormatOptions::default())
@@ -27,27 +27,27 @@ pub fn format_summary_with_options(summary: &Snapshot, options: SummaryFormatOpt
     .unwrap();
     writeln!(out, "  {}", "-".repeat(82)).unwrap();
 
-    write_signed_duration_row(&mut out, "RTT", &summary.rtt.primary);
+    write_time_row(&mut out, "RTT", &summary.rtt.primary);
     if options.verbose {
-        write_duration_row(&mut out, "raw RTT", &summary.rtt.raw);
-        write_signed_duration_row(&mut out, "adjusted RTT", &summary.rtt.adjusted);
+        write_time_row(&mut out, "raw RTT", &summary.rtt.raw);
+        write_time_row(&mut out, "adjusted RTT", &summary.rtt.adjusted);
     }
-    write_duration_row(&mut out, "IPDV/jitter", &summary.ipdv.round_trip);
-    write_duration_row(&mut out, "send IPDV", &summary.ipdv.send);
-    write_duration_row(&mut out, "receive IPDV", &summary.ipdv.receive);
-    write_duration_row(&mut out, "send delay", &summary.one_way_delay.send_delay);
-    write_duration_row(
+    write_time_row(&mut out, "IPDV/jitter", &summary.ipdv.round_trip);
+    write_time_row(&mut out, "send IPDV", &summary.ipdv.send);
+    write_time_row(&mut out, "receive IPDV", &summary.ipdv.receive);
+    write_time_row(&mut out, "send delay", &summary.one_way_delay.send_delay);
+    write_time_row(
         &mut out,
         "receive delay",
         &summary.one_way_delay.receive_delay,
     );
-    write_duration_row_no_median(
+    write_time_row(
         &mut out,
         "server processing",
         &summary.server_processing.processing,
     );
-    write_duration_row_no_median(&mut out, "send call", &summary.send_call);
-    write_duration_row_no_median(&mut out, "timer error", &summary.timer_error);
+    write_time_row(&mut out, "send call", &summary.send_call);
+    write_time_row(&mut out, "timer error", &summary.timer_error);
 
     writeln!(out).unwrap();
     writeln!(
@@ -92,24 +92,7 @@ pub fn format_summary_with_options(summary: &Snapshot, options: SummaryFormatOpt
     out
 }
 
-fn write_duration_row(out: &mut String, label: &str, value: &DurationStatsWithMedian) {
-    if value.stats.count == 0 {
-        return;
-    }
-    writeln!(
-        out,
-        "  {label:<18} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        value.stats.count,
-        format_ns_u64(value.stats.min_ns),
-        format_ns_f64(value.stats.mean_ns),
-        format_ns_f64_opt(value.median_ns),
-        format_ns_u64(value.stats.max_ns),
-        format_ns_f64(value.stddev_ns())
-    )
-    .unwrap();
-}
-
-fn write_duration_row_no_median(out: &mut String, label: &str, value: &DurationStats) {
+fn write_time_row(out: &mut String, label: &str, value: &TimeStats) {
     if value.count == 0 {
         return;
     }
@@ -117,27 +100,10 @@ fn write_duration_row_no_median(out: &mut String, label: &str, value: &DurationS
         out,
         "  {label:<18} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
         value.count,
-        format_ns_u64(value.min_ns),
+        format_ns_i128(value.min_ns),
         format_ns_f64(value.mean_ns),
-        "-",
-        format_ns_u64(value.max_ns),
-        format_ns_f64(value.stddev_ns())
-    )
-    .unwrap();
-}
-
-fn write_signed_duration_row(out: &mut String, label: &str, value: &SignedDurationStatsWithMedian) {
-    if value.stats.count == 0 {
-        return;
-    }
-    writeln!(
-        out,
-        "  {label:<18} {:>7} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        value.stats.count,
-        format_ns_i128(value.stats.min_ns),
-        format_ns_f64(value.stats.mean_ns),
         format_ns_f64_opt(value.median_ns),
-        format_ns_i128(value.stats.max_ns),
+        format_ns_i128(value.max_ns),
         format_ns_f64(value.stddev_ns())
     )
     .unwrap();
@@ -145,12 +111,6 @@ fn write_signed_duration_row(out: &mut String, label: &str, value: &SignedDurati
 
 fn format_percent(value: f64) -> String {
     format!("{value:.2}%")
-}
-
-fn format_ns_u64(value: Option<u64>) -> String {
-    value
-        .map(|value| format_ns_f64(value as f64))
-        .unwrap_or_else(|| "-".to_owned())
 }
 
 fn format_ns_i128(value: Option<i128>) -> String {
@@ -183,7 +143,7 @@ mod tests {
     use irtt_client::{
         ClientEvent, ClientTimestamp, PacketMeta, RttSample, ServerTiming, SignedDuration,
     };
-    use irtt_stats::{SignedDurationStats, StatsCollector, StatsConfig};
+    use irtt_stats::{StatsCollector, StatsConfig};
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         time::{Duration, Instant, UNIX_EPOCH},
@@ -308,20 +268,18 @@ mod tests {
 
     #[test]
     fn signed_stats_can_format_negative_values() {
-        let stats = SignedDurationStatsWithMedian {
-            stats: SignedDurationStats {
-                count: 1,
-                total_ns: -500,
-                min_ns: Some(-500),
-                max_ns: Some(-500),
-                mean_ns: -500.0,
-                variance_ns2: 0.0,
-            },
+        let stats = TimeStats {
+            count: 1,
+            total_ns: -500,
+            min_ns: Some(-500),
+            max_ns: Some(-500),
+            mean_ns: -500.0,
             median_ns: Some(-500.0),
+            variance_ns2: 0.0,
         };
 
         let mut out = String::new();
-        write_signed_duration_row(&mut out, "RTT", &stats);
+        write_time_row(&mut out, "RTT", &stats);
         assert!(out.contains("-500ns"));
     }
 }

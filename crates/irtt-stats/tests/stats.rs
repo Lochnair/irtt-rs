@@ -29,8 +29,8 @@ fn continuous_mode_tracks_samples_without_exact_medians() {
     }
 
     let snapshot = collector.snapshot();
-    assert_eq!(snapshot.rtt.primary.stats.count, 4104);
-    assert_eq!(snapshot.ipdv.round_trip.stats.count, 4103);
+    assert_eq!(snapshot.rtt.primary.count, 4104);
+    assert_eq!(snapshot.ipdv.round_trip.count, 4103);
     assert_eq!(snapshot.rtt.primary.median_ns, None);
     assert_eq!(snapshot.ipdv.round_trip.median_ns, None);
 }
@@ -42,10 +42,10 @@ fn cumulative_rtt_uses_signed_effective_and_tracks_raw() {
     collector.process(&reply(1, 10, 8));
 
     let snapshot = collector.snapshot();
-    assert_eq!(snapshot.rtt.primary.stats.count, 2);
-    assert_eq!(snapshot.rtt.primary.stats.min_ns, Some(-2_000_000));
+    assert_eq!(snapshot.rtt.primary.count, 2);
+    assert_eq!(snapshot.rtt.primary.min_ns, Some(-2_000_000));
     assert_eq!(snapshot.rtt.primary.median_ns, Some(3_000_000.0));
-    assert_eq!(snapshot.rtt.raw.stats.total_ns, 11_000_000);
+    assert_eq!(snapshot.rtt.raw.total_ns, 11_000_000);
 }
 
 #[test]
@@ -68,7 +68,7 @@ fn late_unique_counts_and_duplicates_do_not_update_measurements() {
     assert_eq!(snapshot.packets.unique_replies, 2);
     assert_eq!(snapshot.packets.duplicates, 1);
     assert_eq!(snapshot.packets.late_packets, 1);
-    assert_eq!(snapshot.rtt.primary.stats.count, 2);
+    assert_eq!(snapshot.rtt.primary.count, 2);
     assert_eq!(snapshot.loss.lost_packets, 0);
     assert_eq!(snapshot.loss.duplicate_percent, 100.0 / 3.0);
 }
@@ -126,8 +126,8 @@ fn ipdv_is_sequence_adjacent_and_gap_preserving() {
 
     assert!(adjacent.contributed_sample);
     assert_one_ipdv_pair(&adjacent, 2, 3, Duration::from_millis(3));
-    assert_eq!(snapshot.ipdv.round_trip.stats.count, 1);
-    assert_eq!(snapshot.ipdv.round_trip.stats.total_ns, 3_000_000);
+    assert_eq!(snapshot.ipdv.round_trip.count, 1);
+    assert_eq!(snapshot.ipdv.round_trip.total_ns, 3_000_000);
 }
 
 #[test]
@@ -141,8 +141,8 @@ fn late_reply_can_complete_ipdv_pair() {
     assert!(update.contributed_sample);
     assert_one_ipdv_pair(&update, 0, 1, Duration::from_millis(10));
 
-    assert_eq!(snapshot.ipdv.round_trip.stats.count, 1);
-    assert_eq!(snapshot.ipdv.round_trip.stats.total_ns, 10_000_000);
+    assert_eq!(snapshot.ipdv.round_trip.count, 1);
+    assert_eq!(snapshot.ipdv.round_trip.total_ns, 10_000_000);
 }
 
 #[test]
@@ -184,8 +184,8 @@ fn gap_fill_update_exposes_both_completed_ipdv_pairs() {
     assert_eq!(fill.ipdv_pairs[1].rtt_ipdv, Duration::from_millis(7));
 
     let snapshot = collector.snapshot();
-    assert_eq!(snapshot.ipdv.round_trip.stats.count, 2);
-    assert_eq!(snapshot.ipdv.round_trip.stats.total_ns, 10_000_000);
+    assert_eq!(snapshot.ipdv.round_trip.count, 2);
+    assert_eq!(snapshot.ipdv.round_trip.total_ns, 10_000_000);
 }
 
 #[test]
@@ -208,7 +208,7 @@ fn server_processing_and_one_way_require_available_samples() {
 
     let snapshot = collector.snapshot();
     assert_eq!(snapshot.server_processing.processing.count, 1);
-    assert_eq!(snapshot.one_way_delay.send_delay.stats.count, 1);
+    assert_eq!(snapshot.one_way_delay.send_delay.count, 1);
     assert_eq!(snapshot.events.untracked_late_replies, 1);
 }
 
@@ -226,7 +226,7 @@ fn rolling_count_eviction_recomputes_from_bounded_events() {
     let rolling = collector.rolling_count().unwrap();
     assert_eq!(rolling.packets.packets_sent, 0);
     assert_eq!(rolling.packets.unique_replies, 2);
-    assert_eq!(rolling.rtt.primary.stats.count, 2);
+    assert_eq!(rolling.rtt.primary.count, 2);
 }
 
 #[test]

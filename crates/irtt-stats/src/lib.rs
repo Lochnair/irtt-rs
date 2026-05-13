@@ -137,8 +137,8 @@ pub struct Snapshot {
     pub events: EventCounts,
     pub packets: PacketCounts,
     pub loss: LossStats,
-    pub send_call: DurationStats,
-    pub timer_error: DurationStats,
+    pub send_call: TimeStats,
+    pub timer_error: TimeStats,
     pub rtt: RttStats,
     pub ipdv: IpdvStats,
     pub one_way_delay: OneWayDelayStats,
@@ -184,82 +184,47 @@ pub struct LossStats {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct RttStats {
-    pub primary: SignedDurationStatsWithMedian,
-    pub raw: DurationStatsWithMedian,
-    pub adjusted: SignedDurationStatsWithMedian,
+    pub primary: TimeStats,
+    pub raw: TimeStats,
+    pub adjusted: TimeStats,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct IpdvStats {
-    pub round_trip: DurationStatsWithMedian,
-    pub send: DurationStatsWithMedian,
-    pub receive: DurationStatsWithMedian,
+    pub round_trip: TimeStats,
+    pub send: TimeStats,
+    pub receive: TimeStats,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct OneWayDelayStats {
-    pub send_delay: DurationStatsWithMedian,
-    pub receive_delay: DurationStatsWithMedian,
+    pub send_delay: TimeStats,
+    pub receive_delay: TimeStats,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ServerProcessingStats {
-    pub processing: DurationStats,
+    pub processing: TimeStats,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DurationStats {
-    pub count: u64,
-    pub total_ns: u128,
-    pub min_ns: Option<u64>,
-    pub max_ns: Option<u64>,
-    pub mean_ns: f64,
-    pub variance_ns2: f64,
-}
-
-impl DurationStats {
-    pub fn stddev_ns(&self) -> f64 {
-        self.variance_ns2.sqrt()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct DurationStatsWithMedian {
-    pub stats: DurationStats,
-    pub median_ns: Option<f64>,
-}
-
-impl DurationStatsWithMedian {
-    pub fn stddev_ns(&self) -> f64 {
-        self.stats.stddev_ns()
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SignedDurationStats {
+pub struct TimeStats {
     pub count: u64,
     pub total_ns: i128,
     pub min_ns: Option<i128>,
     pub max_ns: Option<i128>,
     pub mean_ns: f64,
+    pub median_ns: Option<f64>,
     pub variance_ns2: f64,
 }
 
-impl SignedDurationStats {
+impl TimeStats {
     pub fn stddev_ns(&self) -> f64 {
         self.variance_ns2.sqrt()
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SignedDurationStatsWithMedian {
-    pub stats: SignedDurationStats,
-    pub median_ns: Option<f64>,
-}
-
-impl SignedDurationStatsWithMedian {
-    pub fn stddev_ns(&self) -> f64 {
-        self.stats.stddev_ns()
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
@@ -269,17 +234,17 @@ struct CoreStats {
     sequence_limit: Option<usize>,
     events: EventCounts,
     packets: PacketCounts,
-    send_call: MetricU64,
-    timer_error: MetricU64,
-    rtt_primary: MetricI128,
-    rtt_raw: MetricU64,
-    rtt_adjusted: MetricI128,
-    ipdv_round_trip: MetricU64,
-    ipdv_send: MetricU64,
-    ipdv_receive: MetricU64,
-    send_delay: MetricU64,
-    receive_delay: MetricU64,
-    server_processing: MetricU64,
+    send_call: TimeMetric,
+    timer_error: TimeMetric,
+    rtt_primary: TimeMetric,
+    rtt_raw: TimeMetric,
+    rtt_adjusted: TimeMetric,
+    ipdv_round_trip: TimeMetric,
+    ipdv_send: TimeMetric,
+    ipdv_receive: TimeMetric,
+    send_delay: TimeMetric,
+    receive_delay: TimeMetric,
+    server_processing: TimeMetric,
     samples: HashMap<u32, UniqueSample>,
     sample_order: VecDeque<u32>,
     ipdv_pairs: HashSet<u32>,
@@ -296,17 +261,17 @@ impl CoreStats {
             },
             events: EventCounts::default(),
             packets: PacketCounts::default(),
-            send_call: MetricU64::new(false),
-            timer_error: MetricU64::new(false),
-            rtt_primary: MetricI128::new(median == MedianMode::ExactFinite),
-            rtt_raw: MetricU64::new(median == MedianMode::ExactFinite),
-            rtt_adjusted: MetricI128::new(median == MedianMode::ExactFinite),
-            ipdv_round_trip: MetricU64::new(median == MedianMode::ExactFinite),
-            ipdv_send: MetricU64::new(median == MedianMode::ExactFinite),
-            ipdv_receive: MetricU64::new(median == MedianMode::ExactFinite),
-            send_delay: MetricU64::new(median == MedianMode::ExactFinite),
-            receive_delay: MetricU64::new(median == MedianMode::ExactFinite),
-            server_processing: MetricU64::new(false),
+            send_call: TimeMetric::new(false),
+            timer_error: TimeMetric::new(false),
+            rtt_primary: TimeMetric::new(median == MedianMode::ExactFinite),
+            rtt_raw: TimeMetric::new(median == MedianMode::ExactFinite),
+            rtt_adjusted: TimeMetric::new(median == MedianMode::ExactFinite),
+            ipdv_round_trip: TimeMetric::new(median == MedianMode::ExactFinite),
+            ipdv_send: TimeMetric::new(median == MedianMode::ExactFinite),
+            ipdv_receive: TimeMetric::new(median == MedianMode::ExactFinite),
+            send_delay: TimeMetric::new(median == MedianMode::ExactFinite),
+            receive_delay: TimeMetric::new(median == MedianMode::ExactFinite),
+            server_processing: TimeMetric::new(false),
             samples: HashMap::new(),
             sample_order: VecDeque::new(),
             ipdv_pairs: HashSet::new(),
@@ -325,8 +290,8 @@ impl CoreStats {
                 self.events.sent_events += 1;
                 self.packets.packets_sent += 1;
                 self.packets.bytes_sent = self.packets.bytes_sent.saturating_add(bytes as u64);
-                self.send_call.push(send_call_ns);
-                self.timer_error.push(timer_error_ns);
+                self.send_call.push_ns(send_call_ns);
+                self.timer_error.push_ns(timer_error_ns);
             }
             WindowEvent::UniqueReply {
                 is_late, sample, ..
@@ -349,19 +314,19 @@ impl CoreStats {
                     self.packets.server_received_window = Some(window);
                 }
 
-                self.rtt_primary.push(sample.rtt_primary_ns);
-                self.rtt_raw.push(sample.rtt_raw_ns);
+                self.rtt_primary.push_ns(sample.rtt_primary_ns);
+                self.rtt_raw.push_ns(sample.rtt_raw_ns);
                 if let Some(adjusted) = sample.rtt_adjusted_ns {
-                    self.rtt_adjusted.push(adjusted);
+                    self.rtt_adjusted.push_ns(adjusted);
                 }
                 if let Some(processing) = sample.server_processing_ns {
-                    self.server_processing.push(processing);
+                    self.server_processing.push_ns(processing);
                 }
                 if let Some(delay) = sample.send_delay_ns {
-                    self.send_delay.push(delay);
+                    self.send_delay.push_ns(delay);
                 }
                 if let Some(delay) = sample.receive_delay_ns {
-                    self.receive_delay.push(delay);
+                    self.receive_delay.push_ns(delay);
                 }
 
                 let seq = sample.seq;
@@ -432,26 +397,26 @@ impl CoreStats {
 
         // Compute everything before mutating metric fields, otherwise the borrow
         // checker may quite reasonably start throwing furniture.
-        let rtt_ipdv = abs_i128_to_u64(current.rtt_primary_ns - previous.rtt_primary_ns);
-        let send_ipdv = send_ipdv_ns(previous, current).map(abs_i128_to_u64);
-        let receive_ipdv = receive_ipdv_ns(previous, current).map(abs_i128_to_u64);
+        let rtt_ipdv = abs_i128_ns(current.rtt_primary_ns - previous.rtt_primary_ns);
+        let send_ipdv = send_ipdv_ns(previous, current).map(abs_i128_ns);
+        let receive_ipdv = receive_ipdv_ns(previous, current).map(abs_i128_ns);
 
-        self.ipdv_round_trip.push(rtt_ipdv);
+        self.ipdv_round_trip.push_ns(rtt_ipdv);
 
         if let Some(value) = send_ipdv {
-            self.ipdv_send.push(value);
+            self.ipdv_send.push_ns(value);
         }
 
         if let Some(value) = receive_ipdv {
-            self.ipdv_receive.push(value);
+            self.ipdv_receive.push_ns(value);
         }
 
         Some(IpdvPairUpdate {
             previous_seq,
             current_seq,
-            rtt_ipdv: Duration::from_nanos(rtt_ipdv),
-            send_ipdv: send_ipdv.map(Duration::from_nanos),
-            receive_ipdv: receive_ipdv.map(Duration::from_nanos),
+            rtt_ipdv: duration_from_i128_ns(rtt_ipdv),
+            send_ipdv: send_ipdv.map(duration_from_i128_ns),
+            receive_ipdv: receive_ipdv.map(duration_from_i128_ns),
         })
     }
 
@@ -464,18 +429,18 @@ impl CoreStats {
             send_call: self.send_call.stats(),
             timer_error: self.timer_error.stats(),
             rtt: RttStats {
-                primary: self.rtt_primary.stats_with_median(),
-                raw: self.rtt_raw.stats_with_median(),
-                adjusted: self.rtt_adjusted.stats_with_median(),
+                primary: self.rtt_primary.stats(),
+                raw: self.rtt_raw.stats(),
+                adjusted: self.rtt_adjusted.stats(),
             },
             ipdv: IpdvStats {
-                round_trip: self.ipdv_round_trip.stats_with_median(),
-                send: self.ipdv_send.stats_with_median(),
-                receive: self.ipdv_receive.stats_with_median(),
+                round_trip: self.ipdv_round_trip.stats(),
+                send: self.ipdv_send.stats(),
+                receive: self.ipdv_receive.stats(),
             },
             one_way_delay: OneWayDelayStats {
-                send_delay: self.send_delay.stats_with_median(),
-                receive_delay: self.receive_delay.stats_with_median(),
+                send_delay: self.send_delay.stats(),
+                receive_delay: self.receive_delay.stats(),
             },
             server_processing: ServerProcessingStats {
                 processing: self.server_processing.stats(),
@@ -489,8 +454,8 @@ enum WindowEvent {
     Sent {
         at: Instant,
         bytes: usize,
-        send_call_ns: u64,
-        timer_error_ns: u64,
+        send_call_ns: i128,
+        timer_error_ns: i128,
     },
     UniqueReply {
         at: Instant,
@@ -523,8 +488,8 @@ impl WindowEvent {
             } => Some(Self::Sent {
                 at: sent_at.mono,
                 bytes: *bytes,
-                send_call_ns: duration_ns_u64(*send_call),
-                timer_error_ns: duration_ns_u64(*timer_error),
+                send_call_ns: duration_ns_i128(*send_call),
+                timer_error_ns: duration_ns_i128(*timer_error),
             }),
             ClientEvent::EchoReply {
                 seq,
@@ -605,11 +570,11 @@ struct UniqueSample {
     seq: u32,
     bytes: usize,
     rtt_primary_ns: i128,
-    rtt_raw_ns: u64,
+    rtt_raw_ns: i128,
     rtt_adjusted_ns: Option<i128>,
-    send_delay_ns: Option<u64>,
-    receive_delay_ns: Option<u64>,
-    server_processing_ns: Option<u64>,
+    send_delay_ns: Option<i128>,
+    receive_delay_ns: Option<i128>,
+    server_processing_ns: Option<i128>,
     received_count: Option<u32>,
     received_window: Option<u64>,
     client_send_mono: Instant,
@@ -638,17 +603,17 @@ impl UniqueSample {
             seq,
             bytes,
             rtt_primary_ns: signed_duration_ns(rtt.effective_signed),
-            rtt_raw_ns: duration_ns_u64(rtt.raw),
+            rtt_raw_ns: duration_ns_i128(rtt.raw),
             rtt_adjusted_ns: rtt.adjusted_signed.map(signed_duration_ns),
             send_delay_ns: one_way
                 .and_then(|sample| sample.client_to_server)
-                .map(duration_ns_u64),
+                .map(duration_ns_i128),
             receive_delay_ns: one_way
                 .and_then(|sample| sample.server_to_client)
-                .map(duration_ns_u64),
+                .map(duration_ns_i128),
             server_processing_ns: server_timing
                 .and_then(|timing| timing.processing)
-                .map(duration_ns_u64),
+                .map(duration_ns_i128),
             received_count: received_stats.and_then(|stats| stats.count),
             received_window: received_stats.and_then(|stats| stats.window),
             client_send_mono: sent_at.mono,
@@ -664,143 +629,69 @@ impl UniqueSample {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct MetricU64 {
-    running: RunningU64,
-    samples: Option<Vec<u64>>,
-}
-
-impl MetricU64 {
-    fn new(retain_samples: bool) -> Self {
-        Self {
-            running: RunningU64::default(),
-            samples: retain_samples.then(Vec::new),
-        }
-    }
-
-    fn push(&mut self, value: u64) {
-        self.running.push(value);
-        if let Some(samples) = self.samples.as_mut() {
-            samples.push(value);
-        }
-    }
-
-    fn stats(&self) -> DurationStats {
-        self.running.stats()
-    }
-
-    fn stats_with_median(&self) -> DurationStatsWithMedian {
-        DurationStatsWithMedian {
-            stats: self.stats(),
-            median_ns: self
-                .samples
-                .as_ref()
-                .and_then(|samples| median_u64(samples)),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct MetricI128 {
-    running: RunningI128,
+struct TimeMetric {
+    running: RunningStats,
     samples: Option<Vec<i128>>,
 }
 
-impl MetricI128 {
+impl TimeMetric {
     fn new(retain_samples: bool) -> Self {
         Self {
-            running: RunningI128::default(),
+            running: RunningStats::default(),
             samples: retain_samples.then(Vec::new),
         }
     }
 
-    fn push(&mut self, value: i128) {
+    fn push_ns(&mut self, value: i128) {
         self.running.push(value);
         if let Some(samples) = self.samples.as_mut() {
             samples.push(value);
         }
     }
 
-    fn stats(&self) -> SignedDurationStats {
-        self.running.stats()
+    #[allow(dead_code)]
+    fn push_duration(&mut self, duration: Duration) {
+        self.push_ns(duration_ns_i128(duration));
     }
 
-    fn stats_with_median(&self) -> SignedDurationStatsWithMedian {
-        SignedDurationStatsWithMedian {
-            stats: self.stats(),
-            median_ns: self
-                .samples
-                .as_ref()
-                .and_then(|samples| median_i128(samples)),
-        }
+    fn stats(&self) -> TimeStats {
+        self.running
+            .stats(self.samples.as_ref().and_then(|samples| median_ns(samples)))
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Default)]
-struct RunningU64 {
+struct RunningStats {
     count: u64,
-    total: u128,
-    min: Option<u64>,
-    max: Option<u64>,
-    mean: f64,
-    m2: f64,
+    total_ns: i128,
+    min_ns: Option<i128>,
+    max_ns: Option<i128>,
+    mean_ns: f64,
+    m2_ns2: f64,
 }
 
-impl RunningU64 {
-    fn push(&mut self, value: u64) {
-        self.count += 1;
-        self.total = self.total.saturating_add(u128::from(value));
-        self.min = Some(self.min.map_or(value, |min| min.min(value)));
-        self.max = Some(self.max.map_or(value, |max| max.max(value)));
-        let x = value as f64;
-        let delta = x - self.mean;
-        self.mean += delta / self.count as f64;
-        let delta2 = x - self.mean;
-        self.m2 += delta * delta2;
-    }
-
-    fn stats(&self) -> DurationStats {
-        DurationStats {
-            count: self.count,
-            total_ns: self.total,
-            min_ns: self.min,
-            max_ns: self.max,
-            mean_ns: if self.count == 0 { 0.0 } else { self.mean },
-            variance_ns2: sample_variance(self.count, self.m2),
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Default)]
-struct RunningI128 {
-    count: u64,
-    total: i128,
-    min: Option<i128>,
-    max: Option<i128>,
-    mean: f64,
-    m2: f64,
-}
-
-impl RunningI128 {
+impl RunningStats {
     fn push(&mut self, value: i128) {
         self.count += 1;
-        self.total = self.total.saturating_add(value);
-        self.min = Some(self.min.map_or(value, |min| min.min(value)));
-        self.max = Some(self.max.map_or(value, |max| max.max(value)));
+        self.total_ns = self.total_ns.saturating_add(value);
+        self.min_ns = Some(self.min_ns.map_or(value, |min| min.min(value)));
+        self.max_ns = Some(self.max_ns.map_or(value, |max| max.max(value)));
         let x = value as f64;
-        let delta = x - self.mean;
-        self.mean += delta / self.count as f64;
-        let delta2 = x - self.mean;
-        self.m2 += delta * delta2;
+        let delta = x - self.mean_ns;
+        self.mean_ns += delta / self.count as f64;
+        let delta2 = x - self.mean_ns;
+        self.m2_ns2 += delta * delta2;
     }
 
-    fn stats(&self) -> SignedDurationStats {
-        SignedDurationStats {
+    fn stats(&self, median_ns: Option<f64>) -> TimeStats {
+        TimeStats {
             count: self.count,
-            total_ns: self.total,
-            min_ns: self.min,
-            max_ns: self.max,
-            mean_ns: if self.count == 0 { 0.0 } else { self.mean },
-            variance_ns2: sample_variance(self.count, self.m2),
+            total_ns: self.total_ns,
+            min_ns: self.min_ns,
+            max_ns: self.max_ns,
+            mean_ns: if self.count == 0 { 0.0 } else { self.mean_ns },
+            median_ns,
+            variance_ns2: sample_variance(self.count, self.m2_ns2),
         }
     }
 }
@@ -821,25 +712,7 @@ fn sample_variance(count: u64, m2: f64) -> f64 {
     }
 }
 
-fn median_u64(samples: &[u64]) -> Option<f64> {
-    if samples.is_empty() {
-        return None;
-    }
-    let mut sorted = samples.to_vec();
-    sorted.sort_unstable();
-    Some(median_sorted_u64(&sorted))
-}
-
-fn median_sorted_u64(sorted: &[u64]) -> f64 {
-    let mid = sorted.len() / 2;
-    if sorted.len() % 2 == 1 {
-        sorted[mid] as f64
-    } else {
-        (sorted[mid - 1] as f64 + sorted[mid] as f64) / 2.0
-    }
-}
-
-fn median_i128(samples: &[i128]) -> Option<f64> {
+fn median_ns(samples: &[i128]) -> Option<f64> {
     if samples.is_empty() {
         return None;
     }
@@ -978,10 +851,6 @@ fn system_time_ns(time: SystemTime) -> Option<i128> {
         .map(|duration| -duration_ns_i128(duration))
 }
 
-fn duration_ns_u64(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
-}
-
 fn duration_ns_i128(duration: Duration) -> i128 {
     i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
 }
@@ -990,8 +859,12 @@ fn signed_duration_ns(duration: SignedDuration) -> i128 {
     duration.ns
 }
 
-fn abs_i128_to_u64(value: i128) -> u64 {
-    u64::try_from(value.saturating_abs()).unwrap_or(u64::MAX)
+fn abs_i128_ns(value: i128) -> i128 {
+    value.saturating_abs()
+}
+
+fn duration_from_i128_ns(value: i128) -> Duration {
+    Duration::from_nanos(u64::try_from(value).unwrap_or(u64::MAX))
 }
 
 #[cfg(test)]
@@ -1001,10 +874,10 @@ mod tests {
 
     #[test]
     fn running_duration_stats_use_sample_variance() {
-        let mut metric = MetricU64::new(false);
-        metric.push(1);
-        metric.push(2);
-        metric.push(3);
+        let mut metric = TimeMetric::new(false);
+        metric.push_ns(1);
+        metric.push_ns(2);
+        metric.push_ns(3);
         let stats = metric.stats();
         assert_eq!(stats.count, 3);
         assert_eq!(stats.total_ns, 6);
@@ -1017,16 +890,16 @@ mod tests {
 
     #[test]
     fn exact_median_handles_odd_and_even_samples() {
-        assert_eq!(median_u64(&[3, 1, 2]), Some(2.0));
-        assert_eq!(median_u64(&[4, 1, 2, 3]), Some(2.5));
-        assert_eq!(median_i128(&[-5, 1, 3]), Some(1.0));
-        assert_eq!(median_i128(&[-5, 1, 3, 7]), Some(2.0));
+        assert_eq!(median_ns(&[3, 1, 2]), Some(2.0));
+        assert_eq!(median_ns(&[4, 1, 2, 3]), Some(2.5));
+        assert_eq!(median_ns(&[-5, 1, 3]), Some(1.0));
+        assert_eq!(median_ns(&[-5, 1, 3, 7]), Some(2.0));
     }
 
     #[test]
     fn single_sample_stddev_is_zero() {
-        let mut metric = MetricU64::new(false);
-        metric.push(42);
+        let mut metric = TimeMetric::new(false);
+        metric.push_ns(42);
         let stats = metric.stats();
         assert_eq!(stats.variance_ns2, 0.0);
         assert_eq!(stats.stddev_ns(), 0.0);
