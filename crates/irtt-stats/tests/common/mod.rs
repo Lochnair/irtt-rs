@@ -54,9 +54,9 @@ pub fn reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
         received_at,
         rtt: rtt(raw_ms, effective_ms),
         server_timing: Some(ServerTiming {
-            receive_wall_ns: Some(system_time_ns(sent_at.wall) as i64 + 1_000_000),
+            receive_wall_ns: Some(unix_time_ns_after_epoch(sent_at.wall) as i64 + 1_000_000),
             receive_mono_ns: Some(seq as i64 * 10_000_000 + 1_000_000),
-            send_wall_ns: Some(system_time_ns(sent_at.wall) as i64 + 2_000_000),
+            send_wall_ns: Some(unix_time_ns_after_epoch(sent_at.wall) as i64 + 2_000_000),
             send_mono_ns: Some(seq as i64 * 10_000_000 + 2_000_000),
             midpoint_wall_ns: None,
             midpoint_mono_ns: None,
@@ -107,7 +107,7 @@ pub fn late_reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
     }
 }
 
-fn system_time_ns(time: std::time::SystemTime) -> i128 {
+fn unix_time_ns_after_epoch(time: std::time::SystemTime) -> i128 {
     time.duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos() as i128)
         .unwrap()

@@ -22,7 +22,7 @@ fn disabled_median_avoids_finite_retention() {
 }
 
 #[test]
-fn continuous_mode_bounds_sequence_tracking() {
+fn continuous_mode_tracks_samples_without_exact_medians() {
     let mut collector = StatsCollector::new(StatsConfig::continuous());
     for seq in 0..4104 {
         collector.process(&reply(seq, 10, 10));
