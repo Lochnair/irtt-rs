@@ -76,7 +76,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
         human_options: HumanOutputOptions {
             verbose: args.verbose,
         },
-        print_finite_summary: !continuous,
+        print_final_summary: false,
         out: &mut stdout,
         #[cfg(feature = "stats")]
         stats: &mut stats,
@@ -204,7 +204,7 @@ fn sleep_until_next_send(deadline: Option<Instant>) {
 struct EventOutput<'a, W: Write> {
     mode: irtt_cli::OutputMode,
     human_options: HumanOutputOptions,
-    print_finite_summary: bool,
+    print_final_summary: bool,
     out: &'a mut W,
     #[cfg(feature = "stats")]
     stats: &'a mut StatsCollector,
@@ -243,7 +243,7 @@ impl<W: Write> EventOutput<'_, W> {
     }
 
     fn print_summary(&mut self) -> io::Result<()> {
-        if !self.print_finite_summary || !self.mode.prints_summary() {
+        if !self.print_final_summary || !self.mode.prints_summary() {
             return Ok(());
         }
 
@@ -457,7 +457,7 @@ mod tests {
             let mut output = EventOutput {
                 mode: irtt_cli::OutputMode::RttUs,
                 human_options: HumanOutputOptions::default(),
-                print_finite_summary: true,
+                print_final_summary: true,
                 out: &mut out,
                 stats: &mut stats,
             };
@@ -473,14 +473,14 @@ mod tests {
     }
 
     #[test]
-    fn continuous_output_does_not_print_finite_summary() {
+    fn output_does_not_print_final_summary_when_disabled() {
         let mut stats = StatsCollector::new(StatsConfig::continuous());
         let mut out = Vec::new();
         {
             let mut output = EventOutput {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
-                print_finite_summary: false,
+                print_final_summary: false,
                 out: &mut out,
                 stats: &mut stats,
             };
@@ -499,7 +499,7 @@ mod tests {
             let mut output = EventOutput {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
-                print_finite_summary: false,
+                print_final_summary: false,
                 out: &mut out,
                 stats: &mut stats,
             };
