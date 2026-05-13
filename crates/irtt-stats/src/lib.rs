@@ -30,6 +30,9 @@ pub struct StatsConfig {
     /// How timing samples are retained for median-capable metrics.
     pub samples: SampleMode,
     /// Number of recent normalized events retained for count-based rolling snapshots.
+    ///
+    /// A successful probe usually contributes two normalized events: one send event
+    /// and one unique reply event.
     pub rolling_count: Option<usize>,
     /// Time span of recent normalized events retained for time-based rolling snapshots.
     pub rolling_time: Option<Duration>,
