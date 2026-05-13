@@ -12,7 +12,7 @@ fn disabled_median_avoids_finite_retention() {
     collector.process(&reply(0, 10, 9));
     collector.process(&reply(1, 20, 19));
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
     assert_eq!(snapshot.rtt.primary.median_ns, None);
     assert_eq!(snapshot.rtt.raw.median_ns, None);
     assert_eq!(snapshot.rtt.adjusted.median_ns, None);
@@ -28,7 +28,7 @@ fn continuous_mode_tracks_samples_without_exact_medians() {
         collector.process(&reply(seq, 10, 10));
     }
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
     assert_eq!(snapshot.rtt.primary.stats.count, 4104);
     assert_eq!(snapshot.ipdv.round_trip.stats.count, 4103);
     assert_eq!(snapshot.rtt.primary.median_ns, None);
@@ -41,7 +41,7 @@ fn cumulative_rtt_uses_signed_effective_and_tracks_raw() {
     collector.process(&reply(0, 1, -2));
     collector.process(&reply(1, 10, 8));
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
     assert_eq!(snapshot.rtt.primary.stats.count, 2);
     assert_eq!(snapshot.rtt.primary.stats.min_ns, Some(-2_000_000));
     assert_eq!(snapshot.rtt.primary.median_ns, Some(3_000_000.0));
@@ -62,7 +62,7 @@ fn late_unique_counts_and_duplicates_do_not_update_measurements() {
         bytes: 64,
     });
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
     assert_eq!(snapshot.packets.packets_sent, 2);
     assert_eq!(snapshot.packets.packets_received, 3);
     assert_eq!(snapshot.packets.unique_replies, 2);
@@ -85,7 +85,7 @@ fn final_loss_uses_sent_minus_unique_replies_not_echo_loss_events() {
     });
     collector.process(&late_reply(0, 10, 9));
 
-    let snapshot = collector.summary();
+    let snapshot = collector.snapshot();
     assert_eq!(snapshot.events.loss_events, 1);
     assert_eq!(snapshot.packets.unique_replies, 1);
     assert_eq!(snapshot.loss.lost_packets, 1);
@@ -117,7 +117,7 @@ fn ipdv_is_sequence_adjacent_and_gap_preserving() {
     let gap = collector.process(&reply(2, 15, 15));
     let adjacent = collector.process(&reply(3, 12, 12));
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
     assert!(first.contributed_sample);
     assert_no_ipdv_pairs(&first);
 
@@ -136,7 +136,7 @@ fn late_reply_can_complete_ipdv_pair() {
     collector.process(&reply(1, 20, 20));
     let update = collector.process(&late_reply(0, 10, 10));
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
 
     assert!(update.contributed_sample);
     assert_one_ipdv_pair(&update, 0, 1, Duration::from_millis(10));
@@ -183,7 +183,7 @@ fn gap_fill_update_exposes_both_completed_ipdv_pairs() {
     assert_eq!(fill.ipdv_pairs[1].current_seq, 2);
     assert_eq!(fill.ipdv_pairs[1].rtt_ipdv, Duration::from_millis(7));
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
     assert_eq!(snapshot.ipdv.round_trip.stats.count, 2);
     assert_eq!(snapshot.ipdv.round_trip.stats.total_ns, 10_000_000);
 }
@@ -206,7 +206,7 @@ fn server_processing_and_one_way_require_available_samples() {
         packet_meta: PacketMeta::default(),
     });
 
-    let snapshot = collector.cumulative();
+    let snapshot = collector.snapshot();
     assert_eq!(snapshot.server_processing.processing.count, 1);
     assert_eq!(snapshot.one_way_delay.send_delay.stats.count, 1);
     assert_eq!(snapshot.events.untracked_late_replies, 1);
@@ -246,12 +246,12 @@ fn rolling_time_eviction_uses_event_timestamps() {
 
 #[test]
 fn empty_and_all_lost_edges_are_defined() {
-    let empty = StatsCollector::new(StatsConfig::finite()).summary();
+    let empty = StatsCollector::new(StatsConfig::finite()).snapshot();
     assert_eq!(empty.loss.packet_loss_percent, 0.0);
 
     let mut collector = StatsCollector::new(StatsConfig::finite());
     collector.process(&sent(0, ts(0)));
-    let all_lost = collector.summary();
+    let all_lost = collector.snapshot();
     assert_eq!(all_lost.loss.lost_packets, 1);
     assert_eq!(all_lost.loss.packet_loss_percent, 100.0);
 }
@@ -263,7 +263,7 @@ fn directional_loss_uses_server_received_count_when_available() {
     collector.process(&sent(1, ts(10)));
     collector.process(&reply(0, 10, 10));
 
-    let loss = collector.summary().loss;
+    let loss = collector.snapshot().loss;
     assert_eq!(loss.upstream_loss_packets, Some(1));
     assert_eq!(loss.downstream_loss_packets, Some(0));
     assert_eq!(loss.upstream_loss_percent, 50.0);

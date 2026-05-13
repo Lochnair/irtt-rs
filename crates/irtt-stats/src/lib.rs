@@ -104,25 +104,18 @@ impl StatsCollector {
         update
     }
 
-    pub fn cumulative(&self) -> CumulativeSnapshot {
+    pub fn snapshot(&self) -> Snapshot {
         self.cumulative.snapshot()
     }
 
-    pub fn rolling_count(&self) -> Option<RollingSnapshot> {
+    pub fn rolling_count(&self) -> Option<Snapshot> {
         self.rolling_count.as_ref().map(snapshot_window)
     }
 
-    pub fn rolling_time(&self) -> Option<RollingSnapshot> {
+    pub fn rolling_time(&self) -> Option<Snapshot> {
         self.rolling_time.as_ref().map(snapshot_window)
     }
-
-    pub fn summary(&self) -> FiniteSummary {
-        self.cumulative()
-    }
 }
-
-pub type RollingSnapshot = CumulativeSnapshot;
-pub type FiniteSummary = CumulativeSnapshot;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct EventStatsUpdate {
@@ -140,7 +133,7 @@ pub struct IpdvPairUpdate {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct CumulativeSnapshot {
+pub struct Snapshot {
     pub events: EventCounts,
     pub packets: PacketCounts,
     pub loss: LossStats,
@@ -462,9 +455,9 @@ impl CoreStats {
         })
     }
 
-    fn snapshot(&self) -> CumulativeSnapshot {
+    fn snapshot(&self) -> Snapshot {
         let packets = self.packets;
-        CumulativeSnapshot {
+        Snapshot {
             events: self.events,
             packets,
             loss: loss_stats(packets),
@@ -812,7 +805,7 @@ impl RunningI128 {
     }
 }
 
-fn snapshot_window(events: &VecDeque<WindowEvent>) -> CumulativeSnapshot {
+fn snapshot_window(events: &VecDeque<WindowEvent>) -> Snapshot {
     let mut core = CoreStats::new(MedianMode::Disabled);
     for event in events {
         core.apply(event.clone());

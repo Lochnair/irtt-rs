@@ -1,10 +1,8 @@
 use std::fmt::Write as _;
 
-use irtt_stats::{
-    DurationStats, DurationStatsWithMedian, FiniteSummary, SignedDurationStatsWithMedian,
-};
+use irtt_stats::{DurationStats, DurationStatsWithMedian, SignedDurationStatsWithMedian, Snapshot};
 
-pub fn format_summary(summary: &FiniteSummary) -> String {
+pub fn format_summary(summary: &Snapshot) -> String {
     format_summary_with_options(summary, SummaryFormatOptions::default())
 }
 
@@ -13,10 +11,7 @@ pub struct SummaryFormatOptions {
     pub verbose: bool,
 }
 
-pub fn format_summary_with_options(
-    summary: &FiniteSummary,
-    options: SummaryFormatOptions,
-) -> String {
+pub fn format_summary_with_options(summary: &Snapshot, options: SummaryFormatOptions) -> String {
     let mut out = String::new();
     let packets = summary.packets;
     let loss = summary.loss;
@@ -207,7 +202,7 @@ mod tests {
 
     #[test]
     fn empty_summary_omits_optional_metric_sections() {
-        let summary = StatsCollector::new(StatsConfig::finite()).summary();
+        let summary = StatsCollector::new(StatsConfig::finite()).snapshot();
         let output = format_summary(&summary);
 
         assert!(output.contains("Metric"));
@@ -263,7 +258,7 @@ mod tests {
             packet_meta: PacketMeta::default(),
         });
 
-        let output = format_summary(&collector.summary());
+        let output = format_summary(&collector.snapshot());
 
         assert!(output.contains("packets: sent=1 received=1 unique=1 lost=0 loss=0.00%"));
         assert!(output.contains("bytes: sent=64 received=64"));
@@ -303,7 +298,7 @@ mod tests {
         });
 
         let output = format_summary_with_options(
-            &collector.summary(),
+            &collector.snapshot(),
             SummaryFormatOptions { verbose: true },
         );
 

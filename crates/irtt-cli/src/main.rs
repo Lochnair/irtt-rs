@@ -237,7 +237,7 @@ impl<W: Write> EventOutput<'_, W> {
                 self.out,
                 "{}",
                 irtt_cli::summary::format_summary_with_options(
-                    &self.stats.summary(),
+                    &self.stats.snapshot(),
                     irtt_cli::summary::SummaryFormatOptions {
                         verbose: self.human_options.verbose,
                     },
@@ -390,7 +390,7 @@ mod tests {
         }
 
         let rendered = String::from_utf8(out).unwrap();
-        let summary = stats.summary();
+        let summary = stats.snapshot();
         assert_eq!(rendered, "1200\n");
         assert_eq!(summary.packets.packets_sent, 1);
         assert_eq!(summary.packets.unique_replies, 1);
@@ -462,7 +462,7 @@ mod tests {
             });
         }
 
-        assert_eq!(collector.summary().rtt.primary.median_ns, None);
+        assert_eq!(collector.snapshot().rtt.primary.median_ns, None);
     }
 
     #[test]
