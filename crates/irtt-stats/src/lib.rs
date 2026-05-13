@@ -308,7 +308,7 @@ impl CoreStats {
                     self.packets.server_received_window = Some(window);
                 }
 
-                self.rtt_primary.push_ns(sample.rtt_primary_ns);
+                self.rtt_primary.push_ns(sample.ipdv.rtt_primary_ns);
                 self.rtt_raw.push_ns(sample.rtt_raw_ns);
                 if let Some(adjusted) = sample.rtt_adjusted_ns {
                     self.rtt_adjusted.push_ns(adjusted);
@@ -323,7 +323,7 @@ impl CoreStats {
                     self.receive_delay.push_ns(delay);
                 }
 
-                for pair in self.ipdv_tracker.insert(sample) {
+                for pair in self.ipdv_tracker.insert(sample.ipdv) {
                     let Some(rtt_ipdv) = duration_from_non_negative_i128_ns(pair.rtt_ipdv_ns)
                     else {
                         continue;
@@ -412,7 +412,7 @@ enum StatsEvent {
     UniqueReply {
         at: Instant,
         is_late: bool,
-        sample: Box<UniqueSample>,
+        sample: Box<ReplySample>,
     },
     DuplicateReply {
         at: Instant,
@@ -456,7 +456,7 @@ impl StatsEvent {
             } => Some(Self::UniqueReply {
                 at: received_at.mono,
                 is_late: false,
-                sample: Box::new(UniqueSample::new(
+                sample: Box::new(ReplySample::new(
                     *seq,
                     *sent_at,
                     *received_at,
@@ -480,7 +480,7 @@ impl StatsEvent {
             } => Some(Self::UniqueReply {
                 at: received_at.mono,
                 is_late: true,
-                sample: Box::new(UniqueSample::new(
+                sample: Box::new(ReplySample::new(
                     *seq,
                     *sent_at,
                     *received_at,
@@ -518,10 +518,8 @@ impl StatsEvent {
 }
 
 #[derive(Debug, Clone, PartialEq)]
-struct UniqueSample {
-    seq: u32,
+struct ReplySample {
     bytes: usize,
-    rtt_primary_ns: i128,
     rtt_raw_ns: i128,
     rtt_adjusted_ns: Option<i128>,
     send_delay_ns: Option<i128>,
@@ -529,6 +527,13 @@ struct UniqueSample {
     server_processing_ns: Option<i128>,
     received_count: Option<u32>,
     received_window: Option<u64>,
+    ipdv: IpdvSample,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IpdvSample {
+    seq: u32,
+    rtt_primary_ns: i128,
     client_send_mono: Instant,
     client_receive_mono: Instant,
     client_send_wall_ns: Option<i128>,
@@ -539,7 +544,7 @@ struct UniqueSample {
     server_send_wall_ns: Option<i64>,
 }
 
-impl UniqueSample {
+impl ReplySample {
     #[allow(clippy::too_many_arguments)]
     fn new(
         seq: u32,
@@ -551,10 +556,9 @@ impl UniqueSample {
         received_stats: Option<ReceivedStatsSample>,
         bytes: usize,
     ) -> Self {
+        let rtt_primary_ns = signed_duration_ns(rtt.effective_signed);
         Self {
-            seq,
             bytes,
-            rtt_primary_ns: signed_duration_ns(rtt.effective_signed),
             rtt_raw_ns: duration_ns_i128(rtt.raw),
             rtt_adjusted_ns: rtt.adjusted_signed.map(signed_duration_ns),
             send_delay_ns: one_way
@@ -568,21 +572,25 @@ impl UniqueSample {
                 .map(duration_ns_i128),
             received_count: received_stats.and_then(|stats| stats.count),
             received_window: received_stats.and_then(|stats| stats.window),
-            client_send_mono: sent_at.mono,
-            client_receive_mono: received_at.mono,
-            client_send_wall_ns: system_time_ns(sent_at.wall),
-            client_receive_wall_ns: system_time_ns(received_at.wall),
-            server_receive_mono_ns: server_timing.and_then(|timing| timing.receive_mono_ns),
-            server_send_mono_ns: server_timing.and_then(|timing| timing.send_mono_ns),
-            server_receive_wall_ns: server_timing.and_then(|timing| timing.receive_wall_ns),
-            server_send_wall_ns: server_timing.and_then(|timing| timing.send_wall_ns),
+            ipdv: IpdvSample {
+                seq,
+                rtt_primary_ns,
+                client_send_mono: sent_at.mono,
+                client_receive_mono: received_at.mono,
+                client_send_wall_ns: system_time_ns(sent_at.wall),
+                client_receive_wall_ns: system_time_ns(received_at.wall),
+                server_receive_mono_ns: server_timing.and_then(|timing| timing.receive_mono_ns),
+                server_send_mono_ns: server_timing.and_then(|timing| timing.send_mono_ns),
+                server_receive_wall_ns: server_timing.and_then(|timing| timing.receive_wall_ns),
+                server_send_wall_ns: server_timing.and_then(|timing| timing.send_wall_ns),
+            },
         }
     }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct IpdvTracker {
-    samples: HashMap<u32, UniqueSample>,
+    samples: HashMap<u32, IpdvSample>,
     sample_order: VecDeque<u32>,
     completed_pairs: HashSet<u32>,
     sequence_limit: Option<usize>,
@@ -598,7 +606,7 @@ impl IpdvTracker {
         }
     }
 
-    fn insert(&mut self, sample: UniqueSample) -> Vec<CompletedIpdvPair> {
+    fn insert(&mut self, sample: IpdvSample) -> Vec<CompletedIpdvPair> {
         let seq = sample.seq;
         if self.samples.insert(seq, sample).is_some() {
             return Vec::new();
@@ -828,7 +836,7 @@ fn percent(numerator: f64, denominator: f64) -> f64 {
     100.0 * numerator / denominator
 }
 
-fn send_ipdv_ns(previous: &UniqueSample, current: &UniqueSample) -> Option<i128> {
+fn send_ipdv_ns(previous: &IpdvSample, current: &IpdvSample) -> Option<i128> {
     if let (Some(prev_server), Some(cur_server)) = (
         previous.server_receive_mono_ns,
         current.server_receive_mono_ns,
@@ -850,7 +858,7 @@ fn send_ipdv_ns(previous: &UniqueSample, current: &UniqueSample) -> Option<i128>
     None
 }
 
-fn receive_ipdv_ns(previous: &UniqueSample, current: &UniqueSample) -> Option<i128> {
+fn receive_ipdv_ns(previous: &IpdvSample, current: &IpdvSample) -> Option<i128> {
     if let (Some(prev_server), Some(cur_server)) =
         (previous.server_send_mono_ns, current.server_send_mono_ns)
     {
@@ -911,19 +919,11 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
-    fn unique_sample(seq: u32, rtt_primary_ns: i128) -> UniqueSample {
+    fn ipdv_sample(seq: u32, rtt_primary_ns: i128) -> IpdvSample {
         let now = Instant::now();
-        UniqueSample {
+        IpdvSample {
             seq,
-            bytes: 64,
             rtt_primary_ns,
-            rtt_raw_ns: rtt_primary_ns,
-            rtt_adjusted_ns: None,
-            send_delay_ns: None,
-            receive_delay_ns: None,
-            server_processing_ns: None,
-            received_count: None,
-            received_window: None,
             client_send_mono: now,
             client_receive_mono: now,
             client_send_wall_ns: None,
@@ -981,9 +981,9 @@ mod tests {
     #[test]
     fn ipdv_tracker_completes_adjacent_pair() {
         let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
+        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
 
-        let pairs = tracker.insert(unique_sample(1, 14));
+        let pairs = tracker.insert(ipdv_sample(1, 14));
 
         assert_eq!(
             pairs,
@@ -1000,10 +1000,10 @@ mod tests {
     #[test]
     fn ipdv_tracker_gap_fill_completes_both_adjacent_pairs() {
         let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
-        assert!(tracker.insert(unique_sample(2, 20)).is_empty());
+        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
+        assert!(tracker.insert(ipdv_sample(2, 20)).is_empty());
 
-        let pairs = tracker.insert(unique_sample(1, 13));
+        let pairs = tracker.insert(ipdv_sample(1, 13));
 
         assert_eq!(
             pairs,
@@ -1029,19 +1029,19 @@ mod tests {
     #[test]
     fn ipdv_tracker_duplicate_sequence_does_not_emit_pair_again() {
         let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
-        assert_eq!(tracker.insert(unique_sample(1, 14)).len(), 1);
+        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
+        assert_eq!(tracker.insert(ipdv_sample(1, 14)).len(), 1);
 
-        assert!(tracker.insert(unique_sample(1, 18)).is_empty());
+        assert!(tracker.insert(ipdv_sample(1, 18)).is_empty());
     }
 
     #[test]
     fn ipdv_tracker_bounded_mode_evicts_old_sequence_state() {
         let mut tracker = IpdvTracker::new(Some(2));
-        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
-        assert_eq!(tracker.insert(unique_sample(1, 14)).len(), 1);
+        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
+        assert_eq!(tracker.insert(ipdv_sample(1, 14)).len(), 1);
 
-        let pairs = tracker.insert(unique_sample(2, 20));
+        let pairs = tracker.insert(ipdv_sample(2, 20));
 
         assert_eq!(pairs.len(), 1);
         assert!(!tracker.samples.contains_key(&0));
