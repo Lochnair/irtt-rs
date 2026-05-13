@@ -2,10 +2,7 @@
 
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::VecDeque,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use irtt_client::{
     ClientEvent, ClientTimestamp, OneWayDelaySample, ReceivedStatsSample, RttSample, ServerTiming,
@@ -14,11 +11,13 @@ use irtt_client::{
 
 mod ipdv;
 mod loss;
+mod rolling;
 mod time_stats;
 
 use ipdv::{IpdvSample, IpdvTracker};
 use loss::loss_stats;
 pub use loss::LossStats;
+use rolling::RollingEvents;
 use time_stats::TimeMetric;
 pub use time_stats::TimeStats;
 
@@ -99,52 +98,6 @@ impl StatsCollector {
 
     pub fn rolling_time(&self) -> Option<Snapshot> {
         self.rolling.time_snapshot()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-struct RollingEvents {
-    count_limit: Option<usize>,
-    time_limit: Option<Duration>,
-    count_events: Option<VecDeque<StatsEvent>>,
-    time_events: Option<VecDeque<StatsEvent>>,
-}
-
-impl RollingEvents {
-    fn new(config: StatsConfig) -> Self {
-        Self {
-            count_limit: config.rolling_count,
-            time_limit: config.rolling_time,
-            count_events: config.rolling_count.map(|_| VecDeque::new()),
-            time_events: config.rolling_time.map(|_| VecDeque::new()),
-        }
-    }
-
-    fn push(&mut self, event: StatsEvent) {
-        if let (Some(limit), Some(window)) = (self.count_limit, self.count_events.as_mut()) {
-            window.push_back(event.clone());
-            while window.len() > limit {
-                window.pop_front();
-            }
-        }
-
-        if let (Some(duration), Some(window)) = (self.time_limit, self.time_events.as_mut()) {
-            let cutoff = event.at().checked_sub(duration);
-            window.push_back(event);
-            if let Some(cutoff) = cutoff {
-                while window.front().is_some_and(|event| event.at() < cutoff) {
-                    window.pop_front();
-                }
-            }
-        }
-    }
-
-    fn count_snapshot(&self) -> Option<Snapshot> {
-        self.count_events.as_ref().map(snapshot_window)
-    }
-
-    fn time_snapshot(&self) -> Option<Snapshot> {
-        self.time_events.as_ref().map(snapshot_window)
     }
 }
 
@@ -629,14 +582,6 @@ impl ReplySample {
             },
         }
     }
-}
-
-fn snapshot_window(events: &VecDeque<StatsEvent>) -> Snapshot {
-    let mut core = CoreStats::new(SampleMode::RunningOnly);
-    for event in events {
-        core.apply(event.clone());
-    }
-    core.snapshot()
 }
 
 fn system_time_ns(time: SystemTime) -> Option<i128> {
