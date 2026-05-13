@@ -445,23 +445,39 @@ impl CoreStats {
             loss: loss_stats(packets),
             send_call: self.send_call.stats(),
             timer_error: self.timer_error.stats(),
-            rtt: RttStats {
-                primary: self.rtt_primary.stats(),
-                raw: self.rtt_raw.stats(),
-                adjusted: self.rtt_adjusted.stats(),
-            },
-            ipdv: IpdvStats {
-                round_trip: self.ipdv_round_trip.stats(),
-                send: self.ipdv_send.stats(),
-                receive: self.ipdv_receive.stats(),
-            },
-            one_way_delay: OneWayDelayStats {
-                send_delay: self.send_delay.stats(),
-                receive_delay: self.receive_delay.stats(),
-            },
-            server_processing: ServerProcessingStats {
-                processing: self.server_processing.stats(),
-            },
+            rtt: self.rtt_stats(),
+            ipdv: self.ipdv_stats(),
+            one_way_delay: self.one_way_delay_stats(),
+            server_processing: self.server_processing_stats(),
+        }
+    }
+
+    fn rtt_stats(&self) -> RttStats {
+        RttStats {
+            primary: self.rtt_primary.stats(),
+            raw: self.rtt_raw.stats(),
+            adjusted: self.rtt_adjusted.stats(),
+        }
+    }
+
+    fn ipdv_stats(&self) -> IpdvStats {
+        IpdvStats {
+            round_trip: self.ipdv_round_trip.stats(),
+            send: self.ipdv_send.stats(),
+            receive: self.ipdv_receive.stats(),
+        }
+    }
+
+    fn one_way_delay_stats(&self) -> OneWayDelayStats {
+        OneWayDelayStats {
+            send_delay: self.send_delay.stats(),
+            receive_delay: self.receive_delay.stats(),
+        }
+    }
+
+    fn server_processing_stats(&self) -> ServerProcessingStats {
+        ServerProcessingStats {
+            processing: self.server_processing.stats(),
         }
     }
 }
