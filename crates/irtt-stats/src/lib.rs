@@ -16,7 +16,7 @@ const CONTINUOUS_SEQUENCE_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StatsConfig {
-    pub median: MedianMode,
+    pub samples: SampleMode,
     pub rolling_count: Option<usize>,
     pub rolling_time: Option<Duration>,
 }
@@ -24,7 +24,7 @@ pub struct StatsConfig {
 impl StatsConfig {
     pub fn finite() -> Self {
         Self {
-            median: MedianMode::ExactFinite,
+            samples: SampleMode::Exact,
             rolling_count: None,
             rolling_time: None,
         }
@@ -32,11 +32,11 @@ impl StatsConfig {
 
     /// Configuration for long-running use.
     ///
-    /// This disables finite median retention and bounds sequence-adjacent IPDV
+    /// This disables exact sample retention and bounds sequence-adjacent IPDV
     /// tracking. Exact arbitrary-late IPDV completion is finite-mode behavior.
     pub fn continuous() -> Self {
         Self {
-            median: MedianMode::Disabled,
+            samples: SampleMode::RunningOnly,
             rolling_count: None,
             rolling_time: None,
         }
@@ -50,9 +50,9 @@ impl Default for StatsConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MedianMode {
-    Disabled,
-    ExactFinite,
+pub enum SampleMode {
+    RunningOnly,
+    Exact,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -67,7 +67,7 @@ impl StatsCollector {
     pub fn new(config: StatsConfig) -> Self {
         Self {
             config,
-            cumulative: CoreStats::new(config.median),
+            cumulative: CoreStats::new(config.samples),
             rolling_count: config.rolling_count.map(|_| VecDeque::new()),
             rolling_time: config.rolling_time.map(|_| VecDeque::new()),
         }
@@ -230,7 +230,7 @@ impl TimeStats {
 
 #[derive(Debug, Clone, PartialEq)]
 struct CoreStats {
-    median: MedianMode,
+    sample_mode: SampleMode,
     sequence_limit: Option<usize>,
     events: EventCounts,
     packets: PacketCounts,
@@ -251,10 +251,10 @@ struct CoreStats {
 }
 
 impl CoreStats {
-    fn new(median: MedianMode) -> Self {
+    fn new(sample_mode: SampleMode) -> Self {
         Self {
-            median,
-            sequence_limit: if median == MedianMode::ExactFinite {
+            sample_mode,
+            sequence_limit: if sample_mode == SampleMode::Exact {
                 None
             } else {
                 Some(CONTINUOUS_SEQUENCE_LIMIT)
@@ -263,14 +263,14 @@ impl CoreStats {
             packets: PacketCounts::default(),
             send_call: TimeMetric::new(false),
             timer_error: TimeMetric::new(false),
-            rtt_primary: TimeMetric::new(median == MedianMode::ExactFinite),
-            rtt_raw: TimeMetric::new(median == MedianMode::ExactFinite),
-            rtt_adjusted: TimeMetric::new(median == MedianMode::ExactFinite),
-            ipdv_round_trip: TimeMetric::new(median == MedianMode::ExactFinite),
-            ipdv_send: TimeMetric::new(median == MedianMode::ExactFinite),
-            ipdv_receive: TimeMetric::new(median == MedianMode::ExactFinite),
-            send_delay: TimeMetric::new(median == MedianMode::ExactFinite),
-            receive_delay: TimeMetric::new(median == MedianMode::ExactFinite),
+            rtt_primary: TimeMetric::new(sample_mode == SampleMode::Exact),
+            rtt_raw: TimeMetric::new(sample_mode == SampleMode::Exact),
+            rtt_adjusted: TimeMetric::new(sample_mode == SampleMode::Exact),
+            ipdv_round_trip: TimeMetric::new(sample_mode == SampleMode::Exact),
+            ipdv_send: TimeMetric::new(sample_mode == SampleMode::Exact),
+            ipdv_receive: TimeMetric::new(sample_mode == SampleMode::Exact),
+            send_delay: TimeMetric::new(sample_mode == SampleMode::Exact),
+            receive_delay: TimeMetric::new(sample_mode == SampleMode::Exact),
             server_processing: TimeMetric::new(false),
             samples: HashMap::new(),
             sample_order: VecDeque::new(),
@@ -696,7 +696,7 @@ impl RunningStats {
 }
 
 fn snapshot_window(events: &VecDeque<WindowEvent>) -> Snapshot {
-    let mut core = CoreStats::new(MedianMode::Disabled);
+    let mut core = CoreStats::new(SampleMode::RunningOnly);
     for event in events {
         core.apply(event.clone());
     }

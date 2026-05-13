@@ -4,10 +4,10 @@ use std::time::{Duration, Instant};
 
 use common::{late_reply, reply, sent, ts};
 use irtt_client::{ClientEvent, PacketMeta};
-use irtt_stats::{EventStatsUpdate, IpdvPairUpdate, MedianMode, StatsCollector, StatsConfig};
+use irtt_stats::{EventStatsUpdate, IpdvPairUpdate, SampleMode, StatsCollector, StatsConfig};
 
 #[test]
-fn disabled_median_avoids_finite_retention() {
+fn running_only_samples_avoid_finite_retention() {
     let mut collector = StatsCollector::new(StatsConfig::continuous());
     collector.process(&reply(0, 10, 9));
     collector.process(&reply(1, 20, 19));
@@ -22,7 +22,7 @@ fn disabled_median_avoids_finite_retention() {
 }
 
 #[test]
-fn continuous_mode_tracks_samples_without_exact_medians() {
+fn continuous_mode_tracks_running_samples_without_exact_medians() {
     let mut collector = StatsCollector::new(StatsConfig::continuous());
     for seq in 0..4104 {
         collector.process(&reply(seq, 10, 10));
@@ -215,7 +215,7 @@ fn server_processing_and_one_way_require_available_samples() {
 #[test]
 fn rolling_count_eviction_recomputes_from_bounded_events() {
     let mut collector = StatsCollector::new(StatsConfig {
-        median: MedianMode::Disabled,
+        samples: SampleMode::RunningOnly,
         rolling_count: Some(2),
         rolling_time: None,
     });
@@ -232,7 +232,7 @@ fn rolling_count_eviction_recomputes_from_bounded_events() {
 #[test]
 fn rolling_time_eviction_uses_event_timestamps() {
     let mut collector = StatsCollector::new(StatsConfig {
-        median: MedianMode::Disabled,
+        samples: SampleMode::RunningOnly,
         rolling_count: None,
         rolling_time: Some(Duration::from_millis(15)),
     });
