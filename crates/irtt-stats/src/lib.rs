@@ -74,7 +74,7 @@ impl StatsCollector {
     }
 
     pub fn process(&mut self, event: &ClientEvent) -> EventStatsUpdate {
-        let Some(stats_event) = StatsEvent::from_client_event(event) else {
+        let Some(stats_event) = normalize_event(event) else {
             return EventStatsUpdate::default();
         };
 
@@ -428,83 +428,83 @@ enum StatsEvent {
     },
 }
 
-impl StatsEvent {
-    fn from_client_event(event: &ClientEvent) -> Option<Self> {
-        match event {
-            ClientEvent::EchoSent {
-                sent_at,
-                bytes,
-                send_call,
-                timer_error,
-                ..
-            } => Some(Self::Sent {
-                at: sent_at.mono,
-                bytes: *bytes,
-                send_call_ns: duration_ns_i128(*send_call),
-                timer_error_ns: duration_ns_i128(*timer_error),
-            }),
-            ClientEvent::EchoReply {
-                seq,
-                sent_at,
-                received_at,
-                rtt,
-                server_timing,
-                one_way,
-                received_stats,
-                bytes,
-                ..
-            } => Some(Self::UniqueReply {
-                at: received_at.mono,
-                is_late: false,
-                sample: Box::new(ReplySample::new(
-                    *seq,
-                    *sent_at,
-                    *received_at,
-                    *rtt,
-                    *server_timing,
-                    *one_way,
-                    *received_stats,
-                    *bytes,
-                )),
-            }),
-            ClientEvent::LateReply {
-                seq,
-                sent_at: Some(sent_at),
-                received_at,
-                rtt: Some(rtt),
-                server_timing,
-                one_way,
-                received_stats,
-                bytes,
-                ..
-            } => Some(Self::UniqueReply {
-                at: received_at.mono,
-                is_late: true,
-                sample: Box::new(ReplySample::new(
-                    *seq,
-                    *sent_at,
-                    *received_at,
-                    *rtt,
-                    *server_timing,
-                    *one_way,
-                    *received_stats,
-                    *bytes,
-                )),
-            }),
-            ClientEvent::LateReply { received_at, .. } => Some(Self::UntrackedLate {
-                at: received_at.mono,
-            }),
-            ClientEvent::DuplicateReply { received_at, .. } => Some(Self::DuplicateReply {
-                at: received_at.mono,
-            }),
-            ClientEvent::EchoLoss { timeout_at, .. } => Some(Self::Loss { at: *timeout_at }),
-            ClientEvent::Warning { at, .. } => Some(Self::Warning { at: at.mono }),
-            ClientEvent::SessionStarted { .. }
-            | ClientEvent::NoTestCompleted { .. }
-            | ClientEvent::SessionClosed { .. } => None,
-        }
+fn normalize_event(event: &ClientEvent) -> Option<StatsEvent> {
+    match event {
+        ClientEvent::EchoSent {
+            sent_at,
+            bytes,
+            send_call,
+            timer_error,
+            ..
+        } => Some(StatsEvent::Sent {
+            at: sent_at.mono,
+            bytes: *bytes,
+            send_call_ns: duration_ns_i128(*send_call),
+            timer_error_ns: duration_ns_i128(*timer_error),
+        }),
+        ClientEvent::EchoReply {
+            seq,
+            sent_at,
+            received_at,
+            rtt,
+            server_timing,
+            one_way,
+            received_stats,
+            bytes,
+            ..
+        } => Some(StatsEvent::UniqueReply {
+            at: received_at.mono,
+            is_late: false,
+            sample: Box::new(ReplySample::from_reply_parts(
+                *seq,
+                *sent_at,
+                *received_at,
+                *rtt,
+                *server_timing,
+                *one_way,
+                *received_stats,
+                *bytes,
+            )),
+        }),
+        ClientEvent::LateReply {
+            seq,
+            sent_at: Some(sent_at),
+            received_at,
+            rtt: Some(rtt),
+            server_timing,
+            one_way,
+            received_stats,
+            bytes,
+            ..
+        } => Some(StatsEvent::UniqueReply {
+            at: received_at.mono,
+            is_late: true,
+            sample: Box::new(ReplySample::from_reply_parts(
+                *seq,
+                *sent_at,
+                *received_at,
+                *rtt,
+                *server_timing,
+                *one_way,
+                *received_stats,
+                *bytes,
+            )),
+        }),
+        ClientEvent::LateReply { received_at, .. } => Some(StatsEvent::UntrackedLate {
+            at: received_at.mono,
+        }),
+        ClientEvent::DuplicateReply { received_at, .. } => Some(StatsEvent::DuplicateReply {
+            at: received_at.mono,
+        }),
+        ClientEvent::EchoLoss { timeout_at, .. } => Some(StatsEvent::Loss { at: *timeout_at }),
+        ClientEvent::Warning { at, .. } => Some(StatsEvent::Warning { at: at.mono }),
+        ClientEvent::SessionStarted { .. }
+        | ClientEvent::NoTestCompleted { .. }
+        | ClientEvent::SessionClosed { .. } => None,
     }
+}
 
+impl StatsEvent {
     fn at(&self) -> Instant {
         match self {
             Self::Sent { at, .. }
@@ -546,7 +546,7 @@ struct IpdvSample {
 
 impl ReplySample {
     #[allow(clippy::too_many_arguments)]
-    fn new(
+    fn from_reply_parts(
         seq: u32,
         sent_at: ClientTimestamp,
         received_at: ClientTimestamp,
