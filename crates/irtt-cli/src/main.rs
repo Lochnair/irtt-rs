@@ -130,6 +130,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
 
     let events = client.close()?;
     output.print_events(&events)?;
+    output.print_final_summary = should_print_final_summary(continuous, interrupted);
     output.print_summary()?;
     output.out.flush()?;
     Ok(())
@@ -153,6 +154,10 @@ fn should_send_probe(next_send_deadline: Option<Instant>, shutdown_requested: &A
 }
 
 fn should_drain_final(continuous: bool, interrupted: bool) -> bool {
+    !continuous || interrupted
+}
+
+fn should_print_final_summary(continuous: bool, interrupted: bool) -> bool {
     !continuous || interrupted
 }
 

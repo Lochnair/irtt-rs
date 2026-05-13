@@ -29,7 +29,7 @@ pub struct CliArgs {
         default_value = "10s",
         value_parser = parse_test_duration,
         help = "Test duration; use 0 for continuous mode",
-        long_help = "Test duration; use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and does not print a finite summary."
+        long_help = "Test duration; use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary only when interrupted."
     )]
     pub duration: Duration,
 
