@@ -9,6 +9,7 @@ pub fn format_summary(summary: &Snapshot) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct SummaryFormatOptions {
     pub verbose: bool,
+    pub show_running_only_note: bool,
 }
 
 pub fn format_summary_with_options(summary: &Snapshot, options: SummaryFormatOptions) -> String {
@@ -18,6 +19,13 @@ pub fn format_summary_with_options(summary: &Snapshot, options: SummaryFormatOpt
 
     writeln!(out).unwrap();
     writeln!(out, "irtt-rs summary").unwrap();
+    if options.show_running_only_note {
+        writeln!(
+            out,
+            "note: medians unavailable in continuous mode; running statistics are bounded-memory"
+        )
+        .unwrap();
+    }
     writeln!(out).unwrap();
     writeln!(
         out,
@@ -232,6 +240,7 @@ mod tests {
         assert!(output.contains("10.0µs"));
         assert!(output.contains("timer error"));
         assert!(output.contains("2.0µs"));
+        assert!(!output.contains("medians unavailable"));
     }
 
     #[test]
@@ -259,11 +268,30 @@ mod tests {
 
         let output = format_summary_with_options(
             &collector.snapshot(),
-            SummaryFormatOptions { verbose: true },
+            SummaryFormatOptions {
+                verbose: true,
+                ..SummaryFormatOptions::default()
+            },
         );
 
         assert!(output.contains("raw RTT"));
         assert!(output.contains("adjusted RTT"));
+    }
+
+    #[test]
+    fn running_only_note_is_format_option() {
+        let summary = StatsCollector::new(StatsConfig::continuous()).snapshot();
+        let output = format_summary_with_options(
+            &summary,
+            SummaryFormatOptions {
+                show_running_only_note: true,
+                ..SummaryFormatOptions::default()
+            },
+        );
+
+        assert!(output.contains("irtt-rs summary"));
+        assert!(output.contains("medians unavailable"));
+        assert!(output.contains("continuous mode"));
     }
 
     #[test]

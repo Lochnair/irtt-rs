@@ -77,6 +77,7 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
             verbose: args.verbose,
         },
         print_final_summary: false,
+        show_running_only_summary_note: false,
         out: &mut stdout,
         #[cfg(feature = "stats")]
         stats: &mut stats,
@@ -130,7 +131,9 @@ fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std
 
     let events = client.close()?;
     output.print_events(&events)?;
-    output.print_final_summary = should_print_final_summary(continuous, interrupted);
+    let print_final_summary = should_print_final_summary(continuous, interrupted);
+    output.print_final_summary = print_final_summary;
+    output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
     output.print_summary()?;
     output.out.flush()?;
     Ok(())
@@ -210,6 +213,7 @@ struct EventOutput<'a, W: Write> {
     mode: irtt_cli::OutputMode,
     human_options: HumanOutputOptions,
     print_final_summary: bool,
+    show_running_only_summary_note: bool,
     out: &'a mut W,
     #[cfg(feature = "stats")]
     stats: &'a mut StatsCollector,
@@ -261,6 +265,7 @@ impl<W: Write> EventOutput<'_, W> {
                     &self.stats.snapshot(),
                     irtt_cli::summary::SummaryFormatOptions {
                         verbose: self.human_options.verbose,
+                        show_running_only_note: self.show_running_only_summary_note,
                     },
                 )
             )?;
@@ -471,6 +476,7 @@ mod tests {
                 mode: irtt_cli::OutputMode::RttUs,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: true,
+                show_running_only_summary_note: false,
                 out: &mut out,
                 stats: &mut stats,
             };
@@ -494,6 +500,7 @@ mod tests {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: false,
+                show_running_only_summary_note: true,
                 out: &mut out,
                 stats: &mut stats,
             };
@@ -512,6 +519,7 @@ mod tests {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: true,
+                show_running_only_summary_note: true,
                 out: &mut out,
                 stats: &mut stats,
             };
@@ -521,6 +529,8 @@ mod tests {
 
         let rendered = String::from_utf8(out).unwrap();
         assert!(rendered.contains("irtt-rs summary"));
+        assert!(rendered.contains("medians unavailable"));
+        assert!(rendered.contains("continuous mode"));
         assert!(rendered.contains("packets:"));
         assert!(rendered.contains("received=1"));
     }
@@ -535,6 +545,7 @@ mod tests {
                 mode: irtt_cli::OutputMode::Human,
                 human_options: HumanOutputOptions::default(),
                 print_final_summary: false,
+                show_running_only_summary_note: false,
                 out: &mut out,
                 stats: &mut stats,
             };
