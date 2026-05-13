@@ -351,7 +351,15 @@ impl CoreStats {
             self.receive_delay.push_ns(delay);
         }
 
-        for pair in self.ipdv_tracker.insert(sample.ipdv) {
+        update.ipdv_pairs = self.apply_ipdv_sample(sample.ipdv);
+
+        update
+    }
+
+    fn apply_ipdv_sample(&mut self, sample: IpdvSample) -> Vec<IpdvPairUpdate> {
+        let mut updates = Vec::new();
+
+        for pair in self.ipdv_tracker.insert(sample) {
             let Some(rtt_ipdv) = duration_from_non_negative_i128_ns(pair.rtt_ipdv_ns) else {
                 continue;
             };
@@ -372,7 +380,7 @@ impl CoreStats {
                 self.ipdv_receive.push_ns(value);
             }
 
-            update.ipdv_pairs.push(IpdvPairUpdate {
+            updates.push(IpdvPairUpdate {
                 previous_seq: pair.previous_seq,
                 current_seq: pair.current_seq,
                 rtt_ipdv,
@@ -381,7 +389,7 @@ impl CoreStats {
             });
         }
 
-        update
+        updates
     }
 
     fn apply_duplicate_reply(&mut self) {
