@@ -414,9 +414,9 @@ impl CoreStats {
         Some(IpdvPairUpdate {
             previous_seq,
             current_seq,
-            rtt_ipdv: duration_from_i128_ns(rtt_ipdv),
-            send_ipdv: send_ipdv.map(duration_from_i128_ns),
-            receive_ipdv: receive_ipdv.map(duration_from_i128_ns),
+            rtt_ipdv: duration_from_non_negative_i128_ns(rtt_ipdv)?,
+            send_ipdv: send_ipdv.map(duration_from_non_negative_i128_ns)?,
+            receive_ipdv: receive_ipdv.map(duration_from_non_negative_i128_ns)?,
         })
     }
 
@@ -858,8 +858,8 @@ fn abs_i128_ns(value: i128) -> i128 {
     value.saturating_abs()
 }
 
-fn duration_from_i128_ns(value: i128) -> Duration {
-    Duration::from_nanos(u64::try_from(value).unwrap_or(u64::MAX))
+fn duration_from_non_negative_i128_ns(value: i128) -> Option<Duration> {
+    u64::try_from(value).ok().map(Duration::from_nanos)
 }
 
 #[cfg(test)]
