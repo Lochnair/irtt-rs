@@ -4,6 +4,8 @@
 //! snapshots for reporting and integration code.
 
 #![forbid(unsafe_code)]
+#![warn(missing_docs)]
+#![warn(rustdoc::missing_crate_level_docs)]
 
 use std::time::Duration;
 
