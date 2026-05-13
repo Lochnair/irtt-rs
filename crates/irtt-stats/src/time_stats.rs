@@ -1,19 +1,33 @@
 #[derive(Debug, Clone, Copy, PartialEq)]
+/// Summary statistics for timing values.
+///
+/// All fields use nanoseconds except `variance_ns2`, which is nanoseconds
+/// squared. Values may represent signed timing quantities such as scheduling
+/// error or one-way delay.
 pub struct TimeStats {
+    /// Number of samples included in this summary.
     pub count: u64,
+    /// Sum of all samples, in nanoseconds.
     pub total_ns: i128,
+    /// Smallest sample, in nanoseconds.
     pub min_ns: Option<i128>,
+    /// Largest sample, in nanoseconds.
     pub max_ns: Option<i128>,
+    /// Arithmetic mean, in nanoseconds.
     pub mean_ns: f64,
+    /// Median, in nanoseconds, when exact samples were retained.
     pub median_ns: Option<f64>,
+    /// Sample variance, in nanoseconds squared.
     pub variance_ns2: f64,
 }
 
 impl TimeStats {
+    /// Returns the sample standard deviation, in nanoseconds.
     pub fn stddev_ns(&self) -> f64 {
         self.variance_ns2.sqrt()
     }
 
+    /// Returns whether this summary contains no samples.
     pub fn is_empty(&self) -> bool {
         self.count == 0
     }
