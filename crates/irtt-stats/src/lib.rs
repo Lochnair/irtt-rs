@@ -230,8 +230,6 @@ impl TimeStats {
 
 #[derive(Debug, Clone, PartialEq)]
 struct CoreStats {
-    sample_mode: SampleMode,
-    sequence_limit: Option<usize>,
     events: EventCounts,
     packets: PacketCounts,
     send_call: TimeMetric,
@@ -245,20 +243,18 @@ struct CoreStats {
     send_delay: TimeMetric,
     receive_delay: TimeMetric,
     server_processing: TimeMetric,
-    samples: HashMap<u32, UniqueSample>,
-    sample_order: VecDeque<u32>,
-    ipdv_pairs: HashSet<u32>,
+    ipdv_tracker: IpdvTracker,
 }
 
 impl CoreStats {
     fn new(sample_mode: SampleMode) -> Self {
+        let sequence_limit = if sample_mode == SampleMode::Exact {
+            None
+        } else {
+            Some(CONTINUOUS_SEQUENCE_LIMIT)
+        };
+
         Self {
-            sample_mode,
-            sequence_limit: if sample_mode == SampleMode::Exact {
-                None
-            } else {
-                Some(CONTINUOUS_SEQUENCE_LIMIT)
-            },
             events: EventCounts::default(),
             packets: PacketCounts::default(),
             send_call: TimeMetric::new(false),
@@ -272,9 +268,7 @@ impl CoreStats {
             send_delay: TimeMetric::new(sample_mode == SampleMode::Exact),
             receive_delay: TimeMetric::new(sample_mode == SampleMode::Exact),
             server_processing: TimeMetric::new(false),
-            samples: HashMap::new(),
-            sample_order: VecDeque::new(),
-            ipdv_pairs: HashSet::new(),
+            ipdv_tracker: IpdvTracker::new(sequence_limit),
         }
     }
 
@@ -329,18 +323,35 @@ impl CoreStats {
                     self.receive_delay.push_ns(delay);
                 }
 
-                let seq = sample.seq;
-                if self.samples.insert(seq, sample).is_none() {
-                    self.sample_order.push_back(seq);
-                    self.enforce_sequence_limit();
-                    if let Some(pair) = self.try_ipdv_pair(seq) {
-                        update.ipdv_pairs.push(pair);
+                for pair in self.ipdv_tracker.insert(sample) {
+                    let Some(rtt_ipdv) = duration_from_non_negative_i128_ns(pair.rtt_ipdv_ns)
+                    else {
+                        continue;
+                    };
+                    let send_ipdv = pair
+                        .send_ipdv_ns
+                        .and_then(duration_from_non_negative_i128_ns);
+                    let receive_ipdv = pair
+                        .receive_ipdv_ns
+                        .and_then(duration_from_non_negative_i128_ns);
+
+                    self.ipdv_round_trip.push_ns(pair.rtt_ipdv_ns);
+
+                    if let Some(value) = pair.send_ipdv_ns {
+                        self.ipdv_send.push_ns(value);
                     }
-                    if let Some(next) = seq.checked_add(1) {
-                        if let Some(pair) = self.try_ipdv_pair(next) {
-                            update.ipdv_pairs.push(pair);
-                        }
+
+                    if let Some(value) = pair.receive_ipdv_ns {
+                        self.ipdv_receive.push_ns(value);
                     }
+
+                    update.ipdv_pairs.push(IpdvPairUpdate {
+                        previous_seq: pair.previous_seq,
+                        current_seq: pair.current_seq,
+                        rtt_ipdv,
+                        send_ipdv,
+                        receive_ipdv,
+                    });
                 }
             }
             StatsEvent::DuplicateReply { .. } => {
@@ -359,69 +370,6 @@ impl CoreStats {
             }
         }
         update
-    }
-
-    fn enforce_sequence_limit(&mut self) {
-        let Some(limit) = self.sequence_limit else {
-            return;
-        };
-        while self.samples.len() > limit {
-            let Some(seq) = self.sample_order.pop_front() else {
-                break;
-            };
-            if self.samples.remove(&seq).is_some() {
-                self.ipdv_pairs.remove(&seq);
-                if let Some(next) = seq.checked_add(1) {
-                    self.ipdv_pairs.remove(&next);
-                }
-            }
-        }
-    }
-
-    fn try_ipdv_pair(&mut self, current_seq: u32) -> Option<IpdvPairUpdate> {
-        let previous_seq = current_seq.checked_sub(1)?;
-
-        if !self.ipdv_pairs.insert(current_seq) {
-            return None;
-        }
-
-        let Some(previous) = self.samples.get(&previous_seq) else {
-            self.ipdv_pairs.remove(&current_seq);
-            return None;
-        };
-
-        let Some(current) = self.samples.get(&current_seq) else {
-            self.ipdv_pairs.remove(&current_seq);
-            return None;
-        };
-
-        // Compute everything before mutating metric fields, otherwise the borrow
-        // checker may quite reasonably start throwing furniture.
-        let rtt_ipdv = abs_i128_ns(current.rtt_primary_ns - previous.rtt_primary_ns);
-        let send_ipdv = send_ipdv_ns(previous, current).map(abs_i128_ns);
-        let receive_ipdv = receive_ipdv_ns(previous, current).map(abs_i128_ns);
-
-        let rtt_ipdv_duration = duration_from_non_negative_i128_ns(rtt_ipdv)?;
-        let send_ipdv_duration = send_ipdv.and_then(duration_from_non_negative_i128_ns);
-        let receive_ipdv_duration = receive_ipdv.and_then(duration_from_non_negative_i128_ns);
-
-        self.ipdv_round_trip.push_ns(rtt_ipdv);
-
-        if let Some(value) = send_ipdv {
-            self.ipdv_send.push_ns(value);
-        }
-
-        if let Some(value) = receive_ipdv {
-            self.ipdv_receive.push_ns(value);
-        }
-
-        Some(IpdvPairUpdate {
-            previous_seq,
-            current_seq,
-            rtt_ipdv: rtt_ipdv_duration,
-            send_ipdv: send_ipdv_duration,
-            receive_ipdv: receive_ipdv_duration,
-        })
     }
 
     fn snapshot(&self) -> Snapshot {
@@ -630,6 +578,98 @@ impl UniqueSample {
             server_send_wall_ns: server_timing.and_then(|timing| timing.send_wall_ns),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct IpdvTracker {
+    samples: HashMap<u32, UniqueSample>,
+    sample_order: VecDeque<u32>,
+    completed_pairs: HashSet<u32>,
+    sequence_limit: Option<usize>,
+}
+
+impl IpdvTracker {
+    fn new(sequence_limit: Option<usize>) -> Self {
+        Self {
+            samples: HashMap::new(),
+            sample_order: VecDeque::new(),
+            completed_pairs: HashSet::new(),
+            sequence_limit,
+        }
+    }
+
+    fn insert(&mut self, sample: UniqueSample) -> Vec<CompletedIpdvPair> {
+        let seq = sample.seq;
+        if self.samples.insert(seq, sample).is_some() {
+            return Vec::new();
+        }
+
+        self.sample_order.push_back(seq);
+        self.enforce_sequence_limit();
+
+        let mut pairs = Vec::with_capacity(2);
+        if let Some(pair) = self.try_pair(seq) {
+            pairs.push(pair);
+        }
+        if let Some(next) = seq.checked_add(1) {
+            if let Some(pair) = self.try_pair(next) {
+                pairs.push(pair);
+            }
+        }
+        pairs
+    }
+
+    fn enforce_sequence_limit(&mut self) {
+        let Some(limit) = self.sequence_limit else {
+            return;
+        };
+        while self.samples.len() > limit {
+            let Some(seq) = self.sample_order.pop_front() else {
+                break;
+            };
+            if self.samples.remove(&seq).is_some() {
+                self.completed_pairs.remove(&seq);
+                if let Some(next) = seq.checked_add(1) {
+                    self.completed_pairs.remove(&next);
+                }
+            }
+        }
+    }
+
+    fn try_pair(&mut self, current_seq: u32) -> Option<CompletedIpdvPair> {
+        let previous_seq = current_seq.checked_sub(1)?;
+
+        if !self.completed_pairs.insert(current_seq) {
+            return None;
+        }
+
+        let Some(previous) = self.samples.get(&previous_seq) else {
+            self.completed_pairs.remove(&current_seq);
+            return None;
+        };
+
+        let Some(current) = self.samples.get(&current_seq) else {
+            self.completed_pairs.remove(&current_seq);
+            return None;
+        };
+
+        Some(CompletedIpdvPair {
+            previous_seq,
+            current_seq,
+            rtt_ipdv_ns: abs_i128_ns(current.rtt_primary_ns - previous.rtt_primary_ns),
+            send_ipdv_ns: send_ipdv_ns(previous, current).map(abs_i128_ns),
+            receive_ipdv_ns: receive_ipdv_ns(previous, current).map(abs_i128_ns),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CompletedIpdvPair {
+    previous_seq: u32,
+    current_seq: u32,
+    rtt_ipdv_ns: i128,
+    send_ipdv_ns: Option<i128>,
+    receive_ipdv_ns: Option<i128>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -871,6 +911,30 @@ mod tests {
     use super::*;
     use std::time::SystemTime;
 
+    fn unique_sample(seq: u32, rtt_primary_ns: i128) -> UniqueSample {
+        let now = Instant::now();
+        UniqueSample {
+            seq,
+            bytes: 64,
+            rtt_primary_ns,
+            rtt_raw_ns: rtt_primary_ns,
+            rtt_adjusted_ns: None,
+            send_delay_ns: None,
+            receive_delay_ns: None,
+            server_processing_ns: None,
+            received_count: None,
+            received_window: None,
+            client_send_mono: now,
+            client_receive_mono: now,
+            client_send_wall_ns: None,
+            client_receive_wall_ns: None,
+            server_receive_mono_ns: None,
+            server_send_mono_ns: None,
+            server_receive_wall_ns: None,
+            server_send_wall_ns: None,
+        }
+    }
+
     #[test]
     fn running_duration_stats_use_sample_variance() {
         let mut metric = TimeMetric::new(false);
@@ -912,5 +976,77 @@ mod tests {
         assert_eq!(system_time_ns(after), Some(7));
         let now = SystemTime::now();
         assert!(system_time_ns(now).is_some());
+    }
+
+    #[test]
+    fn ipdv_tracker_completes_adjacent_pair() {
+        let mut tracker = IpdvTracker::new(None);
+        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
+
+        let pairs = tracker.insert(unique_sample(1, 14));
+
+        assert_eq!(
+            pairs,
+            vec![CompletedIpdvPair {
+                previous_seq: 0,
+                current_seq: 1,
+                rtt_ipdv_ns: 4,
+                send_ipdv_ns: None,
+                receive_ipdv_ns: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn ipdv_tracker_gap_fill_completes_both_adjacent_pairs() {
+        let mut tracker = IpdvTracker::new(None);
+        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
+        assert!(tracker.insert(unique_sample(2, 20)).is_empty());
+
+        let pairs = tracker.insert(unique_sample(1, 13));
+
+        assert_eq!(
+            pairs,
+            vec![
+                CompletedIpdvPair {
+                    previous_seq: 0,
+                    current_seq: 1,
+                    rtt_ipdv_ns: 3,
+                    send_ipdv_ns: None,
+                    receive_ipdv_ns: None,
+                },
+                CompletedIpdvPair {
+                    previous_seq: 1,
+                    current_seq: 2,
+                    rtt_ipdv_ns: 7,
+                    send_ipdv_ns: None,
+                    receive_ipdv_ns: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn ipdv_tracker_duplicate_sequence_does_not_emit_pair_again() {
+        let mut tracker = IpdvTracker::new(None);
+        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
+        assert_eq!(tracker.insert(unique_sample(1, 14)).len(), 1);
+
+        assert!(tracker.insert(unique_sample(1, 18)).is_empty());
+    }
+
+    #[test]
+    fn ipdv_tracker_bounded_mode_evicts_old_sequence_state() {
+        let mut tracker = IpdvTracker::new(Some(2));
+        assert!(tracker.insert(unique_sample(0, 10)).is_empty());
+        assert_eq!(tracker.insert(unique_sample(1, 14)).len(), 1);
+
+        let pairs = tracker.insert(unique_sample(2, 20));
+
+        assert_eq!(pairs.len(), 1);
+        assert!(!tracker.samples.contains_key(&0));
+        assert!(!tracker.completed_pairs.contains(&0));
+        assert!(!tracker.completed_pairs.contains(&1));
+        assert!(tracker.completed_pairs.contains(&2));
     }
 }
