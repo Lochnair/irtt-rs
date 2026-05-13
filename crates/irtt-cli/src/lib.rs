@@ -89,7 +89,7 @@ pub struct CliArgs {
     #[arg(long)]
     pub loose: bool,
 
-    /// Output format: human, simple, machine, or rtt-us.
+    /// Output format.
     #[arg(long, value_enum, default_value_t = OutputMode::Human)]
     pub output: OutputMode,
 
@@ -201,6 +201,9 @@ pub enum OutputMode {
     Simple,
     /// RTT microseconds only.
     RttUs,
+    /// TUI dashboard with live cumulative statistics.
+    #[cfg(feature = "tui")]
+    Tui,
 }
 
 impl OutputMode {
@@ -320,6 +323,8 @@ pub fn format_event(event: &ClientEvent, mode: OutputMode) -> Option<String> {
         OutputMode::Human => Some(format_human_event(event, None)),
         OutputMode::Machine => Some(format_machine(event)),
         OutputMode::Simple => Some(format_simple(event)),
+        #[cfg(feature = "tui")]
+        OutputMode::Tui => None,
     }
 }
 
