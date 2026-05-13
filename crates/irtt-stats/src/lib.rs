@@ -319,6 +319,14 @@ impl CoreStats {
             ..EventStatsUpdate::default()
         };
 
+        self.account_unique_reply(is_late, &sample);
+        self.record_reply_metrics(&sample);
+        update.ipdv_pairs = self.apply_ipdv_sample(sample.ipdv);
+
+        update
+    }
+
+    fn account_unique_reply(&mut self, is_late: bool, sample: &ReplySample) {
         self.events.echo_replies += u64::from(!is_late);
         self.events.late_unique_replies += u64::from(is_late);
         self.packets.packets_received += 1;
@@ -335,7 +343,9 @@ impl CoreStats {
         if let Some(window) = sample.received_window {
             self.packets.server_received_window = Some(window);
         }
+    }
 
+    fn record_reply_metrics(&mut self, sample: &ReplySample) {
         self.rtt_primary.push_ns(sample.ipdv.rtt_primary_ns);
         self.rtt_raw.push_ns(sample.rtt_raw_ns);
         if let Some(adjusted) = sample.rtt_adjusted_ns {
@@ -350,10 +360,6 @@ impl CoreStats {
         if let Some(delay) = sample.receive_delay_ns {
             self.receive_delay.push_ns(delay);
         }
-
-        update.ipdv_pairs = self.apply_ipdv_sample(sample.ipdv);
-
-        update
     }
 
     fn apply_ipdv_sample(&mut self, sample: IpdvSample) -> Vec<IpdvPairUpdate> {
