@@ -273,7 +273,6 @@ impl CoreStats {
     }
 
     fn apply(&mut self, event: StatsEvent) -> EventStatsUpdate {
-        let mut update = EventStatsUpdate::default();
         match event {
             StatsEvent::Sent {
                 bytes,
@@ -281,95 +280,126 @@ impl CoreStats {
                 timer_error_ns,
                 ..
             } => {
-                self.events.sent_events += 1;
-                self.packets.packets_sent += 1;
-                self.packets.bytes_sent = self.packets.bytes_sent.saturating_add(bytes as u64);
-                self.send_call.push_ns(send_call_ns);
-                self.timer_error.push_ns(timer_error_ns);
+                self.apply_sent(bytes, send_call_ns, timer_error_ns);
+                EventStatsUpdate::default()
             }
             StatsEvent::UniqueReply {
                 is_late, sample, ..
-            } => {
-                let sample = *sample;
-                self.events.echo_replies += u64::from(!is_late);
-                self.events.late_unique_replies += u64::from(is_late);
-                self.packets.packets_received += 1;
-                self.packets.unique_replies += 1;
-                self.packets.late_packets += u64::from(is_late);
-                self.packets.bytes_received = self
-                    .packets
-                    .bytes_received
-                    .saturating_add(sample.bytes as u64);
-                update.contributed_sample = true;
-                if let Some(count) = sample.received_count {
-                    self.packets.server_packets_received = Some(u64::from(count));
-                }
-                if let Some(window) = sample.received_window {
-                    self.packets.server_received_window = Some(window);
-                }
-
-                self.rtt_primary.push_ns(sample.ipdv.rtt_primary_ns);
-                self.rtt_raw.push_ns(sample.rtt_raw_ns);
-                if let Some(adjusted) = sample.rtt_adjusted_ns {
-                    self.rtt_adjusted.push_ns(adjusted);
-                }
-                if let Some(processing) = sample.server_processing_ns {
-                    self.server_processing.push_ns(processing);
-                }
-                if let Some(delay) = sample.send_delay_ns {
-                    self.send_delay.push_ns(delay);
-                }
-                if let Some(delay) = sample.receive_delay_ns {
-                    self.receive_delay.push_ns(delay);
-                }
-
-                for pair in self.ipdv_tracker.insert(sample.ipdv) {
-                    let Some(rtt_ipdv) = duration_from_non_negative_i128_ns(pair.rtt_ipdv_ns)
-                    else {
-                        continue;
-                    };
-                    let send_ipdv = pair
-                        .send_ipdv_ns
-                        .and_then(duration_from_non_negative_i128_ns);
-                    let receive_ipdv = pair
-                        .receive_ipdv_ns
-                        .and_then(duration_from_non_negative_i128_ns);
-
-                    self.ipdv_round_trip.push_ns(pair.rtt_ipdv_ns);
-
-                    if let Some(value) = pair.send_ipdv_ns {
-                        self.ipdv_send.push_ns(value);
-                    }
-
-                    if let Some(value) = pair.receive_ipdv_ns {
-                        self.ipdv_receive.push_ns(value);
-                    }
-
-                    update.ipdv_pairs.push(IpdvPairUpdate {
-                        previous_seq: pair.previous_seq,
-                        current_seq: pair.current_seq,
-                        rtt_ipdv,
-                        send_ipdv,
-                        receive_ipdv,
-                    });
-                }
-            }
+            } => self.apply_unique_reply(is_late, *sample),
             StatsEvent::DuplicateReply { .. } => {
-                self.events.duplicate_replies += 1;
-                self.packets.packets_received += 1;
-                self.packets.duplicates += 1;
+                self.apply_duplicate_reply();
+                EventStatsUpdate::default()
             }
             StatsEvent::Loss { .. } => {
-                self.events.loss_events += 1;
+                self.apply_loss();
+                EventStatsUpdate::default()
             }
             StatsEvent::Warning { .. } => {
-                self.events.warning_events += 1;
+                self.apply_warning();
+                EventStatsUpdate::default()
             }
             StatsEvent::UntrackedLate { .. } => {
-                self.events.untracked_late_replies += 1;
+                self.apply_untracked_late();
+                EventStatsUpdate::default()
             }
         }
+    }
+
+    fn apply_sent(&mut self, bytes: usize, send_call_ns: i128, timer_error_ns: i128) {
+        self.events.sent_events += 1;
+        self.packets.packets_sent += 1;
+        self.packets.bytes_sent = self.packets.bytes_sent.saturating_add(bytes as u64);
+        self.send_call.push_ns(send_call_ns);
+        self.timer_error.push_ns(timer_error_ns);
+    }
+
+    fn apply_unique_reply(&mut self, is_late: bool, sample: ReplySample) -> EventStatsUpdate {
+        let mut update = EventStatsUpdate {
+            contributed_sample: true,
+            ..EventStatsUpdate::default()
+        };
+
+        self.events.echo_replies += u64::from(!is_late);
+        self.events.late_unique_replies += u64::from(is_late);
+        self.packets.packets_received += 1;
+        self.packets.unique_replies += 1;
+        self.packets.late_packets += u64::from(is_late);
+        self.packets.bytes_received = self
+            .packets
+            .bytes_received
+            .saturating_add(sample.bytes as u64);
+
+        if let Some(count) = sample.received_count {
+            self.packets.server_packets_received = Some(u64::from(count));
+        }
+        if let Some(window) = sample.received_window {
+            self.packets.server_received_window = Some(window);
+        }
+
+        self.rtt_primary.push_ns(sample.ipdv.rtt_primary_ns);
+        self.rtt_raw.push_ns(sample.rtt_raw_ns);
+        if let Some(adjusted) = sample.rtt_adjusted_ns {
+            self.rtt_adjusted.push_ns(adjusted);
+        }
+        if let Some(processing) = sample.server_processing_ns {
+            self.server_processing.push_ns(processing);
+        }
+        if let Some(delay) = sample.send_delay_ns {
+            self.send_delay.push_ns(delay);
+        }
+        if let Some(delay) = sample.receive_delay_ns {
+            self.receive_delay.push_ns(delay);
+        }
+
+        for pair in self.ipdv_tracker.insert(sample.ipdv) {
+            let Some(rtt_ipdv) = duration_from_non_negative_i128_ns(pair.rtt_ipdv_ns) else {
+                continue;
+            };
+            let send_ipdv = pair
+                .send_ipdv_ns
+                .and_then(duration_from_non_negative_i128_ns);
+            let receive_ipdv = pair
+                .receive_ipdv_ns
+                .and_then(duration_from_non_negative_i128_ns);
+
+            self.ipdv_round_trip.push_ns(pair.rtt_ipdv_ns);
+
+            if let Some(value) = pair.send_ipdv_ns {
+                self.ipdv_send.push_ns(value);
+            }
+
+            if let Some(value) = pair.receive_ipdv_ns {
+                self.ipdv_receive.push_ns(value);
+            }
+
+            update.ipdv_pairs.push(IpdvPairUpdate {
+                previous_seq: pair.previous_seq,
+                current_seq: pair.current_seq,
+                rtt_ipdv,
+                send_ipdv,
+                receive_ipdv,
+            });
+        }
+
         update
+    }
+
+    fn apply_duplicate_reply(&mut self) {
+        self.events.duplicate_replies += 1;
+        self.packets.packets_received += 1;
+        self.packets.duplicates += 1;
+    }
+
+    fn apply_loss(&mut self) {
+        self.events.loss_events += 1;
+    }
+
+    fn apply_warning(&mut self) {
+        self.events.warning_events += 1;
+    }
+
+    fn apply_untracked_late(&mut self) {
+        self.events.untracked_late_replies += 1;
     }
 
     fn snapshot(&self) -> Snapshot {
