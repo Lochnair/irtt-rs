@@ -25,6 +25,18 @@ const RECV_BUDGET: RecvBudget = RecvBudget { max_packets: 16 };
 const MAX_FINAL_DRAIN: Duration = Duration::from_secs(30);
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
+#[cfg(feature = "stats")]
+const FINITE_STATS_BYTES_PER_PROBE: u64 = 500;
+#[cfg(feature = "stats")]
+const MIB: u64 = 1024 * 1024;
+#[cfg(feature = "stats")]
+const GIB: u64 = 1024 * MIB;
+#[cfg(feature = "stats")]
+const FINITE_STATS_MEMORY_WARNING_BYTES: u64 = 128 * MIB;
+#[cfg(feature = "stats")]
+const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
+#[cfg(feature = "stats")]
+const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
 
 fn main() -> ExitCode {
     let args = CliArgs::parse();
@@ -52,6 +64,10 @@ fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(), ctr
 fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
     let mode = args.output;
     let continuous = args.is_continuous();
+    #[cfg(feature = "stats")]
+    if let Some(warning) = finite_stats_memory_warning(&args) {
+        eprintln!("{warning}");
+    }
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     #[cfg(feature = "stats")]
     let mut stats = StatsCollector::new(stats_config(continuous));
@@ -258,6 +274,60 @@ fn stats_config(continuous: bool) -> StatsConfig {
     }
 }
 
+#[cfg(feature = "stats")]
+fn expected_probe_count(duration: Duration, interval: Duration) -> u64 {
+    let interval_nanos = interval.as_nanos();
+    if interval_nanos == 0 {
+        return u64::MAX;
+    }
+
+    let expected = duration
+        .as_nanos()
+        .saturating_add(interval_nanos.saturating_sub(1))
+        / interval_nanos;
+    expected.min(u128::from(u64::MAX)) as u64
+}
+
+#[cfg(feature = "stats")]
+fn estimate_finite_stats_memory_bytes(expected_probes: u64) -> u64 {
+    expected_probes.saturating_mul(FINITE_STATS_BYTES_PER_PROBE)
+}
+
+#[cfg(feature = "stats")]
+fn finite_stats_memory_warning(args: &CliArgs) -> Option<String> {
+    if args.is_continuous() || args.duration.is_zero() {
+        return None;
+    }
+
+    let expected_probes = expected_probe_count(args.duration, args.interval);
+    let estimated_bytes = estimate_finite_stats_memory_bytes(expected_probes);
+    if estimated_bytes < FINITE_STATS_MEMORY_WARNING_BYTES {
+        return None;
+    }
+
+    let formatted = format_bytes_for_warning(estimated_bytes);
+    let guidance = if estimated_bytes >= FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES {
+        "this may be unsuitable on memory-constrained systems"
+    } else if estimated_bytes >= FINITE_STATS_MEMORY_STRONG_WARNING_BYTES {
+        "consider shortening the run, increasing the interval, or using continuous mode"
+    } else {
+        "use continuous mode for bounded-memory long-running tests"
+    };
+
+    Some(format!(
+        "irtt-rs: warning: finite exact statistics may retain about {formatted} for this run; {guidance}"
+    ))
+}
+
+#[cfg(feature = "stats")]
+fn format_bytes_for_warning(bytes: u64) -> String {
+    if bytes >= GIB {
+        format!("{} GiB", bytes.saturating_add(GIB / 2) / GIB)
+    } else {
+        format!("{} MiB", bytes.saturating_add(MIB / 2) / MIB)
+    }
+}
+
 fn final_drain_duration(probe_timeout: Duration) -> Duration {
     probe_timeout.min(MAX_FINAL_DRAIN)
 }
@@ -339,6 +409,12 @@ mod tests {
             bytes: 64,
             packet_meta: PacketMeta::default(),
         }
+    }
+
+    fn cli_args(args: &[&str]) -> CliArgs {
+        let mut argv = vec!["irtt-rs"];
+        argv.extend_from_slice(args);
+        CliArgs::try_parse_from(argv).unwrap()
     }
 
     #[test]
@@ -463,6 +539,91 @@ mod tests {
         }
 
         assert_eq!(collector.snapshot().rtt.primary.median_ns, None);
+    }
+
+    #[test]
+    fn finite_stats_memory_warning_skips_continuous_mode() {
+        let args = cli_args(&["--duration", "0", "--interval", "1ms", "127.0.0.1:2112"]);
+
+        assert_eq!(finite_stats_memory_warning(&args), None);
+    }
+
+    #[test]
+    fn finite_stats_memory_warning_skips_small_finite_run() {
+        let args = cli_args(&[
+            "--duration",
+            "1000ms",
+            "--interval",
+            "1ms",
+            "127.0.0.1:2112",
+        ]);
+
+        assert_eq!(finite_stats_memory_warning(&args), None);
+    }
+
+    #[test]
+    fn finite_stats_memory_warning_reports_128_mib_tier() {
+        let expected_probes =
+            FINITE_STATS_MEMORY_WARNING_BYTES.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
+        let args = cli_args(&[
+            "--duration",
+            &format!("{expected_probes}ms"),
+            "--interval",
+            "1ms",
+            "127.0.0.1:2112",
+        ]);
+
+        let warning = finite_stats_memory_warning(&args).unwrap();
+        assert!(warning.contains("about 128 MiB"));
+        assert!(warning.contains("bounded-memory long-running tests"));
+    }
+
+    #[test]
+    fn finite_stats_memory_warning_reports_512_mib_tier() {
+        let expected_probes =
+            FINITE_STATS_MEMORY_STRONG_WARNING_BYTES.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
+        let args = cli_args(&[
+            "--duration",
+            &format!("{expected_probes}ms"),
+            "--interval",
+            "1ms",
+            "127.0.0.1:2112",
+        ]);
+
+        let warning = finite_stats_memory_warning(&args).unwrap();
+        assert!(warning.contains("about 512 MiB"));
+        assert!(warning.contains("shortening the run"));
+        assert!(warning.contains("increasing the interval"));
+    }
+
+    #[test]
+    fn finite_stats_memory_warning_reports_1_gib_tier() {
+        let expected_probes =
+            FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
+        let args = cli_args(&[
+            "--duration",
+            &format!("{expected_probes}ms"),
+            "--interval",
+            "1ms",
+            "127.0.0.1:2112",
+        ]);
+
+        let warning = finite_stats_memory_warning(&args).unwrap();
+        assert!(warning.contains("about 1 GiB"));
+        assert!(warning.contains("memory-constrained systems"));
+    }
+
+    #[test]
+    fn expected_probe_count_rounds_up() {
+        assert_eq!(
+            expected_probe_count(Duration::from_millis(1001), Duration::from_secs(1)),
+            2
+        );
+    }
+
+    #[test]
+    fn estimate_finite_stats_memory_bytes_saturates() {
+        assert_eq!(estimate_finite_stats_memory_bytes(u64::MAX), u64::MAX);
     }
 
     #[test]
