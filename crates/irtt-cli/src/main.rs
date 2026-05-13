@@ -62,6 +62,17 @@ fn install_signal_handler(shutdown_requested: Arc<AtomicBool>) -> Result<(), ctr
 }
 
 fn run(args: CliArgs, shutdown_requested: &AtomicBool) -> Result<(), Box<dyn std::error::Error>> {
+    match args.output {
+        OutputMode::Human | OutputMode::Machine | OutputMode::Simple | OutputMode::RttUs => {
+            run_stream(args, shutdown_requested)
+        }
+    }
+}
+
+fn run_stream(
+    args: CliArgs,
+    shutdown_requested: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mode = args.output;
     let continuous = args.is_continuous();
     #[cfg(feature = "stats")]
