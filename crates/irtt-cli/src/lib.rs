@@ -1175,45 +1175,23 @@ mod tests {
     }
 
     #[test]
-    fn machine_echo_reply_metadata_unavailable_prints_none() {
-        let line = format_event(&reply_event(), OutputMode::Machine).unwrap();
+    fn machine_echo_reply_metadata_prints_observed_and_unavailable_values() {
+        let cases = [
+            (PacketMeta::default(), ("none", "none", "none", "none")),
+            (packet_meta(0, 0, 0), ("0", "0", "0", "none")),
+            (packet_meta(186, 46, 2), ("186", "46", "2", "none")),
+            (
+                packet_meta_with_timestamp(Some(UNIX_EPOCH + Duration::new(1, 234))),
+                ("none", "none", "none", "1000000234"),
+            ),
+        ];
 
-        assert_machine_packet_meta(&line, "none", "none", "none", "none");
-    }
+        for (packet_meta, (traffic_class, dscp, ecn, kernel_rx_ns)) in cases {
+            let line =
+                format_event(&reply_event_with_meta(packet_meta), OutputMode::Machine).unwrap();
 
-    #[test]
-    fn machine_echo_reply_metadata_observed_zero_prints_zero() {
-        let line = format_event(
-            &reply_event_with_meta(packet_meta(0, 0, 0)),
-            OutputMode::Machine,
-        )
-        .unwrap();
-
-        assert_machine_packet_meta(&line, "0", "0", "0", "none");
-    }
-
-    #[test]
-    fn machine_echo_reply_metadata_dscp_46_ecn_2_prints_values() {
-        let line = format_event(
-            &reply_event_with_meta(packet_meta(186, 46, 2)),
-            OutputMode::Machine,
-        )
-        .unwrap();
-
-        assert_machine_packet_meta(&line, "186", "46", "2", "none");
-    }
-
-    #[test]
-    fn machine_echo_reply_metadata_kernel_rx_timestamp_prints_ns() {
-        let line = format_event(
-            &reply_event_with_meta(packet_meta_with_timestamp(Some(
-                UNIX_EPOCH + Duration::new(1, 234),
-            ))),
-            OutputMode::Machine,
-        )
-        .unwrap();
-
-        assert_machine_packet_meta(&line, "none", "none", "none", "1000000234");
+            assert_machine_packet_meta(&line, traffic_class, dscp, ecn, kernel_rx_ns);
+        }
     }
 
     #[test]

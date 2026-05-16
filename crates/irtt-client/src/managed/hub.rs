@@ -290,14 +290,16 @@ mod tests {
         }
     }
 
-    #[test]
-    fn publishes_to_one_subscriber() {
-        let hub = EventHub::new();
-        let sub = hub.subscribe(SubscriberConfig::default()).unwrap();
-
-        hub.publish(event(1));
-
-        assert_eq!(event_message(sub.try_recv().unwrap().unwrap()), "event-1");
+    fn assert_next(
+        sub: &EventSubscription,
+        expected: Result<Option<&str>, EventSubscriptionError>,
+    ) {
+        match (sub.try_recv(), expected) {
+            (Ok(Some(event)), Ok(Some(message))) => assert_eq!(event_message(event), message),
+            (Ok(None), Ok(None)) => {}
+            (Err(actual), Err(expected)) => assert_eq!(actual, expected),
+            (actual, expected) => panic!("expected {expected:?}, got {actual:?}"),
+        }
     }
 
     #[test]
@@ -313,56 +315,40 @@ mod tests {
     }
 
     #[test]
-    fn drop_newest_keeps_existing_events() {
-        let hub = EventHub::new();
-        let sub = hub
-            .subscribe(SubscriberConfig {
-                capacity: 1,
-                overflow: SubscriberOverflow::DropNewest,
-            })
-            .unwrap();
+    fn full_subscriber_overflow_policy_is_applied() {
+        let cases = [
+            (
+                SubscriberOverflow::DropNewest,
+                Ok(Some("event-1")),
+                Ok(None),
+            ),
+            (
+                SubscriberOverflow::DropOldest,
+                Ok(Some("event-2")),
+                Ok(None),
+            ),
+            (
+                SubscriberOverflow::Disconnect,
+                Err(EventSubscriptionError::Disconnected),
+                Err(EventSubscriptionError::Disconnected),
+            ),
+        ];
 
-        hub.publish(event(1));
-        hub.publish(event(2));
+        for (overflow, first_expected, second_expected) in cases {
+            let hub = EventHub::new();
+            let sub = hub
+                .subscribe(SubscriberConfig {
+                    capacity: 1,
+                    overflow,
+                })
+                .unwrap();
 
-        assert_eq!(event_message(sub.try_recv().unwrap().unwrap()), "event-1");
-        assert!(sub.try_recv().unwrap().is_none());
-    }
+            hub.publish(event(1));
+            hub.publish(event(2));
 
-    #[test]
-    fn drop_oldest_replaces_existing_events() {
-        let hub = EventHub::new();
-        let sub = hub
-            .subscribe(SubscriberConfig {
-                capacity: 1,
-                overflow: SubscriberOverflow::DropOldest,
-            })
-            .unwrap();
-
-        hub.publish(event(1));
-        hub.publish(event(2));
-
-        assert_eq!(event_message(sub.try_recv().unwrap().unwrap()), "event-2");
-        assert!(sub.try_recv().unwrap().is_none());
-    }
-
-    #[test]
-    fn disconnect_removes_full_subscriber() {
-        let hub = EventHub::new();
-        let sub = hub
-            .subscribe(SubscriberConfig {
-                capacity: 1,
-                overflow: SubscriberOverflow::Disconnect,
-            })
-            .unwrap();
-
-        hub.publish(event(1));
-        hub.publish(event(2));
-
-        assert_eq!(
-            sub.try_recv().unwrap_err(),
-            EventSubscriptionError::Disconnected
-        );
+            assert_next(&sub, first_expected);
+            assert_next(&sub, second_expected);
+        }
     }
 
     #[test]
