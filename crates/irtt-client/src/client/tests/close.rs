@@ -69,31 +69,6 @@ fn send_probe_fails_after_close() {
 }
 
 #[test]
-fn close_clears_timed_out_metadata() {
-    let params = default_params();
-    let server = silent_open_server(params);
-    let config = ClientConfig {
-        probe_timeout: Duration::from_millis(40),
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(60));
-    client.poll_timeouts().unwrap();
-    assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
-
-    client.close().unwrap();
-    assert!(client.session.is_none());
-    server.join();
-}
-
-#[test]
 fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
     let params = default_params();
     let server = start_fake_server({

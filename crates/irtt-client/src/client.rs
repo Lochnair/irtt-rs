@@ -457,7 +457,7 @@ impl Client {
                 .is_some_and(|h| sequence_is_before(wire_seq, h));
             let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
 
-            update_highest_received(session, wire_seq);
+            update_highest_received(&mut session.highest_received_seq, wire_seq);
             session.completed.insert(wire_seq);
 
             let mut events = Vec::new();
@@ -494,7 +494,7 @@ impl Client {
             }
             Ok(events)
         } else if session.completed.contains(wire_seq) {
-            update_highest_received(session, wire_seq);
+            update_highest_received(&mut session.highest_received_seq, wire_seq);
             Ok(vec![ClientEvent::DuplicateReply {
                 seq: wire_seq,
                 remote: self.remote,
@@ -507,7 +507,7 @@ impl Client {
             let one_way = compute_one_way(&timed_out.sent_at, &now, &reply.timestamps);
             let received_stats = build_received_stats(&reply);
             let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
-            update_highest_received(session, wire_seq);
+            update_highest_received(&mut session.highest_received_seq, wire_seq);
             session.completed.insert(wire_seq);
 
             let mut events = vec![ClientEvent::LateReply {
@@ -690,8 +690,8 @@ impl Client {
     }
 }
 
-fn update_highest_received(session: &mut ActiveSession, wire_seq: u32) {
-    session.highest_received_seq = Some(session.highest_received_seq.map_or(wire_seq, |h| {
+fn update_highest_received(highest_received_seq: &mut Option<u32>, wire_seq: u32) {
+    *highest_received_seq = Some(highest_received_seq.map_or(wire_seq, |h| {
         if sequence_is_after(wire_seq, h) {
             wire_seq
         } else {
