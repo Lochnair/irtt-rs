@@ -1,10 +1,4 @@
 use super::*;
-use std::time::Instant;
-
-use crate::{
-    probe::{CompletedSet, PendingMap, TimedOutMap},
-    session::ActiveSession,
-};
 
 #[test]
 fn sequence_ordering_handles_normal_and_wrapped_values() {
@@ -24,21 +18,10 @@ fn sequence_ordering_handles_normal_and_wrapped_values() {
 
 #[test]
 fn highest_received_seq_updates_across_wrap() {
-    let mut session = ActiveSession {
-        next_wire_seq: 0,
-        highest_received_seq: Some(u32::MAX),
-        packets_sent: 0,
-        start_mono: Instant::now(),
-        end_mono: None,
-        next_send_at: Instant::now(),
-        pending: PendingMap::new(8),
-        timed_out: TimedOutMap::new(8),
-        completed: CompletedSet::new(8),
-        sending_done: false,
-    };
+    let mut highest = Some(u32::MAX);
 
-    update_highest_received(&mut session, 0);
-    assert_eq!(session.highest_received_seq, Some(0));
-    update_highest_received(&mut session, u32::MAX);
-    assert_eq!(session.highest_received_seq, Some(0));
+    update_highest_received(&mut highest, 0);
+    assert_eq!(highest, Some(0));
+    update_highest_received(&mut highest, u32::MAX);
+    assert_eq!(highest, Some(0));
 }

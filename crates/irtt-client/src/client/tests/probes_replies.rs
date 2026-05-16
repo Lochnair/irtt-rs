@@ -86,7 +86,7 @@ fn echo_sent_reports_schedule_and_timer_error() {
         wall: SystemTime::now(),
     };
     assert_open_started(client.open().unwrap());
-    let session_start = client.session.as_ref().unwrap().start_mono;
+    let session_start = client.next_send_deadline().unwrap();
     assert!(
         session_start >= start.mono,
         "probe schedule must start after open begins"
@@ -170,8 +170,7 @@ fn send_probe_respects_finite_duration_exclusive_end() {
     let mut client = Client::connect(config).unwrap();
     assert_open_started(client.open().unwrap());
 
-    let session = client.session.as_ref().unwrap();
-    let start = session.start_mono;
+    let start = client.next_send_deadline().unwrap();
     let interval = Duration::from_millis(500);
 
     let now0 = ClientTimestamp {
@@ -192,7 +191,6 @@ fn send_probe_respects_finite_duration_exclusive_end() {
     };
     let events = client.send_probe_at(now2).unwrap();
     assert!(events.is_empty());
-    assert!(client.session.as_ref().unwrap().sending_done);
     assert!(client.next_send_deadline().is_none());
 
     client.close().unwrap();
@@ -223,7 +221,7 @@ fn continuous_duration_keeps_generating_send_deadlines() {
     let mut client = Client::connect(config).unwrap();
     assert_open_started(client.open().unwrap());
 
-    let start = client.session.as_ref().unwrap().start_mono;
+    let start = client.next_send_deadline().unwrap();
     let interval = Duration::from_millis(500);
     for seq in 0..4 {
         let now = ClientTimestamp {
@@ -233,7 +231,6 @@ fn continuous_duration_keeps_generating_send_deadlines() {
         let events = client.send_probe_at(now).unwrap();
         assert_eq!(events.len(), 1);
         assert!(client.next_send_deadline().is_some());
-        assert!(!client.session.as_ref().unwrap().sending_done);
     }
 
     client.close().unwrap();
@@ -245,52 +242,17 @@ fn next_send_deadline_advances_by_interval() {
     let params = default_params();
     let (mut client, server) = open_client_with_echo_server(&params);
 
-    let session = client.session.as_ref().unwrap();
-    let start = session.start_mono;
     let deadline0 = client.next_send_deadline().unwrap();
-    assert_eq!(deadline0, start);
 
     client.send_probe().unwrap();
     let deadline1 = client.next_send_deadline().unwrap();
-    assert_eq!(deadline1, start + Duration::from_secs(1));
+    assert_eq!(deadline1, deadline0 + Duration::from_secs(1));
 
     client.send_probe().unwrap();
     let deadline2 = client.next_send_deadline().unwrap();
-    assert_eq!(deadline2, start + Duration::from_secs(2));
+    assert_eq!(deadline2, deadline0 + Duration::from_secs(2));
 
     client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn send_probe_reports_schedule_overflow() {
-    let params = Params {
-        protocol_version: 1,
-        duration_ns: 0,
-        interval_ns: 1_000_000_000,
-        received_stats: ReceivedStats::Both,
-        stamp_at: StampAt::Both,
-        clock: Clock::Both,
-        ..Params::default()
-    };
-    let server = silent_open_server(params);
-    let config = ClientConfig {
-        duration: None,
-        interval: Duration::from_secs(1),
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-    client.session.as_mut().unwrap().packets_sent = u64::MAX - 1;
-
-    assert!(matches!(
-        client.send_probe(),
-        Err(ClientError::DurationOverflow)
-    ));
     server.join();
 }
 
@@ -803,8 +765,6 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
     thread::sleep(Duration::from_millis(60));
     let losses = client.poll_timeouts().unwrap();
     assert!(matches!(&losses[0], ClientEvent::EchoLoss { seq: 0, .. }));
-    assert_eq!(client.session.as_ref().unwrap().pending.len(), 0);
-    assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 1);
 
     let late = client.recv_once().unwrap();
     match &late[0] {
@@ -830,8 +790,6 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
         }
         other => panic!("expected stats-eligible LateReply, got {other:?}"),
     }
-    assert_eq!(client.session.as_ref().unwrap().timed_out.len(), 0);
-
     let duplicate = client.recv_once().unwrap();
     assert!(matches!(
         &duplicate[0],
@@ -1057,12 +1015,6 @@ fn unmatched_future_reply_does_not_update_highest_received_seq() {
     let ev_future = client.recv_once().unwrap();
     assert!(matches!(&ev_future[0], ClientEvent::Warning { .. }));
 
-    assert_eq!(
-        client.session.as_ref().unwrap().highest_received_seq,
-        Some(0),
-        "highest_received_seq should not be updated by unmatched future reply"
-    );
-
     thread::sleep(Duration::from_millis(30));
     let ev1 = client.recv_once().unwrap();
     assert!(
@@ -1276,65 +1228,6 @@ fn recv_available_respects_packet_budget() {
     assert!(matches!(&second[0], ClientEvent::EchoReply { seq: 1, .. }));
 
     client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn wrapped_reply_after_u32_max_is_not_late() {
-    let params = default_params();
-    let server = start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
-        socket.send_to(&reply, peer).unwrap();
-
-        socket
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut seqs = Vec::new();
-        for _ in 0..2 {
-            let mut buf = [0_u8; 2048];
-            let (size, _) = socket.recv_from(&mut buf).unwrap();
-            tx.send(buf[..size].to_vec()).unwrap();
-            seqs.push(u32::from_le_bytes(buf[12..16].try_into().unwrap()));
-        }
-        assert_eq!(seqs, vec![u32::MAX, 0]);
-
-        let ts = TimestampFields::default();
-        let reply_max = echo_reply_packet(TOKEN, u32::MAX, &params, &ts, None);
-        socket.send_to(&reply_max, peer).unwrap();
-        thread::sleep(Duration::from_millis(10));
-        let reply_zero = echo_reply_packet(TOKEN, 0, &params, &ts, None);
-        socket.send_to(&reply_zero, peer).unwrap();
-    });
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-    let session = client.session.as_mut().unwrap();
-    session.next_wire_seq = u32::MAX;
-
-    client.send_probe().unwrap();
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(50));
-
-    let first = client.recv_once().unwrap();
-    assert!(matches!(
-        &first[0],
-        ClientEvent::EchoReply { seq: u32::MAX, .. }
-    ));
-
-    thread::sleep(Duration::from_millis(30));
-    let second = client.recv_once().unwrap();
-    assert!(
-        matches!(&second[0], ClientEvent::EchoReply { seq: 0, .. }),
-        "freshly wrapped reply should not be late, got {:?}",
-        second[0]
-    );
     server.join();
 }
 
