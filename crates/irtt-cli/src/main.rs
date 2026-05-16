@@ -599,75 +599,53 @@ mod tests {
     }
 
     #[test]
-    fn finite_stats_memory_warning_skips_continuous_mode() {
-        let args = cli_args(&["--duration", "0", "--interval", "1ms", "127.0.0.1:2112"]);
-
-        assert_eq!(finite_stats_memory_warning(&args), None);
+    fn finite_stats_memory_warning_skips_non_warning_runs() {
+        for args in [
+            cli_args(&["--duration", "0", "--interval", "1ms", "127.0.0.1:2112"]),
+            cli_args(&[
+                "--duration",
+                "1000ms",
+                "--interval",
+                "1ms",
+                "127.0.0.1:2112",
+            ]),
+        ] {
+            assert_eq!(finite_stats_memory_warning(&args), None);
+        }
     }
 
     #[test]
-    fn finite_stats_memory_warning_skips_small_finite_run() {
-        let args = cli_args(&[
-            "--duration",
-            "1000ms",
-            "--interval",
-            "1ms",
-            "127.0.0.1:2112",
-        ]);
+    fn finite_stats_memory_warning_reports_threshold_tiers() {
+        for (threshold, size, guidance) in [
+            (
+                FINITE_STATS_MEMORY_WARNING_BYTES,
+                "about 128 MiB",
+                "bounded-memory long-running tests",
+            ),
+            (
+                FINITE_STATS_MEMORY_STRONG_WARNING_BYTES,
+                "about 512 MiB",
+                "shortening the run",
+            ),
+            (
+                FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES,
+                "about 1 GiB",
+                "memory-constrained systems",
+            ),
+        ] {
+            let expected_probes = threshold.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
+            let args = cli_args(&[
+                "--duration",
+                &format!("{expected_probes}ms"),
+                "--interval",
+                "1ms",
+                "127.0.0.1:2112",
+            ]);
 
-        assert_eq!(finite_stats_memory_warning(&args), None);
-    }
-
-    #[test]
-    fn finite_stats_memory_warning_reports_128_mib_tier() {
-        let expected_probes =
-            FINITE_STATS_MEMORY_WARNING_BYTES.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
-        let args = cli_args(&[
-            "--duration",
-            &format!("{expected_probes}ms"),
-            "--interval",
-            "1ms",
-            "127.0.0.1:2112",
-        ]);
-
-        let warning = finite_stats_memory_warning(&args).unwrap();
-        assert!(warning.contains("about 128 MiB"));
-        assert!(warning.contains("bounded-memory long-running tests"));
-    }
-
-    #[test]
-    fn finite_stats_memory_warning_reports_512_mib_tier() {
-        let expected_probes =
-            FINITE_STATS_MEMORY_STRONG_WARNING_BYTES.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
-        let args = cli_args(&[
-            "--duration",
-            &format!("{expected_probes}ms"),
-            "--interval",
-            "1ms",
-            "127.0.0.1:2112",
-        ]);
-
-        let warning = finite_stats_memory_warning(&args).unwrap();
-        assert!(warning.contains("about 512 MiB"));
-        assert!(warning.contains("shortening the run"));
-        assert!(warning.contains("increasing the interval"));
-    }
-
-    #[test]
-    fn finite_stats_memory_warning_reports_1_gib_tier() {
-        let expected_probes =
-            FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
-        let args = cli_args(&[
-            "--duration",
-            &format!("{expected_probes}ms"),
-            "--interval",
-            "1ms",
-            "127.0.0.1:2112",
-        ]);
-
-        let warning = finite_stats_memory_warning(&args).unwrap();
-        assert!(warning.contains("about 1 GiB"));
-        assert!(warning.contains("memory-constrained systems"));
+            let warning = finite_stats_memory_warning(&args).unwrap();
+            assert!(warning.contains(size));
+            assert!(warning.contains(guidance));
+        }
     }
 
     #[test]

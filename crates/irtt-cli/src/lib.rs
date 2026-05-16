@@ -971,15 +971,12 @@ mod tests {
     }
 
     #[test]
-    fn duration_zero_selects_continuous_config() {
+    fn cli_options_map_to_client_config() {
         let args = parse(&["--duration", "0", "127.0.0.1:2112"]).unwrap();
         assert!(args.is_continuous());
         assert_eq!(args.duration, Duration::ZERO);
         assert_eq!(args.to_client_config().duration, None);
-    }
 
-    #[test]
-    fn parses_output_clock_and_timestamp_modes() {
         let args = parse(&[
             "--output",
             "machine",
@@ -994,6 +991,7 @@ mod tests {
         assert_eq!(args.clock, ClockArg::Wall);
         assert_eq!(args.timestamp_mode(), TimestampArg::Send);
         assert_eq!(args.to_client_config().stamp_at, StampAt::Send);
+        assert_eq!(args.to_client_config().clock, Clock::Wall);
 
         let args = parse(&[
             "--output",
@@ -1009,13 +1007,11 @@ mod tests {
         assert_eq!(args.clock, ClockArg::Monotonic);
         assert_eq!(args.timestamp_mode(), TimestampArg::Receive);
         assert_eq!(args.to_client_config().stamp_at, StampAt::Receive);
+        assert_eq!(args.to_client_config().clock, Clock::Monotonic);
 
         let args = parse(&["--output", "human", "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.output, OutputMode::Human);
-    }
 
-    #[test]
-    fn maps_tstamp_modes() {
         for (value, expected) in [
             ("none", StampAt::None),
             ("send", StampAt::Send),
@@ -1026,29 +1022,11 @@ mod tests {
             let args = parse(&["--tstamp", value, "127.0.0.1:2112"]).unwrap();
             assert_eq!(args.to_client_config().stamp_at, expected);
         }
-    }
 
-    #[test]
-    fn timestamps_alias_accepts_midpoint() {
         let args = parse(&["--timestamps", "midpoint", "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.timestamp_mode(), TimestampArg::Midpoint);
         assert_eq!(args.to_client_config().stamp_at, StampAt::Midpoint);
-    }
 
-    #[test]
-    fn rejects_duplicate_timestamp_options() {
-        assert!(parse(&[
-            "--tstamp",
-            "send",
-            "--timestamps",
-            "receive",
-            "127.0.0.1:2112"
-        ])
-        .is_err());
-    }
-
-    #[test]
-    fn maps_received_stats_modes() {
         for (value, expected) in [
             ("none", ReceivedStats::None),
             ("count", ReceivedStats::Count),
@@ -1061,10 +1039,7 @@ mod tests {
 
         let args = parse(&["127.0.0.1:2112"]).unwrap();
         assert_eq!(args.to_client_config().received_stats, ReceivedStats::Both);
-    }
 
-    #[test]
-    fn maps_sfill_server_fill_options() {
         let args = parse(&["--sfill", "abc", "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.to_client_config().server_fill.as_deref(), Some("abc"));
 
@@ -1074,18 +1049,12 @@ mod tests {
         let max = "0123456789abcdef0123456789abcdef";
         let args = parse(&["--sfill", max, "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.to_client_config().server_fill.as_deref(), Some(max));
-    }
 
-    #[test]
-    fn maps_dscp_codepoints() {
         for value in ["0", "46", "63"] {
             let args = parse(&["--dscp", value, "127.0.0.1:2112"]).unwrap();
             assert_eq!(args.to_client_config().dscp, value.parse::<u8>().unwrap());
         }
-    }
 
-    #[test]
-    fn maps_ttl_values() {
         for value in ["1", "64", "255"] {
             let args = parse(&["--ttl", value, "127.0.0.1:2112"]).unwrap();
             assert_eq!(
@@ -1093,10 +1062,7 @@ mod tests {
                 Some(value.parse::<u32>().unwrap())
             );
         }
-    }
 
-    #[test]
-    fn maps_length_option() {
         let args = parse(&["--length", "1472", "127.0.0.1:2112"]).unwrap();
         assert_eq!(args.length, 1472);
         assert_eq!(args.to_client_config().length, 1472);
@@ -1104,10 +1070,7 @@ mod tests {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
         assert_eq!(args.length, 0);
         assert_eq!(args.to_client_config().length, 0);
-    }
 
-    #[test]
-    fn maps_loose_negotiation() {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
         assert_eq!(
             args.to_client_config().negotiation_policy,
@@ -1119,6 +1082,18 @@ mod tests {
             args.to_client_config().negotiation_policy,
             NegotiationPolicy::Loose
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_timestamp_options() {
+        assert!(parse(&[
+            "--tstamp",
+            "send",
+            "--timestamps",
+            "receive",
+            "127.0.0.1:2112"
+        ])
+        .is_err());
     }
 
     #[test]

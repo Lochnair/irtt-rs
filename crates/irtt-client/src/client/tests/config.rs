@@ -51,7 +51,7 @@ fn params_from_config_maps_compatibility_fields() {
 }
 
 #[test]
-fn params_from_config_accepts_udp_payload_length_boundary_values() {
+fn params_from_config_accepts_boundary_values() {
     for length in [0, 1, 1472, 4096, MAX_UDP_PAYLOAD_LENGTH] {
         let config = ClientConfig {
             length,
@@ -62,18 +62,12 @@ fn params_from_config_accepts_udp_payload_length_boundary_values() {
             i64::from(length)
         );
     }
-}
 
-#[test]
-fn params_from_config_rejects_oversized_udp_payload_length() {
     let config = ClientConfig {
-        length: MAX_UDP_PAYLOAD_LENGTH + 1,
+        dscp: 63,
         ..ClientConfig::default()
     };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { reason }) if reason.contains("packet length")
-    ));
+    assert_eq!(params_from_config(&config).unwrap().dscp, 63);
 }
 
 #[test]
@@ -86,97 +80,85 @@ fn params_from_config_encodes_continuous_duration_as_zero() {
 }
 
 #[test]
-fn params_from_config_rejects_zero_finite_duration() {
-    let config = ClientConfig {
-        duration: Some(Duration::ZERO),
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { reason })
-            if reason == "duration must be greater than zero; use None for continuous mode"
-    ));
-}
-
-#[test]
-fn params_from_config_rejects_zero_interval() {
-    let config = ClientConfig {
-        interval: Duration::ZERO,
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { reason }) if reason == "interval must be greater than zero"
-    ));
-}
-
-#[test]
-fn params_from_config_rejects_nanosecond_encoding_overflow_as_invalid_config() {
+fn params_from_config_rejects_invalid_values() {
     let i64_max_ns = u64::try_from(i64::MAX).unwrap();
-    let config = ClientConfig {
-        duration: Some(Duration::from_nanos(i64_max_ns) + Duration::from_nanos(1)),
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { reason })
-            if reason == "duration is too large to encode as nanoseconds"
-    ));
+    let too_large = Duration::from_nanos(i64_max_ns) + Duration::from_nanos(1);
+    let cases = [
+        (
+            "oversized UDP payload",
+            ClientConfig {
+                length: MAX_UDP_PAYLOAD_LENGTH + 1,
+                ..ClientConfig::default()
+            },
+            "packet length",
+        ),
+        (
+            "zero finite duration",
+            ClientConfig {
+                duration: Some(Duration::ZERO),
+                ..ClientConfig::default()
+            },
+            "duration must be greater than zero; use None for continuous mode",
+        ),
+        (
+            "zero interval",
+            ClientConfig {
+                interval: Duration::ZERO,
+                ..ClientConfig::default()
+            },
+            "interval must be greater than zero",
+        ),
+        (
+            "duration nanosecond overflow",
+            ClientConfig {
+                duration: Some(too_large),
+                ..ClientConfig::default()
+            },
+            "duration is too large to encode as nanoseconds",
+        ),
+        (
+            "interval nanosecond overflow",
+            ClientConfig {
+                interval: too_large,
+                ..ClientConfig::default()
+            },
+            "interval is too large to encode as nanoseconds",
+        ),
+        (
+            "invalid DSCP codepoint",
+            ClientConfig {
+                dscp: 64,
+                ..ClientConfig::default()
+            },
+            "dscp",
+        ),
+        (
+            "empty server fill",
+            ClientConfig {
+                server_fill: Some("".to_owned()),
+                ..ClientConfig::default()
+            },
+            "server_fill",
+        ),
+        (
+            "oversized server fill",
+            ClientConfig {
+                server_fill: Some("0123456789abcdef0123456789abcdefx".to_owned()),
+                ..ClientConfig::default()
+            },
+            "server_fill",
+        ),
+    ];
 
-    let config = ClientConfig {
-        interval: Duration::from_nanos(i64_max_ns) + Duration::from_nanos(1),
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { reason })
-            if reason == "interval is too large to encode as nanoseconds"
-    ));
-}
-
-#[test]
-fn params_from_config_accepts_max_dscp_codepoint() {
-    let config = ClientConfig {
-        dscp: 63,
-        ..ClientConfig::default()
-    };
-    assert_eq!(params_from_config(&config).unwrap().dscp, 63);
-}
-
-#[test]
-fn params_from_config_rejects_invalid_dscp_codepoint() {
-    let config = ClientConfig {
-        dscp: 64,
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { .. })
-    ));
-}
-
-#[test]
-fn params_from_config_rejects_empty_server_fill() {
-    let config = ClientConfig {
-        server_fill: Some("".to_owned()),
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { .. })
-    ));
-}
-
-#[test]
-fn params_from_config_rejects_oversized_server_fill() {
-    let config = ClientConfig {
-        server_fill: Some("0123456789abcdef0123456789abcdefx".to_owned()),
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        params_from_config(&config),
-        Err(ClientError::InvalidConfig { .. })
-    ));
+    for (name, config, expected_reason) in cases {
+        assert!(
+            matches!(
+                params_from_config(&config),
+                Err(ClientError::InvalidConfig { reason }) if reason.contains(expected_reason)
+            ),
+            "{name} should fail with InvalidConfig containing {expected_reason:?}"
+        );
+    }
 }
 
 #[test]
