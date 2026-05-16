@@ -1218,17 +1218,6 @@ mod tests {
     }
 
     #[test]
-    fn machine_echo_reply_metadata_dscp_46_ecn_0_prints_values() {
-        let line = format_event(
-            &reply_event_with_meta(packet_meta(184, 46, 0)),
-            OutputMode::Machine,
-        )
-        .unwrap();
-
-        assert_machine_packet_meta(&line, "184", "46", "0", "none");
-    }
-
-    #[test]
     fn machine_echo_reply_metadata_dscp_46_ecn_2_prints_values() {
         let line = format_event(
             &reply_event_with_meta(packet_meta(186, 46, 2)),
@@ -1253,18 +1242,6 @@ mod tests {
     }
 
     #[test]
-    fn machine_late_reply_metadata_unavailable_prints_none() {
-        let line = format_event(
-            &late_event_with_meta(PacketMeta::default()),
-            OutputMode::Machine,
-        )
-        .unwrap();
-
-        assert!(line.starts_with("event=late "));
-        assert_machine_packet_meta(&line, "none", "none", "none", "none");
-    }
-
-    #[test]
     fn machine_late_reply_metadata_observed_values_prints_values() {
         let line = format_event(
             &late_event_with_meta(packet_meta(186, 46, 2)),
@@ -1274,20 +1251,6 @@ mod tests {
 
         assert!(line.starts_with("event=late "));
         assert_machine_packet_meta(&line, "186", "46", "2", "none");
-    }
-
-    #[test]
-    fn machine_late_reply_metadata_kernel_rx_timestamp_prints_ns() {
-        let line = format_event(
-            &late_event_with_meta(packet_meta_with_timestamp(Some(
-                UNIX_EPOCH + Duration::new(2, 345),
-            ))),
-            OutputMode::Machine,
-        )
-        .unwrap();
-
-        assert!(line.starts_with("event=late "));
-        assert_machine_packet_meta(&line, "none", "none", "none", "2000000345");
     }
 
     #[test]

@@ -122,47 +122,27 @@ fn hmac_close_success_sends_authenticated_close_and_closes_session() {
 }
 
 #[test]
-fn missing_client_key_against_hmac_required_server_times_out() {
-    let key = b"compat-secret".to_vec();
-    let server = start_hmac_required_open_drop_server(key, Duration::from_millis(250));
-    let mut config = config_for_params(server.addr, &default_params());
-    config.open_timeouts = vec![Duration::from_millis(200)];
-    config.hmac_key = None;
+fn hmac_required_server_rejects_missing_or_wrong_client_key() {
+    for (hmac_key, expected_hmac_flag) in [(None, false), (Some(b"wrong-secret".to_vec()), true)] {
+        let server_key = b"compat-secret".to_vec();
+        let server = start_hmac_required_open_drop_server(server_key, Duration::from_millis(250));
+        let mut config = config_for_params(server.addr, &default_params());
+        config.open_timeouts = vec![Duration::from_millis(200)];
+        config.hmac_key = hmac_key;
 
-    let mut client = Client::connect(config).unwrap();
-    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
+        let mut client = Client::connect(config).unwrap();
+        assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
 
-    let observations = server.observations(1);
-    assert!(matches!(
-        observations.as_slice(),
-        [ServerObservation::RejectedHmac {
-            hmac: false,
-            bad_hmac: true
-        }]
-    ));
-    server.join();
-}
-
-#[test]
-fn wrong_client_key_against_hmac_required_server_times_out() {
-    let server_key = b"compat-secret".to_vec();
-    let server = start_hmac_required_open_drop_server(server_key, Duration::from_millis(250));
-    let mut config = config_for_params(server.addr, &default_params());
-    config.open_timeouts = vec![Duration::from_millis(200)];
-    config.hmac_key = Some(b"wrong-secret".to_vec());
-
-    let mut client = Client::connect(config).unwrap();
-    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
-
-    let observations = server.observations(1);
-    assert!(matches!(
-        observations.as_slice(),
-        [ServerObservation::RejectedHmac {
-            hmac: true,
-            bad_hmac: true
-        }]
-    ));
-    server.join();
+        let observations = server.observations(1);
+        assert!(matches!(
+            observations.as_slice(),
+            [ServerObservation::RejectedHmac {
+                hmac,
+                bad_hmac: true
+            }] if *hmac == expected_hmac_flag
+        ));
+        server.join();
+    }
 }
 
 #[test]
@@ -311,25 +291,15 @@ fn backend_hmac_correct_key_succeeds() {
 }
 
 #[test]
-fn backend_hmac_wrong_key_fails() {
-    let server_key = b"compat-secret".to_vec();
-    let peer = BackendPeer::start_hmac_required(server_key);
-    let mut config = config_for_params(peer.addr(), &default_params());
-    config.open_timeouts = vec![Duration::from_millis(200)];
-    config.hmac_key = Some(b"wrong-secret".to_vec());
+fn backend_hmac_required_rejects_missing_or_wrong_client_key() {
+    for hmac_key in [None, Some(b"wrong-secret".to_vec())] {
+        let server_key = b"compat-secret".to_vec();
+        let peer = BackendPeer::start_hmac_required(server_key);
+        let mut config = config_for_params(peer.addr(), &default_params());
+        config.open_timeouts = vec![Duration::from_millis(200)];
+        config.hmac_key = hmac_key;
 
-    let mut client = Client::connect(config).unwrap();
-    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
-}
-
-#[test]
-fn backend_hmac_missing_key_fails() {
-    let server_key = b"compat-secret".to_vec();
-    let peer = BackendPeer::start_hmac_required(server_key);
-    let mut config = config_for_params(peer.addr(), &default_params());
-    config.open_timeouts = vec![Duration::from_millis(200)];
-    config.hmac_key = None;
-
-    let mut client = Client::connect(config).unwrap();
-    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
+        let mut client = Client::connect(config).unwrap();
+        assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
+    }
 }
