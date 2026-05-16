@@ -688,10 +688,6 @@ impl Client {
     fn send_probe_at(&mut self, ts: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
         self.send_probe_inner(Some(ts))
     }
-
-    fn recv_once_at(&mut self, ts: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
-        self.recv_once_inner(Some(ts))
-    }
 }
 
 fn update_highest_received(session: &mut ActiveSession, wire_seq: u32) {
