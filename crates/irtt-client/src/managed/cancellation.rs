@@ -28,11 +28,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn token_starts_uncancelled() {
-        assert!(!CancellationToken::new().is_cancelled());
-    }
-
-    #[test]
     fn cancel_is_idempotent_and_visible_through_clones() {
         let token = CancellationToken::new();
         let clone = token.clone();

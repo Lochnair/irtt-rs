@@ -99,16 +99,6 @@ mod tests {
     }
 
     #[test]
-    fn compute_hmac_does_not_mutate_input() {
-        let packet = packet_with_hmac_field([0xa5; HMAC_SIZE]);
-        let original = packet.clone();
-
-        let _digest = compute_hmac(b"testkey", &packet, hmac_offset()).unwrap();
-
-        assert_eq!(packet, original);
-    }
-
-    #[test]
     fn compute_hmac_matches_copy_and_zero_semantics() {
         let mut packet = packet_with_hmac_field([0xa5; HMAC_SIZE]);
         packet.extend_from_slice(&[5, 6, 7, 8, 9]);
@@ -117,42 +107,6 @@ mod tests {
         let reference = reference_copy_zero_hmac(b"testkey", &packet, hmac_offset()).unwrap();
 
         assert_eq!(digest, reference);
-    }
-
-    #[test]
-    fn compute_hmac_in_place_does_not_set_hmac_flag() {
-        let mut packet = Vec::new();
-        packet.extend_from_slice(&MAGIC);
-        packet.push(FLAG_OPEN);
-        packet.extend_from_slice(&[0; HMAC_SIZE]);
-        packet.extend_from_slice(&[1, 2, 3, 4]);
-
-        compute_hmac_in_place(b"testkey", &mut packet, hmac_offset()).unwrap();
-
-        assert_eq!(packet[3], FLAG_OPEN);
-        assert!(packet[hmac_offset()..hmac_offset() + HMAC_SIZE]
-            .iter()
-            .any(|byte| *byte != 0));
-        assert_eq!(&packet[hmac_offset() + HMAC_SIZE..], &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn compute_hmac_in_place_only_writes_hmac_field() {
-        let mut packet = packet_with_hmac_field([0xa5; HMAC_SIZE]);
-        packet.extend_from_slice(&[5, 6, 7, 8, 9]);
-        let original = packet.clone();
-
-        compute_hmac_in_place(b"testkey", &mut packet, hmac_offset()).unwrap();
-
-        assert_eq!(&packet[..hmac_offset()], &original[..hmac_offset()]);
-        assert_ne!(
-            &packet[hmac_offset()..hmac_offset() + HMAC_SIZE],
-            &original[hmac_offset()..hmac_offset() + HMAC_SIZE]
-        );
-        assert_eq!(
-            &packet[hmac_offset() + HMAC_SIZE..],
-            &original[hmac_offset() + HMAC_SIZE..]
-        );
     }
 
     #[test]

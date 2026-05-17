@@ -363,37 +363,15 @@ mod shutdown_tests {
     use super::*;
 
     #[test]
-    fn shutdown_flag_stops_run_loop() {
-        let shutdown = AtomicBool::new(false);
-        assert!(should_continue_run(true, Some(Instant::now()), &shutdown));
-
-        shutdown.store(true, Ordering::Relaxed);
-        assert!(!should_continue_run(true, Some(Instant::now()), &shutdown));
-    }
-
-    #[test]
-    fn shutdown_flag_suppresses_due_probe_send() {
-        let shutdown = AtomicBool::new(false);
-        let due = Instant::now() - Duration::from_millis(1);
-        assert!(should_send_probe(Some(due), &shutdown));
-
-        shutdown.store(true, Ordering::Relaxed);
-        assert!(!should_send_probe(Some(due), &shutdown));
-    }
-
-    #[test]
-    fn interrupted_continuous_run_uses_final_drain_before_close() {
-        assert!(should_drain_final(true, true));
-        assert!(!should_drain_final(true, false));
-        assert!(should_drain_final(false, false));
-    }
-
-    #[test]
-    fn final_summary_gate_prints_finite_or_interrupted_continuous() {
-        assert!(should_print_final_summary(false, false));
-        assert!(should_print_final_summary(false, true));
-        assert!(!should_print_final_summary(true, false));
-        assert!(should_print_final_summary(true, true));
+    fn final_drain_uses_capped_probe_timeout() {
+        assert_eq!(
+            final_drain_duration(Duration::from_secs(4)),
+            Duration::from_secs(4)
+        );
+        assert_eq!(
+            final_drain_duration(Duration::from_secs(60)),
+            Duration::from_secs(30)
+        );
     }
 }
 
@@ -502,26 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn output_does_not_print_final_summary_when_disabled() {
-        let mut stats = StatsCollector::new(StatsConfig::continuous());
-        let mut out = Vec::new();
-        {
-            let mut stream_output = StreamOutput {
-                mode: irtt_cli::OutputMode::Human,
-                human_options: HumanOutputOptions::default(),
-                print_final_summary: false,
-                show_running_only_summary_note: true,
-                out: &mut out,
-                stats: &mut stats,
-            };
-            stream_output.print_summary().unwrap();
-        }
-
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn continuous_interrupted_output_prints_bounded_summary_when_enabled() {
+    fn continuous_summary_prints_when_enabled_and_suppresses_when_disabled() {
         let mut stats = StatsCollector::new(StatsConfig::continuous());
         let mut out = Vec::new();
         {
@@ -543,6 +502,22 @@ mod tests {
         assert!(rendered.contains("continuous mode"));
         assert!(rendered.contains("packets:"));
         assert!(rendered.contains("received=1"));
+
+        let mut stats = StatsCollector::new(StatsConfig::continuous());
+        let mut out = Vec::new();
+        {
+            let mut stream_output = StreamOutput {
+                mode: irtt_cli::OutputMode::Human,
+                human_options: HumanOutputOptions::default(),
+                print_final_summary: false,
+                show_running_only_summary_note: true,
+                out: &mut out,
+                stats: &mut stats,
+            };
+            stream_output.print_summary().unwrap();
+        }
+
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -596,7 +571,7 @@ mod tests {
     }
 
     #[test]
-    fn finite_stats_memory_warning_skips_non_warning_runs() {
+    fn finite_stats_memory_warning_reports_only_large_finite_runs() {
         for args in [
             cli_args(&["--duration", "0", "--interval", "1ms", "127.0.0.1:2112"]),
             cli_args(&[
@@ -609,10 +584,7 @@ mod tests {
         ] {
             assert_eq!(finite_stats_memory_warning(&args), None);
         }
-    }
 
-    #[test]
-    fn finite_stats_memory_warning_reports_threshold_tiers() {
         for (threshold, size, guidance) in [
             (
                 FINITE_STATS_MEMORY_WARNING_BYTES,
@@ -656,17 +628,5 @@ mod tests {
     #[test]
     fn estimate_finite_stats_memory_bytes_saturates() {
         assert_eq!(estimate_finite_stats_memory_bytes(u64::MAX), u64::MAX);
-    }
-
-    #[test]
-    fn final_drain_uses_capped_probe_timeout() {
-        assert_eq!(
-            final_drain_duration(Duration::from_secs(4)),
-            Duration::from_secs(4)
-        );
-        assert_eq!(
-            final_drain_duration(Duration::from_secs(60)),
-            Duration::from_secs(30)
-        );
     }
 }

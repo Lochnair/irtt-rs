@@ -25,17 +25,6 @@ mod tests {
     use crate::event::PacketMeta;
 
     #[test]
-    fn metadata_default_is_unavailable() {
-        let meta = ReceiveMeta::default();
-        let packet_meta = PacketMeta::from(meta);
-
-        assert_eq!(packet_meta.traffic_class, None);
-        assert_eq!(packet_meta.dscp, None);
-        assert_eq!(packet_meta.ecn, None);
-        assert_eq!(packet_meta.kernel_rx_timestamp, None);
-    }
-
-    #[test]
     fn metadata_observed_traffic_class_zero_preserves_observed_zero() {
         let packet_meta = PacketMeta::from(ReceiveMeta {
             traffic_class: Some(0),

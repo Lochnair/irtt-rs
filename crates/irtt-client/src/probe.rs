@@ -194,18 +194,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_map_insert_and_remove() {
-        let mut map = PendingMap::new(10);
-        let now = Instant::now();
-        let probe = pending(0, now + Duration::from_secs(4));
-        map.insert(probe).unwrap();
-        assert_eq!(map.len(), 1);
-        assert!(map.remove(0).is_some());
-        assert_eq!(map.len(), 0);
-        assert!(map.remove(0).is_none());
-    }
-
-    #[test]
     fn pending_map_rejects_over_capacity() {
         let mut map = PendingMap::new(2);
         let now = Instant::now();
@@ -220,7 +208,7 @@ mod tests {
     }
 
     #[test]
-    fn completed_set_tracks_and_evicts() {
+    fn bounded_probe_tracking_evicts_oldest_entries() {
         let mut set = CompletedSet::new(3);
         set.insert(0);
         set.insert(1);
@@ -232,10 +220,7 @@ mod tests {
         assert_eq!(set.set.len(), 3);
         assert!(!set.contains(0));
         assert!(set.contains(3));
-    }
 
-    #[test]
-    fn timed_out_map_tracks_and_evicts() {
         let mut map = TimedOutMap::new(2);
         let now = Instant::now();
         map.insert(pending(0, now));

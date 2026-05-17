@@ -241,7 +241,7 @@ mod tests {
     }
 
     #[test]
-    fn params_round_trip_received_stats_modes() {
+    fn params_round_trip_negotiated_option_modes() {
         for received_stats in [
             ReceivedStats::None,
             ReceivedStats::Count,
@@ -254,10 +254,7 @@ mod tests {
                 ..Params::default()
             });
         }
-    }
 
-    #[test]
-    fn params_round_trip_timestamp_modes() {
         for stamp_at in [
             StampAt::None,
             StampAt::Send,
@@ -272,10 +269,7 @@ mod tests {
                 ..Params::default()
             });
         }
-    }
 
-    #[test]
-    fn params_round_trip_clock_modes() {
         for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
             assert_round_trip(Params {
                 protocol_version: 1,

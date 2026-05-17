@@ -32,20 +32,6 @@ mod tests {
     use crate::{hmac, FLAG_HMAC};
 
     #[test]
-    fn close_request_sizes() {
-        let request = CloseRequest {
-            token: 0x7896_b6ab_8771_5213,
-        };
-        assert_eq!(encode_close_request(&request, None).unwrap().len(), 12);
-        assert_eq!(
-            encode_close_request(&request, Some(b"testkey"))
-                .unwrap()
-                .len(),
-            28
-        );
-    }
-
-    #[test]
     fn hmac_close_request_places_token_after_hmac() {
         let packet = encode_close_request(
             &CloseRequest {

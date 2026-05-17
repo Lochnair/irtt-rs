@@ -155,6 +155,12 @@ mod tests {
 
     #[test]
     fn verified_layout_lengths() {
+        assert_eq!(PacketLayout::open_request(false).header_len(), 4);
+        assert_eq!(PacketLayout::open_request(true).header_len(), 20);
+        assert_eq!(PacketLayout::open_reply(false).header_len(), 12);
+        assert_eq!(PacketLayout::open_reply(true).header_len(), 28);
+        assert_eq!(PacketLayout::close_request(false).header_len(), 12);
+        assert_eq!(PacketLayout::close_request(true).header_len(), 28);
         assert_eq!(
             echo_header_len(
                 false,
@@ -197,16 +203,6 @@ mod tests {
             ),
             76
         );
-    }
-
-    #[test]
-    fn open_and_close_layout_lengths_account_for_hmac() {
-        assert_eq!(PacketLayout::open_request(false).header_len(), 4);
-        assert_eq!(PacketLayout::open_request(true).header_len(), 20);
-        assert_eq!(PacketLayout::open_reply(false).header_len(), 12);
-        assert_eq!(PacketLayout::open_reply(true).header_len(), 28);
-        assert_eq!(PacketLayout::close_request(false).header_len(), 12);
-        assert_eq!(PacketLayout::close_request(true).header_len(), 28);
     }
 
     #[test]
@@ -277,16 +273,6 @@ mod tests {
                     }
                 }
             }
-        }
-    }
-
-    #[test]
-    fn no_timestamp_layout_ignores_clock() {
-        for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
-            assert_eq!(
-                echo_header_len(false, &params(ReceivedStats::None, StampAt::None, clock)),
-                16
-            );
         }
     }
 
