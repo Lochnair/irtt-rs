@@ -13,19 +13,13 @@ pub fn ts(ms: u64) -> ClientTimestamp {
 }
 
 pub fn rtt(raw_ms: u64, effective_ms: i128) -> RttSample {
+    let effective = SignedDuration {
+        ns: effective_ms * 1_000_000,
+    };
     RttSample {
         raw: Duration::from_millis(raw_ms),
-        adjusted: u64::try_from(effective_ms).ok().map(Duration::from_millis),
-        effective: u64::try_from(effective_ms)
-            .ok()
-            .map(Duration::from_millis)
-            .unwrap_or_else(|| Duration::from_millis(raw_ms)),
-        adjusted_signed: Some(SignedDuration {
-            ns: effective_ms * 1_000_000,
-        }),
-        effective_signed: SignedDuration {
-            ns: effective_ms * 1_000_000,
-        },
+        adjusted: Some(effective),
+        effective,
     }
 }
 

@@ -18,13 +18,27 @@ fn server_processing_greater_than_raw_does_not_underflow() {
             ..Default::default()
         },
     );
-    assert!(rtt.adjusted.is_none());
-    assert_eq!(rtt.effective, rtt.raw);
-    assert_eq!(
-        rtt.adjusted_signed,
-        Some(SignedDuration { ns: -999_999_999 })
+    assert_eq!(rtt.adjusted, Some(SignedDuration { ns: -999_999_999 }));
+    assert_eq!(rtt.effective, SignedDuration { ns: -999_999_999 });
+}
+
+#[test]
+fn effective_rtt_uses_raw_when_adjusted_rtt_is_unavailable() {
+    let base = Instant::now();
+    let rtt = compute_rtt(
+        &ClientTimestamp {
+            mono: base,
+            wall: SystemTime::now(),
+        },
+        &ClientTimestamp {
+            mono: base + Duration::from_nanos(42),
+            wall: SystemTime::now(),
+        },
+        &TimestampFields::default(),
     );
-    assert_eq!(rtt.effective_signed, SignedDuration { ns: -999_999_999 });
+
+    assert_eq!(rtt.adjusted, None);
+    assert_eq!(rtt.effective, SignedDuration::from_duration(rtt.raw));
 }
 
 #[test]

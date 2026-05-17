@@ -41,7 +41,11 @@ fn recv_once_decodes_echo_reply_and_emits_event() {
             assert_eq!(*seq, 0);
             assert_eq!(*bytes, echo_packet_len(false, &params));
             assert!(rtt.raw > Duration::ZERO);
-            assert_eq!(rtt.effective, rtt.adjusted.unwrap_or(rtt.raw));
+            assert_eq!(
+                rtt.effective,
+                rtt.adjusted
+                    .unwrap_or_else(|| SignedDuration::from_duration(rtt.raw))
+            );
             assert!(received_stats.is_some());
             let stats = received_stats.as_ref().unwrap();
             assert_eq!(stats.count, Some(42));

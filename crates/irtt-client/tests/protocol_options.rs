@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use irtt_client::{
     Client, ClientConfig, ClientError, ClientEvent, OneWayDelaySample, ReceivedStatsSample,
-    RttSample, ServerTiming,
+    RttSample, ServerTiming, SignedDuration,
 };
 use irtt_proto::{Clock, Params, ReceivedStats, StampAt, TimestampFields};
 
@@ -69,7 +69,10 @@ fn timestamp_modes_drive_reply_event_timing_fields() {
                 assert!(reply.server_timing.is_none());
                 assert!(reply.one_way.is_none());
                 assert!(reply.rtt.adjusted.is_none());
-                assert_eq!(reply.rtt.effective, reply.rtt.raw);
+                assert_eq!(
+                    reply.rtt.effective,
+                    SignedDuration::from_duration(reply.rtt.raw)
+                );
                 assert!(reply.rtt.raw > Duration::ZERO);
             }
             StampAt::Send => {
@@ -349,7 +352,7 @@ fn assert_processing_subtracted(reply: ReplyView<'_>) {
     assert_eq!(processing, Duration::from_nanos(1));
     let adjusted = reply.rtt.adjusted.unwrap();
     assert_eq!(reply.rtt.effective, adjusted);
-    assert!(adjusted < reply.rtt.raw);
+    assert!(adjusted.ns < SignedDuration::from_duration(reply.rtt.raw).ns);
 }
 
 fn assert_one_way_presence(

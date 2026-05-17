@@ -22,6 +22,7 @@ pub(crate) enum StatsEvent {
     },
     DuplicateReply {
         at: Instant,
+        bytes: usize,
     },
     Loss {
         at: Instant,
@@ -31,6 +32,7 @@ pub(crate) enum StatsEvent {
     },
     UntrackedLate {
         at: Instant,
+        bytes: usize,
     },
 }
 
@@ -96,11 +98,17 @@ pub(crate) fn normalize_event(event: &ClientEvent) -> Option<StatsEvent> {
                 *bytes,
             )),
         }),
-        ClientEvent::LateReply { received_at, .. } => Some(StatsEvent::UntrackedLate {
+        ClientEvent::LateReply {
+            received_at, bytes, ..
+        } => Some(StatsEvent::UntrackedLate {
             at: received_at.mono,
+            bytes: *bytes,
         }),
-        ClientEvent::DuplicateReply { received_at, .. } => Some(StatsEvent::DuplicateReply {
+        ClientEvent::DuplicateReply {
+            received_at, bytes, ..
+        } => Some(StatsEvent::DuplicateReply {
             at: received_at.mono,
+            bytes: *bytes,
         }),
         ClientEvent::EchoLoss { timeout_at, .. } => Some(StatsEvent::Loss { at: *timeout_at }),
         ClientEvent::Warning { at, .. } => Some(StatsEvent::Warning { at: at.mono }),
@@ -115,10 +123,10 @@ impl StatsEvent {
         match self {
             Self::Sent { at, .. }
             | Self::UniqueReply { at, .. }
-            | Self::DuplicateReply { at }
+            | Self::DuplicateReply { at, .. }
             | Self::Loss { at }
             | Self::Warning { at }
-            | Self::UntrackedLate { at } => *at,
+            | Self::UntrackedLate { at, .. } => *at,
         }
     }
 }
@@ -148,11 +156,11 @@ impl ReplySample {
         received_stats: Option<ReceivedStatsSample>,
         bytes: usize,
     ) -> Self {
-        let rtt_primary_ns = signed_duration_ns(rtt.effective_signed);
+        let rtt_primary_ns = signed_duration_ns(rtt.effective);
         Self {
             bytes,
             rtt_raw_ns: duration_ns_i128(rtt.raw),
-            rtt_adjusted_ns: rtt.adjusted_signed.map(signed_duration_ns),
+            rtt_adjusted_ns: rtt.adjusted.map(signed_duration_ns),
             send_delay_ns: one_way
                 .and_then(|sample| sample.client_to_server)
                 .map(duration_ns_i128),

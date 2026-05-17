@@ -69,8 +69,8 @@ impl CoreStats {
             StatsEvent::UniqueReply {
                 is_late, sample, ..
             } => self.apply_unique_reply(is_late, *sample),
-            StatsEvent::DuplicateReply { .. } => {
-                self.apply_duplicate_reply();
+            StatsEvent::DuplicateReply { bytes, .. } => {
+                self.apply_duplicate_reply(bytes);
                 EventStatsUpdate::default()
             }
             StatsEvent::Loss { .. } => {
@@ -81,8 +81,8 @@ impl CoreStats {
                 self.apply_warning();
                 EventStatsUpdate::default()
             }
-            StatsEvent::UntrackedLate { .. } => {
-                self.apply_untracked_late();
+            StatsEvent::UntrackedLate { bytes, .. } => {
+                self.apply_untracked_late(bytes);
                 EventStatsUpdate::default()
             }
         }
@@ -121,7 +121,12 @@ impl CoreStats {
             .saturating_add(sample.bytes as u64);
 
         if let Some(count) = sample.received_count {
-            self.packets.server_packets_received = Some(u64::from(count));
+            let count = u64::from(count);
+            self.packets.server_packets_received = Some(
+                self.packets
+                    .server_packets_received
+                    .map_or(count, |current| current.max(count)),
+            );
         }
         if let Some(window) = sample.received_window {
             self.packets.server_received_window = Some(window);
@@ -181,10 +186,11 @@ impl CoreStats {
         updates
     }
 
-    fn apply_duplicate_reply(&mut self) {
+    fn apply_duplicate_reply(&mut self, bytes: usize) {
         self.events.duplicate_replies += 1;
         self.packets.packets_received += 1;
         self.packets.duplicates += 1;
+        self.packets.bytes_received = self.packets.bytes_received.saturating_add(bytes as u64);
     }
 
     fn apply_loss(&mut self) {
@@ -195,8 +201,11 @@ impl CoreStats {
         self.events.warning_events += 1;
     }
 
-    fn apply_untracked_late(&mut self) {
+    fn apply_untracked_late(&mut self, bytes: usize) {
         self.events.untracked_late_replies += 1;
+        self.packets.packets_received += 1;
+        self.packets.late_packets += 1;
+        self.packets.bytes_received = self.packets.bytes_received.saturating_add(bytes as u64);
     }
 
     pub(crate) fn snapshot(&self) -> Snapshot {

@@ -129,7 +129,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     while let Ok(event) = events.recv() {
         match event {
             ClientEvent::EchoReply { seq, rtt, .. } => {
-                println!("seq={seq} rtt_us={}", rtt.effective.as_micros());
+                println!("seq={seq} rtt_us={}", rtt.effective.ns / 1_000);
             }
             ClientEvent::SessionClosed { .. } => break,
             _ => {}

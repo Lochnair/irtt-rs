@@ -49,7 +49,7 @@ fn cumulative_rtt_uses_signed_effective_and_tracks_raw() {
 }
 
 #[test]
-fn late_unique_counts_and_duplicates_do_not_update_measurements() {
+fn late_unique_counts_and_duplicates_do_not_update_duplicate_measurements() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
     collector.process(&sent(0, ts(0)));
     collector.process(&sent(1, ts(10)));
@@ -68,6 +68,7 @@ fn late_unique_counts_and_duplicates_do_not_update_measurements() {
     assert_eq!(snapshot.packets.unique_replies, 2);
     assert_eq!(snapshot.packets.duplicates, 1);
     assert_eq!(snapshot.packets.late_packets, 1);
+    assert_eq!(snapshot.packets.bytes_received, 64 + 64 + 64);
     assert_eq!(snapshot.rtt.primary.count, 2);
     assert_eq!(snapshot.loss.lost_packets, 0);
     assert_eq!(snapshot.loss.duplicate_percent, 100.0 / 3.0);
@@ -210,6 +211,20 @@ fn server_processing_and_one_way_require_available_samples() {
     assert_eq!(snapshot.server_processing.processing.count, 1);
     assert_eq!(snapshot.one_way_delay.send_delay.count, 1);
     assert_eq!(snapshot.events.untracked_late_replies, 1);
+    assert_eq!(snapshot.packets.packets_received, 2);
+    assert_eq!(snapshot.packets.unique_replies, 1);
+    assert_eq!(snapshot.packets.late_packets, 1);
+    assert_eq!(snapshot.packets.bytes_received, 128);
+}
+
+#[test]
+fn older_cumulative_server_receive_count_does_not_regress() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    collector.process(&reply(1, 10, 10));
+    collector.process(&late_reply(0, 10, 10));
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.packets.server_packets_received, Some(2));
 }
 
 #[test]

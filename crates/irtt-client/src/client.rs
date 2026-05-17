@@ -727,22 +727,15 @@ fn compute_rtt(
 
     let server_processing = compute_server_processing(ts);
 
-    let adjusted = server_processing.and_then(|sp| raw.checked_sub(sp));
-
-    let effective = adjusted.unwrap_or(raw);
-    let adjusted_signed = server_processing.map(|sp| SignedDuration {
+    let adjusted = server_processing.map(|sp| SignedDuration {
         ns: duration_ns_i128(raw) - duration_ns_i128(sp),
     });
-    let effective_signed = adjusted_signed.unwrap_or(SignedDuration {
-        ns: duration_ns_i128(raw),
-    });
+    let effective = adjusted.unwrap_or_else(|| SignedDuration::from_duration(raw));
 
     RttSample {
         raw,
         adjusted,
         effective,
-        adjusted_signed,
-        effective_signed,
     }
 }
 

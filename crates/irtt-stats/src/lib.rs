@@ -198,6 +198,9 @@ pub struct EventCounts {
     /// Warning events processed.
     pub warning_events: u64,
     /// Late replies that could not be matched to retained in-flight state.
+    ///
+    /// These replies are observed on the socket, but cannot contribute RTT,
+    /// one-way delay, server-processing, or IPDV samples.
     pub untracked_late_replies: u64,
 }
 
@@ -206,19 +209,26 @@ pub struct EventCounts {
 pub struct PacketCounts {
     /// Probe packets sent by the local client.
     pub packets_sent: u64,
-    /// Reply packets received by the local client, including duplicates and late packets.
+    /// Reply packets observed by the local client.
+    ///
+    /// This includes unique measurable replies, duplicate replies, and late
+    /// replies that cannot be matched to retained in-flight state.
     pub packets_received: u64,
-    /// Unique replies received by the local client.
+    /// Unique replies that can contribute timing measurements.
     pub unique_replies: u64,
     /// Duplicate replies received by the local client.
     pub duplicates: u64,
-    /// Late reply packets received by the local client.
+    /// Late reply packets received by the local client, including untracked-late replies.
     pub late_packets: u64,
     /// Probe bytes sent by the local client.
     pub bytes_sent: u64,
-    /// Reply bytes received by the local client.
+    /// Reply bytes observed by the local client.
+    ///
+    /// This includes bytes from unique measurable replies, duplicate replies,
+    /// and untracked-late replies. Per-category byte counts are not currently
+    /// exposed separately.
     pub bytes_received: u64,
-    /// Server-reported packets received, when available.
+    /// Highest cumulative server-reported packets received, when available.
     pub server_packets_received: Option<u64>,
     /// Server-reported receive window, when available.
     pub server_received_window: Option<u64>,

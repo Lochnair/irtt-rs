@@ -106,16 +106,34 @@ pub enum WarningKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RttSample {
+    /// Client-observed RTT from send to receive.
     pub raw: Duration,
-    pub adjusted: Option<Duration>,
-    pub effective: Duration,
-    pub adjusted_signed: Option<SignedDuration>,
-    pub effective_signed: SignedDuration,
+    /// Signed RTT adjusted for server processing when server processing is available.
+    pub adjusted: Option<SignedDuration>,
+    /// Signed effective RTT used by stats and CLI reporting.
+    ///
+    /// This is `adjusted` when server processing is available, otherwise `raw`
+    /// converted to a signed duration.
+    pub effective: SignedDuration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SignedDuration {
     pub ns: i128,
+}
+
+impl SignedDuration {
+    pub fn from_duration(duration: Duration) -> Self {
+        Self {
+            ns: i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX),
+        }
+    }
+}
+
+impl From<Duration> for SignedDuration {
+    fn from(value: Duration) -> Self {
+        Self::from_duration(value)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

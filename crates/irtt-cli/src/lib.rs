@@ -12,8 +12,8 @@ use std::{
 use clap::{Parser, ValueEnum};
 use irtt_client::{
     ClientConfig, ClientEvent, NegotiatedParams, NegotiationPolicy, OneWayDelaySample, PacketMeta,
-    ReceivedStatsSample, RttSample, ServerTiming, SocketConfig, WarningKind, MAX_DSCP_CODEPOINT,
-    MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
+    ReceivedStatsSample, RttSample, ServerTiming, SignedDuration, SocketConfig, WarningKind,
+    MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
 };
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
@@ -397,7 +397,7 @@ pub fn format_human_event_with_options(
             ..
         } => {
             let mut out = format!("seq={seq}");
-            write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
+            write!(out, "  rtt={}", format_signed_duration(rtt.effective)).unwrap();
             write_human_one_way(&mut out, *one_way);
             write!(out, "  ipdv={}", format_human_ipdv(stats, *seq)).unwrap();
             if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
@@ -425,7 +425,7 @@ pub fn format_human_event_with_options(
         } => {
             let mut out = format!("late  seq={seq}  highest_seen={highest_seen}  remote={remote}",);
             if let Some(rtt) = rtt {
-                write!(out, "  rtt={}", format_duration(rtt.effective)).unwrap();
+                write!(out, "  rtt={}", format_signed_duration(rtt.effective)).unwrap();
                 write_human_one_way(&mut out, *one_way);
                 write!(out, "  ipdv={}", format_human_ipdv(stats, *seq)).unwrap();
             }
@@ -440,7 +440,7 @@ pub fn format_human_event_with_options(
 
 fn format_rtt_us(event: &ClientEvent) -> Option<String> {
     match event {
-        ClientEvent::EchoReply { rtt, .. } => Some(duration_us(rtt.effective).to_string()),
+        ClientEvent::EchoReply { rtt, .. } => Some(signed_duration_us(rtt.effective).to_string()),
         _ => None,
     }
 }
@@ -585,10 +585,10 @@ fn format_simple(event: &ClientEvent) -> String {
         } => {
             let mut out = format!(
                 "reply seq={seq} remote={remote} rtt_us={}",
-                duration_us(rtt.effective)
+                signed_duration_us(rtt.effective)
             );
-            if let Some(raw) = rtt.adjusted.map(|_| rtt.raw) {
-                write!(out, " raw_rtt_us={}", duration_us(raw)).unwrap();
+            if rtt.adjusted.is_some() {
+                write!(out, " raw_rtt_us={}", duration_us(rtt.raw)).unwrap();
             }
             if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
                 write!(out, " server_processing_us={}", duration_us(processing)).unwrap();
@@ -610,7 +610,7 @@ fn format_simple(event: &ClientEvent) -> String {
         } => {
             let mut out = format!("late seq={seq} highest_seen={highest_seen} remote={remote}",);
             if let Some(rtt) = rtt {
-                write!(out, " rtt_us={}", duration_us(rtt.effective)).unwrap();
+                write!(out, " rtt_us={}", signed_duration_us(rtt.effective)).unwrap();
             }
             out
         }
@@ -656,11 +656,11 @@ fn write_rtt(out: &mut String, rtt: &RttSample) {
         out,
         " raw_rtt_us={} effective_rtt_us={}",
         duration_us(rtt.raw),
-        duration_us(rtt.effective)
+        signed_duration_us(rtt.effective)
     )
     .unwrap();
     if let Some(adjusted) = rtt.adjusted {
-        write!(out, " adjusted_rtt_us={}", duration_us(adjusted)).unwrap();
+        write!(out, " adjusted_rtt_us={}", signed_duration_us(adjusted)).unwrap();
     }
 }
 
@@ -773,6 +773,10 @@ fn duration_us(duration: Duration) -> u128 {
     duration.as_micros()
 }
 
+fn signed_duration_us(duration: SignedDuration) -> i128 {
+    duration.ns / 1_000
+}
+
 fn format_optional_duration(duration: Option<Duration>) -> String {
     duration
         .map(format_duration)
@@ -781,6 +785,18 @@ fn format_optional_duration(duration: Option<Duration>) -> String {
 
 fn format_duration(duration: Duration) -> String {
     format_ns(duration.as_nanos() as f64)
+}
+
+fn format_signed_duration(duration: SignedDuration) -> String {
+    format_signed_ns(duration.ns as f64)
+}
+
+fn format_signed_ns(ns: f64) -> String {
+    if ns < 0.0 {
+        format!("-{}", format_ns(-ns))
+    } else {
+        format_ns(ns)
+    }
 }
 
 fn format_ns(ns: f64) -> String {
@@ -853,10 +869,8 @@ mod tests {
             received_at: test_timestamp(Duration::from_secs(1) + Duration::from_micros(1500)),
             rtt: RttSample {
                 raw: Duration::from_micros(1500),
-                adjusted: Some(Duration::from_micros(1200)),
-                effective: Duration::from_micros(1200),
-                adjusted_signed: Some(SignedDuration { ns: 1_200_000 }),
-                effective_signed: SignedDuration { ns: 1_200_000 },
+                adjusted: Some(SignedDuration { ns: 1_200_000 }),
+                effective: SignedDuration { ns: 1_200_000 },
             },
             server_timing: Some(ServerTiming {
                 receive_wall_ns: Some(1_000),
@@ -877,6 +891,33 @@ mod tests {
             }),
             bytes: 64,
             packet_meta,
+        }
+    }
+
+    fn negative_adjusted_reply_event() -> ClientEvent {
+        ClientEvent::EchoReply {
+            seq: 8,
+            remote: test_remote(),
+            sent_at: test_timestamp(Duration::from_secs(1)),
+            received_at: test_timestamp(Duration::from_secs(1) + Duration::from_micros(500)),
+            rtt: RttSample {
+                raw: Duration::from_micros(500),
+                adjusted: Some(SignedDuration { ns: -1_500_000 }),
+                effective: SignedDuration { ns: -1_500_000 },
+            },
+            server_timing: Some(ServerTiming {
+                receive_wall_ns: Some(1_000),
+                receive_mono_ns: Some(2_000),
+                send_wall_ns: Some(2_001_000),
+                send_mono_ns: Some(2_002_000),
+                midpoint_wall_ns: None,
+                midpoint_mono_ns: None,
+                processing: Some(Duration::from_micros(2_000)),
+            }),
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
         }
     }
 
@@ -1155,6 +1196,28 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    #[cfg(feature = "stats")]
+    fn streamed_and_summary_rtt_use_signed_effective_policy() {
+        let event = negative_adjusted_reply_event();
+
+        assert_eq!(
+            format_event(&event, OutputMode::RttUs),
+            Some("-1500".to_owned())
+        );
+
+        let machine = format_event(&event, OutputMode::Machine).unwrap();
+        assert!(machine.contains("raw_rtt_us=500"));
+        assert!(machine.contains("effective_rtt_us=-1500"));
+        assert!(machine.contains("adjusted_rtt_us=-1500"));
+
+        let mut collector = irtt_stats::StatsCollector::new(irtt_stats::StatsConfig::finite());
+        collector.process(&event);
+        let summary = collector.snapshot();
+        assert_eq!(summary.rtt.primary.min_ns, Some(-1_500_000));
+        assert_eq!(summary.rtt.adjusted.min_ns, Some(-1_500_000));
     }
 
     #[test]

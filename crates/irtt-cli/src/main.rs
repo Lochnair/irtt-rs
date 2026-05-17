@@ -426,9 +426,7 @@ mod tests {
             rtt: RttSample {
                 raw: Duration::from_micros(rtt_us),
                 adjusted: None,
-                effective: Duration::from_micros(rtt_us),
-                adjusted_signed: None,
-                effective_signed: SignedDuration {
+                effective: SignedDuration {
                     ns: i128::from(rtt_us) * 1_000,
                 },
             },
@@ -468,9 +466,7 @@ mod tests {
                 rtt: RttSample {
                     raw: Duration::from_micros(1200),
                     adjusted: None,
-                    effective: Duration::from_micros(1200),
-                    adjusted_signed: None,
-                    effective_signed: SignedDuration { ns: 1_200_000 },
+                    effective: SignedDuration { ns: 1_200_000 },
                 },
                 server_timing: None,
                 one_way: None,
@@ -583,9 +579,7 @@ mod tests {
                 rtt: RttSample {
                     raw: Duration::from_micros(1),
                     adjusted: None,
-                    effective: Duration::from_micros(1),
-                    adjusted_signed: None,
-                    effective_signed: SignedDuration { ns: 1_000 },
+                    effective: SignedDuration { ns: 1_000 },
                 },
                 server_timing: None,
                 one_way: None,
