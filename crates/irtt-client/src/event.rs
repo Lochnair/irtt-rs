@@ -168,9 +168,27 @@ pub struct ServerTiming {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Directional one-way delay samples computed from wall-clock timestamps.
+///
+/// Each directional field is an `Option<SignedDuration>`. `None` means the
+/// required client or server wall-clock timestamp was unavailable, or the
+/// timestamp arithmetic was out of range. `Some(value)` means the delay was
+/// computed from available timestamps.
+///
+/// Negative computed values are preserved as `Some` instead of being clamped to
+/// zero or dropped. A negative one-way delay usually indicates wall-clock skew
+/// between the client and server.
 pub struct OneWayDelaySample {
-    pub client_to_server: Option<Duration>,
-    pub server_to_client: Option<Duration>,
+    /// Client-to-server delay.
+    ///
+    /// This is computed from the client send wall time and the server receive
+    /// wall time when both are available.
+    pub client_to_server: Option<SignedDuration>,
+    /// Server-to-client delay.
+    ///
+    /// This is computed from the server send wall time and the client receive
+    /// wall time when both are available.
+    pub server_to_client: Option<SignedDuration>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

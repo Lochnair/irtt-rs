@@ -681,10 +681,10 @@ fn write_server_timing(out: &mut String, timing: Option<ServerTiming>) {
 fn write_one_way(out: &mut String, one_way: Option<OneWayDelaySample>) {
     if let Some(one_way) = one_way {
         if let Some(value) = one_way.client_to_server {
-            write!(out, " client_to_server_us={}", duration_us(value)).unwrap();
+            write!(out, " client_to_server_us={}", signed_duration_us(value)).unwrap();
         }
         if let Some(value) = one_way.server_to_client {
-            write!(out, " server_to_client_us={}", duration_us(value)).unwrap();
+            write!(out, " server_to_client_us={}", signed_duration_us(value)).unwrap();
         }
     }
 }
@@ -716,8 +716,8 @@ fn write_human_one_way(out: &mut String, one_way: Option<OneWayDelaySample>) {
             write!(
                 out,
                 "  rd={}  sd={}",
-                format_optional_duration(one_way.server_to_client),
-                format_optional_duration(one_way.client_to_server)
+                format_optional_signed_duration(one_way.server_to_client),
+                format_optional_signed_duration(one_way.client_to_server)
             )
             .unwrap();
         }
@@ -777,9 +777,9 @@ fn signed_duration_us(duration: SignedDuration) -> i128 {
     duration.as_micros()
 }
 
-fn format_optional_duration(duration: Option<Duration>) -> String {
+fn format_optional_signed_duration(duration: Option<SignedDuration>) -> String {
     duration
-        .map(format_duration)
+        .map(format_signed_duration)
         .unwrap_or_else(|| "n/a".to_owned())
 }
 
@@ -882,8 +882,8 @@ mod tests {
                 processing: Some(Duration::from_micros(300)),
             }),
             one_way: Some(OneWayDelaySample {
-                client_to_server: Some(Duration::from_micros(400)),
-                server_to_client: Some(Duration::from_micros(500)),
+                client_to_server: Some(SignedDuration::from_nanos(400_000)),
+                server_to_client: Some(SignedDuration::from_nanos(500_000)),
             }),
             received_stats: Some(ReceivedStatsSample {
                 count: Some(9),
@@ -919,6 +919,40 @@ mod tests {
             received_stats: None,
             bytes: 64,
             packet_meta: PacketMeta::default(),
+        }
+    }
+
+    fn negative_one_way_reply_event() -> ClientEvent {
+        let ClientEvent::EchoReply {
+            seq,
+            remote,
+            sent_at,
+            received_at,
+            rtt,
+            server_timing,
+            received_stats,
+            bytes,
+            packet_meta,
+            ..
+        } = reply_event()
+        else {
+            unreachable!();
+        };
+
+        ClientEvent::EchoReply {
+            seq,
+            remote,
+            sent_at,
+            received_at,
+            rtt,
+            server_timing,
+            one_way: Some(OneWayDelaySample {
+                client_to_server: Some(SignedDuration::from_nanos(-400_000)),
+                server_to_client: Some(SignedDuration::from_nanos(-500_000)),
+            }),
+            received_stats,
+            bytes,
+            packet_meta,
         }
     }
 
@@ -1239,6 +1273,14 @@ mod tests {
     }
 
     #[test]
+    fn machine_prints_negative_one_way_delay_values() {
+        let line = format_event(&negative_one_way_reply_event(), OutputMode::Machine).unwrap();
+
+        assert!(line.contains("client_to_server_us=-400"));
+        assert!(line.contains("server_to_client_us=-500"));
+    }
+
+    #[test]
     fn machine_echo_reply_metadata_prints_observed_and_unavailable_values() {
         let cases = [
             (PacketMeta::default(), ("none", "none", "none", "none")),
@@ -1298,6 +1340,14 @@ mod tests {
         assert!(!OutputMode::Simple.prints_summary());
         assert!(!OutputMode::Machine.prints_summary());
         assert!(!OutputMode::RttUs.prints_summary());
+    }
+
+    #[test]
+    fn human_prints_negative_one_way_delay_values() {
+        let line = format_event(&negative_one_way_reply_event(), OutputMode::Human).unwrap();
+
+        assert!(line.contains("rd=-500.0µs"));
+        assert!(line.contains("sd=-400.0µs"));
     }
 
     #[test]

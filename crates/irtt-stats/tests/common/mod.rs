@@ -72,8 +72,8 @@ fn reply_with_rtt(seq: u32, raw_ms: u64, rtt: RttSample) -> ClientEvent {
             processing: Some(Duration::from_millis(1)),
         }),
         one_way: Some(OneWayDelaySample {
-            client_to_server: Some(Duration::from_millis(1)),
-            server_to_client: Some(Duration::from_millis(2)),
+            client_to_server: Some(SignedDuration::from_nanos(1_000_000)),
+            server_to_client: Some(SignedDuration::from_nanos(2_000_000)),
         }),
         received_stats: Some(ReceivedStatsSample {
             count: Some(seq + 1),

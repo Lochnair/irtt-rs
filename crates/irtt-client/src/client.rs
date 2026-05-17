@@ -789,11 +789,11 @@ fn compute_one_way(
     let c2s = server_recv_wall
         .zip(client_send_ns)
         .and_then(|(srv, cli)| srv.checked_sub(cli))
-        .and_then(|d| u64::try_from(d).ok().map(Duration::from_nanos));
+        .map(|d| SignedDuration::from_nanos(i128::from(d)));
     let s2c = client_recv_ns
         .zip(server_send_wall)
         .and_then(|(cli, srv)| cli.checked_sub(srv))
-        .and_then(|d| u64::try_from(d).ok().map(Duration::from_nanos));
+        .map(|d| SignedDuration::from_nanos(i128::from(d)));
 
     if c2s.is_none() && s2c.is_none() {
         return None;

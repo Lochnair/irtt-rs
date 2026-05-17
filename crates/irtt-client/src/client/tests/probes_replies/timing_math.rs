@@ -90,6 +90,68 @@ fn compute_one_way_returns_available_direction_samples() {
     };
 
     let sample = compute_one_way(&sent_at, &received_at, &ts).unwrap();
-    assert_eq!(sample.client_to_server, Some(Duration::from_millis(15)));
-    assert_eq!(sample.server_to_client, Some(Duration::from_millis(15)));
+    assert_eq!(
+        sample.client_to_server,
+        Some(SignedDuration::from_nanos(15_000_000))
+    );
+    assert_eq!(
+        sample.server_to_client,
+        Some(SignedDuration::from_nanos(15_000_000))
+    );
+}
+
+#[test]
+fn compute_one_way_preserves_negative_client_to_server_delay() {
+    let sent_at = ClientTimestamp {
+        mono: Instant::now(),
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+    };
+    let received_at = ClientTimestamp {
+        mono: sent_at.mono + Duration::from_millis(40),
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(10) + Duration::from_millis(40),
+    };
+    let ts = TimestampFields {
+        recv_wall: Some(10_000_000_000 - 5_000_000),
+        send_wall: Some(10_000_000_000 + 25_000_000),
+        ..Default::default()
+    };
+
+    let sample = compute_one_way(&sent_at, &received_at, &ts).unwrap();
+
+    assert_eq!(
+        sample.client_to_server,
+        Some(SignedDuration::from_nanos(-5_000_000))
+    );
+    assert_eq!(
+        sample.server_to_client,
+        Some(SignedDuration::from_nanos(15_000_000))
+    );
+}
+
+#[test]
+fn compute_one_way_preserves_negative_server_to_client_delay() {
+    let sent_at = ClientTimestamp {
+        mono: Instant::now(),
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(10),
+    };
+    let received_at = ClientTimestamp {
+        mono: sent_at.mono + Duration::from_millis(40),
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(10) + Duration::from_millis(40),
+    };
+    let ts = TimestampFields {
+        recv_wall: Some(10_000_000_000 + 15_000_000),
+        send_wall: Some(10_000_000_000 + 45_000_000),
+        ..Default::default()
+    };
+
+    let sample = compute_one_way(&sent_at, &received_at, &ts).unwrap();
+
+    assert_eq!(
+        sample.client_to_server,
+        Some(SignedDuration::from_nanos(15_000_000))
+    );
+    assert_eq!(
+        sample.server_to_client,
+        Some(SignedDuration::from_nanos(-5_000_000))
+    );
 }

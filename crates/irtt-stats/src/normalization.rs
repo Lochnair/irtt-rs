@@ -163,10 +163,10 @@ impl ReplySample {
             rtt_adjusted_ns: rtt.adjusted.map(signed_duration_ns),
             send_delay_ns: one_way
                 .and_then(|sample| sample.client_to_server)
-                .map(duration_ns_i128),
+                .map(signed_duration_ns),
             receive_delay_ns: one_way
                 .and_then(|sample| sample.server_to_client)
-                .map(duration_ns_i128),
+                .map(signed_duration_ns),
             server_processing_ns: server_timing
                 .and_then(|timing| timing.processing)
                 .map(duration_ns_i128),

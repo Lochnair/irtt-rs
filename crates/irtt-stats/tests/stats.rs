@@ -3,7 +3,9 @@ mod common;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use common::{adjusted_reply, sent, ts, unadjusted_late_reply, unadjusted_reply};
-use irtt_client::{ClientEvent, ClientTimestamp, PacketMeta, RttSample, SignedDuration};
+use irtt_client::{
+    ClientEvent, ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, SignedDuration,
+};
 use irtt_stats::{EventStatsUpdate, IpdvPairUpdate, SampleMode, StatsCollector, StatsConfig};
 
 #[test]
@@ -278,6 +280,48 @@ fn server_processing_and_one_way_require_available_samples() {
     assert_eq!(snapshot.packets.unique_replies, 1);
     assert_eq!(snapshot.packets.late_packets, 1);
     assert_eq!(snapshot.packets.bytes_received, 128);
+}
+
+#[test]
+fn negative_one_way_delay_samples_are_included_in_stats() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    let sent_at = ts(0);
+    let received_at = ClientTimestamp {
+        mono: sent_at.mono + Duration::from_millis(10),
+        wall: sent_at.wall + Duration::from_millis(10),
+    };
+
+    collector.process(&ClientEvent::EchoReply {
+        seq: 0,
+        remote: "127.0.0.1:2112".parse().unwrap(),
+        sent_at,
+        received_at,
+        rtt: RttSample {
+            raw: Duration::from_millis(10),
+            adjusted: None,
+            effective: SignedDuration::from_nanos(10_000_000),
+        },
+        server_timing: None,
+        one_way: Some(OneWayDelaySample {
+            client_to_server: Some(SignedDuration::from_nanos(-1_000_000)),
+            server_to_client: Some(SignedDuration::from_nanos(-2_000_000)),
+        }),
+        received_stats: None,
+        bytes: 64,
+        packet_meta: PacketMeta::default(),
+    });
+
+    let snapshot = collector.snapshot();
+
+    assert_eq!(snapshot.one_way_delay.send_delay.count, 1);
+    assert_eq!(snapshot.one_way_delay.send_delay.min_ns, Some(-1_000_000));
+    assert_eq!(snapshot.one_way_delay.send_delay.total_ns, -1_000_000);
+    assert_eq!(snapshot.one_way_delay.receive_delay.count, 1);
+    assert_eq!(
+        snapshot.one_way_delay.receive_delay.min_ns,
+        Some(-2_000_000)
+    );
+    assert_eq!(snapshot.one_way_delay.receive_delay.total_ns, -2_000_000);
 }
 
 #[test]
