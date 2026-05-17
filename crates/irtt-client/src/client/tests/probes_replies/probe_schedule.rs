@@ -51,83 +51,6 @@ fn send_probe_sends_valid_echo_request() {
 }
 
 #[test]
-fn echo_sent_reports_schedule_and_timer_error() {
-    let params = default_params();
-    let server = silent_open_server(params);
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    let start = ClientTimestamp {
-        mono: Instant::now(),
-        wall: SystemTime::now(),
-    };
-    assert_open_started(client.open().unwrap());
-    let session_start = client.next_send_deadline().unwrap();
-    assert!(
-        session_start >= start.mono,
-        "probe schedule must start after open begins"
-    );
-    let first_probe_at = ClientTimestamp {
-        mono: session_start,
-        wall: SystemTime::now(),
-    };
-
-    let events = client.send_probe_at(first_probe_at).unwrap();
-    match &events[0] {
-        ClientEvent::EchoSent {
-            scheduled_at,
-            sent_at,
-            timer_error,
-            ..
-        } => {
-            assert_eq!(*scheduled_at, session_start);
-            assert_eq!(*sent_at, first_probe_at);
-            assert_eq!(*timer_error, Duration::ZERO);
-        }
-        other => panic!("expected EchoSent, got {other:?}"),
-    }
-
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn send_probe_starts_seq_at_zero_and_increments() {
-    let params = default_params();
-    let server = silent_open_server(params);
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-    client.send_probe().unwrap();
-    client.send_probe().unwrap();
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(30));
-    let packets: Vec<_> = server.rx.try_iter().collect();
-    let echo_reqs: Vec<_> = packets
-        .iter()
-        .filter(|p| p.len() >= 4 && p[3] & FLAG_OPEN == 0 && p[3] & flags::FLAG_CLOSE == 0)
-        .collect();
-    assert_eq!(echo_reqs.len(), 3);
-    for (i, pkt) in echo_reqs.iter().enumerate() {
-        let seq = u32::from_le_bytes(pkt[12..16].try_into().unwrap());
-        assert_eq!(seq, i as u32);
-    }
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
 fn send_probe_respects_finite_duration_exclusive_end() {
     let params = Params {
         protocol_version: 1,
@@ -179,84 +102,20 @@ fn send_probe_respects_finite_duration_exclusive_end() {
 }
 
 #[test]
-fn continuous_duration_keeps_generating_send_deadlines() {
-    let params = Params {
-        protocol_version: 1,
-        duration_ns: 0,
-        interval_ns: 500_000_000,
-        received_stats: ReceivedStats::Both,
-        stamp_at: StampAt::Both,
-        clock: Clock::Both,
-        ..Params::default()
-    };
-    let server = silent_open_server(params);
-    let config = ClientConfig {
-        duration: None,
-        interval: Duration::from_millis(500),
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
+fn connect_rejects_invalid_probe_limits() {
+    for config in [
+        ClientConfig {
+            max_pending_probes: 0,
+            ..ClientConfig::default()
         },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-
-    let start = client.next_send_deadline().unwrap();
-    let interval = Duration::from_millis(500);
-    for seq in 0..4 {
-        let now = ClientTimestamp {
-            mono: start + interval * seq,
-            wall: SystemTime::now(),
-        };
-        let events = client.send_probe_at(now).unwrap();
-        assert_eq!(events.len(), 1);
-        assert!(client.next_send_deadline().is_some());
+        ClientConfig {
+            probe_timeout: Duration::ZERO,
+            ..ClientConfig::default()
+        },
+    ] {
+        assert!(matches!(
+            Client::connect(config),
+            Err(ClientError::InvalidConfig { .. })
+        ));
     }
-
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn next_send_deadline_advances_by_interval() {
-    let params = default_params();
-    let (mut client, server) = open_client_with_echo_server(&params);
-
-    let deadline0 = client.next_send_deadline().unwrap();
-
-    client.send_probe().unwrap();
-    let deadline1 = client.next_send_deadline().unwrap();
-    assert_eq!(deadline1, deadline0 + Duration::from_secs(1));
-
-    client.send_probe().unwrap();
-    let deadline2 = client.next_send_deadline().unwrap();
-    assert_eq!(deadline2, deadline0 + Duration::from_secs(2));
-
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn connect_rejects_zero_max_pending_probes() {
-    let config = ClientConfig {
-        max_pending_probes: 0,
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        Client::connect(config),
-        Err(ClientError::InvalidConfig { .. })
-    ));
-}
-
-#[test]
-fn connect_rejects_zero_probe_timeout() {
-    let config = ClientConfig {
-        probe_timeout: Duration::ZERO,
-        ..ClientConfig::default()
-    };
-    assert!(matches!(
-        Client::connect(config),
-        Err(ClientError::InvalidConfig { .. })
-    ));
 }

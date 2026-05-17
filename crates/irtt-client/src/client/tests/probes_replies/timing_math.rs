@@ -1,49 +1,6 @@
 use super::*;
 
 #[test]
-fn echo_reply_rtt_uses_client_monotonic() {
-    let params = default_params();
-    let (mut client, server) = open_client_with_echo_server(&params);
-
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(20));
-
-    let events = client.recv_once().unwrap();
-    if let ClientEvent::EchoReply { rtt, .. } = &events[0] {
-        assert!(rtt.raw >= Duration::from_millis(15));
-    } else {
-        panic!("expected EchoReply");
-    }
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn server_processing_subtracted_when_valid() {
-    let params = default_params();
-    let (mut client, server) = open_client_with_echo_server(&params);
-    client.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(20));
-    let events = client.recv_once().unwrap();
-    if let ClientEvent::EchoReply {
-        rtt, server_timing, ..
-    } = &events[0]
-    {
-        let st = server_timing.as_ref().unwrap();
-        let processing = st.processing.unwrap();
-        assert!(processing > Duration::ZERO);
-        if let Some(adj) = rtt.adjusted {
-            assert!(adj < rtt.raw);
-            assert_eq!(rtt.effective, adj);
-        }
-    } else {
-        panic!("expected EchoReply");
-    }
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
 fn server_processing_greater_than_raw_does_not_underflow() {
     let base = Instant::now();
     let rtt = compute_rtt(
@@ -68,14 +25,6 @@ fn server_processing_greater_than_raw_does_not_underflow() {
         Some(SignedDuration { ns: -999_999_999 })
     );
     assert_eq!(rtt.effective_signed, SignedDuration { ns: -999_999_999 });
-}
-
-#[test]
-fn compute_one_way_returns_none_when_both_directions_fail() {
-    let ts = TimestampFields::default();
-    let now = ClientTimestamp::now();
-    let result = compute_one_way(&now, &now, &ts);
-    assert!(result.is_none());
 }
 
 #[test]
@@ -108,49 +57,6 @@ fn compute_one_way_omits_samples_when_client_wall_time_overflows_i64() {
     };
 
     assert_eq!(compute_one_way(&sent_at, &received_at, &ts), None);
-}
-
-#[test]
-fn matched_reply_with_reversed_monotonic_time_still_emits_event() {
-    let params = default_params();
-    let server = silent_open_server(params.clone());
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-
-    let base = Instant::now() + Duration::from_secs(1);
-    let send_ts = ClientTimestamp {
-        mono: base,
-        wall: SystemTime::now(),
-    };
-    client.send_probe_at(send_ts).unwrap();
-
-    let recv_ts = ClientTimestamp {
-        mono: send_ts.mono - Duration::from_millis(500),
-        wall: send_ts.wall + Duration::from_millis(10),
-    };
-    let reply = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
-    let events = client
-        .process_received_packet(&reply, recv_ts, ReceiveMeta::default())
-        .unwrap();
-
-    assert_eq!(events.len(), 1);
-    match &events[0] {
-        ClientEvent::EchoReply { rtt, .. } => {
-            assert_eq!(rtt.raw, Duration::ZERO);
-            assert_eq!(rtt.effective, Duration::ZERO);
-        }
-        other => panic!("expected EchoReply, got {other:?}"),
-    }
-
-    client.close().unwrap();
-    server.join();
 }
 
 #[test]

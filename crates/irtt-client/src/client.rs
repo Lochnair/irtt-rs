@@ -664,26 +664,6 @@ impl Client {
     fn send_probe_at(&mut self, ts: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
         self.send_probe_inner(Some(ts))
     }
-
-    fn process_received_packet(
-        &mut self,
-        packet: &[u8],
-        received_at: ClientTimestamp,
-        meta: ReceiveMeta,
-    ) -> Result<Vec<ClientEvent>, ClientError> {
-        let Some(reply) = self.decode_received_packet(packet) else {
-            return Ok(vec![ClientEvent::Warning {
-                kind: WarningKind::MalformedOrUnrelatedPacket,
-                message: "dropped malformed or unrelated packet".to_owned(),
-                at: received_at,
-            }]);
-        };
-        self.process_echo_reply(reply, packet.len(), received_at, meta)
-    }
-
-    fn recv_buffer_size(&self) -> usize {
-        self.recv_buffer.len()
-    }
 }
 
 fn update_highest_received(highest_received_seq: &mut Option<u32>, wire_seq: u32) {
