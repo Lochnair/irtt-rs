@@ -352,7 +352,7 @@ fn assert_processing_subtracted(reply: ReplyView<'_>) {
     assert_eq!(processing, Duration::from_nanos(1));
     let adjusted = reply.rtt.adjusted.unwrap();
     assert_eq!(reply.rtt.effective, adjusted);
-    assert!(adjusted.ns < SignedDuration::from_duration(reply.rtt.raw).ns);
+    assert!(adjusted < SignedDuration::from_duration(reply.rtt.raw));
 }
 
 fn assert_one_way_presence(

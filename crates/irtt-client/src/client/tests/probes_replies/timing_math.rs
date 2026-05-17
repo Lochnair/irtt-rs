@@ -18,8 +18,8 @@ fn server_processing_greater_than_raw_does_not_underflow() {
             ..Default::default()
         },
     );
-    assert_eq!(rtt.adjusted, Some(SignedDuration { ns: -999_999_999 }));
-    assert_eq!(rtt.effective, SignedDuration { ns: -999_999_999 });
+    assert_eq!(rtt.adjusted, Some(SignedDuration::from_nanos(-999_999_999)));
+    assert_eq!(rtt.effective, SignedDuration::from_nanos(-999_999_999));
 }
 
 #[test]

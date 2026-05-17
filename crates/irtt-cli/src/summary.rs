@@ -206,8 +206,8 @@ mod tests {
             received_at,
             rtt: RttSample {
                 raw: Duration::from_micros(1500),
-                adjusted: Some(SignedDuration { ns: 1_200_000 }),
-                effective: SignedDuration { ns: 1_200_000 },
+                adjusted: Some(SignedDuration::from_nanos(1_200_000)),
+                effective: SignedDuration::from_nanos(1_200_000),
             },
             server_timing: Some(ServerTiming {
                 receive_wall_ns: None,
@@ -252,8 +252,8 @@ mod tests {
             received_at,
             rtt: RttSample {
                 raw: Duration::from_micros(1500),
-                adjusted: Some(SignedDuration { ns: 1_200_000 }),
-                effective: SignedDuration { ns: 1_200_000 },
+                adjusted: Some(SignedDuration::from_nanos(1_200_000)),
+                effective: SignedDuration::from_nanos(1_200_000),
             },
             server_timing: None,
             one_way: None,

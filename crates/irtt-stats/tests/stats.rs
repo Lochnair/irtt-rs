@@ -2,19 +2,20 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use common::{late_reply, reply, sent, ts};
+use common::{adjusted_reply, sent, ts, unadjusted_late_reply, unadjusted_reply};
 use irtt_client::{ClientEvent, PacketMeta};
 use irtt_stats::{EventStatsUpdate, IpdvPairUpdate, SampleMode, StatsCollector, StatsConfig};
 
 #[test]
 fn running_only_samples_avoid_finite_retention() {
     let mut collector = StatsCollector::new(StatsConfig::continuous());
-    collector.process(&reply(0, 10, 9));
-    collector.process(&reply(1, 20, 19));
+    collector.process(&unadjusted_reply(0, 10));
+    collector.process(&unadjusted_reply(1, 20));
 
     let snapshot = collector.snapshot();
     assert_eq!(snapshot.rtt.primary.median_ns, None);
     assert_eq!(snapshot.rtt.raw.median_ns, None);
+    assert_eq!(snapshot.rtt.adjusted.count, 0);
     assert_eq!(snapshot.rtt.adjusted.median_ns, None);
     assert_eq!(snapshot.ipdv.round_trip.median_ns, None);
     assert_eq!(snapshot.one_way_delay.send_delay.median_ns, None);
@@ -25,7 +26,7 @@ fn running_only_samples_avoid_finite_retention() {
 fn continuous_mode_tracks_running_samples_without_exact_medians() {
     let mut collector = StatsCollector::new(StatsConfig::continuous());
     for seq in 0..4104 {
-        collector.process(&reply(seq, 10, 10));
+        collector.process(&unadjusted_reply(seq, 10));
     }
 
     let snapshot = collector.snapshot();
@@ -38,14 +39,15 @@ fn continuous_mode_tracks_running_samples_without_exact_medians() {
 #[test]
 fn cumulative_rtt_uses_signed_effective_and_tracks_raw() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
-    collector.process(&reply(0, 1, -2));
-    collector.process(&reply(1, 10, 8));
+    collector.process(&adjusted_reply(0, 1, -2));
+    collector.process(&adjusted_reply(1, 10, 8));
 
     let snapshot = collector.snapshot();
     assert_eq!(snapshot.rtt.primary.count, 2);
     assert_eq!(snapshot.rtt.primary.min_ns, Some(-2_000_000));
     assert_eq!(snapshot.rtt.primary.median_ns, Some(3_000_000.0));
     assert_eq!(snapshot.rtt.raw.total_ns, 11_000_000);
+    assert_eq!(snapshot.rtt.adjusted.count, 2);
 }
 
 #[test]
@@ -53,8 +55,8 @@ fn late_unique_counts_and_duplicates_do_not_update_duplicate_measurements() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
     collector.process(&sent(0, ts(0)));
     collector.process(&sent(1, ts(10)));
-    collector.process(&reply(1, 10, 9));
-    collector.process(&late_reply(0, 20, 19));
+    collector.process(&unadjusted_reply(1, 10));
+    collector.process(&unadjusted_late_reply(0, 20));
     collector.process(&ClientEvent::DuplicateReply {
         seq: 0,
         remote: "127.0.0.1:2112".parse().unwrap(),
@@ -84,7 +86,7 @@ fn final_loss_uses_sent_minus_unique_replies_not_echo_loss_events() {
         sent_at: ts(0),
         timeout_at: Instant::now(),
     });
-    collector.process(&late_reply(0, 10, 9));
+    collector.process(&unadjusted_late_reply(0, 10));
 
     let snapshot = collector.snapshot();
     assert_eq!(snapshot.events.loss_events, 1);
@@ -114,9 +116,9 @@ fn assert_one_ipdv_pair(
 #[test]
 fn ipdv_is_sequence_adjacent_and_gap_preserving() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
-    let first = collector.process(&reply(0, 10, 10));
-    let gap = collector.process(&reply(2, 15, 15));
-    let adjacent = collector.process(&reply(3, 12, 12));
+    let first = collector.process(&unadjusted_reply(0, 10));
+    let gap = collector.process(&unadjusted_reply(2, 15));
+    let adjacent = collector.process(&unadjusted_reply(3, 12));
 
     let snapshot = collector.snapshot();
     assert!(first.contributed_sample);
@@ -134,8 +136,8 @@ fn ipdv_is_sequence_adjacent_and_gap_preserving() {
 #[test]
 fn late_reply_can_complete_ipdv_pair() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
-    collector.process(&reply(1, 20, 20));
-    let update = collector.process(&late_reply(0, 10, 10));
+    collector.process(&unadjusted_reply(1, 20));
+    let update = collector.process(&unadjusted_late_reply(0, 10));
 
     let snapshot = collector.snapshot();
 
@@ -149,8 +151,8 @@ fn late_reply_can_complete_ipdv_pair() {
 #[test]
 fn update_exposes_directional_ipdv_when_available() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
-    collector.process(&reply(0, 10, 10));
-    let update = collector.process(&reply(1, 13, 13));
+    collector.process(&unadjusted_reply(0, 10));
+    let update = collector.process(&unadjusted_reply(1, 13));
 
     assert!(update.contributed_sample);
 
@@ -163,9 +165,9 @@ fn update_exposes_directional_ipdv_when_available() {
 fn gap_fill_update_exposes_both_completed_ipdv_pairs() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
 
-    let first = collector.process(&reply(0, 10, 10));
-    let gap = collector.process(&reply(2, 20, 20));
-    let fill = collector.process(&reply(1, 13, 13));
+    let first = collector.process(&unadjusted_reply(0, 10));
+    let gap = collector.process(&unadjusted_reply(2, 20));
+    let fill = collector.process(&unadjusted_reply(1, 13));
 
     assert!(first.contributed_sample);
     assert!(first.ipdv_pairs.is_empty());
@@ -192,7 +194,7 @@ fn gap_fill_update_exposes_both_completed_ipdv_pairs() {
 #[test]
 fn server_processing_and_one_way_require_available_samples() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
-    collector.process(&reply(0, 10, 9));
+    collector.process(&unadjusted_reply(0, 10));
     collector.process(&ClientEvent::LateReply {
         seq: 9,
         highest_seen: 10,
@@ -220,8 +222,8 @@ fn server_processing_and_one_way_require_available_samples() {
 #[test]
 fn older_cumulative_server_receive_count_does_not_regress() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
-    collector.process(&reply(1, 10, 10));
-    collector.process(&late_reply(0, 10, 10));
+    collector.process(&unadjusted_reply(1, 10));
+    collector.process(&unadjusted_late_reply(0, 10));
 
     let snapshot = collector.snapshot();
     assert_eq!(snapshot.packets.server_packets_received, Some(2));
@@ -235,8 +237,8 @@ fn rolling_count_eviction_recomputes_from_bounded_events() {
         rolling_time: None,
     });
     collector.process(&sent(0, ts(0)));
-    collector.process(&reply(0, 10, 10));
-    collector.process(&reply(1, 20, 20));
+    collector.process(&unadjusted_reply(0, 10));
+    collector.process(&unadjusted_reply(1, 20));
 
     let rolling = collector.rolling_count().unwrap();
     assert_eq!(rolling.packets.packets_sent, 0);
@@ -276,7 +278,7 @@ fn directional_loss_uses_server_received_count_when_available() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
     collector.process(&sent(0, ts(0)));
     collector.process(&sent(1, ts(10)));
-    collector.process(&reply(0, 10, 10));
+    collector.process(&unadjusted_reply(0, 10));
 
     let loss = collector.snapshot().loss;
     assert_eq!(loss.lost_packets, 1);

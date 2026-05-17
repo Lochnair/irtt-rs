@@ -727,9 +727,8 @@ fn compute_rtt(
 
     let server_processing = compute_server_processing(ts);
 
-    let adjusted = server_processing.map(|sp| SignedDuration {
-        ns: duration_ns_i128(raw) - duration_ns_i128(sp),
-    });
+    let adjusted = server_processing
+        .map(|sp| SignedDuration::from_nanos(duration_ns_i128(raw) - duration_ns_i128(sp)));
     let effective = adjusted.unwrap_or_else(|| SignedDuration::from_duration(raw));
 
     RttSample {

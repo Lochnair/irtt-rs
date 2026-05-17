@@ -12,14 +12,21 @@ pub fn ts(ms: u64) -> ClientTimestamp {
     }
 }
 
-pub fn rtt(raw_ms: u64, effective_ms: i128) -> RttSample {
-    let effective = SignedDuration {
-        ns: effective_ms * 1_000_000,
-    };
+pub fn adjusted_rtt(raw_ms: u64, adjusted_ms: i128) -> RttSample {
+    let adjusted = SignedDuration::from_nanos(adjusted_ms * 1_000_000);
     RttSample {
         raw: Duration::from_millis(raw_ms),
-        adjusted: Some(effective),
-        effective,
+        adjusted: Some(adjusted),
+        effective: adjusted,
+    }
+}
+
+pub fn unadjusted_rtt(raw_ms: u64) -> RttSample {
+    let raw = Duration::from_millis(raw_ms);
+    RttSample {
+        raw,
+        adjusted: None,
+        effective: SignedDuration::from_duration(raw),
     }
 }
 
@@ -35,7 +42,15 @@ pub fn sent(seq: u32, sent_at: ClientTimestamp) -> ClientEvent {
     }
 }
 
-pub fn reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
+pub fn adjusted_reply(seq: u32, raw_ms: u64, adjusted_ms: i128) -> ClientEvent {
+    reply_with_rtt(seq, raw_ms, adjusted_rtt(raw_ms, adjusted_ms))
+}
+
+pub fn unadjusted_reply(seq: u32, raw_ms: u64) -> ClientEvent {
+    reply_with_rtt(seq, raw_ms, unadjusted_rtt(raw_ms))
+}
+
+fn reply_with_rtt(seq: u32, raw_ms: u64, rtt: RttSample) -> ClientEvent {
     let sent_at = ts(seq as u64 * 10);
     let received_at = ClientTimestamp {
         mono: sent_at.mono + Duration::from_millis(raw_ms),
@@ -46,7 +61,7 @@ pub fn reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
         remote: "127.0.0.1:2112".parse().unwrap(),
         sent_at,
         received_at,
-        rtt: rtt(raw_ms, effective_ms),
+        rtt,
         server_timing: Some(ServerTiming {
             receive_wall_ns: Some(unix_time_ns_after_epoch(sent_at.wall) as i64 + 1_000_000),
             receive_mono_ns: Some(seq as i64 * 10_000_000 + 1_000_000),
@@ -69,7 +84,11 @@ pub fn reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
     }
 }
 
-pub fn late_reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
+pub fn unadjusted_late_reply(seq: u32, raw_ms: u64) -> ClientEvent {
+    late_reply_from(unadjusted_reply(seq, raw_ms))
+}
+
+fn late_reply_from(reply: ClientEvent) -> ClientEvent {
     let ClientEvent::EchoReply {
         seq,
         remote,
@@ -82,7 +101,7 @@ pub fn late_reply(seq: u32, raw_ms: u64, effective_ms: i128) -> ClientEvent {
         bytes,
         packet_meta,
         ..
-    } = reply(seq, raw_ms, effective_ms)
+    } = reply
     else {
         unreachable!();
     };

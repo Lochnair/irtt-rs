@@ -203,7 +203,7 @@ fn duration_ns_i128(duration: Duration) -> i128 {
 }
 
 fn signed_duration_ns(duration: SignedDuration) -> i128 {
-    duration.ns
+    duration.as_nanos()
 }
 
 #[cfg(test)]

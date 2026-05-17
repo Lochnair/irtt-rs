@@ -15,7 +15,7 @@ use irtt_cli::{
 };
 use irtt_client::{Client, ClientEvent, OpenOutcome, RecvBudget};
 
-#[cfg(test)]
+#[cfg(all(test, feature = "stats"))]
 use irtt_client::ClientTimestamp;
 
 #[cfg(feature = "stats")]
@@ -247,9 +247,14 @@ impl<W: Write> StreamOutput<'_, W> {
 
         let line =
             if self.mode == OutputMode::Human && !matches!(event, ClientEvent::EchoSent { .. }) {
+                #[cfg(feature = "stats")]
+                let human_stats = stats_update.into();
+                #[cfg(not(feature = "stats"))]
+                let human_stats = stats_update;
+
                 Some(format_human_event_with_options(
                     event,
-                    Some(stats_update.into()),
+                    Some(human_stats),
                     self.human_options,
                 ))
             } else {
@@ -426,9 +431,7 @@ mod tests {
             rtt: RttSample {
                 raw: Duration::from_micros(rtt_us),
                 adjusted: None,
-                effective: SignedDuration {
-                    ns: i128::from(rtt_us) * 1_000,
-                },
+                effective: SignedDuration::from_nanos(i128::from(rtt_us) * 1_000),
             },
             server_timing: None,
             one_way: None,
@@ -466,7 +469,7 @@ mod tests {
                 rtt: RttSample {
                     raw: Duration::from_micros(1200),
                     adjusted: None,
-                    effective: SignedDuration { ns: 1_200_000 },
+                    effective: SignedDuration::from_nanos(1_200_000),
                 },
                 server_timing: None,
                 one_way: None,
@@ -579,7 +582,7 @@ mod tests {
                 rtt: RttSample {
                     raw: Duration::from_micros(1),
                     adjusted: None,
-                    effective: SignedDuration { ns: 1_000 },
+                    effective: SignedDuration::from_nanos(1_000),
                 },
                 server_timing: None,
                 one_way: None,

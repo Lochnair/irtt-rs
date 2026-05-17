@@ -774,7 +774,7 @@ fn duration_us(duration: Duration) -> u128 {
 }
 
 fn signed_duration_us(duration: SignedDuration) -> i128 {
-    duration.ns / 1_000
+    duration.as_micros()
 }
 
 fn format_optional_duration(duration: Option<Duration>) -> String {
@@ -788,7 +788,7 @@ fn format_duration(duration: Duration) -> String {
 }
 
 fn format_signed_duration(duration: SignedDuration) -> String {
-    format_signed_ns(duration.ns as f64)
+    format_signed_ns(duration.as_nanos() as f64)
 }
 
 fn format_signed_ns(ns: f64) -> String {
@@ -869,8 +869,8 @@ mod tests {
             received_at: test_timestamp(Duration::from_secs(1) + Duration::from_micros(1500)),
             rtt: RttSample {
                 raw: Duration::from_micros(1500),
-                adjusted: Some(SignedDuration { ns: 1_200_000 }),
-                effective: SignedDuration { ns: 1_200_000 },
+                adjusted: Some(SignedDuration::from_nanos(1_200_000)),
+                effective: SignedDuration::from_nanos(1_200_000),
             },
             server_timing: Some(ServerTiming {
                 receive_wall_ns: Some(1_000),
@@ -894,6 +894,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "stats")]
     fn negative_adjusted_reply_event() -> ClientEvent {
         ClientEvent::EchoReply {
             seq: 8,
@@ -902,8 +903,8 @@ mod tests {
             received_at: test_timestamp(Duration::from_secs(1) + Duration::from_micros(500)),
             rtt: RttSample {
                 raw: Duration::from_micros(500),
-                adjusted: Some(SignedDuration { ns: -1_500_000 }),
-                effective: SignedDuration { ns: -1_500_000 },
+                adjusted: Some(SignedDuration::from_nanos(-1_500_000)),
+                effective: SignedDuration::from_nanos(-1_500_000),
             },
             server_timing: Some(ServerTiming {
                 receive_wall_ns: Some(1_000),

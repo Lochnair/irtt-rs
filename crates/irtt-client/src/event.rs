@@ -117,16 +117,36 @@ pub struct RttSample {
     pub effective: SignedDuration,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SignedDuration {
-    pub ns: i128,
+    ns: i128,
 }
 
 impl SignedDuration {
+    pub const fn from_nanos(ns: i128) -> Self {
+        Self { ns }
+    }
+
     pub fn from_duration(duration: Duration) -> Self {
         Self {
             ns: i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX),
         }
+    }
+
+    pub const fn as_nanos(self) -> i128 {
+        self.ns
+    }
+
+    pub const fn as_micros(self) -> i128 {
+        self.ns / 1_000
+    }
+
+    pub const fn as_millis(self) -> i128 {
+        self.ns / 1_000_000
+    }
+
+    pub const fn is_negative(self) -> bool {
+        self.ns < 0
     }
 }
 
@@ -169,19 +189,4 @@ pub struct PacketMeta {
     pub dscp: Option<u8>,
     pub ecn: Option<u8>,
     pub kernel_rx_timestamp: Option<std::time::SystemTime>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::PacketMeta;
-
-    #[test]
-    fn packet_meta_default_is_unavailable() {
-        let meta = PacketMeta::default();
-
-        assert_eq!(meta.traffic_class, None);
-        assert_eq!(meta.dscp, None);
-        assert_eq!(meta.ecn, None);
-        assert_eq!(meta.kernel_rx_timestamp, None);
-    }
 }

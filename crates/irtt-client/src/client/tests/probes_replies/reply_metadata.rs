@@ -1,3 +1,4 @@
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
 use super::*;
 
 #[test]
