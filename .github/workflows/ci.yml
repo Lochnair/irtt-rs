@@ -63,6 +63,38 @@ jobs:
             --locked \
             -- -D warnings
 
+      - name: Run clippy without default features
+        run: |
+          cargo clippy \
+            --workspace \
+            --all-targets \
+            --no-default-features \
+            --locked \
+            -- -D warnings
+
+  check:
+    name: cargo check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        with:
+          cache-key: check
+
+      - name: Run check without default features
+        run: |
+          cargo check \
+            --workspace \
+            --no-default-features \
+            --locked
+
   test:
     name: cargo test
     runs-on: ubuntu-latest
@@ -85,6 +117,13 @@ jobs:
             --workspace \
             --all-targets \
             --all-features \
+            --locked
+
+      - name: Run tests without default features
+        run: |
+          cargo test \
+            --workspace \
+            --no-default-features \
             --locked
 
   docs:

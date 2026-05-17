@@ -894,7 +894,6 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "stats")]
     fn negative_adjusted_reply_event() -> ClientEvent {
         ClientEvent::EchoReply {
             seq: 8,
@@ -1230,6 +1229,22 @@ mod tests {
                 OutputMode::RttUs
             ),
             None
+        );
+    }
+
+    #[test]
+    fn human_and_simple_print_negative_effective_rtt() {
+        let event = negative_adjusted_reply_event();
+
+        assert!(format_event(&event, OutputMode::Human)
+            .unwrap()
+            .contains("rtt=-1.5ms"));
+        assert_eq!(
+            format_event(&event, OutputMode::Simple),
+            Some(
+                "reply seq=8 remote=127.0.0.1:2112 rtt_us=-1500 raw_rtt_us=500 server_processing_us=2000"
+                    .to_owned()
+            )
         );
     }
 
