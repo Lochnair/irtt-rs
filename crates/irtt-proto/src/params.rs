@@ -1,5 +1,7 @@
 use crate::{varint, ProtoError, Result, PROTOCOL_VERSION};
 
+pub const MAX_SERVER_FILL_BYTES: usize = 32;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Params {
     pub protocol_version: i64,
@@ -59,6 +61,12 @@ impl Params {
                     pos += used;
                     let len = usize::try_from(len)
                         .map_err(|_| ProtoError::ParameterLengthTooLarge { tag, length: len })?;
+                    if len > MAX_SERVER_FILL_BYTES {
+                        return Err(ProtoError::ParameterLengthTooLarge {
+                            tag,
+                            length: len as u64,
+                        });
+                    }
                     if input.len().saturating_sub(pos) < len {
                         return Err(ProtoError::MalformedParams);
                     }
@@ -206,6 +214,14 @@ mod tests {
         assert_eq!(Params::decode(&params.encode()), Ok(params));
     }
 
+    fn encode_server_fill_value(value: &[u8]) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        varint::encode_uvarint(9, &mut encoded);
+        varint::encode_uvarint(value.len() as u64, &mut encoded);
+        encoded.extend_from_slice(value);
+        encoded
+    }
+
     #[test]
     fn params_round_trip() {
         let params = Params {
@@ -321,6 +337,29 @@ mod tests {
             }),
             ..Params::default()
         });
+    }
+
+    #[test]
+    fn server_fill_decode_accepts_max_length() {
+        let value = b"0123456789abcdef0123456789abcdef";
+        let params = Params::decode(&encode_server_fill_value(value)).unwrap();
+
+        assert_eq!(
+            params.server_fill,
+            Some(ServerFill {
+                value: "0123456789abcdef0123456789abcdef".to_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn server_fill_decode_rejects_oversized_length() {
+        let value = b"0123456789abcdef0123456789abcdefx";
+
+        assert_eq!(
+            Params::decode(&encode_server_fill_value(value)),
+            Err(ProtoError::ParameterLengthTooLarge { tag: 9, length: 33 })
+        );
     }
 
     #[test]

@@ -17,7 +17,7 @@ pub use flags::*;
 pub use hmac::{compute_hmac, compute_hmac_in_place, verify_hmac};
 pub use layout::{echo_header_len, echo_packet_len, PacketLayout};
 pub use open::{decode_open_reply, encode_open_request, OpenReply, OpenRequest};
-pub use params::{Clock, Params, ReceivedStats, ServerFill, StampAt};
+pub use params::{Clock, Params, ReceivedStats, ServerFill, StampAt, MAX_SERVER_FILL_BYTES};
 
 pub const MAGIC: [u8; 3] = [0x14, 0xA7, 0x5B];
 pub const PROTOCOL_VERSION: i64 = 1;
