@@ -8,9 +8,16 @@ use crate::{
     probe::{CompletedSet, PendingMap, TimedOutMap},
 };
 
+/// Protocol parameters accepted for a session.
+///
+/// `params` contains the server-returned values that the client will use for
+/// echo packets. `restrictions` records accepted differences from the request
+/// when loose negotiation is enabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiatedParams {
+    /// Server-returned protocol parameters used for the session.
     pub params: Params,
+    /// Accepted server restrictions or parameter changes.
     pub restrictions: Vec<NegotiationRestriction>,
 }
 
@@ -57,6 +64,7 @@ pub enum NegotiationRestriction {
 }
 
 impl NegotiationRestriction {
+    /// Return a human-readable description of this negotiated restriction.
     pub fn message(&self) -> String {
         self.to_string()
     }

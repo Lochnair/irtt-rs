@@ -19,23 +19,83 @@ pub(crate) const MIN_OPEN_TIMEOUT: Duration = Duration::from_millis(200);
 pub(crate) const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(4);
 pub(crate) const DEFAULT_MAX_PENDING: usize = 4096;
 
+/// Configuration for opening and running an IRTT client session.
+///
+/// This type describes both the protocol parameters sent in the IRTT open
+/// request and the local client behavior used to drive the UDP socket. Values
+/// that are negotiated by the server are available after opening the session
+/// through [`NegotiatedParams`](crate::NegotiatedParams).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
+    /// Remote server name or address.
+    ///
+    /// If no port is present, the default IRTT port 2112 is used. IPv6
+    /// literals may be supplied either bracketed or unbracketed when the
+    /// default port should be used.
     pub server_addr: String,
+    /// Requested run duration.
+    ///
+    /// `Some(duration)` requests a finite test and must be greater than zero.
+    /// `None` requests continuous mode and is encoded on the wire as a zero
+    /// duration. Use [`RunMode::NoTest`] when the caller wants negotiation only
+    /// without sending probes.
     pub duration: Option<Duration>,
+    /// Requested spacing between probe sends.
+    ///
+    /// The interval is encoded as nanoseconds in the open request and must be
+    /// greater than zero. The server may return a different interval depending
+    /// on the negotiated policy and server restrictions.
     pub interval: Duration,
+    /// Requested echo packet payload length, in bytes.
+    ///
+    /// The value must fit within the UDP payload limit after protocol overhead.
+    /// A server may reduce the requested length during negotiation.
     pub length: u32,
+    /// Requested server receive-statistics fields in echo replies.
     pub received_stats: ReceivedStats,
+    /// Requested timestamp placement in echo replies.
     pub stamp_at: StampAt,
+    /// Requested server clock sources for timestamp fields.
     pub clock: Clock,
+    /// Requested DSCP codepoint.
+    ///
+    /// This is the six-bit DSCP value, not the full traffic-class byte, and
+    /// must be less than or equal to [`MAX_DSCP_CODEPOINT`].
     pub dscp: u8,
+    /// Optional HMAC key used to authenticate IRTT packets.
+    ///
+    /// When present, open, echo, and close packets are encoded and decoded with
+    /// HMAC authentication. The peer must be configured with the same key.
     pub hmac_key: Option<Vec<u8>>,
+    /// Optional server payload fill request.
+    ///
+    /// `None` leaves server fill behavior unspecified. `Some(value)` requests
+    /// a non-empty server fill mode/value and must not exceed
+    /// [`MAX_SERVER_FILL_BYTES`] bytes when UTF-8 encoded.
     pub server_fill: Option<String>,
+    /// Per-attempt receive timeouts used while opening the session.
+    ///
+    /// The client sends an open request for each entry until a valid open reply
+    /// is received. The list must not be empty, and each timeout must be at
+    /// least 200 ms.
     pub open_timeouts: Vec<Duration>,
+    /// Whether opening the session should start a probe test or perform a
+    /// negotiation-only no-test exchange.
     pub run_mode: RunMode,
+    /// Policy for server changes to negotiable protocol parameters.
     pub negotiation_policy: NegotiationPolicy,
+    /// Local UDP socket configuration.
     pub socket_config: SocketConfig,
+    /// Time after sending a probe before the client reports it as lost.
+    ///
+    /// This timeout is local client behavior; it is not negotiated with the
+    /// server. It must be greater than zero.
     pub probe_timeout: Duration,
+    /// Maximum number of probes tracked as pending/timed-out/completed.
+    ///
+    /// This bounds memory used for reply classification and must be greater
+    /// than zero. A very small value can reject sends when replies are still
+    /// outstanding.
     pub max_pending_probes: usize,
 }
 
@@ -62,29 +122,65 @@ impl Default for ClientConfig {
     }
 }
 
+/// Local UDP socket options used by [`ClientConfig`].
+///
+/// These settings affect how the client binds, resolves, and receives from the
+/// socket. They do not change the IRTT protocol parameters negotiated with the
+/// server.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SocketConfig {
+    /// Local address to bind before connecting the UDP socket.
+    ///
+    /// `None` binds to an unspecified address with an ephemeral port matching
+    /// the selected remote address family.
     pub bind_addr: Option<SocketAddr>,
+    /// Optional IPv4 TTL or IPv6 hop limit applied to sent packets.
+    ///
+    /// `None` leaves the platform default unchanged. Values must fit in the
+    /// platform socket option range; [`MAX_TTL`] is the public configuration
+    /// bound used by this crate.
     pub ttl: Option<u32>,
+    /// Restrict name resolution to IPv4 addresses.
     pub ipv4_only: bool,
+    /// Restrict name resolution to IPv6 addresses and set IPV6_V6ONLY for IPv6
+    /// sockets.
     pub ipv6_only: bool,
+    /// Socket read timeout used after the session is open.
+    ///
+    /// `None` leaves reads blocking for APIs that perform a single receive.
+    /// Managed sessions may replace `None` or long timeouts with a short
+    /// timeout so cooperative cancellation can be observed promptly.
     pub recv_timeout: Option<Duration>,
 }
 
+/// How strictly to handle server-side negotiation restrictions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NegotiationPolicy {
+    /// Reject any negotiated parameter that is more restrictive or different
+    /// than requested.
     Strict,
+    /// Accept documented server restrictions and report them in
+    /// [`NegotiatedParams`](crate::NegotiatedParams).
     Loose,
 }
 
+/// Mode requested during the IRTT open exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
+    /// Open a session and send echo probes for the negotiated run duration.
     Normal,
+    /// Complete negotiation without running the echo probe test.
     NoTest,
 }
 
+/// Bound for a single receive-drain operation.
+///
+/// This is used by lower-level callers that drive [`Client`](crate::Client)
+/// directly and want to cap how many datagrams are processed before returning
+/// to their own event loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvBudget {
+    /// Maximum number of datagrams to process before returning.
     pub max_packets: usize,
 }
 

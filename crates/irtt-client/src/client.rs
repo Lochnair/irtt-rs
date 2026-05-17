@@ -32,6 +32,12 @@ use crate::{
 const MAX_OPEN_PACKET_SIZE: usize = 512;
 const MIN_RECV_BUFFER_SIZE: usize = 2048;
 
+/// Low-level synchronous IRTT client.
+///
+/// `Client` exposes the protocol steps directly: connect a UDP socket, open a
+/// session, send probes, receive replies, poll timeouts, and close. Callers
+/// that do not need to own this loop can use [`ManagedClient`](crate::ManagedClient)
+/// instead.
 #[derive(Debug)]
 pub struct Client {
     config: ClientConfig,
@@ -45,6 +51,11 @@ pub struct Client {
 }
 
 impl Client {
+    /// Resolve the configured server and create a connected UDP socket.
+    ///
+    /// This validates local configuration and prepares the open request, but it
+    /// does not contact the server. Call [`open`](Self::open) to perform the
+    /// IRTT open exchange.
     pub fn connect(config: ClientConfig) -> Result<Self, ClientError> {
         validate_open_timeouts(&config.open_timeouts)?;
         if config.max_pending_probes == 0 {
@@ -73,6 +84,11 @@ impl Client {
         })
     }
 
+    /// Perform the IRTT open exchange.
+    ///
+    /// On success, returns the negotiated open outcome and transitions the
+    /// client into either an open probe session or completed no-test state.
+    /// Open attempts use [`ClientConfig::open_timeouts`].
     pub fn open(&mut self) -> Result<OpenOutcome, ClientError> {
         match self.phase {
             ClientPhase::Connected => {}
@@ -127,6 +143,10 @@ impl Client {
         }
     }
 
+    /// Send a close request and emit a [`ClientEvent::SessionClosed`] event.
+    ///
+    /// The close event means the client has sent its close packet and stopped
+    /// tracking the session locally; it is not a server acknowledgement.
     pub fn close(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         let token = match self.phase {
             ClientPhase::Open { token } => token,
@@ -153,6 +173,8 @@ impl Client {
         }])
     }
 
+    /// Return the monotonic deadline for the next probe send, if another probe
+    /// is scheduled.
     pub fn next_send_deadline(&self) -> Option<Instant> {
         let session = self.session.as_ref()?;
         if session.sending_done {
@@ -161,14 +183,24 @@ impl Client {
         Some(session.next_send_at)
     }
 
+    /// Return the local timeout used to classify pending probes as lost.
     pub fn probe_timeout(&self) -> Duration {
         self.config.probe_timeout
     }
 
+    /// Send one echo probe if the negotiated run is still active.
+    ///
+    /// Returns an `EchoSent` event when a probe is sent. Returns an empty event
+    /// list when the run duration has elapsed and no further probe should be
+    /// sent.
     pub fn send_probe(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         self.send_probe_inner(None)
     }
 
+    /// Receive and classify at most one datagram from the socket.
+    ///
+    /// Returns an empty event list when the socket read would block or times
+    /// out. Malformed or unrelated datagrams are reported as warning events.
     pub fn recv_once(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         self.recv_once_inner(None)
     }
@@ -315,6 +347,8 @@ impl Client {
         self.process_echo_reply(reply, packet_len, now, datagram.meta)
     }
 
+    /// Receive and classify datagrams until a receive produces no events or the
+    /// receive budget is exhausted.
     pub fn recv_available(&mut self, budget: RecvBudget) -> Result<Vec<ClientEvent>, ClientError> {
         let mut all_events = Vec::new();
         for _ in 0..budget.max_packets {
@@ -366,6 +400,11 @@ impl Client {
         Ok(events)
     }
 
+    /// Return whether the current run has completed.
+    ///
+    /// A normal run is complete once no more probes will be sent and all
+    /// pending probes have either replied or timed out. No-test and closed
+    /// sessions are also considered complete.
     pub fn is_run_complete(&self) -> bool {
         let Some(session) = self.session.as_ref() else {
             return matches!(

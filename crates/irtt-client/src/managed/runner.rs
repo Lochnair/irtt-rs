@@ -21,6 +21,12 @@ const MANAGED_FINAL_DRAIN: Duration = Duration::from_millis(100);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
 
+/// Entry point for running a client session on a worker thread.
+///
+/// The managed API owns the lower-level [`Client`](crate::Client) loop: it
+/// opens the session, sends probes at the negotiated interval, receives
+/// datagrams, publishes [`ClientEvent`] values, and closes the session when the
+/// run completes or is cancelled.
 #[derive(Debug)]
 pub struct ManagedClient;
 
@@ -46,26 +52,49 @@ pub struct ManagedClientSession {
 #[must_use = "managed session outcomes contain completion status and counters"]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionOutcome {
+    /// Why the managed loop stopped.
     pub end_reason: SessionEndReason,
+    /// Number of echo requests sent by the client.
     pub packets_sent: u64,
+    /// Number of first in-window echo replies received.
     pub replies_received: u64,
+    /// Number of duplicate reply events emitted.
     pub duplicates: u64,
+    /// Number of late reply events emitted.
     pub late: u64,
+    /// Number of warning events emitted.
     pub warning_events: u64,
 }
 
+/// Reason a managed client session ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionEndReason {
+    /// The negotiated finite test duration completed and the client closed the
+    /// session normally.
     TestComplete,
+    /// Cancellation was requested through [`ManagedClientSession::stop`] or by
+    /// dropping the session handle.
     Cancelled,
+    /// The session was opened in [`RunMode::NoTest`](crate::RunMode) and
+    /// completed after negotiation.
     NoTestComplete,
 }
 
 impl ManagedClient {
+    /// Start a managed session without creating an initial event subscription.
+    ///
+    /// The returned [`ManagedClientSession`] can still create subscriptions via
+    /// [`ManagedClientSession::subscribe`], but events emitted before a
+    /// subscriber is registered are not replayed.
     pub fn start(config: ClientConfig) -> Result<ManagedClientSession, ClientError> {
         Self::start_inner(config, None).map(|(session, _)| session)
     }
 
+    /// Start a managed session and subscribe to events before the worker runs.
+    ///
+    /// The initial subscription receives the open lifecycle event and
+    /// subsequent session events, subject to its queue capacity and overflow
+    /// policy.
     pub fn start_with_subscription(
         config: ClientConfig,
         subscriber_config: SubscriberConfig,
@@ -114,14 +143,28 @@ impl ManagedClient {
 }
 
 impl ManagedClientSession {
+    /// Add another event subscriber to this running managed session.
+    ///
+    /// The subscription receives only events published after it is registered.
     pub fn subscribe(&self, config: SubscriberConfig) -> Result<EventSubscription, ClientError> {
         self.hub.subscribe(config)
     }
 
+    /// Request cooperative cancellation of the managed session.
+    ///
+    /// Cancellation is observed by the worker loop between socket receive,
+    /// timeout polling, and send scheduling steps. Call [`join`](Self::join) to
+    /// wait for the worker and obtain the final [`SessionOutcome`].
     pub fn stop(&self) {
         self.cancellation.cancel();
     }
 
+    /// Wait for the managed worker thread to finish.
+    ///
+    /// On success, returns lifecycle counters for the completed session. If the
+    /// worker panicked, this returns [`ClientError::WorkerPanicked`]. Joining
+    /// also disconnects all event subscriptions while leaving already queued
+    /// events available to drain.
     pub fn join(mut self) -> Result<SessionOutcome, ClientError> {
         let worker = self
             .worker

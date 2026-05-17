@@ -8,9 +8,17 @@ use std::{
 
 use crate::{error::EventSubscriptionError, event::ClientEvent};
 
+/// Configuration for one managed event subscriber.
+///
+/// Each subscriber has an independent bounded queue. The queue bounds memory
+/// growth when event production is faster than that subscriber's consumer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubscriberConfig {
+    /// Maximum number of events buffered for this subscriber.
+    ///
+    /// Must be greater than zero.
     pub capacity: usize,
+    /// Policy applied when publishing to a full subscriber queue.
     pub overflow: SubscriberOverflow,
 }
 
@@ -37,6 +45,11 @@ pub enum SubscriberOverflow {
     Disconnect,
 }
 
+/// Publish/subscribe fan-out for [`ClientEvent`] values.
+///
+/// `EventHub` is used by managed sessions internally and is also exported for
+/// callers that want the same bounded subscription behavior around their own
+/// event producer. Publishing clones each event once per subscriber.
 #[derive(Debug, Clone)]
 pub struct EventHub {
     inner: Arc<HubInner>,
@@ -75,6 +88,7 @@ struct SubscriberState {
 }
 
 impl EventHub {
+    /// Create an empty event hub with no subscribers.
     pub fn new() -> Self {
         Self {
             inner: Arc::new(HubInner {
@@ -84,6 +98,9 @@ impl EventHub {
         }
     }
 
+    /// Register a new subscriber with its own bounded queue.
+    ///
+    /// Returns an error when `config.capacity` is zero.
     pub fn subscribe(
         &self,
         config: SubscriberConfig,
@@ -116,6 +133,11 @@ impl EventHub {
         })
     }
 
+    /// Publish an event to all currently connected subscribers.
+    ///
+    /// Slow subscribers are handled according to their
+    /// [`SubscriberOverflow`] policy. Publishing does not block waiting for a
+    /// subscriber to consume queued events.
     pub fn publish(&self, event: ClientEvent) {
         let subscribers: Vec<(u64, Arc<SubscriberInner>)> = self
             .inner
@@ -149,6 +171,8 @@ impl EventHub {
         }
     }
 
+    /// Disconnect all subscribers after leaving their already queued events
+    /// available to drain.
     pub fn disconnect_all(&self) {
         let subscribers: Vec<Arc<SubscriberInner>> = self
             .inner
