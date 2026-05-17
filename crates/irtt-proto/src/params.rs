@@ -1,7 +1,16 @@
 use crate::{varint, ProtoError, Result, PROTOCOL_VERSION};
 
+/// Protocol compatibility bound for an encoded `server_fill` parameter.
 pub const MAX_SERVER_FILL_BYTES: usize = 32;
 
+/// Low-level wire representation of IRTT open parameters.
+///
+/// `Params` mirrors the protocol fields closely and can be constructed
+/// directly by callers. Direct construction can therefore produce values that
+/// should not be sent on the wire, such as an oversized `server_fill` value.
+/// Higher-level callers should validate user or configuration input before
+/// encoding. The normal `irtt-client` configuration path enforces
+/// [`MAX_SERVER_FILL_BYTES`] for `server_fill`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Params {
     pub protocol_version: i64,
@@ -23,6 +32,10 @@ impl Params {
         }
     }
 
+    /// Encodes these parameters without performing additional validation.
+    ///
+    /// Callers that construct `Params` directly are responsible for validating
+    /// user or configuration input before encoding.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         push_int(1, self.protocol_version, &mut out);
@@ -41,6 +54,10 @@ impl Params {
         out
     }
 
+    /// Decodes parameters and rejects malformed or incompatible incoming values.
+    ///
+    /// This includes invalid enum values, malformed UTF-8, and `server_fill`
+    /// values longer than [`MAX_SERVER_FILL_BYTES`].
     pub fn decode(input: &[u8]) -> Result<Self> {
         let mut params = Self::default();
         let mut pos = 0;
