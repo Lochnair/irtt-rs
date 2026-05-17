@@ -48,10 +48,8 @@ impl IpdvTracker {
         if let Some(pair) = self.try_pair(seq) {
             pairs.push(pair);
         }
-        if let Some(next) = seq.checked_add(1) {
-            if let Some(pair) = self.try_pair(next) {
-                pairs.push(pair);
-            }
+        if let Some(pair) = self.try_pair(seq.wrapping_add(1)) {
+            pairs.push(pair);
         }
         pairs
     }
@@ -66,15 +64,13 @@ impl IpdvTracker {
             };
             if self.samples.remove(&seq).is_some() {
                 self.completed_pairs.remove(&seq);
-                if let Some(next) = seq.checked_add(1) {
-                    self.completed_pairs.remove(&next);
-                }
+                self.completed_pairs.remove(&seq.wrapping_add(1));
             }
         }
     }
 
     fn try_pair(&mut self, current_seq: u32) -> Option<CompletedIpdvPair> {
-        let previous_seq = current_seq.checked_sub(1)?;
+        let previous_seq = current_seq.wrapping_sub(1);
 
         if !self.completed_pairs.insert(current_seq) {
             return None;
@@ -234,6 +230,52 @@ mod tests {
                     receive_ipdv_ns: None,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn ipdv_tracker_completes_wrapped_adjacent_pair() {
+        let mut tracker = IpdvTracker::new(None);
+        assert!(tracker.insert(ipdv_sample(u32::MAX, 10)).is_empty());
+
+        let pairs = tracker.insert(ipdv_sample(0, 14));
+
+        assert_eq!(
+            pairs,
+            vec![CompletedIpdvPair {
+                previous_seq: u32::MAX,
+                current_seq: 0,
+                rtt_ipdv_ns: 4,
+                send_ipdv_ns: None,
+                receive_ipdv_ns: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn ipdv_tracker_wrap_gap_does_not_complete_pair() {
+        let mut tracker = IpdvTracker::new(None);
+        assert!(tracker.insert(ipdv_sample(u32::MAX - 1, 10)).is_empty());
+
+        assert!(tracker.insert(ipdv_sample(0, 14)).is_empty());
+    }
+
+    #[test]
+    fn ipdv_tracker_late_wrapped_previous_completes_pair() {
+        let mut tracker = IpdvTracker::new(None);
+        assert!(tracker.insert(ipdv_sample(0, 14)).is_empty());
+
+        let pairs = tracker.insert(ipdv_sample(u32::MAX, 10));
+
+        assert_eq!(
+            pairs,
+            vec![CompletedIpdvPair {
+                previous_seq: u32::MAX,
+                current_seq: 0,
+                rtt_ipdv_ns: 4,
+                send_ipdv_ns: None,
+                receive_ipdv_ns: None,
+            }]
         );
     }
 

@@ -1,9 +1,9 @@
 mod common;
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use common::{adjusted_reply, sent, ts, unadjusted_late_reply, unadjusted_reply};
-use irtt_client::{ClientEvent, PacketMeta};
+use irtt_client::{ClientEvent, ClientTimestamp, PacketMeta, RttSample, SignedDuration};
 use irtt_stats::{EventStatsUpdate, IpdvPairUpdate, SampleMode, StatsCollector, StatsConfig};
 
 #[test]
@@ -113,6 +113,34 @@ fn assert_one_ipdv_pair(
     pair
 }
 
+fn reply_at(seq: u32, raw_ms: u64, sent_ms: u64) -> ClientEvent {
+    let sent_at = ClientTimestamp {
+        mono: Instant::now() + Duration::from_millis(sent_ms),
+        wall: UNIX_EPOCH + Duration::from_millis(sent_ms),
+    };
+    let received_at = ClientTimestamp {
+        mono: sent_at.mono + Duration::from_millis(raw_ms),
+        wall: sent_at.wall + Duration::from_millis(raw_ms),
+    };
+    let raw = Duration::from_millis(raw_ms);
+    ClientEvent::EchoReply {
+        seq,
+        remote: "127.0.0.1:2112".parse().unwrap(),
+        sent_at,
+        received_at,
+        rtt: RttSample {
+            raw,
+            adjusted: None,
+            effective: SignedDuration::from_duration(raw),
+        },
+        server_timing: None,
+        one_way: None,
+        received_stats: None,
+        bytes: 64,
+        packet_meta: PacketMeta::default(),
+    }
+}
+
 #[test]
 fn ipdv_is_sequence_adjacent_and_gap_preserving() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
@@ -131,6 +159,39 @@ fn ipdv_is_sequence_adjacent_and_gap_preserving() {
     assert_one_ipdv_pair(&adjacent, 2, 3, Duration::from_millis(3));
     assert_eq!(snapshot.ipdv.round_trip.count, 1);
     assert_eq!(snapshot.ipdv.round_trip.total_ns, 3_000_000);
+}
+
+#[test]
+fn ipdv_wraparound_sequence_is_adjacent() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    let first = collector.process(&reply_at(u32::MAX, 10, 0));
+    let wrapped = collector.process(&reply_at(0, 14, 10));
+
+    assert!(first.contributed_sample);
+    assert_no_ipdv_pairs(&first);
+
+    assert!(wrapped.contributed_sample);
+    assert_one_ipdv_pair(&wrapped, u32::MAX, 0, Duration::from_millis(4));
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.ipdv.round_trip.count, 1);
+    assert_eq!(snapshot.ipdv.round_trip.total_ns, 4_000_000);
+}
+
+#[test]
+fn ipdv_wraparound_gap_is_preserved() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    let before_wrap = collector.process(&reply_at(u32::MAX - 1, 10, 0));
+    let wrapped = collector.process(&reply_at(0, 14, 20));
+
+    assert!(before_wrap.contributed_sample);
+    assert_no_ipdv_pairs(&before_wrap);
+
+    assert!(wrapped.contributed_sample);
+    assert_no_ipdv_pairs(&wrapped);
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.ipdv.round_trip.count, 0);
 }
 
 #[test]
