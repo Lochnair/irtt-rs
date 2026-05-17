@@ -11,6 +11,9 @@ readme.workspace = true
 keywords = ["irtt", "networking", "latency", "rtt"]
 categories = ["command-line-utilities", "network-programming"]
 
+[lib]
+doc = false
+
 [features]
 default = ["stats"]
 stats = ["dep:irtt-stats"]

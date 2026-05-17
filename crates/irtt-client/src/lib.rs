@@ -1,3 +1,50 @@
+//! Reusable client/session/event layer for IRTT-compatible probes.
+//!
+//! `irtt-client` opens IRTT-compatible sessions, sends echo probes, receives
+//! replies, classifies loss/late/duplicate packets, and emits [`ClientEvent`]
+//! values for callers to consume directly or aggregate with `irtt-stats`.
+//!
+//! Timing values intentionally preserve signed measurement semantics. When
+//! server timing is available, [`RttSample::effective`] is adjusted for server
+//! processing and can be negative if the reported server processing time exceeds
+//! the raw client-observed RTT. Directional [`OneWayDelaySample`] values are
+//! also signed when the required wall-clock timestamps are available; negative
+//! values usually indicate client/server clock skew.
+//!
+//! A managed session can drive the socket loop on a worker thread and publish
+//! events through a subscription:
+//!
+//! ```no_run
+//! use std::time::Duration;
+//!
+//! use irtt_client::{ClientConfig, ClientEvent, ManagedClient, SubscriberConfig};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let config = ClientConfig {
+//!     server_addr: "127.0.0.1:2112".to_owned(),
+//!     duration: Some(Duration::from_secs(10)),
+//!     interval: Duration::from_secs(1),
+//!     ..ClientConfig::default()
+//! };
+//!
+//! let (session, events) =
+//!     ManagedClient::start_with_subscription(config, SubscriberConfig::default())?;
+//!
+//! while let Ok(event) = events.recv() {
+//!     match event {
+//!         ClientEvent::EchoReply { seq, rtt, .. } => {
+//!             println!("seq={seq} effective_rtt_us={}", rtt.effective.as_micros());
+//!         }
+//!         ClientEvent::SessionClosed { .. } => break,
+//!         _ => {}
+//!     }
+//! }
+//!
+//! let _outcome = session.join()?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 #![cfg_attr(
     not(all(target_os = "linux", feature = "ancillary")),
     forbid(unsafe_code)

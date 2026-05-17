@@ -1,3 +1,21 @@
+//! Low-level wire encode/decode support for the IRTT protocol.
+//!
+//! `irtt-proto` intentionally mirrors protocol fields closely: request/reply
+//! structs expose wire-oriented values, flags, counters, timestamps, and
+//! parameter enums rather than higher-level policy decisions. Higher-level
+//! crates such as `irtt-client` are responsible for session behavior and
+//! user-facing validation.
+//!
+//! [`Params::decode`] rejects malformed or incompatible incoming parameter
+//! values, including invalid enum discriminants, malformed UTF-8, and oversized
+//! `server_fill` values. Direct construction followed by [`Params::encode`]
+//! performs no additional validation, so callers that build `Params` manually
+//! are responsible for validating those values before sending them.
+//!
+//! The crate also provides packet layout calculation, open/echo/close packet
+//! encoding and decoding, and optional HMAC placement, computation, and
+//! verification helpers.
+//!
 #![forbid(unsafe_code)]
 
 pub mod close;
