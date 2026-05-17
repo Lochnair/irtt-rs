@@ -327,12 +327,6 @@ impl Client {
         Ok(all_events)
     }
 
-    #[cfg(test)]
-    pub(crate) fn recv_buffer_size(&self) -> usize {
-        recv_buffer_size(self.config.hmac_key.is_some(), self.negotiated.as_ref())
-            .expect("test params must have a non-negative packet length")
-    }
-
     /// Polls for probes that have timed out as of the current monotonic time.
     pub fn poll_timeouts(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         self.poll_timeouts_at(Instant::now())
@@ -392,24 +386,6 @@ impl Client {
         self.session
             .as_ref()
             .map_or(0, |session| session.packets_sent)
-    }
-
-    #[cfg(test)]
-    fn process_received_packet(
-        &mut self,
-        packet: &[u8],
-        now: ClientTimestamp,
-        meta: ReceiveMeta,
-    ) -> Result<Vec<ClientEvent>, ClientError> {
-        let packet_len = packet.len();
-        let Some(reply) = self.decode_received_packet(packet) else {
-            return Ok(vec![ClientEvent::Warning {
-                kind: WarningKind::MalformedOrUnrelatedPacket,
-                message: "dropped malformed or unrelated packet".to_owned(),
-                at: now,
-            }]);
-        };
-        self.process_echo_reply(reply, packet_len, now, meta)
     }
 
     fn decode_received_packet(&self, packet: &[u8]) -> Option<EchoReply> {

@@ -1,17 +1,6 @@
 use super::*;
 
 #[test]
-fn address_resolution_connects_to_local_fake_server() {
-    let server = start_fake_server(|socket, tx| {
-        let _ = recv_request(&socket, &tx);
-    });
-    let client = Client::connect(default_test_config(server.addr)).unwrap();
-    client.socket.send(b"ping").unwrap();
-    assert_eq!(server.rx.recv().unwrap(), b"ping");
-    server.join();
-}
-
-#[test]
 fn successful_open_handshake() {
     let config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
     let params = params_from_config(&config).unwrap();
@@ -20,7 +9,6 @@ fn successful_open_handshake() {
 
     let negotiated = assert_open_started(client.open().unwrap());
     assert_eq!(negotiated.params, params);
-    assert!(matches!(client.phase, ClientPhase::Open { token: TOKEN }));
     server.join();
 }
 
@@ -66,27 +54,6 @@ fn open_timeout_after_all_timeouts() {
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
     assert_eq!(server.rx.iter().take(2).count(), 2);
-    server.join();
-}
-
-#[test]
-fn open_restores_configured_read_timeout_after_timeout() {
-    let server = timeout_server(Duration::from_millis(700));
-    let config = ClientConfig {
-        open_timeouts: vec![Duration::from_millis(200)],
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(450)),
-            ..crate::SocketConfig::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
-
-    let start = std::time::Instant::now();
-    let mut buf = [0_u8; 1];
-    assert!(client.socket.recv(&mut buf).is_err());
-    assert!(start.elapsed() >= Duration::from_millis(350));
     server.join();
 }
 

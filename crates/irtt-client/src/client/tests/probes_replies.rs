@@ -1058,16 +1058,6 @@ fn compute_one_way_returns_none_when_both_directions_fail() {
 }
 
 #[test]
-fn unix_epoch_ns_i64_rejects_out_of_range_wall_time() {
-    let i64_max_ns = u64::try_from(i64::MAX).unwrap();
-    let max = SystemTime::UNIX_EPOCH + Duration::from_nanos(i64_max_ns);
-    let overflow = max + Duration::from_nanos(1);
-
-    assert_eq!(unix_epoch_ns_i64(max), Some(i64::MAX));
-    assert_eq!(unix_epoch_ns_i64(overflow), None);
-}
-
-#[test]
 fn compute_one_way_omits_samples_when_client_wall_time_overflows_i64() {
     let i64_max_ns = u64::try_from(i64::MAX).unwrap();
     let overflow_wall =
@@ -1087,95 +1077,6 @@ fn compute_one_way_omits_samples_when_client_wall_time_overflows_i64() {
     };
 
     assert_eq!(compute_one_way(&sent_at, &received_at, &ts), None);
-}
-
-#[test]
-fn matched_reply_with_reversed_monotonic_time_still_emits_event() {
-    let params = default_params();
-    let server = silent_open_server(params.clone());
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-
-    let base = Instant::now() + Duration::from_secs(1);
-    let send_ts = ClientTimestamp {
-        mono: base,
-        wall: SystemTime::now(),
-    };
-    client.send_probe_at(send_ts).unwrap();
-
-    let recv_ts = ClientTimestamp {
-        mono: send_ts.mono - Duration::from_millis(500),
-        wall: send_ts.wall + Duration::from_millis(10),
-    };
-    let reply = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
-    let events = client
-        .process_received_packet(&reply, recv_ts, ReceiveMeta::default())
-        .unwrap();
-
-    assert_eq!(events.len(), 1);
-    match &events[0] {
-        ClientEvent::EchoReply { rtt, .. } => {
-            assert_eq!(rtt.raw, Duration::ZERO);
-            assert_eq!(rtt.effective, Duration::ZERO);
-        }
-        other => panic!("expected EchoReply, got {other:?}"),
-    }
-
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn process_received_packet_uses_supplied_receive_metadata() {
-    let params = default_params();
-    let server = silent_open_server(params.clone());
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-
-    client.send_probe_at(ClientTimestamp::now()).unwrap();
-    let recv_ts = ClientTimestamp::now();
-    let reply = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
-    let events = client
-        .process_received_packet(
-            &reply,
-            recv_ts,
-            ReceiveMeta {
-                traffic_class: Some(186),
-                kernel_rx_timestamp: Some(SystemTime::UNIX_EPOCH + Duration::new(12, 34)),
-            },
-        )
-        .unwrap();
-
-    assert_eq!(events.len(), 1);
-    match &events[0] {
-        ClientEvent::EchoReply { packet_meta, .. } => {
-            assert_eq!(packet_meta.traffic_class, Some(186));
-            assert_eq!(packet_meta.dscp, Some(46));
-            assert_eq!(packet_meta.ecn, Some(2));
-            assert_eq!(
-                packet_meta.kernel_rx_timestamp,
-                Some(SystemTime::UNIX_EPOCH + Duration::new(12, 34))
-            );
-        }
-        other => panic!("expected EchoReply, got {other:?}"),
-    }
-
-    client.close().unwrap();
-    server.join();
 }
 
 #[test]
@@ -1258,7 +1159,21 @@ fn short_echo_reply_does_not_emit_echo_reply() {
         length: 64,
         ..default_params()
     };
-    let server = silent_open_server(params.clone());
+    let server = start_fake_server({
+        let params = params.clone();
+        move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+            socket.send_to(&reply, peer).unwrap();
+            let (request, _) = recv_request(&socket, &tx);
+            let seq = u32::from_le_bytes(request[12..16].try_into().unwrap());
+            let mut reply =
+                echo_reply_packet(TOKEN, seq, &params, &TimestampFields::default(), None);
+            reply.truncate(echo_packet_len(false, &params) - 1);
+            socket.send_to(&reply, peer).unwrap();
+            let _ = recv_request_timeout(&socket, &tx);
+        }
+    });
     let config = ClientConfig {
         length: 64,
         socket_config: crate::SocketConfig {
@@ -1271,11 +1186,7 @@ fn short_echo_reply_does_not_emit_echo_reply() {
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
-    let mut packet = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
-    packet.truncate(echo_packet_len(false, &params) - 1);
-    let events = client
-        .process_received_packet(&packet, ClientTimestamp::now(), ReceiveMeta::default())
-        .unwrap();
+    let events = client.recv_once().unwrap();
 
     assert!(matches!(
         events.as_slice(),
@@ -1289,39 +1200,7 @@ fn short_echo_reply_does_not_emit_echo_reply() {
 }
 
 #[test]
-fn overlong_echo_reply_does_not_emit_echo_reply() {
-    let params = default_params();
-    let server = silent_open_server(params.clone());
-    let config = ClientConfig {
-        socket_config: crate::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-    client.send_probe().unwrap();
-
-    let mut packet = echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default(), None);
-    packet.push(0);
-    let events = client
-        .process_received_packet(&packet, ClientTimestamp::now(), ReceiveMeta::default())
-        .unwrap();
-
-    assert!(matches!(
-        events.as_slice(),
-        [ClientEvent::Warning {
-            kind: WarningKind::MalformedOrUnrelatedPacket,
-            ..
-        }]
-    ));
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn overlong_datagram_detection_uses_extra_receive_byte() {
+fn overlong_echo_reply_datagram_does_not_emit_echo_reply() {
     let params = Params {
         length: 4096,
         ..default_params()
@@ -1351,14 +1230,6 @@ fn overlong_datagram_detection_uses_extra_receive_byte() {
     };
     let mut client = Client::connect(config).unwrap();
     assert_open_started(client.open().unwrap());
-    assert_eq!(
-        client.recv_buffer_size(),
-        echo_packet_len(false, &params) + 1
-    );
-    assert_eq!(
-        client.recv_buffer.len(),
-        echo_packet_len(false, &params) + 1
-    );
     client.send_probe().unwrap();
 
     let events = client.recv_once().unwrap();

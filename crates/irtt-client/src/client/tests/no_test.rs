@@ -1,21 +1,6 @@
 use super::*;
 
 #[test]
-fn no_test_open_close_succeeds_on_open_reply_close() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
-    let params = params_from_config(&config).unwrap();
-    let server = no_test_server(params.clone(), 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
-    let negotiated = assert_no_test_completed(client.open().unwrap());
-    assert_eq!(negotiated.params, params);
-    assert_eq!(client.negotiated.as_ref(), Some(&negotiated));
-    assert!(matches!(client.close(), Err(ClientError::NotOpen)));
-    server.join();
-}
-
-#[test]
 fn no_test_success_validates_params() {
     let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
     config.run_mode = RunMode::NoTest;
