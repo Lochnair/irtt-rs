@@ -1,11 +1,32 @@
 use std::{net::SocketAddr, time::Duration};
 
+/// Protocol compatibility bound for a requested `server_fill` value, in UTF-8
+/// bytes.
+///
+/// This is the maximum encoded server-fill string accepted by this client and
+/// protocol decoder. [`ClientConfig::server_fill`] enforces the same bound
+/// before opening a session.
+pub use irtt_proto::MAX_SERVER_FILL_BYTES;
 pub use irtt_proto::MAX_SERVER_FILL_BYTES;
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
 pub(crate) const DEFAULT_PORT: u16 = 2112;
+/// Largest valid DSCP codepoint accepted by client configuration.
+///
+/// DSCP is a six-bit value in the range `0..=63`. The client maps it into the
+/// socket traffic-class field when configuring packet priority.
 pub const MAX_DSCP_CODEPOINT: u8 = 63;
+/// Largest IPv4 TTL or IPv6 hop-limit value accepted by client configuration.
+///
+/// This is the public user-configuration bound for
+/// [`SocketConfig::ttl`]. A value of zero is rejected separately because socket
+/// TTL and hop-limit settings are configured as `1..=255`.
 pub const MAX_TTL: u32 = 255;
+/// Largest UDP payload length accepted by client configuration, in bytes.
+///
+/// This is the maximum UDP payload size excluding IP and UDP headers. It caps
+/// [`ClientConfig::length`] before protocol packets are encoded or sent.
+pub const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 pub const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 pub(crate) const DEFAULT_DURATION: Duration = Duration::from_secs(3);
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
