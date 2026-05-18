@@ -7,7 +7,6 @@ use std::{net::SocketAddr, time::Duration};
 /// protocol decoder. [`ClientConfig::server_fill`] enforces the same bound
 /// before opening a session.
 pub use irtt_proto::MAX_SERVER_FILL_BYTES;
-pub use irtt_proto::MAX_SERVER_FILL_BYTES;
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
 pub(crate) const DEFAULT_PORT: u16 = 2112;
@@ -26,7 +25,6 @@ pub const MAX_TTL: u32 = 255;
 ///
 /// This is the maximum UDP payload size excluding IP and UDP headers. It caps
 /// [`ClientConfig::length`] before protocol packets are encoded or sent.
-pub const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 pub const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 pub(crate) const DEFAULT_DURATION: Duration = Duration::from_secs(3);
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
