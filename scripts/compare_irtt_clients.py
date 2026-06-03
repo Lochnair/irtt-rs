@@ -152,6 +152,19 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--client-command-prefix",
+        default="",
+        help=(
+            "Command prefix applied to both client invocations, for example "
+            "'sudo ip netns exec irtt-client'."
+        ),
+    )
+    parser.add_argument(
+        "--skip-build",
+        action="store_true",
+        help="Do not run cargo build -p irtt-cli before comparisons.",
+    )
+    parser.add_argument(
         "--localhost-port",
         type=int,
         default=2112,
@@ -350,7 +363,9 @@ def run_case(
     case_dir.mkdir(parents=True, exist_ok=True)
 
     upstream_json = case_dir / "upstream.json"
+    client_prefix = shlex.split(args.client_command_prefix)
     upstream_cmd = [
+        *client_prefix,
         args.upstream_irtt,
         "client",
         "-d",
@@ -364,6 +379,7 @@ def run_case(
         case.target,
     ]
     rust_cmd = [
+        *client_prefix,
         *shlex.split(args.irtt_rs_command),
         case.target,
         "--duration",
@@ -1107,7 +1123,7 @@ def main() -> int:
             print(message, file=sys.stderr)
             cases = [case for case in cases if not case.is_local]
 
-    if cases and not preflight_build_irtt_cli(run_dir):
+    if cases and not args.skip_build and not preflight_build_irtt_cli(run_dir):
         write_index(run_dir, [], local_error)
         return 1
 

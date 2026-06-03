@@ -33,6 +33,7 @@ jobs:
           files: >-
             .github/workflows/actions-security.yml,
             .github/workflows/ci.yml,
+            .github/workflows/interop-netem.yml,
             .github/workflows/osv-scanner.yml,
             .github/workflows/rust-clippy.yml,
             .github/workflows/semver.yml,

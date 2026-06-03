@@ -1,0 +1,65 @@
+name: Netem Interop
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  GOBIN: ${{ github.workspace }}/.tools/bin
+  IRTT_UPSTREAM_VERSION: v0.9.1
+
+jobs:
+  netem:
+    name: netem interop
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6 # v1
+        with:
+          cache-key: interop-netem
+
+      - name: Check host tools
+        run: |
+          ip -V
+          tc -V
+          go version
+
+      - name: Install upstream irtt
+        run: |
+          mkdir -p "$GOBIN"
+          go install "github.com/heistp/irtt/cmd/irtt@${IRTT_UPSTREAM_VERSION}"
+          "$GOBIN/irtt" version
+
+      - name: Build irtt-rs CLI
+        run: cargo build -p irtt-cli --locked
+
+      - name: Run netem interop comparisons
+        run: |
+          python3 scripts/run_netem_interop_ci.py \
+            --all \
+            --skip-build \
+            --upstream-irtt "$GOBIN/irtt" \
+            --irtt-rs-command "$PWD/target/debug/irtt-cli"
+
+      - name: Upload netem interop artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: interop-netem
+          path: target/interop-netem
