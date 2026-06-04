@@ -57,6 +57,16 @@ jobs:
             --upstream-irtt "$GOBIN/irtt" \
             --irtt-rs-command "$PWD/target/debug/irtt-cli"
 
+      - name: Append netem interop summary
+        if: always()
+        run: |
+          latest_summary="$(find target/interop-netem -mindepth 2 -maxdepth 2 -name summary.md -type f -print 2>/dev/null | sort | tail -n 1)"
+          if [ -n "$latest_summary" ]; then
+            cat "$latest_summary" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No netem interop summary.md found." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       - name: Upload netem interop artifacts
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7

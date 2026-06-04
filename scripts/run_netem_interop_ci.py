@@ -13,6 +13,7 @@ import datetime as dt
 import json
 import os
 import platform
+import re
 import shutil
 import shlex
 import signal
@@ -141,6 +142,12 @@ def parse_args() -> argparse.Namespace:
         default=10.0,
         help="Packet-loss scenario warning threshold for client loss-rate delta.",
     )
+    parser.add_argument(
+        "--loss-abs-tolerance-pct",
+        type=float,
+        default=8.0,
+        help="Packet-loss scenario absolute tolerance from expected RTT loss percentage.",
+    )
     return parser.parse_args()
 
 
@@ -249,7 +256,12 @@ def netns(args: argparse.Namespace, namespace: str, command: list[str]) -> list[
     return [*sudo_prefix(args), "ip", "netns", "exec", namespace, *command]
 
 
-def run_checked(command: list[str], log_prefix: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_checked(
+    command: list[str],
+    log_prefix: Path,
+    check: bool = True,
+    ignored_stderr_texts: list[str] | None = None,
+) -> subprocess.CompletedProcess[str]:
     print(f"[{utc_now()}] {shlex.join(command)}", flush=True)
     completed = subprocess.run(
         command,
@@ -258,13 +270,24 @@ def run_checked(command: list[str], log_prefix: Path, check: bool = True) -> sub
         stderr=subprocess.PIPE,
         text=True,
     )
+    stderr = filter_stderr(completed.stderr, ignored_stderr_texts or [])
     log_prefix.parent.mkdir(parents=True, exist_ok=True)
     (log_prefix.with_suffix(".stdout")).write_text(completed.stdout, encoding="utf-8")
-    (log_prefix.with_suffix(".stderr")).write_text(completed.stderr, encoding="utf-8")
+    if stderr or not ignored_stderr_texts:
+        (log_prefix.with_suffix(".stderr")).write_text(stderr, encoding="utf-8")
     (log_prefix.with_suffix(".command")).write_text(shlex.join(command) + "\n", encoding="utf-8")
     if check and completed.returncode != 0:
-        raise CommandError(command, completed.returncode, completed.stdout, completed.stderr)
+        raise CommandError(command, completed.returncode, completed.stdout, stderr)
     return completed
+
+
+def filter_stderr(stderr: str, ignored_texts: list[str]) -> str:
+    if not stderr or not ignored_texts:
+        return stderr
+    kept = [line for line in stderr.splitlines() if not any(text in line for text in ignored_texts)]
+    if stderr.endswith("\n") and kept:
+        return "\n".join(kept) + "\n"
+    return "\n".join(kept)
 
 
 def setup_namespaces(args: argparse.Namespace, run_dir: Path) -> None:
@@ -416,7 +439,12 @@ def delete_qdiscs(args: argparse.Namespace, log_dir: Path) -> None:
             dev,
             "root",
         ]
-        run_checked(command, log_dir / "qdisc-cleanup" / f"{namespace}-{dev}", check=False)
+        run_checked(
+            command,
+            log_dir / "qdisc-cleanup" / f"{namespace}-{dev}",
+            check=False,
+            ignored_stderr_texts=["Cannot delete qdisc with handle of zero"],
+        )
 
 
 def load_latest_comparison(compare_root: Path) -> dict[str, Any]:
@@ -477,12 +505,23 @@ def classify_scenario(
     elif scenario.mode == "loss":
         upstream_loss = upstream.get("loss_percent")
         rust_loss = rust.get("loss_percent")
+        expected_loss = expected_rtt_loss_percent(scenario)
         if upstream_loss is not None and rust_loss is not None:
             loss_delta = rust_loss - upstream_loss
             if abs(loss_delta) > args.loss_rate_warning_pct:
                 warnings.append(
                     f"loss-rate delta {loss_delta:.3f}% exceeds warning threshold "
                     f"{args.loss_rate_warning_pct:.3f}%"
+                )
+        for label, observed_loss in [("upstream", upstream_loss), ("irtt-rs", rust_loss)]:
+            if observed_loss is None:
+                failures.append(f"{label} loss rate missing")
+            elif observed_loss <= 0.0:
+                failures.append(f"{label} observed no loss in loss scenario")
+            elif abs(observed_loss - expected_loss) > args.loss_abs_tolerance_pct:
+                failures.append(
+                    f"{label} loss {observed_loss:.3f}% outside expected "
+                    f"{expected_loss:.3f}% +/- {args.loss_abs_tolerance_pct:.3f}%"
                 )
 
     comparison_notes = result.get("comparison", {}).get("notes", []) if result else []
@@ -494,9 +533,24 @@ def classify_scenario(
         "warnings": warnings,
         "notes": sorted(set(notes)),
         "mean_rtt_delta_us": mean_delta_us,
+        "expected_loss_percent": expected_rtt_loss_percent(scenario) if scenario.mode == "loss" else None,
         "upstream": upstream,
         "irtt_rs": rust,
     }
+
+
+def expected_rtt_loss_percent(scenario: Scenario) -> float:
+    client_to_server_loss = netem_loss_percent(scenario.client_to_server)
+    server_to_client_loss = netem_loss_percent(scenario.server_to_client)
+    success_probability = (1.0 - client_to_server_loss / 100.0) * (1.0 - server_to_client_loss / 100.0)
+    return 100.0 * (1.0 - success_probability)
+
+
+def netem_loss_percent(setting: str) -> float:
+    match = re.search(r"(?:^|\s)loss\s+([0-9]+(?:\.[0-9]+)?)%", setting)
+    if match is None:
+        return 0.0
+    return float(match.group(1))
 
 
 def first_comparison_result(comparison: dict[str, Any]) -> dict[str, Any] | None:
@@ -521,6 +575,7 @@ def write_scenario_markdown(path: Path, result: dict[str, Any]) -> None:
         f"server-to-client netem: `{result['qdisc']['server_to_client']}`",
         f"comparison_json: `{result.get('comparison_json')}`",
         f"mean_rtt_delta_us: `{format_optional(result.get('mean_rtt_delta_us'))}`",
+        f"expected_loss_percent: `{format_optional(result.get('expected_loss_percent'))}`",
         "",
         "| client | sent | received | loss % | mean RTT us |",
         "| --- | ---: | ---: | ---: | ---: |",
@@ -561,17 +616,31 @@ def write_run_summary(run_dir: Path, results: list[dict[str, Any]]) -> None:
     lines = [
         "# Netem IRTT Interop Run",
         "",
-        "| scenario | classification | client-to-server | server-to-client | mean RTT delta us |",
-        "| --- | --- | --- | --- | ---: |",
+        "| scenario | classification | expected RTT us | upstream median RTT us | irtt-rs median RTT us | upstream loss % | irtt-rs loss % | mean RTT delta us |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for result in results:
         scenario = result["scenario"]
+        upstream = result["upstream"]
+        rust = result["irtt_rs"]
         lines.append(
             f"| [{scenario['name']}]({scenario['name']}/summary.md) | "
-            f"{result['classification']} | `{result['qdisc']['client_to_server']}` | "
-            f"`{result['qdisc']['server_to_client']}` | "
+            f"{result['classification']} | "
+            f"{format_optional(scenario.get('expected_rtt_us'))} | "
+            f"{format_optional(upstream.get('rtt_median_us'))} | "
+            f"{format_optional(rust.get('rtt_median_us'))} | "
+            f"{format_optional(upstream.get('loss_percent'))} | "
+            f"{format_optional(rust.get('loss_percent'))} | "
             f"{format_optional(result.get('mean_rtt_delta_us'))} |"
         )
+    failures = [(result["scenario"]["name"], item) for result in results for item in result["failures"]]
+    warnings = [(result["scenario"]["name"], item) for result in results for item in result["warnings"]]
+    if failures:
+        lines.extend(["", "## Failures"])
+        lines.extend(f"- [{scenario}]({scenario}/summary.md): {item}" for scenario, item in failures)
+    if warnings:
+        lines.extend(["", "## Warnings"])
+        lines.extend(f"- [{scenario}]({scenario}/summary.md): {item}" for scenario, item in warnings)
     (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
