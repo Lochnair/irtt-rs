@@ -613,20 +613,50 @@ def format_optional(value: Any) -> str:
 
 def write_run_summary(run_dir: Path, results: list[dict[str, Any]]) -> None:
     write_json(run_dir / "netem-summary.json", {"results": results})
+    (run_dir / "summary.md").write_text(
+        build_run_summary_markdown(results, link_scenarios=True, include_artifact_note=False),
+        encoding="utf-8",
+    )
+    (run_dir / "github-step-summary.md").write_text(
+        build_run_summary_markdown(results, link_scenarios=False, include_artifact_note=True),
+        encoding="utf-8",
+    )
+
+
+def build_run_summary_markdown(
+    results: list[dict[str, Any]],
+    *,
+    link_scenarios: bool,
+    include_artifact_note: bool,
+) -> str:
     lines = [
         "# Netem IRTT Interop Run",
         "",
-        "| scenario | classification | expected RTT us | upstream median RTT us | irtt-rs median RTT us | upstream loss % | irtt-rs loss % | mean RTT delta us |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
+    if include_artifact_note:
+        lines.extend(
+            [
+                "Detailed per-scenario files are available in the uploaded `interop-netem` artifact.",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+            "| scenario | classification | expected RTT us | expected loss % | upstream median RTT us | irtt-rs median RTT us | upstream loss % | irtt-rs loss % | mean RTT delta us |",
+            "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        ]
+    )
     for result in results:
         scenario = result["scenario"]
         upstream = result["upstream"]
         rust = result["irtt_rs"]
+        scenario_name = scenario["name"]
+        scenario_cell = f"[{scenario_name}]({scenario_name}/summary.md)" if link_scenarios else scenario_name
         lines.append(
-            f"| [{scenario['name']}]({scenario['name']}/summary.md) | "
+            f"| {scenario_cell} | "
             f"{result['classification']} | "
             f"{format_optional(scenario.get('expected_rtt_us'))} | "
+            f"{format_optional(result.get('expected_loss_percent'))} | "
             f"{format_optional(upstream.get('rtt_median_us'))} | "
             f"{format_optional(rust.get('rtt_median_us'))} | "
             f"{format_optional(upstream.get('loss_percent'))} | "
@@ -637,11 +667,16 @@ def write_run_summary(run_dir: Path, results: list[dict[str, Any]]) -> None:
     warnings = [(result["scenario"]["name"], item) for result in results for item in result["warnings"]]
     if failures:
         lines.extend(["", "## Failures"])
-        lines.extend(f"- [{scenario}]({scenario}/summary.md): {item}" for scenario, item in failures)
+        lines.extend(format_run_summary_item(scenario, item, link_scenarios) for scenario, item in failures)
     if warnings:
         lines.extend(["", "## Warnings"])
-        lines.extend(f"- [{scenario}]({scenario}/summary.md): {item}" for scenario, item in warnings)
-    (run_dir / "summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        lines.extend(format_run_summary_item(scenario, item, link_scenarios) for scenario, item in warnings)
+    return "\n".join(lines) + "\n"
+
+
+def format_run_summary_item(scenario: str, item: str, link_scenarios: bool) -> str:
+    scenario_label = f"[{scenario}]({scenario}/summary.md)" if link_scenarios else scenario
+    return f"- {scenario_label}: {item}"
 
 
 def stop_process(proc: subprocess.Popen[bytes]) -> None:
