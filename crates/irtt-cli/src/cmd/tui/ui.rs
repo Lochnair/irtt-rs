@@ -1,18 +1,15 @@
 use std::{
     collections::VecDeque,
     io::{self, Stdout},
-    sync::atomic::{AtomicBool, Ordering},
     time::{Duration, Instant},
 };
 
 use crossterm::{
     cursor::Show,
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use irtt_cli::CliArgs;
-use irtt_client::{Client, ClientEvent, NegotiatedParams, SignedDuration};
+use irtt_client::{ClientEvent, NegotiatedParams, SignedDuration};
 use irtt_stats::{Snapshot, StatsCollector, TimeStats};
 use ratatui::{
     backend::CrosstermBackend,
@@ -24,254 +21,20 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::{
-    final_drain_duration, is_shutdown_requested, open_event, should_continue_run,
-    should_drain_final, should_send_probe, stats_config, IDLE_SLEEP, RECV_BUDGET,
-};
+use crate::{cmd::tui::args::TuiArgs, shared::client::expected_probe_count};
 
-const RENDER_INTERVAL: Duration = Duration::from_millis(250);
-const TUI_WAIT_SLICE: Duration = Duration::from_millis(20);
 const HISTORY_LIMIT: usize = 240;
 const RECENT_EVENT_LIMIT: usize = 80;
 const MIN_CHART_POINTS: usize = 12;
 const MIN_WIDTH: u16 = 56;
 const MIN_HEIGHT: u16 = 18;
 
-pub fn run_tui(
-    args: CliArgs,
-    shutdown_requested: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let continuous = args.is_continuous();
-    let mut terminal = TuiTerminal::enter()?;
-    let mut state = TuiState::new(TuiConfig::from_args(&args));
-    let mut stats = StatsCollector::new(stats_config(continuous));
-    let mut next_render = Instant::now();
-
-    if is_shutdown_requested(shutdown_requested) {
-        return Ok(());
-    }
-
-    state.set_status(TuiStatus::Opening);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
-
-    let mut client = match Client::connect(args.to_client_config()) {
-        Ok(client) => client,
-        Err(err) => {
-            state.set_error(err.to_string());
-            render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
-            return Err(Box::new(err));
-        }
-    };
-
-    if is_shutdown_requested(shutdown_requested) {
-        return Ok(());
-    }
-
-    let open = client.open()?;
-    state.process_event(open_event(&open), &mut stats);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
-
-    let mut interrupted = false;
-    // Keep this in lockstep with run_stream: send due probes, drain available
-    // replies, poll timeouts, sleep toward the next absolute send deadline,
-    // then perform the same final drain, timeout poll, and close sequence.
-    while should_continue_run(continuous, client.next_send_deadline(), shutdown_requested) {
-        if handle_input(&mut state, shutdown_requested)? {
-            render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
-        }
-        if state.quit_requested {
-            interrupted = true;
-            break;
-        }
-
-        if should_send_probe(client.next_send_deadline(), shutdown_requested) {
-            let events = client.send_probe()?;
-            state.process_events(&events, &mut stats);
-        }
-
-        let events = client.recv_available(RECV_BUDGET)?;
-        state.process_events(&events, &mut stats);
-
-        let events = client.poll_timeouts()?;
-        state.process_events(&events, &mut stats);
-
-        if is_shutdown_requested(shutdown_requested) {
-            interrupted = true;
-            break;
-        }
-
-        render_if_due(&mut terminal, &state, &stats, &mut next_render, false)?;
-        wait_for_tui_activity(
-            client.next_send_deadline(),
-            &mut next_render,
-            &mut state,
-            &stats,
-            &mut terminal,
-            shutdown_requested,
-        )?;
-    }
-    interrupted |= is_shutdown_requested(shutdown_requested);
-
-    if interrupted {
-        state.set_status(TuiStatus::Interrupted);
-        render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
-    }
-
-    if should_drain_final(continuous, interrupted) {
-        drain_final_replies(&mut client, &mut state, &mut stats, &mut terminal)?;
-    }
-
-    let events = client.poll_timeouts()?;
-    state.process_events(&events, &mut stats);
-
-    state.set_status(TuiStatus::Closing);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
-
-    let events = client.close()?;
-    state.process_events(&events, &mut stats);
-    state.set_status(TuiStatus::Complete);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
-    Ok(())
-}
-
-fn drain_final_replies(
-    client: &mut Client,
-    state: &mut TuiState,
-    stats: &mut StatsCollector,
-    terminal: &mut TuiTerminal,
-) -> Result<(), Box<dyn std::error::Error>> {
-    state.set_status(TuiStatus::Draining);
-    let deadline = Instant::now() + final_drain_duration(client.probe_timeout());
-    let mut next_render = Instant::now();
-    loop {
-        let mut received = false;
-
-        let events = client.recv_available(RECV_BUDGET)?;
-        received |= !events.is_empty();
-        state.process_events(&events, stats);
-
-        let events = client.poll_timeouts()?;
-        received |= !events.is_empty();
-        state.process_events(&events, stats);
-
-        render_if_due(terminal, state, stats, &mut next_render, false)?;
-
-        if client.is_run_complete() || Instant::now() >= deadline {
-            break;
-        }
-
-        if !received {
-            std::thread::sleep(IDLE_SLEEP);
-        }
-    }
-    render_if_due(terminal, state, stats, &mut next_render, true)?;
-    Ok(())
-}
-
-fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Result<bool> {
-    let mut force_render = false;
-    while event::poll(Duration::ZERO)? {
-        let Event::Key(key) = event::read()? else {
-            continue;
-        };
-        if key.kind == KeyEventKind::Release {
-            continue;
-        }
-        match key.code {
-            KeyCode::Char('q') => {
-                state.quit_requested = true;
-                shutdown_requested.store(true, Ordering::Relaxed);
-                force_render = true;
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                state.quit_requested = true;
-                shutdown_requested.store(true, Ordering::Relaxed);
-                force_render = true;
-            }
-            KeyCode::Char('r') => {
-                state.clear_visible_history();
-                force_render = true;
-            }
-            KeyCode::Char('p') => {
-                state.toggle_pause();
-                force_render = true;
-            }
-            KeyCode::Char('g') => {
-                state.cycle_graph_mode();
-                force_render = true;
-            }
-            KeyCode::Char('f') => {
-                state.toggle_full_graph();
-                force_render = true;
-            }
-            _ => {}
-        }
-    }
-    Ok(force_render)
-}
-
-fn render_if_due(
-    terminal: &mut TuiTerminal,
-    state: &TuiState,
-    stats: &StatsCollector,
-    next_render: &mut Instant,
-    force: bool,
-) -> io::Result<()> {
-    let now = Instant::now();
-    if !should_render(now, *next_render, state.paused, force) {
-        return Ok(());
-    }
-    terminal.draw(state, &stats.snapshot())?;
-    *next_render = now + RENDER_INTERVAL;
-    Ok(())
-}
-
-fn wait_for_tui_activity(
-    next_send_deadline: Option<Instant>,
-    next_render: &mut Instant,
-    state: &mut TuiState,
-    stats: &StatsCollector,
-    terminal: &mut TuiTerminal,
-    shutdown_requested: &AtomicBool,
-) -> io::Result<()> {
-    let wait_for = tui_wait_duration(next_send_deadline, *next_render, state.paused);
-    if wait_for.is_zero() || !event::poll(wait_for)? {
-        return Ok(());
-    }
-
-    if handle_input(state, shutdown_requested)? {
-        render_if_due(terminal, state, stats, next_render, true)?;
-    }
-    Ok(())
-}
-
-fn tui_wait_duration(
-    next_send_deadline: Option<Instant>,
-    next_render: Instant,
-    paused: bool,
-) -> Duration {
-    let now = Instant::now();
-    let send_wait = next_send_deadline
-        .map(|deadline| deadline.saturating_duration_since(now))
-        .unwrap_or(IDLE_SLEEP);
-    let render_wait = if paused {
-        send_wait
-    } else {
-        next_render.saturating_duration_since(now)
-    };
-    send_wait.min(render_wait).min(TUI_WAIT_SLICE)
-}
-
-fn should_render(now: Instant, next_render: Instant, paused: bool, force: bool) -> bool {
-    force || (!paused && now >= next_render)
-}
-
-struct TuiTerminal {
+pub(super) struct TuiTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
 }
 
 impl TuiTerminal {
-    fn enter() -> io::Result<Self> {
+    pub(super) fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         if let Err(err) = execute!(stdout, EnterAlternateScreen) {
@@ -299,7 +62,7 @@ impl TuiTerminal {
         }
     }
 
-    fn draw(&mut self, state: &TuiState, snapshot: &Snapshot) -> io::Result<()> {
+    pub(super) fn draw(&mut self, state: &TuiState, snapshot: &Snapshot) -> io::Result<()> {
         self.terminal
             .draw(|frame| draw_dashboard(frame, state, snapshot))
             .map(|_| ())
@@ -315,7 +78,7 @@ impl Drop for TuiTerminal {
 }
 
 #[derive(Debug)]
-struct TuiState {
+pub(super) struct TuiState {
     remote: Option<String>,
     session: Option<String>,
     status: TuiStatus,
@@ -328,12 +91,12 @@ struct TuiState {
     last_warning: Option<String>,
     graph_mode: GraphMode,
     full_graph: bool,
-    paused: bool,
-    quit_requested: bool,
+    pub(super) paused: bool,
+    pub(super) quit_requested: bool,
 }
 
 impl TuiState {
-    fn new(config: TuiConfig) -> Self {
+    pub(super) fn new(config: TuiConfig) -> Self {
         Self {
             remote: None,
             session: None,
@@ -352,13 +115,13 @@ impl TuiState {
         }
     }
 
-    fn process_events(&mut self, events: &[ClientEvent], stats: &mut StatsCollector) {
+    pub(super) fn process_events(&mut self, events: &[ClientEvent], stats: &mut StatsCollector) {
         for event in events {
             self.process_event(event, stats);
         }
     }
 
-    fn process_event(&mut self, event: &ClientEvent, stats: &mut StatsCollector) {
+    pub(super) fn process_event(&mut self, event: &ClientEvent, stats: &mut StatsCollector) {
         stats.process(event);
         match event {
             ClientEvent::SessionStarted {
@@ -464,30 +227,30 @@ impl TuiState {
         }
     }
 
-    fn set_status(&mut self, status: TuiStatus) {
+    pub(super) fn set_status(&mut self, status: TuiStatus) {
         self.status = status;
     }
 
-    fn set_error(&mut self, message: String) {
+    pub(super) fn set_error(&mut self, message: String) {
         self.status = TuiStatus::Error;
         self.last_warning = Some(message.clone());
         self.push_event(format!("error {message}"));
     }
 
-    fn clear_visible_history(&mut self) {
+    pub(super) fn clear_visible_history(&mut self) {
         self.graph_history.clear();
         self.push_event("visible graph history reset".to_owned());
     }
 
-    fn toggle_pause(&mut self) {
+    pub(super) fn toggle_pause(&mut self) {
         self.paused = !self.paused;
     }
 
-    fn cycle_graph_mode(&mut self) {
+    pub(super) fn cycle_graph_mode(&mut self) {
         self.graph_mode = self.graph_mode.next();
     }
 
-    fn toggle_full_graph(&mut self) {
+    pub(super) fn toggle_full_graph(&mut self) {
         self.full_graph = !self.full_graph;
     }
 
@@ -507,7 +270,7 @@ impl Default for TuiState {
 }
 
 #[derive(Debug, Clone)]
-struct TuiConfig {
+pub(super) struct TuiConfig {
     interval: Duration,
     duration: Option<Duration>,
     timeout: Duration,
@@ -515,7 +278,7 @@ struct TuiConfig {
 }
 
 impl TuiConfig {
-    fn from_args(args: &CliArgs) -> Self {
+    pub(super) fn from_args(args: &TuiArgs) -> Self {
         Self {
             interval: args.interval,
             duration: (!args.is_continuous()).then_some(args.duration),
@@ -538,7 +301,7 @@ impl Default for TuiConfig {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TuiStatus {
+pub(super) enum TuiStatus {
     Opening,
     Running,
     Draining,
@@ -563,7 +326,7 @@ impl TuiStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GraphMode {
+pub(super) enum GraphMode {
     Rtt,
     OneWay,
     Combined,
@@ -591,7 +354,7 @@ impl GraphMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct GraphSample {
+pub(super) struct GraphSample {
     seq: u32,
     effective_ns: i128,
     raw_ns: i128,
@@ -602,7 +365,7 @@ struct GraphSample {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LastSample {
+pub(super) struct LastSample {
     seq: u32,
     raw_ns: i128,
     adjusted_ns: Option<i128>,
@@ -619,20 +382,7 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
     items.push_back(item);
 }
 
-fn expected_probe_count(duration: Duration, interval: Duration) -> u64 {
-    let interval_nanos = interval.as_nanos();
-    if interval_nanos == 0 {
-        return u64::MAX;
-    }
-
-    let expected = duration
-        .as_nanos()
-        .saturating_add(interval_nanos.saturating_sub(1))
-        / interval_nanos;
-    expected.min(u128::from(u64::MAX)) as u64
-}
-
-fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState, snapshot: &Snapshot) {
+pub(super) fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState, snapshot: &Snapshot) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(too_small(), area);
@@ -649,6 +399,10 @@ fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState, snapshot: &Snapshot) 
     } else {
         draw_compact(frame, area, state, snapshot);
     }
+}
+
+pub(super) fn should_render(now: Instant, next_render: Instant, paused: bool, force: bool) -> bool {
+    force || (!paused && now >= next_render)
 }
 
 fn draw_full_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
@@ -903,8 +657,14 @@ fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let rtt = graph_series(GraphMode::Rtt, &visible);
     let one_way = graph_series(GraphMode::OneWay, &visible);
 
-    render_chart(frame, rows[0], "RTT history", &visible, &rtt);
-    render_chart(frame, rows[1], "one-way delay history", &visible, &one_way);
+    render_chart(frame, rows[0], GraphMode::Rtt.title(), &visible, &rtt);
+    render_chart(
+        frame,
+        rows[1],
+        GraphMode::OneWay.title(),
+        &visible,
+        &one_way,
+    );
 }
 
 fn render_chart(
@@ -918,7 +678,7 @@ fn render_chart(
         let note = if visible.is_empty() {
             "waiting for primary replies"
         } else {
-            "n/a for negotiated timestamps/stats"
+            "one-way data unavailable for negotiated timestamp mode"
         };
         frame.render_widget(
             Paragraph::new(note)
@@ -955,22 +715,16 @@ fn render_chart(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraphValue {
     EffectiveRtt,
-    RawRtt,
-    AdjustedRtt,
     ClientToServer,
     ServerToClient,
-    ServerProcessing,
 }
 
 impl GraphValue {
     fn name(self) -> &'static str {
         match self {
             Self::EffectiveRtt => "eff RTT",
-            Self::RawRtt => "raw RTT",
-            Self::AdjustedRtt => "adj RTT",
             Self::ClientToServer => "c2s",
             Self::ServerToClient => "s2c",
-            Self::ServerProcessing => "srv proc",
         }
     }
 
@@ -979,22 +733,16 @@ impl GraphValue {
             Self::EffectiveRtt => Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
-            Self::RawRtt => Style::default().fg(Color::Yellow),
-            Self::AdjustedRtt => Style::default().fg(Color::Green),
             Self::ClientToServer => Style::default().fg(Color::Magenta),
             Self::ServerToClient => Style::default().fg(Color::LightBlue),
-            Self::ServerProcessing => Style::default().fg(Color::LightRed),
         }
     }
 
     fn value_ns(self, sample: &GraphSample) -> Option<i128> {
         match self {
             Self::EffectiveRtt => Some(sample.effective_ns),
-            Self::RawRtt => Some(sample.raw_ns),
-            Self::AdjustedRtt => sample.adjusted_ns,
             Self::ClientToServer => sample.client_to_server_ns,
             Self::ServerToClient => sample.server_to_client_ns,
-            Self::ServerProcessing => sample.server_processing_ns,
         }
     }
 }
@@ -1002,9 +750,9 @@ impl GraphValue {
 impl GraphMode {
     fn title(self) -> &'static str {
         match self {
-            Self::Rtt => "RTT history",
-            Self::OneWay => "one-way delay history",
-            Self::Combined => "RTT + one-way history",
+            Self::Rtt => "RTT history — effective",
+            Self::OneWay => "one-way delay — c2s / s2c",
+            Self::Combined => "RTT + one-way correlation",
             Self::Split => "split history",
         }
     }
@@ -1029,16 +777,8 @@ fn visible_history_window(history: &VecDeque<GraphSample>, chart_width: u16) -> 
 
 fn graph_series(mode: GraphMode, visible: &[&GraphSample]) -> Vec<ChartSeries> {
     let values: &[GraphValue] = match mode {
-        GraphMode::Rtt => &[
-            GraphValue::EffectiveRtt,
-            GraphValue::RawRtt,
-            GraphValue::AdjustedRtt,
-        ],
-        GraphMode::OneWay => &[
-            GraphValue::ClientToServer,
-            GraphValue::ServerToClient,
-            GraphValue::ServerProcessing,
-        ],
+        GraphMode::Rtt => &[GraphValue::EffectiveRtt],
+        GraphMode::OneWay => &[GraphValue::ClientToServer, GraphValue::ServerToClient],
         GraphMode::Combined => &[
             GraphValue::EffectiveRtt,
             GraphValue::ClientToServer,
@@ -1419,6 +1159,18 @@ mod tests {
         }
     }
 
+    fn graph_sample_with_timing(seq: u32, effective_ns: i128) -> GraphSample {
+        GraphSample {
+            seq,
+            effective_ns,
+            raw_ns: effective_ns + 1_000,
+            adjusted_ns: Some(effective_ns + 500),
+            client_to_server_ns: Some(effective_ns / 3),
+            server_to_client_ns: Some(effective_ns / 2),
+            server_processing_ns: Some(100_000),
+        }
+    }
+
     fn series(data: Vec<(f64, f64)>) -> ChartSeries {
         ChartSeries {
             value: GraphValue::EffectiveRtt,
@@ -1618,10 +1370,38 @@ mod tests {
         assert!(one_way.is_empty());
         assert_eq!(
             rtt.iter().map(|series| series.value).collect::<Vec<_>>(),
+            vec![GraphValue::EffectiveRtt]
+        );
+    }
+
+    #[test]
+    fn graph_modes_use_readable_default_series() {
+        let visible_samples = [graph_sample_with_timing(1, 3_000_000)];
+        let visible: Vec<_> = visible_samples.iter().collect();
+
+        assert_eq!(
+            graph_series(GraphMode::Rtt, &visible)
+                .iter()
+                .map(|series| series.value)
+                .collect::<Vec<_>>(),
+            vec![GraphValue::EffectiveRtt]
+        );
+        assert_eq!(
+            graph_series(GraphMode::OneWay, &visible)
+                .iter()
+                .map(|series| series.value)
+                .collect::<Vec<_>>(),
+            vec![GraphValue::ClientToServer, GraphValue::ServerToClient]
+        );
+        assert_eq!(
+            graph_series(GraphMode::Combined, &visible)
+                .iter()
+                .map(|series| series.value)
+                .collect::<Vec<_>>(),
             vec![
                 GraphValue::EffectiveRtt,
-                GraphValue::RawRtt,
-                GraphValue::AdjustedRtt
+                GraphValue::ClientToServer,
+                GraphValue::ServerToClient
             ]
         );
     }
