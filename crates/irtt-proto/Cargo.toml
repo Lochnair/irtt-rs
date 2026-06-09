@@ -1,6 +1,6 @@
 [package]
 name = "irtt-proto"
-version = "0.2.0"
+version = "0.3.0"
 description = "IRTT protocol encoding and decoding primitives"
 edition.workspace = true
 license.workspace = true

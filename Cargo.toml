@@ -16,9 +16,9 @@ homepage = "https://github.com/Lochnair/irtt-rs"
 readme = "README.md"
 
 [workspace.dependencies]
-irtt-proto = { version = "0.2.0", path = "crates/irtt-proto" }
-irtt-client = { version = "0.2.0", path = "crates/irtt-client" }
-irtt-stats = { version = "0.2.0", path = "crates/irtt-stats" }
+irtt-proto = { version = "0.3.0", path = "crates/irtt-proto" }
+irtt-client = { version = "0.3.0", path = "crates/irtt-client" }
+irtt-stats = { version = "0.3.0", path = "crates/irtt-stats" }
 
 [profile.release]
 opt-level = "z"
