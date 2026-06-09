@@ -10,13 +10,17 @@ It is not the upstream IRTT project. For the original implementation, protocol b
 
 This repository currently provides:
 
-- `irtt-cli`, a command-line IRTT-compatible client
+- `irtt-rs`, the canonical multi-applet binary
+- `irtt-cli`, a stream/text IRTT-compatible client applet
+- `irtt-tui`, an optional terminal UI applet when built with the `tui` feature
 - `irtt-client`, a Rust library for running client sessions and consuming events
 - finite and continuous probe runs
-- human, simple, machine-readable, RTT-only, and optional TUI output modes
+- human, simple, machine-readable, and RTT-only stream output modes
 - optional local summary statistics
 
 Server support is not implemented.
+The installed binary is intentionally not named `irtt` to avoid conflicting or
+confusing overlap with upstream IRTT.
 
 ## Install
 
@@ -30,11 +34,23 @@ cd irtt-rs
 cargo install --path crates/irtt-cli
 ```
 
+The default install provides the normal client-oriented binaries, including
+`irtt-rs` and `irtt-cli`. To install the TUI applet as a separate binary target:
+
+```sh
+cargo install --path crates/irtt-cli --features tui
+```
+
 Or run it directly without installing:
 
 ```sh
 cargo run -p irtt-cli -- <server>
 ```
+
+For space-sensitive packaging, such as OpenWrt packages, distributors can ship
+only `irtt-rs` and symlink or hardlink applet names such as `irtt-cli`,
+`irtt-tui`, and future server applet names to it. Applet dispatch is based on
+the invoked binary name.
 
 ## CLI usage
 
@@ -65,18 +81,22 @@ irtt-cli <server> --output machine
 irtt-cli <server> --output rtt-us
 ```
 
-With the optional TUI feature, `--output tui` opens a live cumulative and
-rolling dashboard for interactive probing. Quit with `q` or `Ctrl-C`; the client
-will drain and close the session gracefully.
+With the optional TUI feature, `irtt-tui` opens a live cumulative dashboard for
+interactive probing. It defaults to continuous probing, equivalent to
+`--duration 0`. Quit with `q` or `Ctrl-C`; the client will drain and close the
+session gracefully.
 
 ```sh
-cargo run -p irtt-cli --features tui -- <server> --output tui
+irtt-tui <server>
+irtt-tui <server> --duration 30s
+cargo run -p irtt-cli --features tui --bin irtt-tui -- <server>
 ```
 
 For available options:
 
 ```sh
 irtt-cli --help
+irtt-tui --help
 ```
 
 ## Machine output
