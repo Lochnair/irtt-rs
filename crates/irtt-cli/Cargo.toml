@@ -30,9 +30,11 @@ required-features = ["tui"]
 
 [features]
 default = ["client", "stats"]
-client = ["dep:irtt-client", "dep:irtt-proto"]
-stats = ["client", "dep:irtt-stats"]
-tui = ["client", "stats", "dep:ratatui", "dep:crossterm"]
+client-runtime = ["dep:irtt-client", "dep:irtt-proto"]
+client = ["client-runtime"]
+stats = ["client-runtime", "dep:irtt-stats"]
+tui = ["client-runtime", "stats", "dep:ratatui", "dep:crossterm"]
+full = ["client", "stats", "tui"]
 
 [dependencies]
 clap = { version = "4.6.1", features = ["derive"] }

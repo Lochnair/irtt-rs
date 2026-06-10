@@ -52,6 +52,10 @@ only `irtt-rs` and symlink or hardlink applet names such as `irtt-cli`,
 `irtt-tui`, and future server applet names to it. Applet dispatch is based on
 the invoked binary name.
 
+cargo-dist release archives currently bundle all enabled applets for a target.
+That is separate from space-sensitive package layouts, which may still ship one
+binary plus applet-name symlinks or hardlinks.
+
 ## CLI usage
 
 Basic test:

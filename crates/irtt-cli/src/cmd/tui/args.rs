@@ -54,8 +54,13 @@ impl std::ops::Deref for TuiArgs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cmd::client::ClientArgs;
     use clap::{CommandFactory, Parser};
+
+    #[derive(Parser)]
+    struct SharedOnlyArgs {
+        #[command(flatten)]
+        common: CommonClientArgs,
+    }
 
     fn parse(args: &[&str]) -> Result<TuiArgs, clap::Error> {
         let mut argv = vec!["irtt-tui"];
@@ -63,10 +68,10 @@ mod tests {
         TuiArgs::try_parse_from(argv)
     }
 
-    fn parse_client(args: &[&str]) -> Result<ClientArgs, clap::Error> {
-        let mut argv = vec!["irtt-cli"];
+    fn parse_shared(args: &[&str]) -> Result<SharedOnlyArgs, clap::Error> {
+        let mut argv = vec!["shared-only"];
         argv.extend_from_slice(args);
-        ClientArgs::try_parse_from(argv)
+        SharedOnlyArgs::try_parse_from(argv)
     }
 
     #[test]
@@ -90,8 +95,29 @@ mod tests {
     }
 
     #[test]
-    fn shared_client_options_match_between_stream_and_tui_parsers() {
+    fn shared_client_options_match_tui_config_mapping() {
         let shared = [
+            "--interval",
+            "250ms",
+            "--length",
+            "128",
+            "--hmac",
+            "secret",
+            "--clock",
+            "monotonic",
+            "--tstamp",
+            "receive",
+            "--stats",
+            "count",
+            "--sfill",
+            "abc",
+            "--dscp",
+            "46",
+            "--ttl",
+            "64",
+            "--loose",
+        ];
+        let tui_args = [
             "--duration",
             "30s",
             "--interval",
@@ -115,20 +141,21 @@ mod tests {
             "--loose",
             "127.0.0.1:2112",
         ];
-        let client = parse_client(&shared).unwrap().to_client_config();
-        let tui = parse(&shared).unwrap().to_client_config();
+        let tui = parse(&tui_args).unwrap().to_client_config();
+        let common = parse_shared(&shared).unwrap().common;
+        let shared = common.to_client_config("127.0.0.1:2112", Duration::from_secs(30));
 
-        assert_eq!(client.server_addr, tui.server_addr);
-        assert_eq!(client.duration, tui.duration);
-        assert_eq!(client.interval, tui.interval);
-        assert_eq!(client.length, tui.length);
-        assert_eq!(client.received_stats, tui.received_stats);
-        assert_eq!(client.stamp_at, tui.stamp_at);
-        assert_eq!(client.clock, tui.clock);
-        assert_eq!(client.dscp, tui.dscp);
-        assert_eq!(client.hmac_key, tui.hmac_key);
-        assert_eq!(client.server_fill, tui.server_fill);
-        assert_eq!(client.negotiation_policy, tui.negotiation_policy);
-        assert_eq!(client.socket_config.ttl, tui.socket_config.ttl);
+        assert_eq!(shared.server_addr, tui.server_addr);
+        assert_eq!(shared.duration, tui.duration);
+        assert_eq!(shared.interval, tui.interval);
+        assert_eq!(shared.length, tui.length);
+        assert_eq!(shared.received_stats, tui.received_stats);
+        assert_eq!(shared.stamp_at, tui.stamp_at);
+        assert_eq!(shared.clock, tui.clock);
+        assert_eq!(shared.dscp, tui.dscp);
+        assert_eq!(shared.hmac_key, tui.hmac_key);
+        assert_eq!(shared.server_fill, tui.server_fill);
+        assert_eq!(shared.negotiation_policy, tui.negotiation_policy);
+        assert_eq!(shared.socket_config.ttl, tui.socket_config.ttl);
     }
 }

@@ -1,2 +1,2 @@
-#[cfg(feature = "client")]
+#[cfg(feature = "client-runtime")]
 pub mod client;
