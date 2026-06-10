@@ -10,7 +10,7 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "Apache-2.0"
-rust-version = "1.75"
+rust-version = "1.85"
 repository = "https://github.com/Lochnair/irtt-rs"
 homepage = "https://github.com/Lochnair/irtt-rs"
 readme = "README.md"

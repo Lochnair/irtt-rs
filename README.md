@@ -24,7 +24,7 @@ confusing overlap with upstream IRTT.
 
 ## Install
 
-Requires Rust 1.75 or newer.
+Requires Rust 1.85 or newer.
 
 From a local checkout:
 
