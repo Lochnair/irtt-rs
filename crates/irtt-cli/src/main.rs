@@ -22,13 +22,12 @@ fn main() -> ExitCode {
 
 fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     let argv: Vec<OsString> = env::args_os().collect();
-    let argv0 = argv
-        .first()
-        .and_then(|arg| arg.to_str())
-        .unwrap_or("irtt-rs");
-    let requested = match detect_applet_from_argv0(argv0) {
-        Some(applet) => applet,
-        None => default_requested_applet()?,
+    let (requested, argv) = match dispatch_from_argv(argv)? {
+        AppletDispatch::Run { applet, argv } => (applet, argv),
+        AppletDispatch::Help(help) => {
+            print!("{help}");
+            return Ok(());
+        }
     };
 
     let shutdown_requested = Arc::new(AtomicBool::new(false));
