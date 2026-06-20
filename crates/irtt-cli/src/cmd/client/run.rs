@@ -9,7 +9,7 @@ use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
 
 use super::{
     args::{ClientArgs, OutputMode},
-    output::{format_event, format_human_event_with_options, HumanOutputOptions},
+    output::{format_event_with_context, HumanEventStats, HumanOutputOptions, RenderContext},
 };
 #[cfg(feature = "stats")]
 use crate::shared::client::expected_probe_count;
@@ -132,23 +132,21 @@ impl<W: Write> StreamOutput<'_, W> {
         let stats_update = self.stats.process(event);
 
         #[cfg(not(feature = "stats"))]
-        let stats_update = crate::cmd::client::HumanEventStats::default();
+        let stats_update = HumanEventStats::default();
 
-        let line =
-            if self.mode == OutputMode::Human && !matches!(event, ClientEvent::EchoSent { .. }) {
-                #[cfg(feature = "stats")]
-                let human_stats = stats_update.into();
-                #[cfg(not(feature = "stats"))]
-                let human_stats = stats_update;
+        #[cfg(feature = "stats")]
+        let human_stats = HumanEventStats::from(stats_update);
+        #[cfg(not(feature = "stats"))]
+        let human_stats = stats_update;
 
-                Some(format_human_event_with_options(
-                    event,
-                    Some(human_stats),
-                    self.human_options,
-                ))
-            } else {
-                format_event(event, self.mode)
-            };
+        let line = format_event_with_context(
+            event,
+            RenderContext {
+                mode: self.mode,
+                human_stats: Some(&human_stats),
+                human_options: self.human_options,
+            },
+        );
 
         if let Some(line) = line {
             writeln!(self.out, "{line}")?;

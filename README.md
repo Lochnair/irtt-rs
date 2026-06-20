@@ -116,16 +116,18 @@ irtt-cli <server> --duration 0 --interval 250ms --output machine
 Each line represents one client event and starts with an `event` field, for example:
 
 ```text
+event=echo_sent seq=4 remote=203.0.113.10:2112 client_send_wall_ns=1760000000000000000 bytes=64 send_call_us=10 timer_error_us=2
 event=echo_reply seq=4 remote=203.0.113.10:2112 client_send_wall_ns=1760000000000000000 client_receive_wall_ns=1760000000012400000 raw_rtt_us=12400 effective_rtt_us=12100 adjusted_rtt_us=12100 server_receive_wall_ns=1760000000006100000 server_receive_mono_ns=5000006100000 server_send_wall_ns=1760000000006400000 server_send_mono_ns=5000006400000 server_processing_us=300 client_to_server_us=6100 server_to_client_us=6000 server_received_count=5 server_received_window=0x1f dscp=0 ecn=0 kernel_rx_ns=none
 ```
 
 Consumers should match on `event=...` and read the fields they need. Unknown fields should be ignored.
-RTT fields are reported in microseconds. `raw_rtt_us` is the measured client
-send-to-receive RTT. `effective_rtt_us` and `adjusted_rtt_us` are signed and may
-be negative when server processing exceeds the raw RTT or timing correction
-produces a negative adjusted value. When one-way delay fields are present,
-`client_to_server_us` and `server_to_client_us` are also signed microseconds and
-may be negative due to wall-clock skew.
+RTT, send-call, and timer-error fields are reported in microseconds.
+`raw_rtt_us` is the measured client send-to-receive RTT. `effective_rtt_us` and
+`adjusted_rtt_us` are signed and may be negative when server processing exceeds
+the raw RTT or timing correction produces a negative adjusted value. When
+one-way delay fields are present, `client_to_server_us` and
+`server_to_client_us` are also signed microseconds and may be negative due to
+wall-clock skew.
 
 For consumers that only need RTT values, use:
 

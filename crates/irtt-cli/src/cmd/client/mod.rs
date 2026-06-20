@@ -6,7 +6,7 @@ pub mod summary;
 
 pub use args::{ClientArgs, OutputMode};
 pub use output::{
-    format_event, format_human_event, format_human_event_with_options, HumanEventStats,
-    HumanIpdvPair, HumanOutputOptions,
+    format_event, format_event_with_context, format_human_event, format_human_event_with_options,
+    HumanEventStats, HumanIpdvPair, HumanOutputOptions, RenderContext,
 };
 pub use run::run_stream;
