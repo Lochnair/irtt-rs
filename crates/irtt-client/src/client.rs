@@ -23,7 +23,7 @@ use crate::{
     metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
     receive::recv_datagram,
-    session::{negotiate_params, ActiveSession, ClientPhase, NegotiatedParams},
+    session::{negotiate_params, ActiveSession, ClientPhase, CloseSource, NegotiatedParams},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
@@ -93,7 +93,7 @@ impl Client {
         match self.phase {
             ClientPhase::Connected => {}
             ClientPhase::Open { .. } => return Err(ClientError::AlreadyOpen),
-            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
             ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
 
@@ -150,7 +150,7 @@ impl Client {
     pub fn close(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         let token = match self.phase {
             ClientPhase::Open { token } => token,
-            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
             ClientPhase::Connected | ClientPhase::NoTestCompleted => {
                 return Err(ClientError::NotOpen)
             }
@@ -160,7 +160,9 @@ impl Client {
         let packet =
             encode_close_request(&CloseRequest { token }, self.config.hmac_key.as_deref())?;
         self.socket.send(&packet)?;
-        self.phase = ClientPhase::Closed;
+        self.phase = ClientPhase::Closed {
+            source: CloseSource::Local,
+        };
         if let Some(session) = self.session.as_mut() {
             session.timed_out.clear();
         }
@@ -211,7 +213,7 @@ impl Client {
     ) -> Result<Vec<ClientEvent>, ClientError> {
         let token = match self.phase {
             ClientPhase::Open { token } => token,
-            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
             ClientPhase::Connected => return Err(ClientError::NotOpen),
             ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         };
@@ -317,7 +319,7 @@ impl Client {
     ) -> Result<Vec<ClientEvent>, ClientError> {
         match self.phase {
             ClientPhase::Open { .. } => {}
-            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
             ClientPhase::Connected => return Err(ClientError::NotOpen),
             ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
@@ -376,7 +378,7 @@ impl Client {
     pub fn poll_timeouts_at(&mut self, now: Instant) -> Result<Vec<ClientEvent>, ClientError> {
         match self.phase {
             ClientPhase::Open { .. } => {}
-            ClientPhase::Closed => return Err(ClientError::AlreadyClosed),
+            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
             ClientPhase::Connected => return Err(ClientError::NotOpen),
             ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
@@ -409,10 +411,25 @@ impl Client {
         let Some(session) = self.session.as_ref() else {
             return matches!(
                 self.phase,
-                ClientPhase::Closed | ClientPhase::NoTestCompleted
+                ClientPhase::Closed { .. } | ClientPhase::NoTestCompleted
             );
         };
         session.sending_done && session.pending.len() == 0
+    }
+
+    /// Return whether the session was closed by a peer close-flagged reply.
+    ///
+    /// Direct operations on a closed client still return
+    /// [`ClientError::AlreadyClosed`]. This method lets higher-level run loops
+    /// avoid treating a successfully observed peer close as a local cleanup
+    /// failure.
+    pub fn is_peer_closed(&self) -> bool {
+        matches!(
+            self.phase,
+            ClientPhase::Closed {
+                source: CloseSource::Peer
+            }
+        )
     }
 
     pub(crate) fn has_timed_out_metadata(&self) -> bool {
@@ -577,7 +594,9 @@ impl Client {
         events: &mut Vec<ClientEvent>,
     ) -> Result<(), ClientError> {
         clear_dscp_on_socket(&self.socket, self.remote)?;
-        self.phase = ClientPhase::Closed;
+        self.phase = ClientPhase::Closed {
+            source: CloseSource::Peer,
+        };
         if let Some(session) = self.session.as_mut() {
             session.timed_out.clear();
         }

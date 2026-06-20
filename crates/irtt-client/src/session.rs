@@ -161,7 +161,13 @@ pub(crate) enum ClientPhase {
     Connected,
     Open { token: u64 },
     NoTestCompleted,
-    Closed,
+    Closed { source: CloseSource },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CloseSource {
+    Local,
+    Peer,
 }
 
 #[derive(Debug)]
