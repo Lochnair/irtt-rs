@@ -157,6 +157,29 @@ fn open_event(outcome: &OpenOutcome) -> &ClientEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irtt_proto::{
+        echo_packet_len,
+        flags::{self, FLAG_OPEN, FLAG_REPLY},
+        layout::PacketLayout,
+        Clock, Params, ReceivedStats, StampAt, TimestampFields, MAGIC, PROTOCOL_VERSION,
+    };
+    use std::{
+        net::{SocketAddr, UdpSocket},
+        thread::JoinHandle,
+    };
+
+    const TOKEN: u64 = 0x1234_5678_90ab_cdef;
+
+    struct FakeServer {
+        addr: SocketAddr,
+        done: JoinHandle<()>,
+    }
+
+    impl FakeServer {
+        fn join(self) {
+            self.done.join().unwrap();
+        }
+    }
 
     #[test]
     fn final_drain_uses_capped_probe_timeout() {
@@ -176,5 +199,172 @@ mod tests {
         assert!(should_drain_final(false, true));
         assert!(should_drain_final(true, true));
         assert!(!should_drain_final(true, false));
+    }
+
+    #[test]
+    fn peer_close_followed_by_session_cleanup_is_successful() {
+        let params = test_params(None, Duration::from_millis(10));
+        let server = start_peer_close_server(params);
+        let mut session = ClientSession::connect(config(server.addr, None), true).unwrap();
+        let shutdown_requested = AtomicBool::new(false);
+
+        assert!(matches!(
+            session.open().unwrap().as_slice(),
+            [ClientEvent::SessionStarted { .. }]
+        ));
+
+        let events = session.step(&shutdown_requested).unwrap();
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::EchoReply { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::SessionClosed { .. })));
+        assert!(!session.should_continue(&shutdown_requested));
+
+        session.drain_final(|_| {}).unwrap();
+        assert!(session.poll_timeouts().unwrap().is_empty());
+        assert!(session.close().unwrap().is_empty());
+        server.join();
+    }
+
+    fn config(addr: SocketAddr, duration: Option<Duration>) -> ClientConfig {
+        ClientConfig {
+            server_addr: addr.to_string(),
+            duration,
+            interval: Duration::from_millis(10),
+            open_timeouts: vec![Duration::from_millis(200)],
+            probe_timeout: Duration::from_millis(20),
+            socket_config: irtt_client::SocketConfig {
+                recv_timeout: Some(Duration::from_millis(200)),
+                ..Default::default()
+            },
+            ..ClientConfig::default()
+        }
+    }
+
+    fn test_params(duration: Option<Duration>, interval: Duration) -> Params {
+        Params {
+            protocol_version: PROTOCOL_VERSION,
+            duration_ns: duration.map_or(0, test_duration_ns_i64),
+            interval_ns: test_duration_ns_i64(interval),
+            length: 0,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            dscp: 0,
+            server_fill: None,
+        }
+    }
+
+    fn test_duration_ns_i64(duration: Duration) -> i64 {
+        i64::try_from(duration.as_nanos()).expect("test duration fits i64 nanoseconds")
+    }
+
+    fn start_peer_close_server(params: Params) -> FakeServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let done = thread::spawn(move || {
+            let (_, peer) = recv_request(&socket);
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+
+            let (packet, peer) = recv_request(&socket);
+            let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+            socket
+                .send_to(
+                    &echo_reply_packet(
+                        TOKEN,
+                        seq,
+                        &params,
+                        &TimestampFields::default(),
+                        FLAG_REPLY | flags::FLAG_CLOSE,
+                    ),
+                    peer,
+                )
+                .unwrap();
+
+            socket
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            while let Some((packet, _)) = recv_request_timeout(&socket) {
+                assert_eq!(
+                    packet[3] & flags::FLAG_CLOSE,
+                    0,
+                    "session cleanup must not send a close after peer close"
+                );
+            }
+        });
+        FakeServer { addr, done }
+    }
+
+    fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
+        let mut buf = [0_u8; 2048];
+        let (size, peer) = socket.recv_from(&mut buf).unwrap();
+        (buf[..size].to_vec(), peer)
+    }
+
+    fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
+        let mut buf = [0_u8; 2048];
+        socket
+            .recv_from(&mut buf)
+            .ok()
+            .map(|(size, peer)| (buf[..size].to_vec(), peer))
+    }
+
+    fn open_reply(flags: u8, token: u64, params: &Params) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&MAGIC);
+        packet.push(flags);
+        packet.extend_from_slice(&token.to_le_bytes());
+        packet.extend_from_slice(&params.encode());
+        packet
+    }
+
+    fn echo_reply_packet(
+        token: u64,
+        seq: u32,
+        params: &Params,
+        timestamps: &TimestampFields,
+        flags: u8,
+    ) -> Vec<u8> {
+        let layout = PacketLayout::echo(false, params);
+        let packet_len = echo_packet_len(false, params)
+            .expect("session test params must have a non-negative packet length");
+        let mut packet = Vec::with_capacity(packet_len);
+
+        packet.extend_from_slice(&MAGIC);
+        packet.push(flags);
+        packet.extend_from_slice(&token.to_le_bytes());
+        packet.extend_from_slice(&seq.to_le_bytes());
+
+        if layout.recv_count {
+            packet.extend_from_slice(&42_u32.to_le_bytes());
+        }
+        if layout.recv_window {
+            packet.extend_from_slice(&0_u64.to_le_bytes());
+        }
+        if layout.recv_wall {
+            packet.extend_from_slice(&timestamps.recv_wall.unwrap_or(0).to_le_bytes());
+        }
+        if layout.recv_mono {
+            packet.extend_from_slice(&timestamps.recv_mono.unwrap_or(0).to_le_bytes());
+        }
+        if layout.midpoint_wall {
+            packet.extend_from_slice(&timestamps.midpoint_wall.unwrap_or(0).to_le_bytes());
+        }
+        if layout.midpoint_mono {
+            packet.extend_from_slice(&timestamps.midpoint_mono.unwrap_or(0).to_le_bytes());
+        }
+        if layout.send_wall {
+            packet.extend_from_slice(&timestamps.send_wall.unwrap_or(0).to_le_bytes());
+        }
+        if layout.send_mono {
+            packet.extend_from_slice(&timestamps.send_mono.unwrap_or(0).to_le_bytes());
+        }
+
+        packet.resize(packet_len, 0);
+        packet
     }
 }

@@ -496,6 +496,53 @@ mod tests {
         FakeServer { addr, done }
     }
 
+    fn start_peer_close_server(params: Params) -> FakeServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let done = thread::spawn(move || {
+            let (_, peer) = recv_request(&socket);
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
+
+            let Some((packet, peer)) = recv_request_timeout(&socket) else {
+                return;
+            };
+            let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+            let ts = TimestampFields {
+                recv_wall: Some(1_000_000_000),
+                recv_mono: Some(100_000),
+                send_wall: Some(1_000_000_000),
+                send_mono: Some(100_000),
+                ..Default::default()
+            };
+            socket
+                .send_to(
+                    &echo_reply_packet_with_flags(
+                        TOKEN,
+                        seq,
+                        &params,
+                        &ts,
+                        FLAG_REPLY | flags::FLAG_CLOSE,
+                    ),
+                    peer,
+                )
+                .unwrap();
+
+            while let Some((packet, _)) = recv_request_timeout(&socket) {
+                assert_eq!(
+                    packet[3] & flags::FLAG_CLOSE,
+                    0,
+                    "managed cleanup must not send a close after peer close"
+                );
+            }
+        });
+        FakeServer { addr, done }
+    }
+
     fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
         let mut buf = [0_u8; 2048];
         let (size, peer) = socket.recv_from(&mut buf).unwrap();
@@ -525,12 +572,22 @@ mod tests {
         params: &Params,
         timestamps: &TimestampFields,
     ) -> Vec<u8> {
+        echo_reply_packet_with_flags(token, seq, params, timestamps, FLAG_REPLY)
+    }
+
+    fn echo_reply_packet_with_flags(
+        token: u64,
+        seq: u32,
+        params: &Params,
+        timestamps: &TimestampFields,
+        flags: u8,
+    ) -> Vec<u8> {
         let layout = PacketLayout::echo(false, params);
         let packet_len = test_echo_packet_len(false, params);
         let mut packet = Vec::with_capacity(packet_len);
 
         packet.extend_from_slice(&MAGIC);
-        packet.push(FLAG_REPLY);
+        packet.push(flags);
         packet.extend_from_slice(&token.to_le_bytes());
         packet.extend_from_slice(&seq.to_le_bytes());
 
@@ -680,6 +737,31 @@ mod tests {
         let late_before_close = late_before_close.expect("missing stats-eligible LateReply");
         let close = close.expect("missing SessionClosed");
         assert!(late_before_close < close);
+    }
+
+    #[test]
+    fn peer_close_during_managed_run_is_successful() {
+        let server = start_peer_close_server(test_params(None, Duration::from_millis(10)));
+        let (session, sub) = ManagedClient::start_with_subscription(
+            config(server.addr, None),
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let events = collect_until_closed(&sub);
+        let outcome = session.join().unwrap();
+        server.join();
+
+        assert_eq!(outcome.end_reason, SessionEndReason::TestComplete);
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::EchoReply { .. })));
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::SessionClosed { .. })));
     }
 
     #[test]
