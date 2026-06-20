@@ -40,12 +40,16 @@ impl ClientSession {
             events.extend(self.client.send_probe()?);
         }
         events.extend(self.client.recv_available(RECV_BUDGET)?);
+        if self.client.is_peer_closed() {
+            return Ok(events);
+        }
         events.extend(self.client.poll_timeouts()?);
         Ok(events)
     }
 
     pub fn should_continue(&self, shutdown_requested: &AtomicBool) -> bool {
         !is_shutdown_requested(shutdown_requested)
+            && !self.client.is_peer_closed()
             && (self.continuous || self.client.next_send_deadline().is_some())
     }
 
@@ -59,11 +63,19 @@ impl ClientSession {
     {
         let deadline = Instant::now() + final_drain_duration(self.client.probe_timeout());
         loop {
+            if self.client.is_peer_closed() {
+                break;
+            }
+
             let mut received = false;
 
             let events = self.client.recv_available(RECV_BUDGET)?;
             received |= !events.is_empty();
             on_events(&events);
+
+            if self.client.is_peer_closed() {
+                break;
+            }
 
             let events = self.client.poll_timeouts()?;
             received |= !events.is_empty();
@@ -81,10 +93,16 @@ impl ClientSession {
     }
 
     pub fn poll_timeouts(&mut self) -> Result<Vec<ClientEvent>, irtt_client::ClientError> {
+        if self.client.is_peer_closed() {
+            return Ok(vec![]);
+        }
         self.client.poll_timeouts()
     }
 
     pub fn close(&mut self) -> Result<Vec<ClientEvent>, irtt_client::ClientError> {
+        if self.client.is_peer_closed() {
+            return Ok(vec![]);
+        }
         self.client.close()
     }
 

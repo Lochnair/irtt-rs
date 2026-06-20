@@ -359,6 +359,9 @@ impl Client {
                 break;
             }
             all_events.extend(events);
+            if self.is_peer_closed() {
+                break;
+            }
         }
         Ok(all_events)
     }

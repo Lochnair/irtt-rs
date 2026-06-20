@@ -224,7 +224,9 @@ fn run_client(
                 &mut counters,
                 client.recv_available(MANAGED_RECV_BUDGET)?,
             );
-            publish_events(&hub, &mut counters, client.poll_timeouts()?);
+            if !client.is_peer_closed() {
+                publish_events(&hub, &mut counters, client.poll_timeouts()?);
+            }
             break;
         }
 
@@ -243,6 +245,9 @@ fn run_client(
             &mut counters,
             client.recv_available(MANAGED_RECV_BUDGET)?,
         );
+        if client.is_peer_closed() {
+            break;
+        }
         publish_events(&hub, &mut counters, client.poll_timeouts()?);
 
         if client.is_run_complete() {
@@ -257,8 +262,10 @@ fn run_client(
     }
 
     let packets_sent = client.packets_sent();
-    let close_events = client.close()?;
-    publish_events(&hub, &mut counters, close_events);
+    if !client.is_peer_closed() {
+        let close_events = client.close()?;
+        publish_events(&hub, &mut counters, close_events);
+    }
 
     Ok(SessionOutcome {
         end_reason: if cancelled {
@@ -295,11 +302,19 @@ fn drain_final_late_replies(
 
     let deadline = Instant::now() + MANAGED_FINAL_DRAIN;
     while Instant::now() < deadline && client.has_timed_out_metadata() {
+        if client.is_peer_closed() {
+            break;
+        }
+
         let mut published = false;
 
         let events = client.recv_available(MANAGED_RECV_BUDGET)?;
         published |= !events.is_empty();
         publish_events(hub, counters, events);
+
+        if client.is_peer_closed() {
+            break;
+        }
 
         let events = client.poll_timeouts()?;
         published |= !events.is_empty();
