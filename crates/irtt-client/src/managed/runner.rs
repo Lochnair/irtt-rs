@@ -532,11 +532,11 @@ mod tests {
                 )
                 .unwrap();
 
-            while let Some((packet, _)) = recv_request_timeout(&socket) {
-                assert_eq!(
-                    packet[3] & flags::FLAG_CLOSE,
-                    0,
-                    "managed cleanup must not send a close after peer close"
+            if let Some((packet, _)) = recv_request_timeout(&socket) {
+                panic!(
+                    "managed cleanup must not send any packet after peer close; flags={:?} len={}",
+                    packet.get(3).copied(),
+                    packet.len()
                 );
             }
         });
