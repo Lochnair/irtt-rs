@@ -6,9 +6,7 @@ use std::{
 };
 
 use irtt_cli::{
-    applet::{
-        default_applet_for_features, detect_applet_from_argv0, AppletAvailability, RequestedApplet,
-    },
+    applet::{dispatch_from_argv, AppletDispatch, RequestedApplet},
     signal::install_signal_handler,
 };
 
@@ -41,15 +39,6 @@ fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
         RequestedApplet::Client => run_client_applet(argv, shutdown_requested.as_ref()),
         RequestedApplet::Tui => run_tui_applet(argv, shutdown_requested.as_ref()),
         RequestedApplet::Server => Err("server applet is not available in this build".into()),
-    }
-}
-
-fn default_requested_applet() -> Result<RequestedApplet, Box<dyn std::error::Error>> {
-    match default_applet_for_features(cfg!(feature = "client"), cfg!(feature = "tui"), false) {
-        AppletAvailability::Client => Ok(RequestedApplet::Client),
-        AppletAvailability::Tui => Ok(RequestedApplet::Tui),
-        AppletAvailability::Server => Ok(RequestedApplet::Server),
-        AppletAvailability::None => Err("no runnable applet is available in this build".into()),
     }
 }
 
