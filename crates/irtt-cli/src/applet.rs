@@ -120,18 +120,58 @@ mod tests {
     }
 
     #[test]
-    fn default_applet_prefers_client_then_tui() {
+    fn canonical_help_renders_dispatcher_help() {
+        let dispatch = dispatch_from_argv(vec!["irtt-rs".into(), "--help".into()]).unwrap();
+        let AppletDispatch::Help(help) = dispatch else {
+            panic!("expected dispatcher help");
+        };
+        assert!(help.contains("IRTT-compatible multi-applet dispatcher"));
+        assert!(help.contains("client"));
+        assert!(help.contains("tui"));
+        assert!(help.contains("server"));
+    }
+
+    #[test]
+    fn canonical_without_applet_is_an_error() {
+        let err = dispatch_from_argv(vec!["irtt-rs".into()]).unwrap_err();
+        assert!(err.contains("choose an applet"));
+        assert!(err.contains("client"));
+        assert!(err.contains("tui"));
+        assert!(err.contains("server"));
+    }
+
+    #[test]
+    fn canonical_subcommands_dispatch_to_applet_argv() {
         assert_eq!(
-            default_applet_for_features(true, true, false),
-            AppletAvailability::Client
+            dispatch_from_argv(vec!["irtt-rs".into(), "client".into(), "host:2112".into()])
+                .unwrap(),
+            AppletDispatch::Run {
+                applet: RequestedApplet::Client,
+                argv: vec!["irtt-cli".into(), "host:2112".into()],
+            }
         );
         assert_eq!(
-            default_applet_for_features(false, true, false),
-            AppletAvailability::Tui
+            dispatch_from_argv(vec!["irtt-rs".into(), "tui".into(), "host:2112".into()]).unwrap(),
+            AppletDispatch::Run {
+                applet: RequestedApplet::Tui,
+                argv: vec!["irtt-tui".into(), "host:2112".into()],
+            }
         );
         assert_eq!(
-            default_applet_for_features(false, false, false),
-            AppletAvailability::None
+            dispatch_from_argv(vec!["irtt-rs".into(), "server".into()]).unwrap(),
+            AppletDispatch::Run {
+                applet: RequestedApplet::Server,
+                argv: vec!["irtt-server".into()],
+            }
         );
+    }
+
+    #[test]
+    fn unknown_irtt_binary_name_is_an_error() {
+        let err = dispatch_from_argv(vec!["/usr/bin/irtt-typo".into()]).unwrap_err();
+        assert!(err.contains("unknown applet name 'irtt-typo'"));
+        assert!(err.contains("irtt-cli"));
+        assert!(err.contains("irtt-tui"));
+        assert!(err.contains("irtt-server"));
     }
 }
