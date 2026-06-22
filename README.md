@@ -44,7 +44,7 @@ cargo install --path crates/irtt-cli --features tui
 Or run it directly without installing:
 
 ```sh
-cargo run -p irtt-cli -- <server>
+cargo run -p irtt-cli --bin irtt-cli -- <server>
 ```
 
 For space-sensitive packaging, such as OpenWrt packages, distributors can ship
@@ -52,9 +52,29 @@ only `irtt-rs` and symlink or hardlink applet names such as `irtt-cli`,
 `irtt-tui`, and future server applet names to it. Applet dispatch is based on
 the invoked binary name.
 
-cargo-dist release archives currently bundle all enabled applets for a target.
-That is separate from space-sensitive package layouts, which may still ship one
-binary plus applet-name symlinks or hardlinks.
+cargo-dist release archives are currently configured with the `full` feature
+set, so target archives bundle the enabled applet binaries: `irtt-rs`,
+`irtt-cli`, and `irtt-tui`. That is separate from space-sensitive package
+layouts, which may still ship one dispatcher binary plus applet-name symlinks
+or hardlinks. cargo-dist is not currently configured to create those links.
+
+## Build verification
+
+Useful local release/package sanity checks:
+
+```sh
+cargo fmt --check
+cargo test -p irtt-cli
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p irtt-cli --release
+cargo build -p irtt-cli --no-default-features --release
+cargo build -p irtt-cli --features tui --release
+cargo build -p irtt-cli --all-features --release
+```
+
+The no-default-features build only provides the `irtt-rs` dispatcher binary;
+the default build provides `irtt-rs` and `irtt-cli`; `tui`, `full`, and
+all-features builds also provide `irtt-tui`.
 
 ## CLI usage
 
@@ -101,7 +121,7 @@ For available options:
 
 ```sh
 irtt-cli --help
-irtt-tui --help
+irtt-tui --help   # when built or installed with the tui feature
 ```
 
 ## Event row output

@@ -9,6 +9,7 @@ the local Rust client output.
 from __future__ import annotations
 
 import argparse
+import csv
 import datetime as dt
 import json
 import math
@@ -147,7 +148,7 @@ def parse_args() -> argparse.Namespace:
         default=DEFAULT_IRTT_RS_COMMAND,
         help=(
             "Command prefix or direct path for the Rust client. Arguments for "
-            "target, duration, interval, and machine output are appended. "
+            "target, duration, interval, and CSV event output are appended. "
             f"Default: {DEFAULT_IRTT_RS_COMMAND!r}"
         ),
     )
@@ -386,8 +387,10 @@ def run_case(
         case.duration,
         "--interval",
         case.interval,
-        "--output",
-        "machine",
+        "--format",
+        "csv",
+        "--columns",
+        "event,seq,effective_rtt_us,raw_rtt_us,adjusted_rtt_us,server_processing_us,client_send_wall_ns",
         *args.rust_extra_arg,
     ]
 
@@ -402,7 +405,7 @@ def run_case(
 
     rust_samples = case_dir / "irtt-rs-rtt-samples.csv"
     upstream_samples = case_dir / "upstream-rtt-samples.csv"
-    rust_metrics = parse_rust_machine(case_dir / "irtt-rs.stdout", rust_samples)
+    rust_metrics = parse_rust_csv(case_dir / "irtt-rs.stdout", rust_samples)
     upstream_metrics = parse_upstream(case_dir / "upstream.stdout", upstream_json, upstream_samples)
 
     comparison = classify_difference(upstream_metrics, rust_metrics)
@@ -529,16 +532,7 @@ def wait_process(proc: subprocess.Popen[bytes] | None) -> int:
             return proc.wait()
 
 
-def parse_kv_line(line: str) -> dict[str, str]:
-    fields: dict[str, str] = {}
-    for token in shlex.split(line):
-        if "=" in token:
-            key, value = token.split("=", 1)
-            fields[key] = value
-    return fields
-
-
-def parse_rust_machine(path: Path, samples_path: Path) -> Metrics:
+def parse_rust_csv(path: Path, samples_path: Path) -> Metrics:
     metrics = Metrics(source="irtt-rs", samples_path=str(samples_path))
     effective: list[float] = []
     raw: list[float] = []
@@ -552,11 +546,11 @@ def parse_rust_machine(path: Path, samples_path: Path) -> Metrics:
         metrics.parse_notes.append(f"missing {path}")
         return metrics
 
-    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
-        if not line.strip():
-            continue
-        fields = parse_kv_line(line)
+    text = path.read_text(encoding="utf-8", errors="replace")
+    for fields in csv.DictReader(line for line in text.splitlines() if line.strip()):
         event = fields.get("event")
+        if event is None:
+            continue
         seq = parse_int(fields.get("seq"))
         if event == "echo_reply":
             if seq is not None:
