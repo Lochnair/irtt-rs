@@ -122,7 +122,7 @@ impl TuiState {
     }
 
     pub(super) fn process_event(&mut self, event: &ClientEvent, stats: &mut StatsCollector) {
-        stats.process(event);
+        process_tui_stats(event, stats);
         match event {
             ClientEvent::SessionStarted {
                 remote,
@@ -260,6 +260,38 @@ impl TuiState {
 
     fn push_event(&mut self, event: String) {
         push_bounded(&mut self.recent_events, event, RECENT_EVENT_LIMIT);
+    }
+}
+
+fn process_tui_stats(event: &ClientEvent, stats: &mut StatsCollector) {
+    if let ClientEvent::LateReply {
+        seq,
+        highest_seen,
+        remote,
+        received_at,
+        bytes,
+        packet_meta,
+        ..
+    } = event
+    {
+        // The TUI treats late replies as diagnostics, even when retained send
+        // metadata lets the client attach RTT fields to the event.
+        let late_counter_event = ClientEvent::LateReply {
+            seq: *seq,
+            highest_seen: *highest_seen,
+            remote: *remote,
+            sent_at: None,
+            received_at: *received_at,
+            rtt: None,
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: *bytes,
+            packet_meta: *packet_meta,
+        };
+        stats.process(&late_counter_event);
+    } else {
+        stats.process(event);
     }
 }
 
@@ -582,10 +614,11 @@ fn packet_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
             format_count(packets.unique_replies)
         )),
         Line::from(format!(
-            "lost {:>8}   duplicates {:>6}   late {:>10}",
+            "lost {:>8}   duplicates {:>6}   late {:>10}   warnings {:>6}",
             format_count(loss.lost_packets),
             format_count(packets.duplicates),
-            format_count(packets.late_packets)
+            format_count(packets.late_packets),
+            format_count(snapshot.events.warning_events)
         )),
         Line::from(format!(
             "loss {:>8}   reply rate {:>10}   progress {progress}",
@@ -1263,6 +1296,14 @@ mod tests {
         );
 
         assert!(state.graph_history.is_empty());
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.events.duplicate_replies, 1);
+        assert_eq!(snapshot.events.late_unique_replies, 0);
+        assert_eq!(snapshot.events.untracked_late_replies, 1);
+        assert_eq!(snapshot.packets.unique_replies, 0);
+        assert_eq!(snapshot.packets.duplicates, 1);
+        assert_eq!(snapshot.packets.late_packets, 1);
+        assert_eq!(snapshot.rtt.primary.count, 0);
         assert!(state
             .recent_events
             .iter()
