@@ -138,10 +138,14 @@ Aliases are accepted for readability: `receive_delay` for `rd`, `send_delay`
 for `sd`, `server_processing` for `proc`, `server_received_count` for
 `server_received`, and `server_received_window` for `server_window`.
 
-The default table output favors readability and omits `echo_sent` rows. Custom
-table column selections and machine-friendly formats include all event rows.
-Missing table values render as `-`; missing CSV and TSV values render as empty
-fields; missing JSONL values render as `null`.
+The default table output favors readability with compact columns:
+`event,seq,rtt,rd,sd,ipdv,proc,message`. It omits `echo_sent` rows. Passing
+`--columns default` is the same as omitting `--columns`, including the default
+table row filtering. Custom table column selections include all event rows.
+CSV, TSV, and JSONL default to all columns for structured export; use
+`--columns all` explicitly to request every column in any format. Missing table
+values render as `-`; missing CSV and TSV values render as empty fields;
+missing JSONL values render as `null`.
 
 Use JSON Lines for structured event streaming:
 

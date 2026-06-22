@@ -27,7 +27,10 @@ impl OutputConfig {
         header: HeaderMode,
         verbose: bool,
     ) -> Result<Self, String> {
-        let default_table_rows = format == OutputFormat::Table && columns.is_none();
+        let uses_default_columns = columns
+            .map(|columns| columns.trim() == "default")
+            .unwrap_or(true);
+        let default_table_rows = format == OutputFormat::Table && uses_default_columns;
         let columns = match columns {
             Some(columns) => parse_columns(columns, format, verbose)?,
             None => default_columns(format, verbose),
@@ -740,18 +743,18 @@ fn default_columns(format: OutputFormat, verbose: bool) -> Vec<Column> {
             let mut columns = vec![
                 Column::Event,
                 Column::Seq,
-                Column::Remote,
                 Column::Rtt,
                 Column::ReceiveDelay,
                 Column::SendDelay,
                 Column::Ipdv,
                 Column::ServerProcessing,
-                Column::ServerReceivedCount,
-                Column::ServerReceivedWindow,
                 Column::Message,
             ];
             if verbose {
                 columns.extend([
+                    Column::Remote,
+                    Column::ServerReceivedCount,
+                    Column::ServerReceivedWindow,
                     Column::RawRttUs,
                     Column::AdjustedRttUs,
                     Column::Bytes,
