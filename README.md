@@ -48,9 +48,9 @@ cargo run -p irtt-cli --bin irtt-cli -- <server>
 ```
 
 For space-sensitive packaging, such as OpenWrt packages, distributors can ship
-only `irtt-rs` and symlink or hardlink applet names such as `irtt-cli`,
-`irtt-tui`, and future server applet names to it. Applet dispatch is based on
-the invoked binary name.
+only `irtt-rs` and symlink or hardlink enabled applet names such as `irtt-cli`
+and, when built with the `tui` feature, `irtt-tui` to it. Applet dispatch is
+based on the invoked binary name. Server support is not implemented.
 
 cargo-dist release archives are currently configured with the `full` feature
 set, so target archives bundle the enabled applet binaries: `irtt-rs`,
