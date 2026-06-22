@@ -51,7 +51,8 @@ fn canonical_client_subcommand_dispatches_to_client() {
 
     assert!(output.status.success(), "{text}");
     assert!(text.contains("Minimal IRTT-compatible stream client"));
-    assert!(text.contains("--output <OUTPUT>"));
+    assert!(text.contains("--format <FORMAT>"));
+    assert!(text.contains("--columns <COLUMNS>"));
 }
 
 #[cfg(unix)]
@@ -65,7 +66,8 @@ fn client_applet_name_dispatches_to_client() {
 
     assert!(output.status.success(), "{text}");
     assert!(text.contains("Minimal IRTT-compatible stream client"));
-    assert!(text.contains("--output <OUTPUT>"));
+    assert!(text.contains("--format <FORMAT>"));
+    assert!(text.contains("--columns <COLUMNS>"));
 }
 
 #[cfg(all(unix, feature = "tui"))]

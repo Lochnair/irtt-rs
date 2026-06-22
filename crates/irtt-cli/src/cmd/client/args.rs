@@ -11,7 +11,8 @@ pub const DEFAULT_CLIENT_DURATION: Duration = Duration::from_secs(10);
 #[command(name = "irtt-cli", about = "Minimal IRTT-compatible stream client")]
 pub struct ClientArgs {
     /// Server address or host, with optional port.
-    pub server: String,
+    #[arg(required_unless_present = "list_columns")]
+    pub server: Option<String>,
 
     #[arg(
         long,
@@ -25,18 +26,35 @@ pub struct ClientArgs {
     #[command(flatten)]
     pub common: CommonClientArgs,
 
-    /// Output format.
-    #[arg(long, value_enum, default_value_t = OutputMode::Human)]
-    pub output: OutputMode,
+    /// Event row renderer format.
+    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    pub format: OutputFormat,
 
-    /// Include extra fields in human output.
+    /// Comma-separated event row columns.
+    #[arg(short = 'c', long, value_name = "COLUMNS")]
+    pub columns: Option<String>,
+
+    /// Print available event row columns and exit.
+    #[arg(long)]
+    pub list_columns: bool,
+
+    /// Header policy for table, CSV, and TSV output.
+    #[arg(long, value_enum, default_value_t = HeaderMode::Auto)]
+    pub header: HeaderMode,
+
+    /// Include extra fields in table output and final summaries.
     #[arg(long)]
     pub verbose: bool,
 }
 
 impl ClientArgs {
     pub fn to_client_config(&self) -> ClientConfig {
-        self.common.to_client_config(&self.server, self.duration)
+        self.common.to_client_config(
+            self.server
+                .as_deref()
+                .expect("server is required unless --list-columns is set"),
+            self.duration,
+        )
     }
 
     pub fn is_continuous(&self) -> bool {
@@ -57,21 +75,31 @@ impl std::ops::Deref for ClientArgs {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-pub enum OutputMode {
-    /// Readable terminal output with a final summary.
-    Human,
-    /// Parseable full event fields.
-    Machine,
-    /// Simple key=value-ish event stream.
-    Simple,
-    /// RTT microseconds only.
-    RttUs,
+pub enum OutputFormat {
+    /// Readable terminal table output.
+    Table,
+    /// Comma-separated event rows.
+    Csv,
+    /// Tab-separated event rows.
+    Tsv,
+    /// One JSON object per event row.
+    Jsonl,
 }
 
-impl OutputMode {
+impl OutputFormat {
     pub fn prints_summary(self) -> bool {
-        matches!(self, Self::Human)
+        matches!(self, Self::Table)
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum HeaderMode {
+    /// Print headers for table, CSV, and TSV output.
+    Auto,
+    /// Always print headers where the format supports them.
+    Always,
+    /// Never print headers.
+    Never,
 }
 
 #[cfg(test)]
@@ -91,10 +119,12 @@ mod tests {
     fn client_parser_keeps_finite_default_duration() {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
 
-        assert_eq!(args.server, "127.0.0.1:2112");
+        assert_eq!(args.server.as_deref(), Some("127.0.0.1:2112"));
         assert_eq!(args.duration, DEFAULT_CLIENT_DURATION);
         assert_eq!(args.interval, Duration::from_secs(1));
-        assert_eq!(args.output, OutputMode::Human);
+        assert_eq!(args.format, OutputFormat::Table);
+        assert_eq!(args.columns, None);
+        assert_eq!(args.header, HeaderMode::Auto);
         assert!(!args.is_continuous());
         assert_eq!(args.timestamp_mode(), TimestampArg::Both);
 
@@ -107,17 +137,27 @@ mod tests {
     }
 
     #[test]
-    fn client_parser_accepts_stream_outputs_and_rejects_tui_output() {
-        for output in ["human", "simple", "machine", "rtt-us"] {
-            assert!(parse(&["--output", output, "127.0.0.1:2112"]).is_ok());
+    fn client_parser_accepts_stream_formats_and_rejects_tui_output() {
+        for format in ["table", "csv", "tsv", "jsonl"] {
+            assert!(parse(&["--format", format, "127.0.0.1:2112"]).is_ok());
         }
-        assert!(parse(&["--output", "tui", "127.0.0.1:2112"]).is_err());
+        assert!(parse(&["--format", "tui", "127.0.0.1:2112"]).is_err());
+    }
+
+    #[test]
+    fn list_columns_does_not_require_server() {
+        let args = parse(&["--list-columns"]).unwrap();
+        assert_eq!(args.server, None);
+        assert!(args.list_columns);
     }
 
     #[test]
     fn client_help_lists_shared_protocol_options() {
         let help = ClientArgs::command().render_help().to_string();
-        assert!(help.contains("--output <OUTPUT>"));
+        assert!(help.contains("--format <FORMAT>"));
+        assert!(help.contains("--columns <COLUMNS>"));
+        assert!(help.contains("--list-columns"));
+        assert!(help.contains("--header <HEADER>"));
         assert!(help.contains("--tstamp <MODE>"));
         assert!(help.contains("--stats <STATS>"));
         assert!(help.contains("--sfill <STRING>"));
@@ -127,10 +167,10 @@ mod tests {
     }
 
     #[test]
-    fn output_mode_summary_policy_is_human_only() {
-        assert!(OutputMode::Human.prints_summary());
-        assert!(!OutputMode::Simple.prints_summary());
-        assert!(!OutputMode::Machine.prints_summary());
-        assert!(!OutputMode::RttUs.prints_summary());
+    fn output_format_summary_policy_is_table_only() {
+        assert!(OutputFormat::Table.prints_summary());
+        assert!(!OutputFormat::Csv.prints_summary());
+        assert!(!OutputFormat::Tsv.prints_summary());
+        assert!(!OutputFormat::Jsonl.prints_summary());
     }
 }

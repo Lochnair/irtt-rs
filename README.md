@@ -15,7 +15,7 @@ This repository currently provides:
 - `irtt-tui`, an optional terminal UI applet when built with the `tui` feature
 - `irtt-client`, a Rust library for running client sessions and consuming events
 - finite and continuous probe runs
-- human, simple, machine-readable, and RTT-only stream output modes
+- table, CSV, TSV, and JSON Lines event-row output formats with selectable columns
 - optional local summary statistics
 
 Server support is not implemented.
@@ -76,13 +76,14 @@ Run continuously:
 irtt-cli <server> --duration 0
 ```
 
-Use a specific output mode:
+Use a specific output format or column selection:
 
 ```sh
-irtt-cli <server> --output human
-irtt-cli <server> --output simple
-irtt-cli <server> --output machine
-irtt-cli <server> --output rtt-us
+irtt-cli <server> --format table
+irtt-cli <server> --format jsonl
+irtt-cli <server> --format csv --columns event,seq,remote,effective_rtt_us
+irtt-cli <server> --format tsv --columns effective_rtt_us --header never
+irtt-cli --list-columns
 ```
 
 With the optional TUI feature, `irtt-tui` opens a live cumulative dashboard for
@@ -103,36 +104,71 @@ irtt-cli --help
 irtt-tui --help
 ```
 
-## Machine output
+## Event row output
 
-Use `--output machine` for line-oriented `key=value` output intended for scripts, monitoring, and autorate consumers.
+The stream client separates event row rendering from final summaries. Event rows
+are controlled by `--format`, `--columns`, and `--header`; final summaries remain
+separate table-style text and are printed for table output when the run policy
+allows a summary.
+
+Formats:
+
+- `table`: default, terminal-readable columns with a header
+- `csv`: comma-separated rows, intended for scripts
+- `tsv`: tab-separated rows, useful for one-value streams and shell pipelines
+- `jsonl`: one JSON object per event row, suitable for streaming consumers
+
+Headers are controlled with `--header auto|always|never`. In `auto`, table, CSV,
+and TSV print one header row; JSON Lines never prints a header.
+
+Columns are selected with `-c, --columns <COLUMNS>`, where `COLUMNS` is a
+comma-separated list. Use `--list-columns` to print the available names. Useful
+columns include:
+
+```text
+event, seq, remote, token, rtt, rtt_us, raw_rtt_us, effective_rtt_us,
+adjusted_rtt_us, rd, rd_us, sd, sd_us, ipdv, ipdv_us, proc,
+server_processing_us, bytes, send_call_us, timer_error_us, highest_seen,
+server_received, server_window, dscp, ecn, traffic_class, kernel_rx_ns,
+warning_kind, message, event_wall_ns, client_send_wall_ns,
+client_receive_wall_ns
+```
+
+Aliases are accepted for readability: `receive_delay` for `rd`, `send_delay`
+for `sd`, `server_processing` for `proc`, `server_received_count` for
+`server_received`, and `server_received_window` for `server_window`.
+
+The default table output favors readability and omits `echo_sent` rows. Custom
+table column selections and machine-friendly formats include all event rows.
+Missing table values render as `-`; missing CSV and TSV values render as empty
+fields; missing JSONL values render as `null`.
+
+Use JSON Lines for structured event streaming:
 
 Example:
 
 ```sh
-irtt-cli <server> --duration 0 --interval 250ms --output machine
+irtt-cli <server> --duration 0 --interval 250ms --format jsonl
 ```
 
-Each line represents one client event and starts with an `event` field, for example:
+Each line is one client event object, for example:
 
-```text
-event=echo_sent seq=4 remote=203.0.113.10:2112 client_send_wall_ns=1760000000000000000 bytes=64 send_call_us=10 timer_error_us=2
-event=echo_reply seq=4 remote=203.0.113.10:2112 client_send_wall_ns=1760000000000000000 client_receive_wall_ns=1760000000012400000 raw_rtt_us=12400 effective_rtt_us=12100 adjusted_rtt_us=12100 server_receive_wall_ns=1760000000006100000 server_receive_mono_ns=5000006100000 server_send_wall_ns=1760000000006400000 server_send_mono_ns=5000006400000 server_processing_us=300 client_to_server_us=6100 server_to_client_us=6000 server_received_count=5 server_received_window=0x1f dscp=0 ecn=0 kernel_rx_ns=none
+```json
+{"event":"echo_reply","seq":4,"remote":"203.0.113.10:2112","token":null,"rtt":"12.1ms","rtt_us":12100,"raw_rtt_us":12400,"effective_rtt_us":12100,"adjusted_rtt_us":12100,"rd":"6.0ms","rd_us":6000,"sd":"6.1ms","sd_us":6100,"ipdv":"300.0µs","ipdv_us":300,"proc":"300.0µs","server_processing_us":300,"bytes":64,"send_call_us":null,"timer_error_us":null,"highest_seen":null,"server_received":5,"server_window":"0x1f","dscp":0,"ecn":0,"traffic_class":0,"kernel_rx_ns":null,"warning_kind":null,"message":null,"event_wall_ns":1760000000012400000,"client_send_wall_ns":1760000000000000000,"client_receive_wall_ns":1760000000012400000}
 ```
 
-Consumers should match on `event=...` and read the fields they need. Unknown fields should be ignored.
-RTT, send-call, and timer-error fields are reported in microseconds.
+Consumers should match on the `event` property and read the columns they need.
+RTT, send-call, and timer-error `*_us` fields are reported in microseconds.
 `raw_rtt_us` is the measured client send-to-receive RTT. `effective_rtt_us` and
 `adjusted_rtt_us` are signed and may be negative when server processing exceeds
 the raw RTT or timing correction produces a negative adjusted value. When
-one-way delay fields are present, `client_to_server_us` and
-`server_to_client_us` are also signed microseconds and may be negative due to
-wall-clock skew.
+one-way delay fields are present, `sd_us` and `rd_us` are also signed
+microseconds and may be negative due to wall-clock skew.
 
-For consumers that only need RTT values, use:
+For consumers that only need effective RTT values in microseconds, use:
 
 ```sh
-irtt-cli <server> --output rtt-us
+irtt-cli <server> --format tsv --columns effective_rtt_us --header never
 ```
 
 ## Library usage

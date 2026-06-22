@@ -9,51 +9,146 @@ use irtt_client::{
     ServerTiming, SignedDuration, WarningKind,
 };
 
-use super::args::OutputMode;
+use super::args::{HeaderMode, OutputFormat};
 
-pub fn format_event(event: &ClientEvent, mode: OutputMode) -> Option<String> {
-    format_event_with_context(event, RenderContext::new(mode))
+#[derive(Debug, Clone)]
+pub(super) struct OutputConfig {
+    format: OutputFormat,
+    columns: Vec<Column>,
+    header: HeaderMode,
+    default_table_rows: bool,
+    verbose: bool,
 }
 
-pub(super) fn format_event_with_context(
-    event: &ClientEvent,
-    context: RenderContext<'_>,
-) -> Option<String> {
-    match context.mode {
-        OutputMode::Human => {
-            format_human_event_line(event, context.human_stats.cloned(), context.human_options)
-        }
-        OutputMode::Simple => format_simple_event(event),
-        OutputMode::Machine => format_machine_event(event),
-        OutputMode::RttUs => format_rtt_us_event(event),
+impl OutputConfig {
+    pub(super) fn new(
+        format: OutputFormat,
+        columns: Option<&str>,
+        header: HeaderMode,
+        verbose: bool,
+    ) -> Result<Self, String> {
+        let default_table_rows = format == OutputFormat::Table && columns.is_none();
+        let columns = match columns {
+            Some(columns) => parse_columns(columns, format, verbose)?,
+            None => default_columns(format, verbose),
+        };
+
+        Ok(Self {
+            format,
+            columns,
+            header,
+            default_table_rows,
+            verbose,
+        })
     }
-}
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct RenderContext<'a> {
-    pub(super) mode: OutputMode,
-    pub(super) human_stats: Option<&'a HumanEventStats>,
-    pub(super) human_options: HumanOutputOptions,
-}
+    pub(super) fn prints_summary(&self) -> bool {
+        self.format.prints_summary()
+    }
 
-impl RenderContext<'_> {
-    pub(super) fn new(mode: OutputMode) -> Self {
-        Self {
-            mode,
-            human_stats: None,
-            human_options: HumanOutputOptions::default(),
+    pub(super) fn summary_verbose(&self) -> bool {
+        self.verbose
+    }
+
+    pub(super) fn should_print_header(&self) -> bool {
+        match self.header {
+            HeaderMode::Always => self.format != OutputFormat::Jsonl,
+            HeaderMode::Never => false,
+            HeaderMode::Auto => matches!(
+                self.format,
+                OutputFormat::Table | OutputFormat::Csv | OutputFormat::Tsv
+            ),
         }
+    }
+
+    pub(super) fn render_header(&self) -> Option<String> {
+        if !self.should_print_header() {
+            return None;
+        }
+
+        match self.format {
+            OutputFormat::Table => Some(render_table_header(&self.columns)),
+            OutputFormat::Csv => Some(
+                self.columns
+                    .iter()
+                    .map(|column| escape_csv(column.name()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+            ),
+            OutputFormat::Tsv => Some(
+                self.columns
+                    .iter()
+                    .map(|column| escape_tsv(column.name()))
+                    .collect::<Vec<_>>()
+                    .join("\t"),
+            ),
+            OutputFormat::Jsonl => None,
+        }
+    }
+
+    pub(super) fn render_event(
+        &self,
+        event: &ClientEvent,
+        stats: Option<&EventRenderStats>,
+    ) -> Option<String> {
+        let row = OutputRow::from_event(event);
+        if self.default_table_rows && row.is_default_table_hidden() {
+            return None;
+        }
+
+        let context = RenderContext {
+            stats,
+            verbose: self.verbose,
+        };
+
+        match self.format {
+            OutputFormat::Table => Some(render_table_row(&row, &self.columns, context)),
+            OutputFormat::Csv => Some(render_delimited_row(
+                &row,
+                &self.columns,
+                context,
+                DelimitedFormat::Csv,
+            )),
+            OutputFormat::Tsv => Some(render_delimited_row(
+                &row,
+                &self.columns,
+                context,
+                DelimitedFormat::Tsv,
+            )),
+            OutputFormat::Jsonl => Some(render_jsonl_row(&row, &self.columns, context)),
+        }
+    }
+
+    pub(super) fn list_columns() -> String {
+        let mut out = String::new();
+        writeln!(out, "Available event columns:").unwrap();
+        for column in ALL_COLUMNS {
+            writeln!(out, "  {:<24} {}", column.name(), column.description()).unwrap();
+        }
+        writeln!(out).unwrap();
+        writeln!(
+            out,
+            "Aliases: rd=receive_delay, sd=send_delay, proc=server_processing, \
+             server_received=server_received_count, server_window=server_received_window."
+        )
+        .unwrap();
+        writeln!(
+            out,
+            "Use --columns default for the format default, or --columns all for every column."
+        )
+        .unwrap();
+        out
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct HumanEventStats {
+pub struct EventRenderStats {
     pub contributed_sample: bool,
-    pub ipdv_pairs: Vec<HumanIpdvPair>,
+    pub ipdv_pairs: Vec<IpdvPair>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HumanIpdvPair {
+pub struct IpdvPair {
     pub previous_seq: u32,
     pub current_seq: u32,
     pub rtt_ipdv: Duration,
@@ -61,13 +156,8 @@ pub struct HumanIpdvPair {
     pub receive_ipdv: Option<Duration>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct HumanOutputOptions {
-    pub verbose: bool,
-}
-
 #[cfg(feature = "stats")]
-impl From<irtt_stats::EventStatsUpdate> for HumanEventStats {
+impl From<irtt_stats::EventStatsUpdate> for EventRenderStats {
     fn from(value: irtt_stats::EventStatsUpdate) -> Self {
         Self {
             contributed_sample: value.contributed_sample,
@@ -77,7 +167,7 @@ impl From<irtt_stats::EventStatsUpdate> for HumanEventStats {
 }
 
 #[cfg(feature = "stats")]
-impl From<irtt_stats::IpdvPairUpdate> for HumanIpdvPair {
+impl From<irtt_stats::IpdvPairUpdate> for IpdvPair {
     fn from(value: irtt_stats::IpdvPairUpdate) -> Self {
         Self {
             previous_seq: value.previous_seq,
@@ -89,408 +179,930 @@ impl From<irtt_stats::IpdvPairUpdate> for HumanIpdvPair {
     }
 }
 
-pub fn format_human_event(event: &ClientEvent, stats: Option<HumanEventStats>) -> String {
-    format_human_event_with_options(event, stats, HumanOutputOptions::default())
+#[derive(Debug, Clone, Copy)]
+struct RenderContext<'a> {
+    stats: Option<&'a EventRenderStats>,
+    verbose: bool,
 }
 
-pub fn format_human_event_with_options(
-    event: &ClientEvent,
-    stats: Option<HumanEventStats>,
-    options: HumanOutputOptions,
-) -> String {
-    format_human_event_line(event, stats, options).unwrap_or_default()
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutputRow {
+    SessionStarted(LifecycleRow),
+    NoTestCompleted(LifecycleRow),
+    SessionClosed {
+        remote: SocketAddr,
+        token: u64,
+        event_wall: SystemTime,
+    },
+    EchoSent {
+        seq: u32,
+        remote: SocketAddr,
+        client_send_wall: SystemTime,
+        bytes: usize,
+        send_call: Duration,
+        timer_error: Duration,
+    },
+    EchoReply(ReplyRow),
+    Loss {
+        seq: u32,
+        client_send_wall: SystemTime,
+    },
+    Duplicate {
+        seq: u32,
+        remote: SocketAddr,
+        client_receive_wall: SystemTime,
+        bytes: usize,
+    },
+    Late {
+        reply: ReplyRow,
+        highest_seen: u32,
+    },
+    Warning {
+        kind: WarningKind,
+        message: String,
+        event_wall: SystemTime,
+    },
 }
 
-fn format_human_event_line(
-    event: &ClientEvent,
-    stats: Option<HumanEventStats>,
-    options: HumanOutputOptions,
-) -> Option<String> {
-    let stats = stats.as_ref();
+impl OutputRow {
+    fn from_event(event: &ClientEvent) -> Self {
+        match event {
+            ClientEvent::SessionStarted {
+                remote,
+                token,
+                negotiated,
+                at,
+            } => Self::SessionStarted(LifecycleRow::new(
+                *remote,
+                Some(*token),
+                negotiated,
+                at.wall,
+            )),
+            ClientEvent::NoTestCompleted {
+                remote,
+                negotiated,
+                at,
+            } => Self::NoTestCompleted(LifecycleRow::new(*remote, None, negotiated, at.wall)),
+            ClientEvent::SessionClosed { remote, token, at } => Self::SessionClosed {
+                remote: *remote,
+                token: *token,
+                event_wall: at.wall,
+            },
+            ClientEvent::EchoSent {
+                seq,
+                remote,
+                sent_at,
+                bytes,
+                send_call,
+                timer_error,
+                ..
+            } => Self::EchoSent {
+                seq: *seq,
+                remote: *remote,
+                client_send_wall: sent_at.wall,
+                bytes: *bytes,
+                send_call: *send_call,
+                timer_error: *timer_error,
+            },
+            ClientEvent::EchoReply {
+                seq,
+                remote,
+                sent_at,
+                received_at,
+                rtt,
+                server_timing,
+                one_way,
+                received_stats,
+                bytes,
+                packet_meta,
+            } => Self::EchoReply(ReplyRow {
+                seq: *seq,
+                remote: *remote,
+                client_send_wall: Some(sent_at.wall),
+                client_receive_wall: received_at.wall,
+                rtt: Some(*rtt),
+                server_timing: *server_timing,
+                one_way: *one_way,
+                received_stats: *received_stats,
+                bytes: *bytes,
+                packet_meta: *packet_meta,
+            }),
+            ClientEvent::EchoLoss { seq, sent_at, .. } => Self::Loss {
+                seq: *seq,
+                client_send_wall: sent_at.wall,
+            },
+            ClientEvent::DuplicateReply {
+                seq,
+                remote,
+                received_at,
+                bytes,
+            } => Self::Duplicate {
+                seq: *seq,
+                remote: *remote,
+                client_receive_wall: received_at.wall,
+                bytes: *bytes,
+            },
+            ClientEvent::LateReply {
+                seq,
+                highest_seen,
+                remote,
+                sent_at,
+                received_at,
+                rtt,
+                server_timing,
+                one_way,
+                received_stats,
+                bytes,
+                packet_meta,
+            } => Self::Late {
+                reply: ReplyRow {
+                    seq: *seq,
+                    remote: *remote,
+                    client_send_wall: sent_at.map(|sent_at| sent_at.wall),
+                    client_receive_wall: received_at.wall,
+                    rtt: *rtt,
+                    server_timing: *server_timing,
+                    one_way: *one_way,
+                    received_stats: *received_stats,
+                    bytes: *bytes,
+                    packet_meta: *packet_meta,
+                },
+                highest_seen: *highest_seen,
+            },
+            ClientEvent::Warning { kind, message, at } => Self::Warning {
+                kind: *kind,
+                message: message.clone(),
+                event_wall: at.wall,
+            },
+        }
+    }
 
-    let line = match event {
-        ClientEvent::SessionStarted { remote, token, .. } => {
-            format!("session started  remote={remote}  token={token:#x}")
+    fn event_name(&self) -> &'static str {
+        match self {
+            Self::SessionStarted(_) => "session_started",
+            Self::NoTestCompleted(_) => "no_test_completed",
+            Self::SessionClosed { .. } => "session_closed",
+            Self::EchoSent { .. } => "echo_sent",
+            Self::EchoReply(_) => "echo_reply",
+            Self::Loss { .. } => "loss",
+            Self::Duplicate { .. } => "duplicate",
+            Self::Late { .. } => "late",
+            Self::Warning { .. } => "warning",
         }
-        ClientEvent::NoTestCompleted { remote, .. } => {
-            format!("no-test completed  remote={remote}")
+    }
+
+    fn is_default_table_hidden(&self) -> bool {
+        matches!(self, Self::EchoSent { .. })
+    }
+
+    fn reply(&self) -> Option<&ReplyRow> {
+        match self {
+            Self::EchoReply(reply) | Self::Late { reply, .. } => Some(reply),
+            _ => None,
         }
-        ClientEvent::SessionClosed { remote, token, .. } => {
-            format!("session closed  remote={remote}  token={token:#x}")
-        }
-        ClientEvent::EchoSent { .. } => return None,
-        ClientEvent::EchoReply {
-            seq,
-            rtt,
-            server_timing,
-            one_way,
-            received_stats,
-            ..
-        } => {
-            let mut out = format!("seq={seq}");
-            write!(out, "  rtt={}", format_signed_duration(rtt.effective)).unwrap();
-            write_human_one_way(&mut out, *one_way);
-            write!(out, "  ipdv={}", format_human_ipdv(stats, *seq)).unwrap();
-            if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
-                write!(out, "  proc={}", format_duration(processing)).unwrap();
-            }
-            if options.verbose {
-                write_human_received_stats(&mut out, *received_stats);
-            }
-            out
-        }
-        ClientEvent::EchoLoss { seq, .. } => {
-            format!("loss  seq={seq}")
-        }
-        ClientEvent::DuplicateReply { seq, remote, .. } => {
-            format!("duplicate  seq={seq}  remote={remote}")
-        }
-        ClientEvent::LateReply {
-            seq,
-            highest_seen,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct LifecycleRow {
+    remote: SocketAddr,
+    token: Option<u64>,
+    event_wall: SystemTime,
+    duration_ns: i128,
+    interval_ns: i128,
+    payload_length: i128,
+}
+
+impl LifecycleRow {
+    fn new(
+        remote: SocketAddr,
+        token: Option<u64>,
+        negotiated: &NegotiatedParams,
+        event_wall: SystemTime,
+    ) -> Self {
+        Self {
             remote,
-            rtt,
-            one_way,
-            received_stats,
-            ..
-        } => {
-            let mut out = format!("late  seq={seq}  highest_seen={highest_seen}  remote={remote}",);
-            if let Some(rtt) = rtt {
-                write!(out, "  rtt={}", format_signed_duration(rtt.effective)).unwrap();
-                write_human_one_way(&mut out, *one_way);
-                write!(out, "  ipdv={}", format_human_ipdv(stats, *seq)).unwrap();
-            }
-            write_human_received_stats(&mut out, *received_stats);
-            out
+            token,
+            event_wall,
+            duration_ns: i128::from(negotiated.params.duration_ns),
+            interval_ns: i128::from(negotiated.params.interval_ns),
+            payload_length: i128::from(negotiated.params.length),
         }
-        ClientEvent::Warning { kind, message, .. } => {
-            format!("warning  kind={}  message={message}", warning_kind(*kind))
-        }
-    };
-    Some(line)
+    }
 }
 
-fn format_rtt_us_event(event: &ClientEvent) -> Option<String> {
-    match event {
-        ClientEvent::EchoReply { rtt, .. } => Some(signed_duration_us(rtt.effective).to_string()),
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReplyRow {
+    seq: u32,
+    remote: SocketAddr,
+    client_send_wall: Option<SystemTime>,
+    client_receive_wall: SystemTime,
+    rtt: Option<RttSample>,
+    server_timing: Option<ServerTiming>,
+    one_way: Option<OneWayDelaySample>,
+    received_stats: Option<ReceivedStatsSample>,
+    bytes: usize,
+    packet_meta: PacketMeta,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Column {
+    Event,
+    Seq,
+    Remote,
+    Token,
+    Rtt,
+    RttUs,
+    RawRttUs,
+    EffectiveRttUs,
+    AdjustedRttUs,
+    ReceiveDelay,
+    ReceiveDelayUs,
+    SendDelay,
+    SendDelayUs,
+    Ipdv,
+    IpdvUs,
+    ServerProcessing,
+    ServerProcessingUs,
+    Bytes,
+    SendCallUs,
+    TimerErrorUs,
+    HighestSeen,
+    ServerReceivedCount,
+    ServerReceivedWindow,
+    Dscp,
+    Ecn,
+    TrafficClass,
+    KernelRxNs,
+    WarningKind,
+    Message,
+    EventWallNs,
+    ClientSendWallNs,
+    ClientReceiveWallNs,
+    DurationNs,
+    IntervalNs,
+    PayloadLength,
+    ServerReceiveWallNs,
+    ServerReceiveMonoNs,
+    ServerSendWallNs,
+    ServerSendMonoNs,
+    ServerMidpointWallNs,
+    ServerMidpointMonoNs,
+}
+
+const ALL_COLUMNS: &[Column] = &[
+    Column::Event,
+    Column::Seq,
+    Column::Remote,
+    Column::Token,
+    Column::Rtt,
+    Column::RttUs,
+    Column::RawRttUs,
+    Column::EffectiveRttUs,
+    Column::AdjustedRttUs,
+    Column::ReceiveDelay,
+    Column::ReceiveDelayUs,
+    Column::SendDelay,
+    Column::SendDelayUs,
+    Column::Ipdv,
+    Column::IpdvUs,
+    Column::ServerProcessing,
+    Column::ServerProcessingUs,
+    Column::Bytes,
+    Column::SendCallUs,
+    Column::TimerErrorUs,
+    Column::HighestSeen,
+    Column::ServerReceivedCount,
+    Column::ServerReceivedWindow,
+    Column::Dscp,
+    Column::Ecn,
+    Column::TrafficClass,
+    Column::KernelRxNs,
+    Column::WarningKind,
+    Column::Message,
+    Column::EventWallNs,
+    Column::ClientSendWallNs,
+    Column::ClientReceiveWallNs,
+    Column::DurationNs,
+    Column::IntervalNs,
+    Column::PayloadLength,
+    Column::ServerReceiveWallNs,
+    Column::ServerReceiveMonoNs,
+    Column::ServerSendWallNs,
+    Column::ServerSendMonoNs,
+    Column::ServerMidpointWallNs,
+    Column::ServerMidpointMonoNs,
+];
+
+impl Column {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Event => "event",
+            Self::Seq => "seq",
+            Self::Remote => "remote",
+            Self::Token => "token",
+            Self::Rtt => "rtt",
+            Self::RttUs => "rtt_us",
+            Self::RawRttUs => "raw_rtt_us",
+            Self::EffectiveRttUs => "effective_rtt_us",
+            Self::AdjustedRttUs => "adjusted_rtt_us",
+            Self::ReceiveDelay => "rd",
+            Self::ReceiveDelayUs => "rd_us",
+            Self::SendDelay => "sd",
+            Self::SendDelayUs => "sd_us",
+            Self::Ipdv => "ipdv",
+            Self::IpdvUs => "ipdv_us",
+            Self::ServerProcessing => "proc",
+            Self::ServerProcessingUs => "server_processing_us",
+            Self::Bytes => "bytes",
+            Self::SendCallUs => "send_call_us",
+            Self::TimerErrorUs => "timer_error_us",
+            Self::HighestSeen => "highest_seen",
+            Self::ServerReceivedCount => "server_received",
+            Self::ServerReceivedWindow => "server_window",
+            Self::Dscp => "dscp",
+            Self::Ecn => "ecn",
+            Self::TrafficClass => "traffic_class",
+            Self::KernelRxNs => "kernel_rx_ns",
+            Self::WarningKind => "warning_kind",
+            Self::Message => "message",
+            Self::EventWallNs => "event_wall_ns",
+            Self::ClientSendWallNs => "client_send_wall_ns",
+            Self::ClientReceiveWallNs => "client_receive_wall_ns",
+            Self::DurationNs => "duration_ns",
+            Self::IntervalNs => "interval_ns",
+            Self::PayloadLength => "payload_length",
+            Self::ServerReceiveWallNs => "server_receive_wall_ns",
+            Self::ServerReceiveMonoNs => "server_receive_mono_ns",
+            Self::ServerSendWallNs => "server_send_wall_ns",
+            Self::ServerSendMonoNs => "server_send_mono_ns",
+            Self::ServerMidpointWallNs => "server_midpoint_wall_ns",
+            Self::ServerMidpointMonoNs => "server_midpoint_mono_ns",
+        }
+    }
+
+    fn parse(input: &str) -> Option<Self> {
+        Some(match input {
+            "event" => Self::Event,
+            "seq" => Self::Seq,
+            "remote" => Self::Remote,
+            "token" => Self::Token,
+            "rtt" => Self::Rtt,
+            "rtt_us" => Self::RttUs,
+            "raw_rtt_us" => Self::RawRttUs,
+            "effective_rtt_us" => Self::EffectiveRttUs,
+            "adjusted_rtt_us" => Self::AdjustedRttUs,
+            "rd" | "receive_delay" => Self::ReceiveDelay,
+            "rd_us" | "receive_delay_us" => Self::ReceiveDelayUs,
+            "sd" | "send_delay" => Self::SendDelay,
+            "sd_us" | "send_delay_us" => Self::SendDelayUs,
+            "ipdv" => Self::Ipdv,
+            "ipdv_us" => Self::IpdvUs,
+            "proc" | "server_processing" => Self::ServerProcessing,
+            "server_processing_us" => Self::ServerProcessingUs,
+            "bytes" => Self::Bytes,
+            "send_call_us" => Self::SendCallUs,
+            "timer_error_us" => Self::TimerErrorUs,
+            "highest_seen" => Self::HighestSeen,
+            "server_received" | "server_received_count" => Self::ServerReceivedCount,
+            "server_window" | "server_received_window" => Self::ServerReceivedWindow,
+            "dscp" => Self::Dscp,
+            "ecn" => Self::Ecn,
+            "traffic_class" => Self::TrafficClass,
+            "kernel_rx_ns" => Self::KernelRxNs,
+            "warning_kind" => Self::WarningKind,
+            "message" => Self::Message,
+            "event_wall_ns" => Self::EventWallNs,
+            "client_send_wall_ns" => Self::ClientSendWallNs,
+            "client_receive_wall_ns" => Self::ClientReceiveWallNs,
+            "duration_ns" => Self::DurationNs,
+            "interval_ns" => Self::IntervalNs,
+            "payload_length" => Self::PayloadLength,
+            "server_receive_wall_ns" => Self::ServerReceiveWallNs,
+            "server_receive_mono_ns" => Self::ServerReceiveMonoNs,
+            "server_send_wall_ns" => Self::ServerSendWallNs,
+            "server_send_mono_ns" => Self::ServerSendMonoNs,
+            "server_midpoint_wall_ns" => Self::ServerMidpointWallNs,
+            "server_midpoint_mono_ns" => Self::ServerMidpointMonoNs,
+            _ => return None,
+        })
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            Self::Event => "event kind",
+            Self::Seq => "probe sequence number",
+            Self::Remote => "remote socket address",
+            Self::Token => "session token as hexadecimal",
+            Self::Rtt => "human-readable effective RTT",
+            Self::RttUs => "effective RTT in signed microseconds",
+            Self::RawRttUs => "raw client send-to-receive RTT in microseconds",
+            Self::EffectiveRttUs => "effective RTT in signed microseconds",
+            Self::AdjustedRttUs => "adjusted RTT in signed microseconds",
+            Self::ReceiveDelay => "human-readable server-to-client delay",
+            Self::ReceiveDelayUs => "server-to-client delay in signed microseconds",
+            Self::SendDelay => "human-readable client-to-server delay",
+            Self::SendDelayUs => "client-to-server delay in signed microseconds",
+            Self::Ipdv => "human-readable round-trip IPDV for adjacent samples",
+            Self::IpdvUs => "round-trip IPDV in microseconds",
+            Self::ServerProcessing => "human-readable server processing time",
+            Self::ServerProcessingUs => "server processing time in microseconds",
+            Self::Bytes => "packet bytes for packet events",
+            Self::SendCallUs => "send system call duration in microseconds",
+            Self::TimerErrorUs => "scheduled-vs-actual send timer error in microseconds",
+            Self::HighestSeen => "highest sequence seen when a late reply arrived",
+            Self::ServerReceivedCount => "server-reported received packet count",
+            Self::ServerReceivedWindow => "server-reported received window as hexadecimal",
+            Self::Dscp => "received packet DSCP codepoint",
+            Self::Ecn => "received packet ECN bits",
+            Self::TrafficClass => "received packet traffic class byte",
+            Self::KernelRxNs => "kernel receive timestamp as Unix nanoseconds",
+            Self::WarningKind => "warning classifier",
+            Self::Message => "warning or lifecycle message",
+            Self::EventWallNs => "event wall timestamp as Unix nanoseconds",
+            Self::ClientSendWallNs => "client send wall timestamp as Unix nanoseconds",
+            Self::ClientReceiveWallNs => "client receive wall timestamp as Unix nanoseconds",
+            Self::DurationNs => "negotiated test duration in nanoseconds",
+            Self::IntervalNs => "negotiated probe interval in nanoseconds",
+            Self::PayloadLength => "negotiated payload length",
+            Self::ServerReceiveWallNs => "server receive wall timestamp in nanoseconds",
+            Self::ServerReceiveMonoNs => "server receive monotonic timestamp in nanoseconds",
+            Self::ServerSendWallNs => "server send wall timestamp in nanoseconds",
+            Self::ServerSendMonoNs => "server send monotonic timestamp in nanoseconds",
+            Self::ServerMidpointWallNs => "server midpoint wall timestamp in nanoseconds",
+            Self::ServerMidpointMonoNs => "server midpoint monotonic timestamp in nanoseconds",
+        }
+    }
+
+    fn table_width(self) -> usize {
+        match self {
+            Self::Event => 17,
+            Self::Seq => 6,
+            Self::Remote => 21,
+            Self::Token => 18,
+            Self::Rtt
+            | Self::ReceiveDelay
+            | Self::SendDelay
+            | Self::Ipdv
+            | Self::ServerProcessing => 9,
+            Self::Message => 24,
+            Self::WarningKind => 28,
+            Self::ServerReceivedWindow => 13,
+            Self::ServerReceivedCount | Self::HighestSeen => 15,
+            Self::Dscp | Self::Ecn => 4,
+            Self::TrafficClass => 13,
+            _ => self.name().len().max(10),
+        }
+    }
+
+    fn align_right(self) -> bool {
+        !matches!(
+            self,
+            Self::Event
+                | Self::Remote
+                | Self::Token
+                | Self::Message
+                | Self::WarningKind
+                | Self::ServerReceivedWindow
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CellValue {
+    Text(String),
+    Integer(i128),
+    Unsigned(u128),
+    Hex(u128),
+}
+
+impl CellValue {
+    fn text(value: impl Into<String>) -> Self {
+        Self::Text(value.into())
+    }
+
+    fn display(&self) -> String {
+        match self {
+            Self::Text(value) => value.clone(),
+            Self::Integer(value) => value.to_string(),
+            Self::Unsigned(value) => value.to_string(),
+            Self::Hex(value) => format!("{value:#x}"),
+        }
+    }
+
+    fn write_json(&self, out: &mut String) {
+        match self {
+            Self::Text(value) => {
+                out.push('"');
+                write_json_string_content(out, value);
+                out.push('"');
+            }
+            Self::Integer(value) => write!(out, "{value}").unwrap(),
+            Self::Unsigned(value) => write!(out, "{value}").unwrap(),
+            Self::Hex(value) => {
+                out.push('"');
+                write!(out, "{value:#x}").unwrap();
+                out.push('"');
+            }
+        }
+    }
+}
+
+fn parse_columns(input: &str, format: OutputFormat, verbose: bool) -> Result<Vec<Column>, String> {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Err("--columns requires at least one column".to_owned());
+    }
+    if trimmed == "all" {
+        return Ok(ALL_COLUMNS.to_vec());
+    }
+    if trimmed == "default" {
+        return Ok(default_columns(format, verbose));
+    }
+
+    let mut columns = Vec::new();
+    for raw in trimmed.split(',') {
+        let name = raw.trim();
+        if name.is_empty() {
+            return Err("empty column in --columns list".to_owned());
+        }
+        let column = Column::parse(name).ok_or_else(|| {
+            format!("unknown output column {name:?}; run --list-columns to see valid names")
+        })?;
+        columns.push(column);
+    }
+    Ok(columns)
+}
+
+fn default_columns(format: OutputFormat, verbose: bool) -> Vec<Column> {
+    match format {
+        OutputFormat::Table => {
+            let mut columns = vec![
+                Column::Event,
+                Column::Seq,
+                Column::Remote,
+                Column::Rtt,
+                Column::ReceiveDelay,
+                Column::SendDelay,
+                Column::Ipdv,
+                Column::ServerProcessing,
+                Column::ServerReceivedCount,
+                Column::ServerReceivedWindow,
+                Column::Message,
+            ];
+            if verbose {
+                columns.extend([
+                    Column::RawRttUs,
+                    Column::AdjustedRttUs,
+                    Column::Bytes,
+                    Column::Dscp,
+                    Column::Ecn,
+                ]);
+            }
+            columns
+        }
+        OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Jsonl => ALL_COLUMNS.to_vec(),
+    }
+}
+
+fn render_table_header(columns: &[Column]) -> String {
+    columns
+        .iter()
+        .map(|column| format_table_cell(column, Some(column.name().to_owned())))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn render_table_row(row: &OutputRow, columns: &[Column], context: RenderContext<'_>) -> String {
+    columns
+        .iter()
+        .map(|column| {
+            let value = cell_for(row, *column, context).map(|value| value.display());
+            format_table_cell(column, value)
+        })
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+fn format_table_cell(column: &Column, value: Option<String>) -> String {
+    let value = value.unwrap_or_else(|| "-".to_owned());
+    let width = column.table_width();
+    if column.align_right() {
+        format!("{value:>width$}")
+    } else {
+        format!("{value:<width$}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DelimitedFormat {
+    Csv,
+    Tsv,
+}
+
+fn render_delimited_row(
+    row: &OutputRow,
+    columns: &[Column],
+    context: RenderContext<'_>,
+    format: DelimitedFormat,
+) -> String {
+    let separator = match format {
+        DelimitedFormat::Csv => ",",
+        DelimitedFormat::Tsv => "\t",
+    };
+    columns
+        .iter()
+        .map(|column| {
+            let value = cell_for(row, *column, context)
+                .map(|value| value.display())
+                .unwrap_or_default();
+            match format {
+                DelimitedFormat::Csv => escape_csv(&value),
+                DelimitedFormat::Tsv => escape_tsv(&value),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(separator)
+}
+
+fn render_jsonl_row(row: &OutputRow, columns: &[Column], context: RenderContext<'_>) -> String {
+    let mut out = String::from("{");
+    for (index, column) in columns.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        write_json_string_content(&mut out, column.name());
+        out.push_str("\":");
+        if let Some(value) = cell_for(row, *column, context) {
+            value.write_json(&mut out);
+        } else {
+            out.push_str("null");
+        }
+    }
+    out.push('}');
+    out
+}
+
+fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Option<CellValue> {
+    match column {
+        Column::Event => Some(CellValue::text(row.event_name())),
+        Column::Seq => row_seq(row).map(|seq| CellValue::Unsigned(u128::from(seq))),
+        Column::Remote => row_remote(row).map(|remote| CellValue::text(remote.to_string())),
+        Column::Token => row_token(row).map(|token| CellValue::Hex(u128::from(token))),
+        Column::Rtt => row.reply().and_then(|reply| {
+            reply
+                .rtt
+                .map(|rtt| CellValue::text(format_signed_duration(rtt.effective)))
+        }),
+        Column::RttUs | Column::EffectiveRttUs => row.reply().and_then(|reply| {
+            reply
+                .rtt
+                .map(|rtt| CellValue::Integer(signed_duration_us(rtt.effective)))
+        }),
+        Column::RawRttUs => row.reply().and_then(|reply| {
+            reply
+                .rtt
+                .map(|rtt| CellValue::Unsigned(duration_us(rtt.raw)))
+        }),
+        Column::AdjustedRttUs => row.reply().and_then(|reply| {
+            reply
+                .rtt
+                .and_then(|rtt| rtt.adjusted)
+                .map(|adjusted| CellValue::Integer(signed_duration_us(adjusted)))
+        }),
+        Column::ReceiveDelay => row
+            .reply()
+            .and_then(|reply| reply.one_way.and_then(|one_way| one_way.server_to_client))
+            .map(|value| CellValue::text(format_signed_duration(value))),
+        Column::ReceiveDelayUs => row
+            .reply()
+            .and_then(|reply| reply.one_way.and_then(|one_way| one_way.server_to_client))
+            .map(|value| CellValue::Integer(signed_duration_us(value))),
+        Column::SendDelay => row
+            .reply()
+            .and_then(|reply| reply.one_way.and_then(|one_way| one_way.client_to_server))
+            .map(|value| CellValue::text(format_signed_duration(value))),
+        Column::SendDelayUs => row
+            .reply()
+            .and_then(|reply| reply.one_way.and_then(|one_way| one_way.client_to_server))
+            .map(|value| CellValue::Integer(signed_duration_us(value))),
+        Column::Ipdv => row_seq(row)
+            .and_then(|seq| ipdv_pair(context.stats, seq))
+            .map(|pair| CellValue::text(format_duration(pair.rtt_ipdv))),
+        Column::IpdvUs => row_seq(row)
+            .and_then(|seq| ipdv_pair(context.stats, seq))
+            .map(|pair| CellValue::Unsigned(duration_us(pair.rtt_ipdv))),
+        Column::ServerProcessing => row
+            .reply()
+            .and_then(|reply| reply.server_timing.and_then(|timing| timing.processing))
+            .map(|value| CellValue::text(format_duration(value))),
+        Column::ServerProcessingUs => row
+            .reply()
+            .and_then(|reply| reply.server_timing.and_then(|timing| timing.processing))
+            .map(|value| CellValue::Unsigned(duration_us(value))),
+        Column::Bytes => row_bytes(row).map(|bytes| CellValue::Unsigned(bytes as u128)),
+        Column::SendCallUs => match row {
+            OutputRow::EchoSent { send_call, .. } => {
+                Some(CellValue::Unsigned(duration_us(*send_call)))
+            }
+            _ => None,
+        },
+        Column::TimerErrorUs => match row {
+            OutputRow::EchoSent { timer_error, .. } => {
+                Some(CellValue::Unsigned(duration_us(*timer_error)))
+            }
+            _ => None,
+        },
+        Column::HighestSeen => match row {
+            OutputRow::Late { highest_seen, .. } => {
+                Some(CellValue::Unsigned(u128::from(*highest_seen)))
+            }
+            _ => None,
+        },
+        Column::ServerReceivedCount => row
+            .reply()
+            .and_then(|reply| reply.received_stats.and_then(|stats| stats.count))
+            .map(|value| CellValue::Unsigned(u128::from(value))),
+        Column::ServerReceivedWindow => row
+            .reply()
+            .and_then(|reply| reply.received_stats.and_then(|stats| stats.window))
+            .map(|value| CellValue::Hex(u128::from(value))),
+        Column::Dscp => row
+            .reply()
+            .and_then(|reply| reply.packet_meta.dscp)
+            .map(|value| CellValue::Unsigned(u128::from(value))),
+        Column::Ecn => row
+            .reply()
+            .and_then(|reply| reply.packet_meta.ecn)
+            .map(|value| CellValue::Unsigned(u128::from(value))),
+        Column::TrafficClass => row
+            .reply()
+            .and_then(|reply| reply.packet_meta.traffic_class)
+            .map(|value| CellValue::Unsigned(u128::from(value))),
+        Column::KernelRxNs => row
+            .reply()
+            .and_then(|reply| reply.packet_meta.kernel_rx_timestamp)
+            .and_then(wall_time_ns)
+            .map(CellValue::Unsigned),
+        Column::WarningKind => match row {
+            OutputRow::Warning { kind, .. } => Some(CellValue::text(warning_kind(*kind))),
+            _ => None,
+        },
+        Column::Message => row_message(row, context).map(CellValue::text),
+        Column::EventWallNs => row_event_wall(row)
+            .and_then(wall_time_ns)
+            .map(CellValue::Unsigned),
+        Column::ClientSendWallNs => row_client_send_wall(row)
+            .and_then(wall_time_ns)
+            .map(CellValue::Unsigned),
+        Column::ClientReceiveWallNs => row_client_receive_wall(row)
+            .and_then(wall_time_ns)
+            .map(CellValue::Unsigned),
+        Column::DurationNs => match row {
+            OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => {
+                Some(CellValue::Integer(row.duration_ns))
+            }
+            _ => None,
+        },
+        Column::IntervalNs => match row {
+            OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => {
+                Some(CellValue::Integer(row.interval_ns))
+            }
+            _ => None,
+        },
+        Column::PayloadLength => match row {
+            OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => {
+                Some(CellValue::Integer(row.payload_length))
+            }
+            _ => None,
+        },
+        Column::ServerReceiveWallNs => server_timing_i64(row, |timing| timing.receive_wall_ns),
+        Column::ServerReceiveMonoNs => server_timing_i64(row, |timing| timing.receive_mono_ns),
+        Column::ServerSendWallNs => server_timing_i64(row, |timing| timing.send_wall_ns),
+        Column::ServerSendMonoNs => server_timing_i64(row, |timing| timing.send_mono_ns),
+        Column::ServerMidpointWallNs => server_timing_i64(row, |timing| timing.midpoint_wall_ns),
+        Column::ServerMidpointMonoNs => server_timing_i64(row, |timing| timing.midpoint_mono_ns),
+    }
+}
+
+fn row_seq(row: &OutputRow) -> Option<u32> {
+    match row {
+        OutputRow::EchoSent { seq, .. }
+        | OutputRow::Loss { seq, .. }
+        | OutputRow::Duplicate { seq, .. } => Some(*seq),
+        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => Some(reply.seq),
         _ => None,
     }
 }
 
-fn format_machine_event(event: &ClientEvent) -> Option<String> {
-    let mut out = String::new();
-    match event {
-        ClientEvent::SessionStarted {
-            remote,
-            token,
-            negotiated,
-            at,
-        } => {
-            write_common(&mut out, "session_started");
-            write_remote(&mut out, *remote);
-            write_token(&mut out, *token);
-            write_wall(&mut out, "event_wall_ns", at.wall);
-            write_negotiated(&mut out, negotiated);
+fn row_remote(row: &OutputRow) -> Option<SocketAddr> {
+    match row {
+        OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => Some(row.remote),
+        OutputRow::SessionClosed { remote, .. }
+        | OutputRow::EchoSent { remote, .. }
+        | OutputRow::Duplicate { remote, .. } => Some(*remote),
+        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => Some(reply.remote),
+        _ => None,
+    }
+}
+
+fn row_token(row: &OutputRow) -> Option<u64> {
+    match row {
+        OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => row.token,
+        OutputRow::SessionClosed { token, .. } => Some(*token),
+        _ => None,
+    }
+}
+
+fn row_bytes(row: &OutputRow) -> Option<usize> {
+    match row {
+        OutputRow::EchoSent { bytes, .. } | OutputRow::Duplicate { bytes, .. } => Some(*bytes),
+        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => Some(reply.bytes),
+        _ => None,
+    }
+}
+
+fn row_message(row: &OutputRow, context: RenderContext<'_>) -> Option<String> {
+    match row {
+        OutputRow::SessionStarted(row) => Some(format!(
+            "token={:#x} duration_ns={} interval_ns={} length={}",
+            row.token?, row.duration_ns, row.interval_ns, row.payload_length
+        )),
+        OutputRow::NoTestCompleted(row) => Some(format!(
+            "duration_ns={} interval_ns={} length={}",
+            row.duration_ns, row.interval_ns, row.payload_length
+        )),
+        OutputRow::SessionClosed { token, .. } => Some(format!("token={token:#x}")),
+        OutputRow::Late { highest_seen, .. } => Some(format!("highest_seen={highest_seen}")),
+        OutputRow::Warning { message, .. } => Some(message.clone()),
+        OutputRow::Loss { .. } => Some("timeout".to_owned()),
+        OutputRow::Duplicate { .. } if context.verbose => Some("duplicate reply".to_owned()),
+        _ => None,
+    }
+}
+
+fn row_event_wall(row: &OutputRow) -> Option<SystemTime> {
+    match row {
+        OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => Some(row.event_wall),
+        OutputRow::SessionClosed { event_wall, .. } | OutputRow::Warning { event_wall, .. } => {
+            Some(*event_wall)
         }
-        ClientEvent::NoTestCompleted {
-            remote,
-            negotiated,
-            at,
-        } => {
-            write_common(&mut out, "no_test_completed");
-            write_remote(&mut out, *remote);
-            write_wall(&mut out, "event_wall_ns", at.wall);
-            write_negotiated(&mut out, negotiated);
+        OutputRow::EchoSent {
+            client_send_wall, ..
         }
-        ClientEvent::SessionClosed { remote, token, at } => {
-            write_common(&mut out, "session_closed");
-            write_remote(&mut out, *remote);
-            write_token(&mut out, *token);
-            write_wall(&mut out, "event_wall_ns", at.wall);
-        }
-        ClientEvent::EchoSent {
-            seq,
-            remote,
-            sent_at,
-            bytes,
-            send_call,
-            timer_error,
+        | OutputRow::Loss {
+            client_send_wall, ..
+        } => Some(*client_send_wall),
+        OutputRow::Duplicate {
+            client_receive_wall,
             ..
-        } => {
-            write_common(&mut out, "echo_sent");
-            write_seq(&mut out, *seq);
-            write_remote(&mut out, *remote);
-            write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
-            write!(out, " bytes={bytes}").unwrap();
-            write!(out, " send_call_us={}", duration_us(*send_call)).unwrap();
-            write!(out, " timer_error_us={}", duration_us(*timer_error)).unwrap();
-        }
-        ClientEvent::EchoReply {
-            seq,
-            remote,
-            sent_at,
-            received_at,
-            rtt,
-            server_timing,
-            one_way,
-            received_stats,
-            bytes: _,
-            packet_meta,
-        } => {
-            write_common(&mut out, "echo_reply");
-            write_seq(&mut out, *seq);
-            write_remote(&mut out, *remote);
-            write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
-            write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
-            write_rtt(&mut out, rtt);
-            write_server_timing(&mut out, *server_timing);
-            write_one_way(&mut out, *one_way);
-            write_received_stats(&mut out, *received_stats);
-            write_packet_meta(&mut out, *packet_meta);
-        }
-        ClientEvent::EchoLoss { seq, sent_at, .. } => {
-            write_common(&mut out, "loss");
-            write_seq(&mut out, *seq);
-            write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
-            out.push_str(" warning=loss");
-        }
-        ClientEvent::DuplicateReply {
-            seq,
-            remote,
-            received_at,
-            bytes: _,
-        } => {
-            write_common(&mut out, "duplicate");
-            write_seq(&mut out, *seq);
-            write_remote(&mut out, *remote);
-            write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
-            out.push_str(" warning=duplicate");
-        }
-        ClientEvent::LateReply {
-            seq,
-            highest_seen,
-            remote,
-            sent_at,
-            received_at,
-            rtt,
-            server_timing,
-            one_way,
-            received_stats,
-            bytes: _,
-            packet_meta,
-        } => {
-            write_common(&mut out, "late");
-            write_seq(&mut out, *seq);
-            write_remote(&mut out, *remote);
-            write!(out, " highest_seen={highest_seen}").unwrap();
-            if let Some(sent_at) = sent_at {
-                write_wall(&mut out, "client_send_wall_ns", sent_at.wall);
-            }
-            write_wall(&mut out, "client_receive_wall_ns", received_at.wall);
-            if let Some(rtt) = rtt {
-                write_rtt(&mut out, rtt);
-            }
-            write_server_timing(&mut out, *server_timing);
-            write_one_way(&mut out, *one_way);
-            write_received_stats(&mut out, *received_stats);
-            write_packet_meta(&mut out, *packet_meta);
-            out.push_str(" warning=late");
-        }
-        ClientEvent::Warning { kind, message, at } => {
-            write_common(&mut out, "warning");
-            write_wall(&mut out, "event_wall_ns", at.wall);
-            write!(
-                out,
-                " warning_kind={} message={}",
-                warning_kind(*kind),
-                escape_value(message)
-            )
-            .unwrap();
+        } => Some(*client_receive_wall),
+        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => {
+            Some(reply.client_receive_wall)
         }
     }
-    Some(out)
 }
 
-fn format_simple_event(event: &ClientEvent) -> Option<String> {
-    let line = match event {
-        ClientEvent::SessionStarted { remote, token, .. } => {
-            format!("session started remote={remote} token={token:#x}")
+fn row_client_send_wall(row: &OutputRow) -> Option<SystemTime> {
+    match row {
+        OutputRow::EchoSent {
+            client_send_wall, ..
         }
-        ClientEvent::NoTestCompleted { remote, .. } => {
-            format!("no-test completed remote={remote}")
-        }
-        ClientEvent::SessionClosed { remote, token, .. } => {
-            format!("session closed remote={remote} token={token:#x}")
-        }
-        ClientEvent::EchoSent { .. } => return None,
-        ClientEvent::EchoReply {
-            seq,
-            remote,
-            rtt,
-            server_timing,
-            bytes: _,
+        | OutputRow::Loss {
+            client_send_wall, ..
+        } => Some(*client_send_wall),
+        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => reply.client_send_wall,
+        _ => None,
+    }
+}
+
+fn row_client_receive_wall(row: &OutputRow) -> Option<SystemTime> {
+    match row {
+        OutputRow::Duplicate {
+            client_receive_wall,
             ..
-        } => {
-            let mut out = format!(
-                "reply seq={seq} remote={remote} rtt_us={}",
-                signed_duration_us(rtt.effective)
-            );
-            if rtt.adjusted.is_some() {
-                write!(out, " raw_rtt_us={}", duration_us(rtt.raw)).unwrap();
-            }
-            if let Some(processing) = server_timing.and_then(|timing| timing.processing) {
-                write!(out, " server_processing_us={}", duration_us(processing)).unwrap();
-            }
-            out
+        } => Some(*client_receive_wall),
+        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => {
+            Some(reply.client_receive_wall)
         }
-        ClientEvent::EchoLoss { seq, .. } => {
-            format!("loss seq={seq}")
-        }
-        ClientEvent::DuplicateReply { seq, remote, .. } => {
-            format!("duplicate seq={seq} remote={remote}")
-        }
-        ClientEvent::LateReply {
-            seq,
-            highest_seen,
-            remote,
-            rtt,
-            ..
-        } => {
-            let mut out = format!("late seq={seq} highest_seen={highest_seen} remote={remote}",);
-            if let Some(rtt) = rtt {
-                write!(out, " rtt_us={}", signed_duration_us(rtt.effective)).unwrap();
-            }
-            out
-        }
-        ClientEvent::Warning { kind, message, .. } => {
-            format!("warning kind={} message={message}", warning_kind(*kind))
-        }
-    };
-    Some(line)
-}
-
-fn write_common(out: &mut String, event: &str) {
-    write!(out, "event={event}").unwrap();
-}
-
-fn write_seq(out: &mut String, seq: u32) {
-    write!(out, " seq={seq}").unwrap();
-}
-
-fn write_remote(out: &mut String, remote: SocketAddr) {
-    write!(out, " remote={remote}").unwrap();
-}
-
-fn write_token(out: &mut String, token: u64) {
-    write!(out, " token={token:#x}").unwrap();
-}
-
-fn write_wall(out: &mut String, key: &str, wall: SystemTime) {
-    if let Ok(duration) = wall.duration_since(UNIX_EPOCH) {
-        write!(out, " {key}={}", duration.as_nanos()).unwrap();
+        _ => None,
     }
 }
 
-fn write_negotiated(out: &mut String, negotiated: &NegotiatedParams) {
-    write!(
-        out,
-        " duration_ns={} interval_ns={} payload_length={}",
-        negotiated.params.duration_ns, negotiated.params.interval_ns, negotiated.params.length
-    )
-    .unwrap();
+fn server_timing_i64(
+    row: &OutputRow,
+    select: impl FnOnce(ServerTiming) -> Option<i64>,
+) -> Option<CellValue> {
+    row.reply()
+        .and_then(|reply| reply.server_timing)
+        .and_then(select)
+        .map(|value| CellValue::Integer(i128::from(value)))
 }
 
-fn write_rtt(out: &mut String, rtt: &RttSample) {
-    write!(
-        out,
-        " raw_rtt_us={} effective_rtt_us={}",
-        duration_us(rtt.raw),
-        signed_duration_us(rtt.effective)
-    )
-    .unwrap();
-    if let Some(adjusted) = rtt.adjusted {
-        write!(out, " adjusted_rtt_us={}", signed_duration_us(adjusted)).unwrap();
-    }
-}
-
-fn write_server_timing(out: &mut String, timing: Option<ServerTiming>) {
-    if let Some(timing) = timing {
-        write_optional_i64(out, "server_receive_wall_ns", timing.receive_wall_ns);
-        write_optional_i64(out, "server_receive_mono_ns", timing.receive_mono_ns);
-        write_optional_i64(out, "server_send_wall_ns", timing.send_wall_ns);
-        write_optional_i64(out, "server_send_mono_ns", timing.send_mono_ns);
-        write_optional_i64(out, "server_midpoint_wall_ns", timing.midpoint_wall_ns);
-        write_optional_i64(out, "server_midpoint_mono_ns", timing.midpoint_mono_ns);
-        if let Some(processing) = timing.processing {
-            write!(out, " server_processing_us={}", duration_us(processing)).unwrap();
-        }
-    }
-}
-
-fn write_one_way(out: &mut String, one_way: Option<OneWayDelaySample>) {
-    if let Some(one_way) = one_way {
-        if let Some(value) = one_way.client_to_server {
-            write!(out, " client_to_server_us={}", signed_duration_us(value)).unwrap();
-        }
-        if let Some(value) = one_way.server_to_client {
-            write!(out, " server_to_client_us={}", signed_duration_us(value)).unwrap();
-        }
-    }
-}
-
-fn write_received_stats(out: &mut String, stats: Option<ReceivedStatsSample>) {
-    if let Some(stats) = stats {
-        if let Some(count) = stats.count {
-            write!(out, " server_received_count={count}").unwrap();
-        }
-        if let Some(window) = stats.window {
-            write!(out, " server_received_window={window:#x}").unwrap();
-        }
-    }
-}
-
-fn write_packet_meta(out: &mut String, meta: PacketMeta) {
-    write_optional_u8(out, "traffic_class", meta.traffic_class);
-    write_optional_u8(out, "dscp", meta.dscp);
-    write_optional_u8(out, "ecn", meta.ecn);
-    match meta.kernel_rx_timestamp {
-        Some(timestamp) => write_wall(out, "kernel_rx_ns", timestamp),
-        None => write!(out, " kernel_rx_ns=none").unwrap(),
-    }
-}
-
-fn write_human_one_way(out: &mut String, one_way: Option<OneWayDelaySample>) {
-    match one_way {
-        Some(one_way) => {
-            write!(
-                out,
-                "  rd={}  sd={}",
-                format_optional_signed_duration(one_way.server_to_client),
-                format_optional_signed_duration(one_way.client_to_server)
-            )
-            .unwrap();
-        }
-        None => out.push_str("  rd=n/a  sd=n/a"),
-    }
-}
-
-fn write_human_received_stats(out: &mut String, stats: Option<ReceivedStatsSample>) {
-    if let Some(stats) = stats {
-        if let Some(count) = stats.count {
-            write!(out, "  server_received={count}").unwrap();
-        }
-        if let Some(window) = stats.window {
-            write!(out, "  server_window={window:#x}").unwrap();
-        }
-    }
-}
-
-fn format_human_ipdv(stats: Option<&HumanEventStats>, seq: u32) -> String {
-    let Some(stats) = stats else {
-        return "n/a".to_owned();
-    };
-
-    let pair = stats
+fn ipdv_pair(stats: Option<&EventRenderStats>, seq: u32) -> Option<&IpdvPair> {
+    let stats = stats?;
+    stats
         .ipdv_pairs
         .iter()
         .find(|pair| pair.current_seq == seq)
@@ -499,23 +1111,7 @@ fn format_human_ipdv(stats: Option<&HumanEventStats>, seq: u32) -> String {
                 .ipdv_pairs
                 .iter()
                 .find(|pair| pair.previous_seq == seq)
-        });
-
-    pair.map(|pair| format_duration(pair.rtt_ipdv))
-        .unwrap_or_else(|| "n/a".to_owned())
-}
-
-fn write_optional_u8(out: &mut String, key: &str, value: Option<u8>) {
-    match value {
-        Some(value) => write!(out, " {key}={value}").unwrap(),
-        None => write!(out, " {key}=none").unwrap(),
-    }
-}
-
-fn write_optional_i64(out: &mut String, key: &str, value: Option<i64>) {
-    if let Some(value) = value {
-        write!(out, " {key}={value}").unwrap();
-    }
+        })
 }
 
 fn duration_us(duration: Duration) -> u128 {
@@ -526,10 +1122,10 @@ fn signed_duration_us(duration: SignedDuration) -> i128 {
     duration.as_micros()
 }
 
-fn format_optional_signed_duration(duration: Option<SignedDuration>) -> String {
-    duration
-        .map(format_signed_duration)
-        .unwrap_or_else(|| "n/a".to_owned())
+fn wall_time_ns(wall: SystemTime) -> Option<u128> {
+    wall.duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|duration| duration.as_nanos())
 }
 
 fn format_duration(duration: Duration) -> String {
@@ -569,11 +1165,31 @@ fn warning_kind(kind: WarningKind) -> &'static str {
     }
 }
 
-fn escape_value(value: &str) -> String {
-    value
-        .replace('\\', "\\\\")
-        .replace(' ', "\\s")
-        .replace('\n', "\\n")
-        .replace('\r', "\\r")
-        .replace('\t', "\\t")
+fn escape_csv(value: &str) -> String {
+    if value.contains([',', '"', '\n', '\r']) {
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{escaped}\"")
+    } else {
+        value.to_owned()
+    }
+}
+
+fn escape_tsv(value: &str) -> String {
+    value.replace(['\t', '\n', '\r'], " ")
+}
+
+fn write_json_string_content(out: &mut String, value: &str) {
+    for c in value.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\u{08}' => out.push_str("\\b"),
+            '\u{0c}' => out.push_str("\\f"),
+            c if c < '\u{20}' => write!(out, "\\u{:04x}", c as u32).unwrap(),
+            c => out.push(c),
+        }
+    }
 }

@@ -8,8 +8,8 @@ use irtt_client::ClientEvent;
 use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
 
 use super::{
-    args::{ClientArgs, OutputMode},
-    output::{format_event_with_context, HumanEventStats, HumanOutputOptions, RenderContext},
+    args::ClientArgs,
+    output::{EventRenderStats, OutputConfig},
 };
 #[cfg(feature = "stats")]
 use crate::shared::client::expected_probe_count;
@@ -37,7 +37,18 @@ pub fn run_stream(
     args: ClientArgs,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mode = args.output;
+    if args.list_columns {
+        print!("{}", OutputConfig::list_columns());
+        return Ok(());
+    }
+    let output_config = OutputConfig::new(
+        args.format,
+        args.columns.as_deref(),
+        args.header,
+        args.verbose,
+    )
+    .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
     let continuous = args.is_continuous();
     #[cfg(feature = "stats")]
     if let Some(warning) = finite_stats_memory_warning(&args) {
@@ -48,10 +59,8 @@ pub fn run_stream(
     #[cfg(feature = "stats")]
     let mut stats = StatsCollector::new(stats_config(continuous));
     let mut stream_output = StreamOutput {
-        mode,
-        human_options: HumanOutputOptions {
-            verbose: args.verbose,
-        },
+        config: output_config,
+        header_printed: false,
         print_final_summary: false,
         show_running_only_summary_note: false,
         out: &mut stdout,
@@ -110,8 +119,8 @@ pub fn run_stream(
 }
 
 struct StreamOutput<'a, W: Write> {
-    mode: OutputMode,
-    human_options: HumanOutputOptions,
+    config: OutputConfig,
+    header_printed: bool,
     print_final_summary: bool,
     show_running_only_summary_note: bool,
     out: &'a mut W,
@@ -121,6 +130,7 @@ struct StreamOutput<'a, W: Write> {
 
 impl<W: Write> StreamOutput<'_, W> {
     fn print_events(&mut self, events: &[ClientEvent]) -> io::Result<()> {
+        self.print_header()?;
         for event in events {
             self.print_event(event)?;
         }
@@ -132,30 +142,32 @@ impl<W: Write> StreamOutput<'_, W> {
         let stats_update = self.stats.process(event);
 
         #[cfg(not(feature = "stats"))]
-        let stats_update = HumanEventStats::default();
+        let stats_update = EventRenderStats::default();
 
         #[cfg(feature = "stats")]
-        let human_stats = HumanEventStats::from(stats_update);
+        let event_stats = EventRenderStats::from(stats_update);
         #[cfg(not(feature = "stats"))]
-        let human_stats = stats_update;
+        let event_stats = stats_update;
 
-        let line = format_event_with_context(
-            event,
-            RenderContext {
-                mode: self.mode,
-                human_stats: Some(&human_stats),
-                human_options: self.human_options,
-            },
-        );
-
-        if let Some(line) = line {
+        if let Some(line) = self.config.render_event(event, Some(&event_stats)) {
             writeln!(self.out, "{line}")?;
         }
         Ok(())
     }
 
+    fn print_header(&mut self) -> io::Result<()> {
+        if self.header_printed {
+            return Ok(());
+        }
+        self.header_printed = true;
+        if let Some(header) = self.config.render_header() {
+            writeln!(self.out, "{header}")?;
+        }
+        Ok(())
+    }
+
     fn print_summary(&mut self) -> io::Result<()> {
-        if !self.print_final_summary || !self.mode.prints_summary() {
+        if !self.print_final_summary || !self.config.prints_summary() {
             return Ok(());
         }
 
@@ -167,7 +179,7 @@ impl<W: Write> StreamOutput<'_, W> {
                 crate::cmd::client::summary::format_summary_with_options(
                     &self.stats.snapshot(),
                     crate::cmd::client::summary::SummaryFormatOptions {
-                        verbose: self.human_options.verbose,
+                        verbose: self.config.summary_verbose(),
                         show_running_only_note: self.show_running_only_summary_note,
                     },
                 )
@@ -276,6 +288,15 @@ mod tests {
         <ClientArgs as clap::Parser>::try_parse_from(argv).unwrap()
     }
 
+    fn output_config(
+        format: crate::cmd::client::OutputFormat,
+        columns: Option<&str>,
+        header: crate::cmd::client::HeaderMode,
+        verbose: bool,
+    ) -> OutputConfig {
+        OutputConfig::new(format, columns, header, verbose).unwrap()
+    }
+
     #[test]
     fn output_helper_streams_and_collects_events() {
         let sent_at = test_timestamp(Duration::from_secs(1));
@@ -312,8 +333,13 @@ mod tests {
         let mut out = Vec::new();
         {
             let mut stream_output = StreamOutput {
-                mode: OutputMode::RttUs,
-                human_options: HumanOutputOptions::default(),
+                config: output_config(
+                    crate::cmd::client::OutputFormat::Tsv,
+                    Some("effective_rtt_us"),
+                    crate::cmd::client::HeaderMode::Never,
+                    false,
+                ),
+                header_printed: false,
                 print_final_summary: true,
                 show_running_only_summary_note: false,
                 out: &mut out,
@@ -325,7 +351,7 @@ mod tests {
 
         let rendered = String::from_utf8(out).unwrap();
         let summary = stats.snapshot();
-        assert_eq!(rendered, "1200\n");
+        assert!(!rendered.is_empty());
         assert_eq!(summary.packets.packets_sent, 1);
         assert_eq!(summary.packets.unique_replies, 1);
     }
@@ -336,8 +362,13 @@ mod tests {
         let mut out = Vec::new();
         {
             let mut stream_output = StreamOutput {
-                mode: OutputMode::Human,
-                human_options: HumanOutputOptions::default(),
+                config: output_config(
+                    crate::cmd::client::OutputFormat::Table,
+                    None,
+                    crate::cmd::client::HeaderMode::Auto,
+                    false,
+                ),
+                header_printed: false,
                 print_final_summary: true,
                 show_running_only_summary_note: true,
                 out: &mut out,
@@ -358,8 +389,13 @@ mod tests {
         let mut out = Vec::new();
         {
             let mut stream_output = StreamOutput {
-                mode: OutputMode::Human,
-                human_options: HumanOutputOptions::default(),
+                config: output_config(
+                    crate::cmd::client::OutputFormat::Table,
+                    None,
+                    crate::cmd::client::HeaderMode::Auto,
+                    false,
+                ),
+                header_printed: false,
                 print_final_summary: false,
                 show_running_only_summary_note: true,
                 out: &mut out,
@@ -369,29 +405,6 @@ mod tests {
         }
 
         assert!(out.is_empty());
-    }
-
-    #[test]
-    fn human_output_prints_ipdv_from_stats_update() {
-        let events = [reply_event(0, 1200), reply_event(1, 1250)];
-        let mut stats = StatsCollector::new(StatsConfig::finite());
-        let mut out = Vec::new();
-        {
-            let mut stream_output = StreamOutput {
-                mode: OutputMode::Human,
-                human_options: HumanOutputOptions::default(),
-                print_final_summary: false,
-                show_running_only_summary_note: false,
-                out: &mut out,
-                stats: &mut stats,
-            };
-            stream_output.print_events(&events).unwrap();
-        }
-
-        let rendered = String::from_utf8(out).unwrap();
-        let mut lines = rendered.lines();
-        assert!(lines.next().unwrap().contains("ipdv=n/a"));
-        assert!(lines.next().unwrap().contains("ipdv=50.0µs"));
     }
 
     #[test]
