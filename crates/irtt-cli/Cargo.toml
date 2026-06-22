@@ -16,16 +16,16 @@ doc = false
 
 [[bin]]
 name = "irtt-rs"
-path = "src/main.rs"
+path = "src/bin/irtt-rs.rs"
 
 [[bin]]
 name = "irtt-cli"
-path = "src/main.rs"
+path = "src/bin/irtt-cli.rs"
 required-features = ["client"]
 
 [[bin]]
 name = "irtt-tui"
-path = "src/main.rs"
+path = "src/bin/irtt-tui.rs"
 required-features = ["tui"]
 
 [features]

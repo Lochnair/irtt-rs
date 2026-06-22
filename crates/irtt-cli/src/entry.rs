@@ -5,12 +5,12 @@ use std::{
     sync::{atomic::AtomicBool, Arc},
 };
 
-use irtt_cli::{
+use crate::{
     applet::{dispatch_from_argv, AppletDispatch, RequestedApplet},
     signal::install_signal_handler,
 };
 
-fn main() -> ExitCode {
+pub fn main() -> ExitCode {
     match run_from_env() {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
@@ -48,8 +48,8 @@ fn run_client_applet(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser;
 
-    let args = irtt_cli::cmd::client::ClientArgs::parse_from(argv);
-    irtt_cli::cmd::client::run_stream(args, shutdown_requested)
+    let args = crate::cmd::client::ClientArgs::parse_from(argv);
+    crate::cmd::client::run_stream(args, shutdown_requested)
 }
 
 #[cfg(not(feature = "client"))]
@@ -67,8 +67,8 @@ fn run_tui_applet(
 ) -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser;
 
-    let args = irtt_cli::cmd::tui::TuiArgs::parse_from(argv);
-    irtt_cli::cmd::tui::run_tui(args, shutdown_requested)
+    let args = crate::cmd::tui::TuiArgs::parse_from(argv);
+    crate::cmd::tui::run_tui(args, shutdown_requested)
 }
 
 #[cfg(not(feature = "tui"))]
