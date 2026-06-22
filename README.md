@@ -134,8 +134,9 @@ warning_kind, message, event_wall_ns, client_send_wall_ns,
 client_receive_wall_ns
 ```
 
-Aliases are accepted for readability: `receive_delay` for `rd`, `send_delay`
-for `sd`, `server_processing` for `proc`, `server_received_count` for
+Aliases are accepted for readability: `receive_delay` and `receive_delay_us`
+for `rd` and `rd_us`, `send_delay` and `send_delay_us` for `sd` and `sd_us`,
+`server_processing` for `proc`, `server_received_count` for
 `server_received`, and `server_received_window` for `server_window`.
 
 The default table output favors readability with compact columns:

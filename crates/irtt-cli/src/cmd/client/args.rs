@@ -26,20 +26,38 @@ pub struct ClientArgs {
     #[command(flatten)]
     pub common: CommonClientArgs,
 
-    /// Event row renderer format.
-    #[arg(long, value_enum, default_value_t = OutputFormat::Table)]
+    /// Event row output format.
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = OutputFormat::Table,
+        long_help = "Event row output format.\n\nTable is the default interactive format. CSV, TSV, and JSON Lines default to all columns for structured export."
+    )]
     pub format: OutputFormat,
 
-    /// Comma-separated event row columns.
-    #[arg(short = 'c', long, value_name = "COLUMNS")]
+    /// Comma-separated event row columns, or default/all.
+    #[arg(
+        short = 'c',
+        long,
+        value_name = "COLUMNS",
+        long_help = "Comma-separated event row columns, or default/all.\n\nThe default table columns are compact and hide echo_sent rows. Custom table columns include all event rows. Run --list-columns to see valid names."
+    )]
     pub columns: Option<String>,
 
-    /// Print available event row columns and exit.
-    #[arg(long)]
+    /// List available event row columns and aliases, then exit.
+    #[arg(
+        long,
+        long_help = "List available event row columns and aliases, then exit.\n\nA server argument is not required when listing columns."
+    )]
     pub list_columns: bool,
 
     /// Header policy for table, CSV, and TSV output.
-    #[arg(long, value_enum, default_value_t = HeaderMode::Auto)]
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = HeaderMode::Auto,
+        long_help = "Header policy for table, CSV, and TSV output.\n\nJSON Lines never prints a header."
+    )]
     pub header: HeaderMode,
 
     /// Include extra fields in table output and final summaries.

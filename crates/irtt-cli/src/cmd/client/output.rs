@@ -129,17 +129,19 @@ impl OutputConfig {
             writeln!(out, "  {:<24} {}", column.name(), column.description()).unwrap();
         }
         writeln!(out).unwrap();
+        writeln!(out, "Aliases:").unwrap();
+        writeln!(out, "  receive_delay, receive_delay_us").unwrap();
+        writeln!(out, "  send_delay, send_delay_us").unwrap();
+        writeln!(out, "  server_processing").unwrap();
+        writeln!(out, "  server_received_count, server_received_window").unwrap();
+        writeln!(out).unwrap();
+        writeln!(out, "Special column sets:").unwrap();
         writeln!(
             out,
-            "Aliases: rd=receive_delay, sd=send_delay, proc=server_processing, \
-             server_received=server_received_count, server_window=server_received_window."
+            "  default  format default; compact for table, all columns for csv/tsv/jsonl"
         )
         .unwrap();
-        writeln!(
-            out,
-            "Use --columns default for the format default, or --columns all for every column."
-        )
-        .unwrap();
+        writeln!(out, "  all      every column").unwrap();
         out
     }
 }
