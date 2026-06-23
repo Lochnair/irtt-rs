@@ -1,39 +1,41 @@
 use std::{
     io,
     sync::atomic::{AtomicBool, Ordering},
+    thread,
     time::{Duration, Instant},
 };
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use irtt_stats::StatsCollector;
+use irtt_client::{
+    ClientEvent, EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
+    ManagedGroupEndReason, SubscriberConfig, SubscriberOverflow,
+};
 
 use crate::{
-    cmd::tui::args::TuiArgs,
+    cmd::tui::args::{ResolvedTuiTarget, TuiArgs},
     shared::client::{is_shutdown_requested, ClientSession},
 };
 
 use super::ui::{should_render, TuiConfig, TuiState, TuiStatus, TuiTerminal};
 
-fn stats_config(continuous: bool) -> irtt_stats::StatsConfig {
-    if continuous {
-        irtt_stats::StatsConfig::continuous()
-    } else {
-        irtt_stats::StatsConfig::finite()
-    }
-}
-
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_WAIT_SLICE: Duration = Duration::from_millis(20);
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
+const GROUP_COMPLETION_GRACE: Duration = Duration::from_secs(1);
 
 pub fn run_tui(
     args: TuiArgs,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let targets = args
+        .resolved_managed_targets()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let continuous = args.is_continuous();
     let mut terminal = TuiTerminal::enter()?;
-    let mut state = TuiState::new(TuiConfig::from_args(&args));
-    let mut stats = StatsCollector::new(stats_config(continuous));
+    let mut state = TuiState::with_target_labels(
+        TuiConfig::from_args(&args),
+        targets.iter().map(|target| target.label.clone()),
+    );
     let mut next_render = Instant::now();
 
     if is_shutdown_requested(shutdown_requested) {
@@ -41,13 +43,24 @@ pub fn run_tui(
     }
 
     state.set_status(TuiStatus::Opening);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+    render_if_due(&mut terminal, &state, &mut next_render, true)?;
+
+    if targets.len() > 1 {
+        return run_group_tui(
+            args,
+            targets,
+            &mut terminal,
+            &mut state,
+            &mut next_render,
+            shutdown_requested,
+        );
+    }
 
     let mut session = match ClientSession::connect(args.to_client_config(), continuous) {
         Ok(session) => session,
         Err(err) => {
             state.set_error(err.to_string());
-            render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+            render_if_due(&mut terminal, &state, &mut next_render, true)?;
             return Err(Box::new(err));
         }
     };
@@ -57,8 +70,8 @@ pub fn run_tui(
     }
 
     let events = session.open()?;
-    state.process_events(&events, &mut stats);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+    state.process_events(&events);
+    render_if_due(&mut terminal, &state, &mut next_render, true)?;
 
     let mut interrupted = false;
     // Keep this in lockstep with run_stream: send due probes, drain available
@@ -66,7 +79,7 @@ pub fn run_tui(
     // then perform the same final drain, timeout poll, and close sequence.
     while session.should_continue(shutdown_requested) {
         if handle_input(&mut state, shutdown_requested)? {
-            render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+            render_if_due(&mut terminal, &state, &mut next_render, true)?;
         }
         if state.quit_requested {
             interrupted = true;
@@ -74,19 +87,18 @@ pub fn run_tui(
         }
 
         let events = session.step(shutdown_requested)?;
-        state.process_events(&events, &mut stats);
+        state.process_events(&events);
 
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
             break;
         }
 
-        render_if_due(&mut terminal, &state, &stats, &mut next_render, false)?;
+        render_if_due(&mut terminal, &state, &mut next_render, false)?;
         wait_for_tui_activity(
             session.next_send_deadline(),
             &mut next_render,
             &mut state,
-            &stats,
             &mut terminal,
             shutdown_requested,
         )?;
@@ -95,30 +107,154 @@ pub fn run_tui(
 
     if interrupted {
         state.set_status(TuiStatus::Interrupted);
-        render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+        render_if_due(&mut terminal, &state, &mut next_render, true)?;
     }
 
     if session.should_drain_final(interrupted) {
         state.set_status(TuiStatus::Draining);
         let mut drain_render = Instant::now();
         session.drain_final(|events| {
-            state.process_events(events, &mut stats);
-            let _ = render_if_due(&mut terminal, &state, &stats, &mut drain_render, false);
+            state.process_events(events);
+            let _ = render_if_due(&mut terminal, &state, &mut drain_render, false);
         })?;
-        render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+        render_if_due(&mut terminal, &state, &mut next_render, true)?;
     }
 
     let events = session.poll_timeouts()?;
-    state.process_events(&events, &mut stats);
+    state.process_events(&events);
 
     state.set_status(TuiStatus::Closing);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+    render_if_due(&mut terminal, &state, &mut next_render, true)?;
 
     let events = session.close()?;
-    state.process_events(&events, &mut stats);
+    state.process_events(&events);
     state.set_status(TuiStatus::Complete);
-    render_if_due(&mut terminal, &state, &stats, &mut next_render, true)?;
+    render_if_due(&mut terminal, &state, &mut next_render, true)?;
     Ok(())
+}
+
+fn run_group_tui(
+    args: TuiArgs,
+    targets: Vec<ResolvedTuiTarget>,
+    terminal: &mut TuiTerminal,
+    state: &mut TuiState,
+    next_render: &mut Instant,
+    shutdown_requested: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = args.to_client_config();
+    let managed_targets = targets
+        .iter()
+        .map(|target| target.managed.clone())
+        .collect::<Vec<_>>();
+    let expected_target_count = managed_targets.len();
+    if let Some(first) = managed_targets.first() {
+        config.server_addr = first.remote.to_string();
+    }
+
+    let group_config = ManagedClientGroupConfig {
+        client: config,
+        pacing: args.pacing.into(),
+    };
+    let (session, events) = ManagedClientGroup::start_with_subscription(
+        group_config,
+        managed_targets,
+        SubscriberConfig {
+            capacity: 16_384,
+            overflow: SubscriberOverflow::DropOldest,
+        },
+    )?;
+
+    let mut interrupted = false;
+    let mut terminal_targets = std::collections::HashSet::new();
+    let mut saw_target_event = false;
+    let mut last_event_at = Instant::now();
+
+    loop {
+        if is_shutdown_requested(shutdown_requested) {
+            interrupted = true;
+            session.stop();
+        }
+
+        if handle_input(state, shutdown_requested)? {
+            render_if_due(terminal, state, next_render, true)?;
+        }
+        if state.quit_requested {
+            interrupted = true;
+            session.stop();
+        }
+
+        match events.try_recv() {
+            Ok(Some(target_event)) => {
+                saw_target_event = true;
+                last_event_at = Instant::now();
+                if is_terminal_target_event(&target_event.event) {
+                    terminal_targets.insert(target_event.target.as_str().to_owned());
+                }
+                state.process_target_event(&target_event);
+                render_if_due(terminal, state, next_render, false)?;
+            }
+            Ok(None) => {
+                if interrupted {
+                    break;
+                }
+                if terminal_targets.len() >= expected_target_count {
+                    break;
+                }
+                if should_join_group_after_idle(&args, saw_target_event, last_event_at) {
+                    break;
+                }
+                wait_for_tui_activity(None, next_render, state, terminal, shutdown_requested)?;
+                thread::sleep(IDLE_SLEEP);
+            }
+            Err(EventSubscriptionError::Disconnected) => break,
+        }
+    }
+
+    if interrupted {
+        state.set_status(TuiStatus::Interrupted);
+        render_if_due(terminal, state, next_render, true)?;
+    }
+
+    state.set_status(TuiStatus::Closing);
+    render_if_due(terminal, state, next_render, true)?;
+
+    let outcome = session.join()?;
+    while let Ok(Some(target_event)) = events.try_recv() {
+        state.process_target_event(&target_event);
+    }
+
+    if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
+        return Err("managed client group was cancelled".into());
+    }
+
+    state.set_status(TuiStatus::Complete);
+    render_if_due(terminal, state, next_render, true)?;
+    Ok(())
+}
+
+fn is_terminal_target_event(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::SessionClosed { .. } | ClientEvent::NoTestCompleted { .. }
+    )
+}
+
+fn estimated_group_completion_grace(args: &TuiArgs) -> Duration {
+    let open_timeout: Duration = args.to_client_config().open_timeouts.iter().sum();
+    open_timeout
+        .saturating_add(args.duration)
+        .saturating_add(GROUP_COMPLETION_GRACE)
+}
+
+fn should_join_group_after_idle(
+    args: &TuiArgs,
+    saw_target_event: bool,
+    last_event_at: Instant,
+) -> bool {
+    if args.is_continuous() && saw_target_event {
+        return false;
+    }
+    last_event_at.elapsed() > estimated_group_completion_grace(args)
 }
 
 fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Result<bool> {
@@ -166,7 +302,6 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
 fn render_if_due(
     terminal: &mut TuiTerminal,
     state: &TuiState,
-    stats: &StatsCollector,
     next_render: &mut Instant,
     force: bool,
 ) -> io::Result<()> {
@@ -174,7 +309,7 @@ fn render_if_due(
     if !should_render(now, *next_render, state.paused, force) {
         return Ok(());
     }
-    terminal.draw(state, &stats.snapshot())?;
+    terminal.draw(state)?;
     *next_render = now + RENDER_INTERVAL;
     Ok(())
 }
@@ -183,7 +318,6 @@ fn wait_for_tui_activity(
     next_send_deadline: Option<Instant>,
     next_render: &mut Instant,
     state: &mut TuiState,
-    stats: &StatsCollector,
     terminal: &mut TuiTerminal,
     shutdown_requested: &AtomicBool,
 ) -> io::Result<()> {
@@ -193,7 +327,7 @@ fn wait_for_tui_activity(
     }
 
     if handle_input(state, shutdown_requested)? {
-        render_if_due(terminal, state, stats, next_render, true)?;
+        render_if_due(terminal, state, next_render, true)?;
     }
     Ok(())
 }

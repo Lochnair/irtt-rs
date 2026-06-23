@@ -129,6 +129,8 @@ session gracefully.
 ```sh
 irtt-tui <server>
 irtt-tui <server> --duration 30s
+irtt-tui host-a:2112 host-b:2112 --pacing burst
+irtt-tui --target ams=ams.example.com:2112 --target sg=sg.example.com:2112
 cargo run -p irtt-cli --features tui --bin irtt-tui -- <server>
 ```
 

@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     io::{self, Stdout},
     time::{Duration, Instant},
 };
@@ -9,7 +9,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use irtt_client::{ClientEvent, NegotiatedParams, SignedDuration};
+use irtt_client::{ClientEvent, NegotiatedParams, SignedDuration, TargetEvent};
 use irtt_stats::{Snapshot, StatsCollector, TimeStats};
 use ratatui::{
     backend::CrosstermBackend,
@@ -21,7 +21,10 @@ use ratatui::{
     Frame, Terminal,
 };
 
-use crate::{cmd::tui::args::TuiArgs, shared::client::expected_probe_count};
+use crate::{
+    cmd::tui::args::TuiArgs,
+    shared::client::{expected_probe_count, GroupPacingArg},
+};
 
 const HISTORY_LIMIT: usize = 240;
 const RECENT_EVENT_LIMIT: usize = 80;
@@ -62,9 +65,9 @@ impl TuiTerminal {
         }
     }
 
-    pub(super) fn draw(&mut self, state: &TuiState, snapshot: &Snapshot) -> io::Result<()> {
+    pub(super) fn draw(&mut self, state: &TuiState) -> io::Result<()> {
         self.terminal
-            .draw(|frame| draw_dashboard(frame, state, snapshot))
+            .draw(|frame| draw_dashboard(frame, state))
             .map(|_| ())
     }
 }
@@ -79,15 +82,12 @@ impl Drop for TuiTerminal {
 
 #[derive(Debug)]
 pub(super) struct TuiState {
-    remote: Option<String>,
-    session: Option<String>,
     status: TuiStatus,
     started_at: Instant,
     config: TuiConfig,
-    negotiated: Option<NegotiatedParams>,
+    target_index: BTreeMap<String, usize>,
+    targets: Vec<TuiTargetState>,
     recent_events: VecDeque<String>,
-    graph_history: VecDeque<GraphSample>,
-    last_sample: Option<LastSample>,
     last_warning: Option<String>,
     graph_mode: GraphMode,
     full_graph: bool,
@@ -97,16 +97,30 @@ pub(super) struct TuiState {
 
 impl TuiState {
     pub(super) fn new(config: TuiConfig) -> Self {
+        Self::with_target_labels(config, ["target".to_owned()])
+    }
+
+    pub(super) fn with_target_labels(
+        config: TuiConfig,
+        labels: impl IntoIterator<Item = String>,
+    ) -> Self {
+        let stats_config = stats_config(config.duration.is_none());
+        let targets = labels
+            .into_iter()
+            .map(|label| TuiTargetState::new(label, stats_config))
+            .collect::<Vec<_>>();
+        let target_index = targets
+            .iter()
+            .enumerate()
+            .map(|(idx, target)| (target.label.clone(), idx))
+            .collect();
         Self {
-            remote: None,
-            session: None,
             status: TuiStatus::Opening,
             started_at: Instant::now(),
             config,
-            negotiated: None,
+            target_index,
+            targets,
             recent_events: VecDeque::with_capacity(RECENT_EVENT_LIMIT),
-            graph_history: VecDeque::with_capacity(HISTORY_LIMIT),
-            last_sample: None,
             last_warning: None,
             graph_mode: GraphMode::Rtt,
             full_graph: false,
@@ -115,115 +129,169 @@ impl TuiState {
         }
     }
 
-    pub(super) fn process_events(&mut self, events: &[ClientEvent], stats: &mut StatsCollector) {
+    pub(super) fn process_events(&mut self, events: &[ClientEvent]) {
         for event in events {
-            self.process_event(event, stats);
+            self.process_event(event);
         }
     }
 
-    pub(super) fn process_event(&mut self, event: &ClientEvent, stats: &mut StatsCollector) {
-        process_tui_stats(event, stats);
-        match event {
-            ClientEvent::SessionStarted {
-                remote,
-                token,
-                negotiated,
-                ..
-            } => {
-                self.remote = Some(remote.to_string());
-                self.session = Some(format!("{token:#x}"));
-                self.negotiated = Some(negotiated.clone());
-                self.set_status(TuiStatus::Running);
-                self.push_event(format!("session started token={token:#x}"));
+    pub(super) fn process_event(&mut self, event: &ClientEvent) {
+        self.process_event_for_target(0, event);
+    }
+
+    pub(super) fn process_target_event(&mut self, event: &TargetEvent) {
+        let label = event.target.as_str();
+        let idx = if let Some(idx) = self.target_index.get(label).copied() {
+            idx
+        } else {
+            let idx = self.targets.len();
+            let mut target = TuiTargetState::new(
+                label.to_owned(),
+                stats_config(self.config.duration.is_none()),
+            );
+            target.status = TargetStatus::Unknown;
+            self.targets.push(target);
+            self.target_index.insert(label.to_owned(), idx);
+            idx
+        };
+        self.process_event_for_target(idx, &event.event);
+    }
+
+    fn process_event_for_target(&mut self, target_idx: usize, event: &ClientEvent) {
+        let recent;
+        let mut global_status = None;
+        let mut global_warning = None;
+        let label = {
+            let Some(target) = self.targets.get_mut(target_idx) else {
+                return;
+            };
+            process_tui_stats(event, &mut target.stats);
+            match event {
+                ClientEvent::SessionStarted {
+                    remote,
+                    token,
+                    negotiated,
+                    ..
+                } => {
+                    target.remote = Some(remote.to_string());
+                    target.session = Some(format!("{token:#x}"));
+                    target.negotiated = Some(negotiated.clone());
+                    target.status = TargetStatus::Active;
+                    global_status = Some(TuiStatus::Running);
+                    recent = Some(format!("session started token={token:#x}"));
+                }
+                ClientEvent::NoTestCompleted {
+                    remote, negotiated, ..
+                } => {
+                    target.remote = Some(remote.to_string());
+                    target.negotiated = Some(negotiated.clone());
+                    target.status = TargetStatus::NoTest;
+                    global_status = Some(TuiStatus::Complete);
+                    recent = Some("no-test negotiation completed".to_owned());
+                }
+                ClientEvent::SessionClosed { token, .. } => {
+                    target.session = Some(format!("{token:#x}"));
+                    target.status = TargetStatus::Closed;
+                    global_status = Some(TuiStatus::Complete);
+                    recent = Some(format!("session closed token={token:#x}"));
+                }
+                ClientEvent::EchoSent { seq, bytes, .. } => {
+                    recent = Some(format!("sent seq={} bytes={bytes}", format_seq(*seq)));
+                }
+                ClientEvent::EchoReply {
+                    seq,
+                    rtt,
+                    one_way,
+                    server_timing,
+                    ..
+                } => {
+                    let client_to_server_ns = one_way
+                        .and_then(|sample| sample.client_to_server)
+                        .map(SignedDuration::as_nanos);
+                    let server_to_client_ns = one_way
+                        .and_then(|sample| sample.server_to_client)
+                        .map(SignedDuration::as_nanos);
+                    let server_processing_ns = server_timing
+                        .and_then(|timing| timing.processing)
+                        .map(duration_ns);
+                    target.push_graph_sample(GraphSample {
+                        seq: *seq,
+                        effective_ns: rtt.effective.as_nanos(),
+                        raw_ns: duration_ns(rtt.raw),
+                        adjusted_ns: rtt.adjusted.map(SignedDuration::as_nanos),
+                        client_to_server_ns,
+                        server_to_client_ns,
+                        server_processing_ns,
+                    });
+                    target.last_sample = Some(LastSample {
+                        seq: *seq,
+                        raw_ns: duration_ns(rtt.raw),
+                        adjusted_ns: rtt.adjusted.map(SignedDuration::as_nanos),
+                        effective_ns: rtt.effective.as_nanos(),
+                        client_to_server_ns,
+                        server_to_client_ns,
+                        server_processing_ns,
+                    });
+                    recent = Some(format!(
+                        "reply seq={} effective={}",
+                        format_seq(*seq),
+                        format_ns_i128(Some(rtt.effective.as_nanos()))
+                    ));
+                }
+                ClientEvent::EchoLoss { seq, .. } => {
+                    recent = Some(format!("loss seq={}", format_seq(*seq)));
+                }
+                ClientEvent::DuplicateReply { seq, remote, .. } => {
+                    recent = Some(format!("duplicate seq={} from {remote}", format_seq(*seq)));
+                }
+                ClientEvent::LateReply {
+                    seq,
+                    highest_seen,
+                    rtt,
+                    ..
+                } => {
+                    let timing = rtt
+                        .map(|sample| {
+                            format!(
+                                " effective={}",
+                                format_ns_i128(Some(sample.effective.as_nanos()))
+                            )
+                        })
+                        .unwrap_or_default();
+                    recent = Some(format!(
+                        "late seq={} highest_seen={}{}",
+                        format_seq(*seq),
+                        format_seq(*highest_seen),
+                        timing
+                    ));
+                }
+                ClientEvent::Warning { kind, message, .. } => {
+                    let warning = format!("{kind:?}: {message}");
+                    target.last_warning = Some(warning.clone());
+                    global_warning = Some(warning.clone());
+                    recent = Some(format!("warning {warning}"));
+                }
             }
-            ClientEvent::NoTestCompleted {
-                remote, negotiated, ..
-            } => {
-                self.remote = Some(remote.to_string());
-                self.negotiated = Some(negotiated.clone());
-                self.set_status(TuiStatus::Complete);
-                self.push_event("no-test negotiation completed".to_owned());
-            }
-            ClientEvent::SessionClosed { token, .. } => {
-                self.session = Some(format!("{token:#x}"));
-                self.set_status(TuiStatus::Complete);
-                self.push_event(format!("session closed token={token:#x}"));
-            }
-            ClientEvent::EchoSent { seq, bytes, .. } => {
-                self.push_event(format!("sent seq={} bytes={bytes}", format_seq(*seq)));
-            }
-            ClientEvent::EchoReply {
-                seq,
-                rtt,
-                one_way,
-                server_timing,
-                ..
-            } => {
-                let client_to_server_ns = one_way
-                    .and_then(|sample| sample.client_to_server)
-                    .map(SignedDuration::as_nanos);
-                let server_to_client_ns = one_way
-                    .and_then(|sample| sample.server_to_client)
-                    .map(SignedDuration::as_nanos);
-                let server_processing_ns = server_timing
-                    .and_then(|timing| timing.processing)
-                    .map(duration_ns);
-                self.push_graph_sample(GraphSample {
-                    seq: *seq,
-                    effective_ns: rtt.effective.as_nanos(),
-                    raw_ns: duration_ns(rtt.raw),
-                    adjusted_ns: rtt.adjusted.map(SignedDuration::as_nanos),
-                    client_to_server_ns,
-                    server_to_client_ns,
-                    server_processing_ns,
-                });
-                self.last_sample = Some(LastSample {
-                    seq: *seq,
-                    raw_ns: duration_ns(rtt.raw),
-                    adjusted_ns: rtt.adjusted.map(SignedDuration::as_nanos),
-                    effective_ns: rtt.effective.as_nanos(),
-                    client_to_server_ns,
-                    server_to_client_ns,
-                    server_processing_ns,
-                });
-                self.push_event(format!(
-                    "reply seq={} effective={}",
-                    format_seq(*seq),
-                    format_ns_i128(Some(rtt.effective.as_nanos()))
-                ));
-            }
-            ClientEvent::EchoLoss { seq, .. } => {
-                self.push_event(format!("loss seq={}", format_seq(*seq)));
-            }
-            ClientEvent::DuplicateReply { seq, remote, .. } => {
-                self.push_event(format!("duplicate seq={} from {remote}", format_seq(*seq)));
-            }
-            ClientEvent::LateReply {
-                seq,
-                highest_seen,
-                rtt,
-                ..
-            } => {
-                let timing = rtt
-                    .map(|sample| {
-                        format!(
-                            " effective={}",
-                            format_ns_i128(Some(sample.effective.as_nanos()))
-                        )
-                    })
-                    .unwrap_or_default();
-                self.push_event(format!(
-                    "late seq={} highest_seen={}{}",
-                    format_seq(*seq),
-                    format_seq(*highest_seen),
-                    timing
-                ));
-            }
-            ClientEvent::Warning { kind, message, .. } => {
-                let warning = format!("{kind:?}: {message}");
-                self.last_warning = Some(warning.clone());
-                self.push_event(format!("warning {warning}"));
-            }
+            target.label.clone()
+        };
+        if let Some(status) = global_status {
+            self.status = if status == TuiStatus::Complete
+                && self.is_multi_target()
+                && !self
+                    .targets
+                    .iter()
+                    .all(|target| target.status.is_terminal())
+            {
+                TuiStatus::Running
+            } else {
+                status
+            };
+        }
+        if let Some(warning) = global_warning {
+            self.last_warning = Some(warning);
+        }
+        if let Some(recent) = recent {
+            self.push_event(format!("{label}: {recent}"));
         }
     }
 
@@ -234,11 +302,17 @@ impl TuiState {
     pub(super) fn set_error(&mut self, message: String) {
         self.status = TuiStatus::Error;
         self.last_warning = Some(message.clone());
+        if let Some(target) = self.targets.first_mut() {
+            target.status = TargetStatus::Failed;
+            target.last_warning = Some(message.clone());
+        }
         self.push_event(format!("error {message}"));
     }
 
     pub(super) fn clear_visible_history(&mut self) {
-        self.graph_history.clear();
+        for target in &mut self.targets {
+            target.graph_history.clear();
+        }
         self.push_event("visible graph history reset".to_owned());
     }
 
@@ -254,12 +328,99 @@ impl TuiState {
         self.full_graph = !self.full_graph;
     }
 
+    fn push_event(&mut self, event: String) {
+        push_bounded(&mut self.recent_events, event, RECENT_EVENT_LIMIT);
+    }
+
+    fn selected_target(&self) -> Option<&TuiTargetState> {
+        self.targets.first()
+    }
+
+    fn selected_snapshot(&self) -> Snapshot {
+        self.selected_target()
+            .map(|target| target.stats.snapshot())
+            .unwrap_or_else(|| StatsCollector::new(stats_config(true)).snapshot())
+    }
+
+    fn is_multi_target(&self) -> bool {
+        self.targets.len() > 1
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct TuiTargetState {
+    label: String,
+    remote: Option<String>,
+    session: Option<String>,
+    status: TargetStatus,
+    negotiated: Option<NegotiatedParams>,
+    graph_history: VecDeque<GraphSample>,
+    last_sample: Option<LastSample>,
+    last_warning: Option<String>,
+    stats: StatsCollector,
+}
+
+impl TuiTargetState {
+    fn new(label: String, stats_config: irtt_stats::StatsConfig) -> Self {
+        Self {
+            label,
+            remote: None,
+            session: None,
+            status: TargetStatus::Opening,
+            negotiated: None,
+            graph_history: VecDeque::with_capacity(HISTORY_LIMIT),
+            last_sample: None,
+            last_warning: None,
+            stats: StatsCollector::new(stats_config),
+        }
+    }
+
     fn push_graph_sample(&mut self, sample: GraphSample) {
         push_bounded(&mut self.graph_history, sample, HISTORY_LIMIT);
     }
+}
 
-    fn push_event(&mut self, event: String) {
-        push_bounded(&mut self.recent_events, event, RECENT_EVENT_LIMIT);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TargetStatus {
+    Opening,
+    Active,
+    Closed,
+    Failed,
+    NoTest,
+    Unknown,
+}
+
+impl TargetStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Opening => "opening",
+            Self::Active => "active",
+            Self::Closed => "closed",
+            Self::Failed => "failed",
+            Self::NoTest => "no-test",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Self::Closed | Self::Failed | Self::NoTest)
+    }
+}
+
+impl GroupPacingArg {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Staggered => "staggered",
+            Self::Burst => "burst",
+        }
+    }
+}
+
+fn stats_config(continuous: bool) -> irtt_stats::StatsConfig {
+    if continuous {
+        irtt_stats::StatsConfig::continuous()
+    } else {
+        irtt_stats::StatsConfig::finite()
     }
 }
 
@@ -307,6 +468,7 @@ pub(super) struct TuiConfig {
     duration: Option<Duration>,
     timeout: Duration,
     target_probes: Option<u64>,
+    pacing: GroupPacingArg,
 }
 
 impl TuiConfig {
@@ -317,6 +479,7 @@ impl TuiConfig {
             timeout: args.to_client_config().probe_timeout,
             target_probes: (!args.is_continuous())
                 .then(|| expected_probe_count(args.duration, args.interval)),
+            pacing: args.pacing,
         }
     }
 }
@@ -328,6 +491,7 @@ impl Default for TuiConfig {
             duration: Some(Duration::from_secs(10)),
             timeout: Duration::from_secs(2),
             target_probes: Some(10),
+            pacing: GroupPacingArg::Staggered,
         }
     }
 }
@@ -414,22 +578,23 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
     items.push_back(item);
 }
 
-pub(super) fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState, snapshot: &Snapshot) {
+pub(super) fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
         frame.render_widget(too_small(), area);
         return;
     }
 
+    let snapshot = state.selected_snapshot();
     if state.full_graph {
-        draw_full_graph(frame, area, state, snapshot);
+        draw_full_graph(frame, area, state, &snapshot);
         return;
     }
 
     if area.width >= 110 && area.height >= 32 {
-        draw_large(frame, area, state, snapshot);
+        draw_large(frame, area, state, &snapshot);
     } else {
-        draw_compact(frame, area, state, snapshot);
+        draw_compact(frame, area, state, &snapshot);
     }
 }
 
@@ -476,7 +641,7 @@ fn draw_large(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Sn
         .split(rows[2]);
 
     frame.render_widget(header(state, HeaderDensity::Large), top[0]);
-    frame.render_widget(packet_panel(state, snapshot), top[1]);
+    frame.render_widget(packet_panel(state, snapshot, top[1].height), top[1]);
     frame.render_widget(timing_panel(snapshot), middle[0]);
     render_graph_area(frame, middle[1], state);
     frame.render_widget(recent_events_panel(state, bottom[0].height), bottom[0]);
@@ -496,7 +661,7 @@ fn draw_compact(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &
         .split(area);
 
     frame.render_widget(header(state, HeaderDensity::Compact), rows[0]);
-    frame.render_widget(packet_panel(state, snapshot), rows[1]);
+    frame.render_widget(packet_panel(state, snapshot, rows[1].height), rows[1]);
     render_graph_area(frame, rows[2], state);
     frame.render_widget(status_line(state), rows[3]);
 }
@@ -517,8 +682,13 @@ enum HeaderDensity {
 }
 
 fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
-    let remote = state.remote.as_deref().unwrap_or("-");
-    let session = state.session.as_deref().unwrap_or("-");
+    let selected = state.selected_target();
+    let remote = selected
+        .and_then(|target| target.remote.as_deref())
+        .unwrap_or("-");
+    let session = selected
+        .and_then(|target| target.session.as_deref())
+        .unwrap_or("-");
     let elapsed = format_duration(state.started_at.elapsed());
     let duration = format_optional_duration(state.config.duration);
     let mode = if state.config.duration.is_some() {
@@ -526,16 +696,20 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
     } else {
         "continuous"
     };
-    let negotiated = state
-        .negotiated
-        .as_ref()
+    let negotiated = selected
+        .and_then(|target| target.negotiated.as_ref())
         .map(|params| format!("negotiated: {}", format_negotiated(params)))
         .unwrap_or_else(|| "negotiated: -".to_owned());
+    let target_count = state.targets.len();
+    let pacing = state.config.pacing.label();
 
     let mut lines = vec![
         Line::from(vec![
             Span::styled("irtt-rs", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!("  status: {}", state.status.label())),
+            Span::raw(format!(
+                "  status: {}  targets: {target_count}  pacing: {pacing}",
+                state.status.label()
+            )),
         ]),
         Line::from(format!("remote: {remote}")),
     ];
@@ -571,11 +745,15 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
 }
 
 fn full_graph_header(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
-    let remote = state.remote.as_deref().unwrap_or("-");
+    let remote = state
+        .selected_target()
+        .and_then(|target| target.remote.as_deref())
+        .unwrap_or("-");
     let elapsed = format_duration(state.started_at.elapsed());
     let packets = snapshot.packets;
     let last = state
-        .last_sample
+        .selected_target()
+        .and_then(|target| target.last_sample)
         .map(|sample| format_ns_i128(Some(sample.effective_ns)))
         .unwrap_or_else(|| "-".to_owned());
 
@@ -588,7 +766,11 @@ fn full_graph_header(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static
     .block(Block::default().title("session").borders(Borders::ALL))
 }
 
-fn packet_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
+fn packet_panel(state: &TuiState, snapshot: &Snapshot, panel_height: u16) -> Paragraph<'static> {
+    if state.is_multi_target() {
+        return target_table_panel(state, panel_height);
+    }
+
     let packets = snapshot.packets;
     let loss = snapshot.loss;
     let progress = state
@@ -640,6 +822,36 @@ fn packet_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
     .wrap(Wrap { trim: true })
 }
 
+fn target_table_panel(state: &TuiState, panel_height: u16) -> Paragraph<'static> {
+    let visible = usize::from(panel_height.saturating_sub(3));
+    let mut lines = vec![Line::from(format!(
+        "{:<16} {:<8} {:>9} {:>5} {:>4} {:>4} {:>4}",
+        "target", "status", "last", "loss", "dup", "late", "warn"
+    ))];
+
+    for target in state.targets.iter().take(visible) {
+        let snapshot = target.stats.snapshot();
+        let last = target
+            .last_sample
+            .map(|sample| format_ns_i128(Some(sample.effective_ns)))
+            .unwrap_or_else(|| "-".to_owned());
+        lines.push(Line::from(format!(
+            "{:<16} {:<8} {:>9} {:>5} {:>4} {:>4} {:>4}",
+            truncate(&target.label, 16),
+            target.status.label(),
+            last,
+            format_count(snapshot.loss.lost_packets),
+            format_count(snapshot.packets.duplicates),
+            format_count(snapshot.packets.late_packets),
+            format_count(snapshot.events.warning_events)
+        )));
+    }
+
+    Paragraph::new(lines)
+        .block(Block::default().title("targets").borders(Borders::ALL))
+        .wrap(Wrap { trim: false })
+}
+
 fn timing_panel(snapshot: &Snapshot) -> Paragraph<'_> {
     let mut lines = vec![Line::from(format!(
         "{:<18} {:>5} {:>9} {:>9} {:>9} {:>9}",
@@ -671,10 +883,19 @@ fn timing_panel(snapshot: &Snapshot) -> Paragraph<'_> {
 }
 
 fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    if state.is_multi_target() {
+        render_multi_target_graph(frame, area, state);
+        return;
+    }
+
     match state.graph_mode {
         GraphMode::Split => render_split_graph(frame, area, state),
         mode => {
-            let visible = visible_history_window(&state.graph_history, area.width);
+            let history = state
+                .selected_target()
+                .map(|target| &target.graph_history)
+                .expect("TuiState always has at least one target");
+            let visible = visible_history_window(history, area.width);
             let series = graph_series(mode, &visible);
             render_chart(frame, area, mode.title(), &visible, &series);
         }
@@ -686,7 +907,11 @@ fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(area);
-    let visible = visible_history_window(&state.graph_history, area.width);
+    let history = state
+        .selected_target()
+        .map(|target| &target.graph_history)
+        .expect("TuiState always has at least one target");
+    let visible = visible_history_window(history, area.width);
     let rtt = graph_series(GraphMode::Rtt, &visible);
     let one_way = graph_series(GraphMode::OneWay, &visible);
 
@@ -698,6 +923,60 @@ fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         &visible,
         &one_way,
     );
+}
+
+fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let capacity = visible_sample_capacity(area.width);
+    let series = state
+        .targets
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, target)| target_rtt_series(target, idx, capacity))
+        .collect::<Vec<_>>();
+    if series.is_empty() {
+        frame.render_widget(
+            Paragraph::new("waiting for primary replies")
+                .block(
+                    Block::default()
+                        .title("RTT history - per target")
+                        .borders(Borders::ALL),
+                )
+                .wrap(Wrap { trim: true }),
+            area,
+        );
+        return;
+    }
+
+    let x_max = series
+        .iter()
+        .map(|series| series.data.len().saturating_sub(1))
+        .max()
+        .unwrap_or(1)
+        .max(1) as f64;
+    let (min_y, max_y) = chart_y_bounds(&series);
+    let datasets = chart_datasets(&series);
+    let chart = Chart::new(datasets)
+        .block(
+            Block::default()
+                .title("RTT history - per target")
+                .borders(Borders::ALL),
+        )
+        .x_axis(
+            Axis::default()
+                .bounds([0.0, x_max])
+                .labels(vec![Span::raw("old"), Span::raw("new")])
+                .style(Style::default().fg(Color::Gray)),
+        )
+        .y_axis(
+            Axis::default()
+                .bounds([min_y, max_y])
+                .labels(vec![
+                    Span::raw(format_ms_label(min_y)),
+                    Span::raw(format_ms_label(max_y)),
+                ])
+                .style(Style::default().fg(Color::Gray)),
+        );
+    frame.render_widget(chart, area);
 }
 
 fn render_chart(
@@ -763,9 +1042,7 @@ impl GraphValue {
 
     fn style(self) -> Style {
         match self {
-            Self::EffectiveRtt => Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Self::EffectiveRtt => target_style(0).add_modifier(Modifier::BOLD),
             Self::ClientToServer => Style::default().fg(Color::Magenta),
             Self::ServerToClient => Style::default().fg(Color::LightBlue),
         }
@@ -793,7 +1070,9 @@ impl GraphMode {
 
 #[derive(Debug, Clone, PartialEq)]
 struct ChartSeries {
-    value: GraphValue,
+    value: Option<GraphValue>,
+    name: String,
+    style: Style,
     data: Vec<(f64, f64)>,
 }
 
@@ -836,7 +1115,34 @@ fn chart_series(value: GraphValue, visible: &[&GraphSample]) -> Option<ChartSeri
         })
         .collect();
 
-    (!data.is_empty()).then_some(ChartSeries { value, data })
+    (!data.is_empty()).then_some(ChartSeries {
+        value: Some(value),
+        name: value.name().to_owned(),
+        style: value.style(),
+        data,
+    })
+}
+
+fn target_rtt_series(
+    target: &TuiTargetState,
+    target_idx: usize,
+    capacity: usize,
+) -> Option<ChartSeries> {
+    let start = target.graph_history.len().saturating_sub(capacity);
+    let data = target
+        .graph_history
+        .iter()
+        .skip(start)
+        .enumerate()
+        .map(|(idx, sample)| (idx as f64, sample.effective_ns as f64 / 1_000_000.0))
+        .collect::<Vec<_>>();
+
+    (!data.is_empty()).then_some(ChartSeries {
+        value: None,
+        name: target.label.clone(),
+        style: target_style(target_idx),
+        data,
+    })
 }
 
 fn chart_datasets(series: &[ChartSeries]) -> Vec<Dataset<'_>> {
@@ -844,13 +1150,27 @@ fn chart_datasets(series: &[ChartSeries]) -> Vec<Dataset<'_>> {
         .iter()
         .map(|series| {
             Dataset::default()
-                .name(series.value.name())
+                .name(series.name.as_str())
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
-                .style(series.value.style())
+                .style(series.style)
                 .data(&series.data)
         })
         .collect()
+}
+
+fn target_style(idx: usize) -> Style {
+    const COLORS: [Color; 8] = [
+        Color::Cyan,
+        Color::Yellow,
+        Color::Green,
+        Color::Magenta,
+        Color::LightBlue,
+        Color::LightRed,
+        Color::LightGreen,
+        Color::White,
+    ];
+    Style::default().fg(COLORS[idx % COLORS.len()])
 }
 
 fn chart_y_bounds(series: &[ChartSeries]) -> (f64, f64) {
@@ -929,8 +1249,12 @@ fn recent_events_visible_count(panel_height: u16) -> usize {
 }
 
 fn sample_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
-    let last = state.last_sample;
-    let warning = state.last_warning.clone().unwrap_or_else(|| "-".to_owned());
+    let selected = state.selected_target();
+    let last = selected.and_then(|target| target.last_sample);
+    let warning = selected
+        .and_then(|target| target.last_warning.clone())
+        .or_else(|| state.last_warning.clone())
+        .unwrap_or_else(|| "-".to_owned());
     Paragraph::new(vec![
         Line::from(format!(
             "last seq: {}",
@@ -978,15 +1302,23 @@ fn status_line(state: &TuiState) -> Paragraph<'_> {
     } else {
         ""
     };
-    Paragraph::new(format!(
+    let legend = if state.is_multi_target() {
+        Some(Line::from(format!("legend: {}", legend_text(state))))
+    } else {
+        None
+    };
+    let mut lines = vec![Line::from(format!(
         "{}{}{} | graph {}{} | q quit | Ctrl-C quit | r reset | p pause | g graph | f full",
         state.status.label(),
         paused,
         quitting,
         state.graph_mode.label(),
         if state.full_graph { " full" } else { "" }
-    ))
-    .block(Block::default().borders(Borders::ALL))
+    ))];
+    if let Some(legend) = legend {
+        lines.push(legend);
+    }
+    Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
 }
 
 fn push_time_line(lines: &mut Vec<Line<'_>>, label: &str, stats: &TimeStats) {
@@ -1106,6 +1438,27 @@ fn format_count(value: u64) -> String {
     value.to_string()
 }
 
+fn truncate(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .chain(std::iter::once('~'))
+        .collect()
+}
+
+fn legend_text(state: &TuiState) -> String {
+    state
+        .targets
+        .iter()
+        .enumerate()
+        .map(|(idx, target)| format!("{} {}", idx + 1, target.label))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
 fn format_seq(value: u32) -> String {
     value.to_string()
 }
@@ -1128,7 +1481,8 @@ fn duration_ns(value: Duration) -> i128 {
 mod tests {
     use super::*;
     use irtt_client::{
-        ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming, WarningKind,
+        ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming, TargetId,
+        WarningKind,
     };
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -1206,8 +1560,21 @@ mod tests {
 
     fn series(data: Vec<(f64, f64)>) -> ChartSeries {
         ChartSeries {
-            value: GraphValue::EffectiveRtt,
+            value: Some(GraphValue::EffectiveRtt),
+            name: GraphValue::EffectiveRtt.name().to_owned(),
+            style: GraphValue::EffectiveRtt.style(),
             data,
+        }
+    }
+
+    fn primary_target(state: &TuiState) -> &TuiTargetState {
+        &state.targets[0]
+    }
+
+    fn target_event(label: &str, event: ClientEvent) -> TargetEvent {
+        TargetEvent {
+            target: TargetId::from(label),
+            event,
         }
     }
 
@@ -1225,42 +1592,39 @@ mod tests {
     #[test]
     fn session_started_sets_remote_session_and_running_status() {
         let mut state = TuiState::default();
-        let mut stats = StatsCollector::new(irtt_stats::StatsConfig::finite());
-        state.process_event(
-            &ClientEvent::SessionStarted {
-                remote: remote(),
-                token: 0xabc,
-                negotiated: NegotiatedParams {
-                    params: irtt_proto::Params::default(),
-                    restrictions: Vec::new(),
-                },
-                at: ts(Duration::ZERO),
+        state.process_event(&ClientEvent::SessionStarted {
+            remote: remote(),
+            token: 0xabc,
+            negotiated: NegotiatedParams {
+                params: irtt_proto::Params::default(),
+                restrictions: Vec::new(),
             },
-            &mut stats,
-        );
+            at: ts(Duration::ZERO),
+        });
 
-        assert_eq!(state.remote.as_deref(), Some("127.0.0.1:2112"));
-        assert_eq!(state.session.as_deref(), Some("0xabc"));
+        let target = primary_target(&state);
+        assert_eq!(target.remote.as_deref(), Some("127.0.0.1:2112"));
+        assert_eq!(target.session.as_deref(), Some("0xabc"));
         assert_eq!(state.status, TuiStatus::Running);
-        assert!(state.negotiated.is_some());
+        assert!(target.negotiated.is_some());
     }
 
     #[test]
     fn echo_reply_appends_bounded_primary_history() {
         let mut state = TuiState::default();
-        let mut stats = StatsCollector::new(irtt_stats::StatsConfig::finite());
         for seq in 0..(HISTORY_LIMIT as u32 + 3) {
-            state.process_event(&reply(seq, i128::from(seq) * 1_000), &mut stats);
+            state.process_event(&reply(seq, i128::from(seq) * 1_000));
         }
 
-        assert_eq!(state.graph_history.len(), HISTORY_LIMIT);
-        assert_eq!(state.graph_history.front().unwrap().seq, 3);
+        let target = primary_target(&state);
+        assert_eq!(target.graph_history.len(), HISTORY_LIMIT);
+        assert_eq!(target.graph_history.front().unwrap().seq, 3);
         assert_eq!(
-            state.graph_history.back().unwrap().effective_ns,
+            target.graph_history.back().unwrap().effective_ns,
             i128::from(HISTORY_LIMIT as u32 + 2) * 1_000
         );
         assert_eq!(
-            stats.snapshot().packets.unique_replies,
+            target.stats.snapshot().packets.unique_replies,
             HISTORY_LIMIT as u64 + 3
         );
     }
@@ -1268,35 +1632,29 @@ mod tests {
     #[test]
     fn duplicate_and_late_replies_do_not_append_primary_history() {
         let mut state = TuiState::default();
-        let mut stats = StatsCollector::new(irtt_stats::StatsConfig::finite());
-        state.process_event(
-            &ClientEvent::DuplicateReply {
-                seq: 7,
-                remote: remote(),
-                received_at: ts(Duration::from_secs(1)),
-                bytes: 64,
-            },
-            &mut stats,
-        );
-        state.process_event(
-            &ClientEvent::LateReply {
-                seq: 8,
-                highest_seen: 9,
-                remote: remote(),
-                sent_at: Some(ts(Duration::from_secs(1))),
-                received_at: ts(Duration::from_secs(2)),
-                rtt: Some(rtt(2_000_000)),
-                server_timing: None,
-                one_way: None,
-                received_stats: None,
-                bytes: 64,
-                packet_meta: PacketMeta::default(),
-            },
-            &mut stats,
-        );
+        state.process_event(&ClientEvent::DuplicateReply {
+            seq: 7,
+            remote: remote(),
+            received_at: ts(Duration::from_secs(1)),
+            bytes: 64,
+        });
+        state.process_event(&ClientEvent::LateReply {
+            seq: 8,
+            highest_seen: 9,
+            remote: remote(),
+            sent_at: Some(ts(Duration::from_secs(1))),
+            received_at: ts(Duration::from_secs(2)),
+            rtt: Some(rtt(2_000_000)),
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
+        });
 
-        assert!(state.graph_history.is_empty());
-        let snapshot = stats.snapshot();
+        let target = primary_target(&state);
+        assert!(target.graph_history.is_empty());
+        let snapshot = target.stats.snapshot();
         assert_eq!(snapshot.events.duplicate_replies, 1);
         assert_eq!(snapshot.events.late_unique_replies, 0);
         assert_eq!(snapshot.events.untracked_late_replies, 1);
@@ -1315,17 +1673,112 @@ mod tests {
     }
 
     #[test]
-    fn warning_updates_recent_events_and_last_warning() {
-        let mut state = TuiState::default();
-        let mut stats = StatsCollector::new(irtt_stats::StatsConfig::finite());
-        state.process_event(
-            &ClientEvent::Warning {
+    fn target_scoped_echo_reply_updates_only_that_target() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+
+        state.process_target_event(&target_event("b", reply(11, 2_500_000)));
+
+        assert!(state.targets[0].graph_history.is_empty());
+        assert_eq!(state.targets[0].stats.snapshot().packets.unique_replies, 0);
+        assert_eq!(state.targets[1].graph_history.len(), 1);
+        assert_eq!(
+            state.targets[1].graph_history.back().unwrap().effective_ns,
+            2_500_000
+        );
+        assert_eq!(state.targets[1].last_sample.unwrap().seq, 11);
+        assert_eq!(state.targets[1].stats.snapshot().packets.unique_replies, 1);
+    }
+
+    #[test]
+    fn target_scoped_duplicate_and_late_are_diagnostic_only() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+
+        state.process_target_event(&target_event(
+            "a",
+            ClientEvent::DuplicateReply {
+                seq: 7,
+                remote: remote(),
+                received_at: ts(Duration::from_secs(1)),
+                bytes: 64,
+            },
+        ));
+        state.process_target_event(&target_event(
+            "b",
+            ClientEvent::LateReply {
+                seq: 8,
+                highest_seen: 9,
+                remote: remote(),
+                sent_at: Some(ts(Duration::from_secs(1))),
+                received_at: ts(Duration::from_secs(2)),
+                rtt: Some(rtt(2_000_000)),
+                server_timing: None,
+                one_way: None,
+                received_stats: None,
+                bytes: 64,
+                packet_meta: PacketMeta::default(),
+            },
+        ));
+
+        assert!(state.targets[0].graph_history.is_empty());
+        assert!(state.targets[1].graph_history.is_empty());
+        assert_eq!(state.targets[0].stats.snapshot().packets.duplicates, 1);
+        assert_eq!(state.targets[1].stats.snapshot().packets.late_packets, 1);
+        assert_eq!(state.targets[1].stats.snapshot().rtt.primary.count, 0);
+    }
+
+    #[test]
+    fn target_scoped_loss_warning_and_terminal_status_update_correct_target() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+
+        state.process_target_event(&target_event(
+            "a",
+            ClientEvent::EchoLoss {
+                seq: 3,
+                sent_at: ts(Duration::from_millis(3)),
+                timeout_at: Instant::now(),
+            },
+        ));
+        state.process_target_event(&target_event(
+            "b",
+            ClientEvent::Warning {
                 kind: WarningKind::WrongToken,
                 message: "wrong token".to_owned(),
                 at: ts(Duration::ZERO),
             },
-            &mut stats,
-        );
+        ));
+        state.process_target_event(&target_event(
+            "a",
+            ClientEvent::NoTestCompleted {
+                remote: remote(),
+                negotiated: NegotiatedParams {
+                    params: irtt_proto::Params::default(),
+                    restrictions: Vec::new(),
+                },
+                at: ts(Duration::ZERO),
+            },
+        ));
+
+        assert_eq!(state.targets[0].stats.snapshot().events.loss_events, 1);
+        assert_eq!(state.targets[0].status, TargetStatus::NoTest);
+        assert_eq!(state.targets[1].stats.snapshot().events.warning_events, 1);
+        assert_eq!(state.targets[1].status, TargetStatus::Opening);
+        assert!(state.targets[1]
+            .last_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("WrongToken")));
+    }
+
+    #[test]
+    fn warning_updates_recent_events_and_last_warning() {
+        let mut state = TuiState::default();
+        state.process_event(&ClientEvent::Warning {
+            kind: WarningKind::WrongToken,
+            message: "wrong token".to_owned(),
+            at: ts(Duration::ZERO),
+        });
 
         assert_eq!(
             state.last_warning.as_deref(),
@@ -1410,7 +1863,9 @@ mod tests {
 
         assert!(one_way.is_empty());
         assert_eq!(
-            rtt.iter().map(|series| series.value).collect::<Vec<_>>(),
+            rtt.iter()
+                .filter_map(|series| series.value)
+                .collect::<Vec<_>>(),
             vec![GraphValue::EffectiveRtt]
         );
     }
@@ -1423,21 +1878,21 @@ mod tests {
         assert_eq!(
             graph_series(GraphMode::Rtt, &visible)
                 .iter()
-                .map(|series| series.value)
+                .filter_map(|series| series.value)
                 .collect::<Vec<_>>(),
             vec![GraphValue::EffectiveRtt]
         );
         assert_eq!(
             graph_series(GraphMode::OneWay, &visible)
                 .iter()
-                .map(|series| series.value)
+                .filter_map(|series| series.value)
                 .collect::<Vec<_>>(),
             vec![GraphValue::ClientToServer, GraphValue::ServerToClient]
         );
         assert_eq!(
             graph_series(GraphMode::Combined, &visible)
                 .iter()
-                .map(|series| series.value)
+                .filter_map(|series| series.value)
                 .collect::<Vec<_>>(),
             vec![
                 GraphValue::EffectiveRtt,
@@ -1478,16 +1933,16 @@ mod tests {
     #[test]
     fn sample_details_preserve_signed_values() {
         let mut state = TuiState::default();
-        let mut stats = StatsCollector::new(irtt_stats::StatsConfig::finite());
-        state.process_event(&reply(4, -1_250_000), &mut stats);
+        state.process_event(&reply(4, -1_250_000));
 
-        let sample = state.last_sample.unwrap();
+        let target = primary_target(&state);
+        let sample = target.last_sample.unwrap();
         assert_eq!(sample.seq, 4);
         assert_eq!(sample.effective_ns, -1_250_000);
         assert_eq!(sample.client_to_server_ns, Some(-20_000));
         assert_eq!(sample.server_processing_ns, Some(100_000));
 
-        let graph = state.graph_history.back().unwrap();
+        let graph = target.graph_history.back().unwrap();
         assert_eq!(graph.seq, 4);
         assert_eq!(graph.effective_ns, -1_250_000);
         assert_eq!(graph.client_to_server_ns, Some(-20_000));
