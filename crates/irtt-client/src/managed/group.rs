@@ -1273,10 +1273,19 @@ impl PacingRuntime {
             self.next_slot_at = None;
             return None;
         }
-        let target = active[self.slot_index % active.len()].clone();
-        self.slot_index = (self.slot_index + 1) % active.len();
-        self.next_slot_at = Some(scheduled_at + divide_duration(interval, active.len()));
-        Some((target, scheduled_at))
+        for offset in 0..active.len() {
+            let index = (self.slot_index + offset) % active.len();
+            if !target_is_due_for_slot(&active[index], scheduled_at) {
+                continue;
+            }
+            let target = active[index].clone();
+            self.slot_index = (index + 1) % active.len();
+            self.next_slot_at = Some(scheduled_at + divide_duration(interval, active.len()));
+            return Some((target, scheduled_at));
+        }
+
+        self.next_slot_at = active.iter().filter_map(target_next_send_deadline).min();
+        None
     }
 
     fn next_burst(&mut self, interval: Duration) -> Option<Instant> {
@@ -1290,6 +1299,19 @@ impl PacingRuntime {
             ManagedGroupPacing::Staggered => self.next_slot_at,
             ManagedGroupPacing::Burst => self.next_burst_at,
         }
+    }
+}
+
+fn target_is_due_for_slot(target: &Arc<Mutex<TargetState>>, scheduled_at: Instant) -> bool {
+    target_next_send_deadline(target).is_some_and(|deadline| deadline <= scheduled_at)
+}
+
+fn target_next_send_deadline(target: &Arc<Mutex<TargetState>>) -> Option<Instant> {
+    let target = target.lock().expect("target mutex poisoned");
+    if matches!(target.status, TargetStatus::Active) {
+        target.runtime.next_send_deadline()
+    } else {
+        None
     }
 }
 
@@ -1813,6 +1835,54 @@ mod tests {
         assert!(events.iter().any(|event| {
             event.target.as_str() == "b" && matches!(event.event, ClientEvent::EchoReply { .. })
         }));
+    }
+
+    #[test]
+    fn staggered_active_set_change_does_not_resend_unchanged_target_early() {
+        let duration = Duration::from_millis(360);
+        let interval = Duration::from_millis(100);
+        let params = test_params(Some(duration), interval);
+        let a = start_echo_server(params.clone(), Duration::ZERO);
+        let b = start_echo_server(params, Duration::from_millis(150));
+
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            group_config(Some(duration), interval, ManagedGroupPacing::Staggered),
+            vec![target("a", a.addr), target("b", b.addr)],
+            SubscriberConfig {
+                capacity: 512,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let _ = session.join().unwrap();
+        let events = drain_after_join(&sub);
+        a.join();
+        b.join();
+
+        let a_sends: Vec<Instant> = events
+            .iter()
+            .filter_map(|event| match (&event.target, &event.event) {
+                (id, ClientEvent::EchoSent { sent_at, .. }) if id.as_str() == "a" => {
+                    Some(sent_at.mono)
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            a_sends.len() >= 3,
+            "expected enough target a sends to verify spacing, got {a_sends:?}"
+        );
+
+        let min_delta = a_sends
+            .windows(2)
+            .map(|window| window[1].duration_since(window[0]))
+            .min()
+            .unwrap();
+        assert!(
+            min_delta >= Duration::from_millis(75),
+            "target a was resent too early after active set changed: {min_delta:?}"
+        );
     }
 
     #[test]
