@@ -96,12 +96,27 @@ Run continuously:
 irtt-cli <server> --duration 0
 ```
 
+Probe multiple targets concurrently:
+
+```sh
+irtt-cli host-a:2112 host-b:2112
+irtt-cli --target ams=ams.example.com:2112 --target sg=sg.example.com:2112
+irtt-cli host-a:2112 host-b:2112 --pacing burst
+```
+
+For positional multi-target runs, the original target string is used as the
+logical target label. Repeated positional strings get a stable numeric suffix.
+For `--target label=host:port`, `label` is used in the `target` output column.
+Labels must be unique. `--pacing staggered|burst` selects managed group pacing
+for multi-target runs; the default is `staggered`.
+
 Use a specific output format or column selection:
 
 ```sh
 irtt-cli <server> --format table
 irtt-cli <server> --format jsonl
 irtt-cli <server> --format csv --columns event,seq,remote,effective_rtt_us
+irtt-cli host-a:2112 host-b:2112 --format csv --columns target,seq,effective_rtt_us
 irtt-cli <server> --format tsv --columns effective_rtt_us --header never
 irtt-cli --list-columns
 ```
@@ -146,7 +161,7 @@ comma-separated list. Use `--list-columns` to print the available names. Useful
 columns include:
 
 ```text
-event, seq, remote, token, rtt, rtt_us, raw_rtt_us, effective_rtt_us,
+target, event, seq, remote, token, rtt, rtt_us, raw_rtt_us, effective_rtt_us,
 adjusted_rtt_us, rd, rd_us, sd, sd_us, ipdv, ipdv_us, proc,
 server_processing_us, bytes, send_call_us, timer_error_us, highest_seen,
 server_received, server_window, dscp, ecn, traffic_class, kernel_rx_ns,
@@ -159,14 +174,16 @@ for `rd` and `rd_us`, `send_delay` and `send_delay_us` for `sd` and `sd_us`,
 `server_processing` for `proc`, `server_received_count` for
 `server_received`, and `server_received_window` for `server_window`.
 
-The default table output favors readability with compact columns:
+The default single-target table output favors readability with compact columns:
 `event,seq,rtt,rd,sd,ipdv,proc,message`. It omits `echo_sent` rows. Passing
 `--columns default` is the same as omitting `--columns`, including the default
-table row filtering. Custom table column selections include all event rows.
-CSV, TSV, and JSONL default to all columns for structured export; use
-`--columns all` explicitly to request every column in any format. Missing table
-values render as `-`; missing CSV and TSV values render as empty fields;
-missing JSONL values render as `null`.
+table row filtering. Multi-target defaults add `target` as the first column so
+rows can be attributed to a logical target label. Custom table column selections
+include all event rows. CSV, TSV, and JSONL default to all non-target columns
+for single-target export and include `target` by default for multi-target
+export; use `--columns all` explicitly to request every column in any format.
+Missing table values render as `-`; missing CSV and TSV values render as empty
+fields; missing JSONL values render as `null`.
 
 Use JSON Lines for structured event streaming:
 

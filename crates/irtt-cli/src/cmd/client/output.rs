@@ -26,14 +26,15 @@ impl OutputConfig {
         columns: Option<&str>,
         header: HeaderMode,
         verbose: bool,
+        multi_target: bool,
     ) -> Result<Self, String> {
         let uses_default_columns = columns
             .map(|columns| columns.trim() == "default")
             .unwrap_or(true);
         let default_table_rows = format == OutputFormat::Table && uses_default_columns;
         let columns = match columns {
-            Some(columns) => parse_columns(columns, format, verbose)?,
-            None => default_columns(format, verbose),
+            Some(columns) => parse_columns(columns, format, verbose, multi_target)?,
+            None => default_columns(format, verbose, multi_target),
         };
 
         Ok(Self {
@@ -92,6 +93,7 @@ impl OutputConfig {
     pub(super) fn render_event(
         &self,
         event: &ClientEvent,
+        target: Option<&str>,
         stats: Option<&EventRenderStats>,
     ) -> Option<String> {
         let row = OutputRow::from_event(event);
@@ -101,6 +103,7 @@ impl OutputConfig {
 
         let context = RenderContext {
             stats,
+            target,
             verbose: self.verbose,
         };
 
@@ -187,6 +190,7 @@ impl From<irtt_stats::IpdvPairUpdate> for IpdvPair {
 #[derive(Debug, Clone, Copy)]
 struct RenderContext<'a> {
     stats: Option<&'a EventRenderStats>,
+    target: Option<&'a str>,
     verbose: bool,
 }
 
@@ -412,6 +416,7 @@ struct ReplyRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Column {
+    Target,
     Event,
     Seq,
     Remote,
@@ -456,6 +461,7 @@ enum Column {
 }
 
 const ALL_COLUMNS: &[Column] = &[
+    Column::Target,
     Column::Event,
     Column::Seq,
     Column::Remote,
@@ -502,6 +508,7 @@ const ALL_COLUMNS: &[Column] = &[
 impl Column {
     fn name(self) -> &'static str {
         match self {
+            Self::Target => "target",
             Self::Event => "event",
             Self::Seq => "seq",
             Self::Remote => "remote",
@@ -548,6 +555,7 @@ impl Column {
 
     fn parse(input: &str) -> Option<Self> {
         Some(match input {
+            "target" => Self::Target,
             "event" => Self::Event,
             "seq" => Self::Seq,
             "remote" => Self::Remote,
@@ -595,6 +603,7 @@ impl Column {
 
     fn description(self) -> &'static str {
         match self {
+            Self::Target => "logical CLI target label",
             Self::Event => "event kind",
             Self::Seq => "probe sequence number",
             Self::Remote => "remote socket address",
@@ -641,6 +650,7 @@ impl Column {
 
     fn table_width(self) -> usize {
         match self {
+            Self::Target => 18,
             Self::Event => 17,
             Self::Seq => 6,
             Self::Remote => 21,
@@ -663,7 +673,8 @@ impl Column {
     fn align_right(self) -> bool {
         !matches!(
             self,
-            Self::Event
+            Self::Target
+                | Self::Event
                 | Self::Remote
                 | Self::Token
                 | Self::Message
@@ -713,7 +724,12 @@ impl CellValue {
     }
 }
 
-fn parse_columns(input: &str, format: OutputFormat, verbose: bool) -> Result<Vec<Column>, String> {
+fn parse_columns(
+    input: &str,
+    format: OutputFormat,
+    verbose: bool,
+    multi_target: bool,
+) -> Result<Vec<Column>, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("--columns requires at least one column".to_owned());
@@ -722,7 +738,7 @@ fn parse_columns(input: &str, format: OutputFormat, verbose: bool) -> Result<Vec
         return Ok(ALL_COLUMNS.to_vec());
     }
     if trimmed == "default" {
-        return Ok(default_columns(format, verbose));
+        return Ok(default_columns(format, verbose, multi_target));
     }
 
     let mut columns = Vec::new();
@@ -739,7 +755,7 @@ fn parse_columns(input: &str, format: OutputFormat, verbose: bool) -> Result<Vec
     Ok(columns)
 }
 
-fn default_columns(format: OutputFormat, verbose: bool) -> Vec<Column> {
+fn default_columns(format: OutputFormat, verbose: bool, multi_target: bool) -> Vec<Column> {
     match format {
         OutputFormat::Table => {
             let mut columns = vec![
@@ -752,6 +768,9 @@ fn default_columns(format: OutputFormat, verbose: bool) -> Vec<Column> {
                 Column::ServerProcessing,
                 Column::Message,
             ];
+            if multi_target {
+                columns.insert(0, Column::Target);
+            }
             if verbose {
                 columns.extend([
                     Column::Remote,
@@ -766,7 +785,17 @@ fn default_columns(format: OutputFormat, verbose: bool) -> Vec<Column> {
             }
             columns
         }
-        OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Jsonl => ALL_COLUMNS.to_vec(),
+        OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Jsonl => {
+            if multi_target {
+                ALL_COLUMNS.to_vec()
+            } else {
+                ALL_COLUMNS
+                    .iter()
+                    .copied()
+                    .filter(|column| *column != Column::Target)
+                    .collect()
+            }
+        }
     }
 }
 
@@ -851,6 +880,7 @@ fn render_jsonl_row(row: &OutputRow, columns: &[Column], context: RenderContext<
 
 fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Option<CellValue> {
     match column {
+        Column::Target => context.target.map(CellValue::text),
         Column::Event => Some(CellValue::text(row.event_name())),
         Column::Seq => row_seq(row).map(|seq| CellValue::Unsigned(u128::from(seq))),
         Column::Remote => row_remote(row).map(|remote| CellValue::text(remote.to_string())),
@@ -1196,5 +1226,103 @@ fn write_json_string_content(out: &mut String, value: &str) {
             c if c < '\u{20}' => write!(out, "\\u{:04x}", c as u32).unwrap(),
             c => out.push(c),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use irtt_client::ClientTimestamp;
+    use std::{
+        net::{IpAddr, Ipv4Addr, SocketAddr},
+        time::Instant,
+    };
+
+    fn output_config(
+        format: OutputFormat,
+        columns: Option<&str>,
+        multi_target: bool,
+    ) -> OutputConfig {
+        OutputConfig::new(format, columns, HeaderMode::Auto, false, multi_target).unwrap()
+    }
+
+    fn remote() -> SocketAddr {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112)
+    }
+
+    fn reply() -> ClientEvent {
+        let sent_at = ClientTimestamp {
+            wall: UNIX_EPOCH + Duration::from_secs(1),
+            mono: Instant::now(),
+        };
+        let received_at = ClientTimestamp {
+            wall: sent_at.wall + Duration::from_micros(1200),
+            mono: sent_at.mono + Duration::from_micros(1200),
+        };
+        ClientEvent::EchoReply {
+            seq: 7,
+            remote: remote(),
+            sent_at,
+            received_at,
+            rtt: RttSample {
+                raw: Duration::from_micros(1200),
+                adjusted: None,
+                effective: SignedDuration::from_nanos(1_200_000),
+            },
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
+        }
+    }
+
+    #[test]
+    fn list_columns_includes_target() {
+        assert!(OutputConfig::list_columns().contains("target"));
+    }
+
+    #[test]
+    fn default_table_columns_include_target_only_for_multi_target() {
+        let single = output_config(OutputFormat::Table, None, false)
+            .render_header()
+            .unwrap();
+        let multi = output_config(OutputFormat::Table, None, true)
+            .render_header()
+            .unwrap();
+
+        assert!(!single.split_whitespace().any(|column| column == "target"));
+        assert_eq!(multi.split_whitespace().next(), Some("target"));
+    }
+
+    #[test]
+    fn default_structured_columns_include_target_for_multi_target() {
+        let single = output_config(OutputFormat::Csv, None, false)
+            .render_header()
+            .unwrap();
+        let multi = output_config(OutputFormat::Csv, None, true)
+            .render_header()
+            .unwrap();
+
+        assert!(!single.split(',').any(|column| column == "target"));
+        assert_eq!(multi.split(',').next(), Some("target"));
+    }
+
+    #[test]
+    fn custom_target_column_renders_label() {
+        let config = output_config(
+            OutputFormat::Csv,
+            Some("target,seq,effective_rtt_us"),
+            false,
+        );
+        let line = config
+            .render_event(&reply(), Some("ams"), Some(&EventRenderStats::default()))
+            .unwrap();
+
+        assert_eq!(
+            config.render_header().as_deref(),
+            Some("target,seq,effective_rtt_us")
+        );
+        assert_eq!(line, "ams,7,1200");
     }
 }

@@ -1,14 +1,22 @@
+#[cfg(feature = "stats")]
+use std::collections::BTreeMap;
 use std::{
+    collections::HashSet,
     io::{self, Write},
     sync::atomic::AtomicBool,
+    thread,
+    time::{Duration, Instant},
 };
 
-use irtt_client::ClientEvent;
+use irtt_client::{
+    ClientEvent, EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
+    ManagedGroupEndReason, SubscriberConfig, SubscriberOverflow, TargetEvent,
+};
 #[cfg(all(test, feature = "stats"))]
 use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
 
 use super::{
-    args::ClientArgs,
+    args::{ClientArgs, ResolvedCliTarget},
     output::{EventRenderStats, OutputConfig},
 };
 #[cfg(feature = "stats")]
@@ -33,6 +41,9 @@ const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
 #[cfg(feature = "stats")]
 const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
 
+const GROUP_IDLE_SLEEP: Duration = Duration::from_millis(5);
+const GROUP_COMPLETION_GRACE: Duration = Duration::from_secs(1);
+
 pub fn run_stream(
     args: ClientArgs,
     shutdown_requested: &AtomicBool,
@@ -46,8 +57,16 @@ pub fn run_stream(
         args.columns.as_deref(),
         args.header,
         args.verbose,
+        args.target_specs()
+            .map(|targets| targets.len() > 1)
+            .unwrap_or(false),
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+
+    let targets = args
+        .resolved_managed_targets()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let multi_target = targets.len() > 1;
 
     let continuous = args.is_continuous();
     #[cfg(feature = "stats")]
@@ -55,6 +74,14 @@ pub fn run_stream(
         eprintln!("{warning}");
     }
 
+    if multi_target {
+        return run_group_stream(args, targets, output_config, continuous, shutdown_requested);
+    }
+
+    let target_label = targets
+        .first()
+        .map(|target| target.label.as_str())
+        .expect("at least one target was validated");
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     #[cfg(feature = "stats")]
     let mut stats = StatsCollector::new(stats_config(continuous));
@@ -64,8 +91,6 @@ pub fn run_stream(
         print_final_summary: false,
         show_running_only_summary_note: false,
         out: &mut stdout,
-        #[cfg(feature = "stats")]
-        stats: &mut stats,
     };
 
     if is_shutdown_requested(shutdown_requested) {
@@ -79,12 +104,18 @@ pub fn run_stream(
     }
 
     let events = session.open()?;
-    stream_output.print_events(&events)?;
+    #[cfg(feature = "stats")]
+    print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
+    #[cfg(not(feature = "stats"))]
+    print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
 
     let mut interrupted = false;
     while session.should_continue(shutdown_requested) {
         let events = session.step(shutdown_requested)?;
-        stream_output.print_events(&events)?;
+        #[cfg(feature = "stats")]
+        print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
+        #[cfg(not(feature = "stats"))]
+        print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
 
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
@@ -101,18 +132,31 @@ pub fn run_stream(
 
     if session.should_drain_final(interrupted) {
         session.drain_final(|events| {
-            let _ = stream_output.print_events(events);
+            #[cfg(feature = "stats")]
+            let _ =
+                print_events_with_stats(&mut stream_output, events, Some(target_label), &mut stats);
+            #[cfg(not(feature = "stats"))]
+            let _ = print_events_with_stats(&mut stream_output, events, Some(target_label));
         })?;
     }
 
     let events = session.poll_timeouts()?;
-    stream_output.print_events(&events)?;
+    #[cfg(feature = "stats")]
+    print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
+    #[cfg(not(feature = "stats"))]
+    print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
 
     let events = session.close()?;
-    stream_output.print_events(&events)?;
+    #[cfg(feature = "stats")]
+    print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
+    #[cfg(not(feature = "stats"))]
+    print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
     let print_final_summary = should_print_final_summary(continuous, interrupted);
     stream_output.print_final_summary = print_final_summary;
     stream_output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
+    #[cfg(feature = "stats")]
+    stream_output.print_summary(&stats)?;
+    #[cfg(not(feature = "stats"))]
     stream_output.print_summary()?;
     stream_output.out.flush()?;
     Ok(())
@@ -124,32 +168,29 @@ struct StreamOutput<'a, W: Write> {
     print_final_summary: bool,
     show_running_only_summary_note: bool,
     out: &'a mut W,
-    #[cfg(feature = "stats")]
-    stats: &'a mut StatsCollector,
 }
 
 impl<W: Write> StreamOutput<'_, W> {
-    fn print_events(&mut self, events: &[ClientEvent]) -> io::Result<()> {
+    fn print_events(
+        &mut self,
+        events: &[ClientEvent],
+        target: Option<&str>,
+        stats_updates: &[EventRenderStats],
+    ) -> io::Result<()> {
         self.print_header()?;
-        for event in events {
-            self.print_event(event)?;
+        for (event, stats_update) in events.iter().zip(stats_updates) {
+            self.print_event(event, target, stats_update)?;
         }
         Ok(())
     }
 
-    fn print_event(&mut self, event: &ClientEvent) -> io::Result<()> {
-        #[cfg(feature = "stats")]
-        let stats_update = self.stats.process(event);
-
-        #[cfg(not(feature = "stats"))]
-        let stats_update = EventRenderStats::default();
-
-        #[cfg(feature = "stats")]
-        let event_stats = EventRenderStats::from(stats_update);
-        #[cfg(not(feature = "stats"))]
-        let event_stats = stats_update;
-
-        if let Some(line) = self.config.render_event(event, Some(&event_stats)) {
+    fn print_event(
+        &mut self,
+        event: &ClientEvent,
+        target: Option<&str>,
+        stats_update: &EventRenderStats,
+    ) -> io::Result<()> {
+        if let Some(line) = self.config.render_event(event, target, Some(stats_update)) {
             writeln!(self.out, "{line}")?;
         }
         Ok(())
@@ -166,28 +207,250 @@ impl<W: Write> StreamOutput<'_, W> {
         Ok(())
     }
 
-    fn print_summary(&mut self) -> io::Result<()> {
+    #[cfg(feature = "stats")]
+    fn print_summary(&mut self, stats: &StatsCollector) -> io::Result<()> {
         if !self.print_final_summary || !self.config.prints_summary() {
             return Ok(());
         }
 
-        #[cfg(feature = "stats")]
-        {
-            write!(
-                self.out,
-                "{}",
-                crate::cmd::client::summary::format_summary_with_options(
-                    &self.stats.snapshot(),
-                    crate::cmd::client::summary::SummaryFormatOptions {
-                        verbose: self.config.summary_verbose(),
-                        show_running_only_note: self.show_running_only_summary_note,
-                    },
-                )
-            )?;
-        }
+        write!(
+            self.out,
+            "{}",
+            crate::cmd::client::summary::format_summary_with_options(
+                &stats.snapshot(),
+                crate::cmd::client::summary::SummaryFormatOptions {
+                    verbose: self.config.summary_verbose(),
+                    show_running_only_note: self.show_running_only_summary_note,
+                },
+            )
+        )?;
 
         Ok(())
     }
+
+    #[cfg(not(feature = "stats"))]
+    fn print_summary(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[cfg(feature = "stats")]
+fn print_events_with_stats<W: Write>(
+    stream_output: &mut StreamOutput<'_, W>,
+    events: &[ClientEvent],
+    target: Option<&str>,
+    stats: &mut StatsCollector,
+) -> io::Result<()> {
+    let stats_updates = events
+        .iter()
+        .map(|event| EventRenderStats::from(stats.process(event)))
+        .collect::<Vec<_>>();
+    stream_output.print_events(events, target, &stats_updates)
+}
+
+#[cfg(not(feature = "stats"))]
+fn print_events_with_stats<W: Write>(
+    stream_output: &mut StreamOutput<'_, W>,
+    events: &[ClientEvent],
+    target: Option<&str>,
+) -> io::Result<()> {
+    let stats_updates = vec![EventRenderStats::default(); events.len()];
+    stream_output.print_events(events, target, &stats_updates)
+}
+
+fn run_group_stream(
+    args: ClientArgs,
+    targets: Vec<ResolvedCliTarget>,
+    output_config: OutputConfig,
+    continuous: bool,
+    shutdown_requested: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut config = args.to_client_config();
+    let managed_targets = targets
+        .iter()
+        .map(|target| target.managed.clone())
+        .collect::<Vec<_>>();
+    let expected_target_count = managed_targets.len();
+    if let Some(first) = managed_targets.first() {
+        config.server_addr = first.remote.to_string();
+    }
+
+    let group_config = ManagedClientGroupConfig {
+        client: config,
+        pacing: args.pacing.into(),
+    };
+
+    let (session, events) = ManagedClientGroup::start_with_subscription(
+        group_config,
+        managed_targets,
+        SubscriberConfig {
+            capacity: 16_384,
+            overflow: SubscriberOverflow::Disconnect,
+        },
+    )?;
+
+    let mut stdout = io::LineWriter::new(io::stdout().lock());
+    #[cfg(feature = "stats")]
+    let mut stats = targets
+        .iter()
+        .map(|target| {
+            (
+                target.label.clone(),
+                StatsCollector::new(stats_config(continuous)),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut stream_output = StreamOutput {
+        config: output_config,
+        header_printed: false,
+        print_final_summary: false,
+        show_running_only_summary_note: false,
+        out: &mut stdout,
+    };
+
+    let mut interrupted = false;
+    let mut terminal_targets = HashSet::new();
+    let mut last_event_at = Instant::now();
+    let mut saw_target_event = false;
+
+    loop {
+        if is_shutdown_requested(shutdown_requested) {
+            interrupted = true;
+            session.stop();
+        }
+
+        match events.try_recv() {
+            Ok(Some(target_event)) => {
+                last_event_at = Instant::now();
+                saw_target_event = true;
+                let label = target_event.target.as_str();
+                if is_terminal_target_event(&target_event.event) {
+                    terminal_targets.insert(label.to_owned());
+                }
+                #[cfg(feature = "stats")]
+                {
+                    let stats = stats
+                        .entry(label.to_owned())
+                        .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
+                    print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
+                }
+                #[cfg(not(feature = "stats"))]
+                {
+                    print_target_event_with_stats(&mut stream_output, &target_event)?;
+                }
+            }
+            Ok(None) => {
+                if interrupted {
+                    break;
+                }
+                if terminal_targets.len() >= expected_target_count {
+                    break;
+                }
+                if should_join_group_after_idle(&args, continuous, saw_target_event, last_event_at)
+                {
+                    break;
+                }
+                thread::sleep(GROUP_IDLE_SLEEP);
+            }
+            Err(EventSubscriptionError::Disconnected) => break,
+        }
+    }
+
+    if interrupted {
+        eprintln!("interrupted, closing group...");
+    }
+
+    let outcome = session.join()?;
+    while let Ok(Some(target_event)) = events.try_recv() {
+        let label = target_event.target.as_str();
+        #[cfg(feature = "stats")]
+        {
+            let stats = stats
+                .entry(label.to_owned())
+                .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
+            print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
+        }
+        #[cfg(not(feature = "stats"))]
+        {
+            print_target_event_with_stats(&mut stream_output, &target_event)?;
+        }
+    }
+
+    if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
+        return Err("managed client group was cancelled".into());
+    }
+
+    let print_final_summary = should_print_final_summary(continuous, interrupted);
+    stream_output.print_final_summary = print_final_summary;
+    stream_output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
+    #[cfg(feature = "stats")]
+    {
+        for (label, stats) in &stats {
+            if stream_output.print_final_summary && stream_output.config.prints_summary() {
+                writeln!(stream_output.out)?;
+                writeln!(stream_output.out, "target: {label}")?;
+            }
+            stream_output.print_summary(stats)?;
+        }
+    }
+    #[cfg(not(feature = "stats"))]
+    {
+        stream_output.print_summary()?;
+    }
+    stream_output.out.flush()?;
+    Ok(())
+}
+
+fn is_terminal_target_event(event: &ClientEvent) -> bool {
+    matches!(
+        event,
+        ClientEvent::SessionClosed { .. } | ClientEvent::NoTestCompleted { .. }
+    )
+}
+
+fn estimated_group_completion_grace(args: &ClientArgs) -> Duration {
+    let open_timeout: Duration = args.to_client_config().open_timeouts.iter().sum();
+    open_timeout
+        .saturating_add(args.duration)
+        .saturating_add(GROUP_COMPLETION_GRACE)
+}
+
+fn should_join_group_after_idle(
+    args: &ClientArgs,
+    continuous: bool,
+    saw_target_event: bool,
+    last_event_at: Instant,
+) -> bool {
+    if continuous && saw_target_event {
+        return false;
+    }
+    last_event_at.elapsed() > estimated_group_completion_grace(args)
+}
+
+#[cfg(feature = "stats")]
+fn print_target_event_with_stats<W: Write>(
+    stream_output: &mut StreamOutput<'_, W>,
+    target_event: &TargetEvent,
+    stats: &mut StatsCollector,
+) -> io::Result<()> {
+    print_events_with_stats(
+        stream_output,
+        std::slice::from_ref(&target_event.event),
+        Some(target_event.target.as_str()),
+        stats,
+    )
+}
+
+#[cfg(not(feature = "stats"))]
+fn print_target_event_with_stats<W: Write>(
+    stream_output: &mut StreamOutput<'_, W>,
+    target_event: &TargetEvent,
+) -> io::Result<()> {
+    print_events_with_stats(
+        stream_output,
+        std::slice::from_ref(&target_event.event),
+        Some(target_event.target.as_str()),
+    )
 }
 
 #[cfg(feature = "stats")]
@@ -294,7 +557,7 @@ mod tests {
         header: crate::cmd::client::HeaderMode,
         verbose: bool,
     ) -> OutputConfig {
-        OutputConfig::new(format, columns, header, verbose).unwrap()
+        OutputConfig::new(format, columns, header, verbose, false).unwrap()
     }
 
     #[test]
@@ -343,10 +606,9 @@ mod tests {
                 print_final_summary: true,
                 show_running_only_summary_note: false,
                 out: &mut out,
-                stats: &mut stats,
             };
-            stream_output.print_events(&events).unwrap();
-            stream_output.print_summary().unwrap();
+            print_events_with_stats(&mut stream_output, &events, None, &mut stats).unwrap();
+            stream_output.print_summary(&stats).unwrap();
         }
 
         let rendered = String::from_utf8(out).unwrap();
@@ -372,10 +634,15 @@ mod tests {
                 print_final_summary: true,
                 show_running_only_summary_note: true,
                 out: &mut out,
-                stats: &mut stats,
             };
-            stream_output.print_event(&reply_event(1, 1200)).unwrap();
-            stream_output.print_summary().unwrap();
+            print_events_with_stats(
+                &mut stream_output,
+                &[reply_event(1, 1200)],
+                None,
+                &mut stats,
+            )
+            .unwrap();
+            stream_output.print_summary(&stats).unwrap();
         }
 
         let rendered = String::from_utf8(out).unwrap();
@@ -385,7 +652,7 @@ mod tests {
         assert!(rendered.contains("packets:"));
         assert!(rendered.contains("received=1"));
 
-        let mut stats = StatsCollector::new(StatsConfig::continuous());
+        let stats = StatsCollector::new(StatsConfig::continuous());
         let mut out = Vec::new();
         {
             let mut stream_output = StreamOutput {
@@ -399,9 +666,8 @@ mod tests {
                 print_final_summary: false,
                 show_running_only_summary_note: true,
                 out: &mut out,
-                stats: &mut stats,
             };
-            stream_output.print_summary().unwrap();
+            stream_output.print_summary(&stats).unwrap();
         }
 
         assert!(out.is_empty());
