@@ -118,6 +118,30 @@ pub struct ClientConfig {
     pub max_pending_probes: usize,
 }
 
+/// Authentication settings used by client sessions.
+///
+/// `ClientConfig` keeps its existing top-level HMAC field for source
+/// compatibility. Managed multi-target callers can use this smaller type for
+/// per-target auth overrides without carrying a full independent
+/// [`ClientConfig`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ClientAuthConfig {
+    /// Optional HMAC key used to authenticate IRTT packets.
+    pub hmac_key: Option<Vec<u8>>,
+}
+
+impl From<Option<Vec<u8>>> for ClientAuthConfig {
+    fn from(hmac_key: Option<Vec<u8>>) -> Self {
+        Self { hmac_key }
+    }
+}
+
+impl From<ClientAuthConfig> for Option<Vec<u8>> {
+    fn from(auth: ClientAuthConfig) -> Self {
+        auth.hmac_key
+    }
+}
+
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {

@@ -59,6 +59,7 @@ mod managed;
 mod metadata;
 mod probe;
 mod receive;
+mod runtime;
 mod session;
 mod socket;
 mod socket_options;
@@ -66,8 +67,8 @@ mod timing;
 
 pub use client::Client;
 pub use config::{
-    ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig, MAX_DSCP_CODEPOINT,
-    MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
+    ClientAuthConfig, ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig,
+    MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
 };
 pub use error::{ClientError, EventSubscriptionError};
 pub use event::{
@@ -75,8 +76,11 @@ pub use event::{
     ServerTiming, SignedDuration, WarningKind,
 };
 pub use managed::{
-    CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientSession,
-    SessionEndReason, SessionOutcome, SubscriberConfig, SubscriberOverflow,
+    CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientGroup,
+    ManagedClientGroupConfig, ManagedClientGroupSession, ManagedClientSession,
+    ManagedGroupEndReason, ManagedGroupOutcome, ManagedGroupPacing, ManagedTargetConfig,
+    ManagedTargetEndReason, ManagedTargetOutcome, SessionEndReason, SessionOutcome,
+    SubscriberConfig, SubscriberOverflow, TargetEvent, TargetEventSubscription, TargetId,
 };
 pub use session::{NegotiatedParams, NegotiationRestriction};
 pub use timing::ClientTimestamp;

@@ -15,6 +15,14 @@ pub(crate) struct ReceivedDatagram {
     pub(crate) meta: ReceiveMeta,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReceivedDatagramFrom {
+    pub(crate) len: usize,
+    pub(crate) source: SocketAddr,
+    pub(crate) received_at: ClientTimestamp,
+    pub(crate) meta: ReceiveMeta,
+}
+
 #[cfg(not(all(target_os = "linux", feature = "ancillary")))]
 pub(crate) fn recv_datagram(
     socket: &UdpSocket,
@@ -30,12 +38,36 @@ pub(crate) fn recv_datagram(
     })
 }
 
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+pub(crate) fn recv_datagram_from(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagramFrom, io::Error> {
+    let (len, source) = socket.recv_from(buf)?;
+    let received_at = ClientTimestamp::now();
+
+    Ok(ReceivedDatagramFrom {
+        len,
+        source,
+        received_at,
+        meta: ReceiveMeta::default(),
+    })
+}
+
 #[cfg(all(target_os = "linux", feature = "ancillary"))]
 pub(crate) fn recv_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> Result<ReceivedDatagram, io::Error> {
     linux::recv_datagram(socket, buf)
+}
+
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+pub(crate) fn recv_datagram_from(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagramFrom, io::Error> {
+    linux::recv_datagram_from(socket, buf)
 }
 
 #[cfg(not(all(target_os = "linux", feature = "ancillary")))]

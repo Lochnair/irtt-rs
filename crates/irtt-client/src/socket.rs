@@ -99,6 +99,44 @@ pub(crate) fn connect_udp_socket(
     Ok(socket)
 }
 
+pub(crate) fn bind_unconnected_udp_socket(
+    config: &SocketConfig,
+    family_remote: SocketAddr,
+) -> Result<UdpSocket, ClientError> {
+    let domain = if family_remote.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+    if config.ipv6_only && family_remote.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    let bind_addr = config.bind_addr.unwrap_or_else(|| {
+        if family_remote.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0_u16; 8], 0))
+        }
+    });
+    socket.bind(&bind_addr.into())?;
+
+    let socket: UdpSocket = socket.into();
+    configure_receive_metadata(&socket, family_remote).map_err(|source| {
+        ClientError::SocketOption {
+            operation: "enable receive metadata",
+            remote: family_remote,
+            source,
+        }
+    })?;
+    if let Some(ttl) = config.ttl {
+        apply_ttl_to_socket(&socket, family_remote, ttl)?;
+    }
+    socket.set_read_timeout(config.recv_timeout)?;
+    Ok(socket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

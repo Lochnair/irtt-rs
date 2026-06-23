@@ -45,20 +45,20 @@ pub enum SubscriberOverflow {
     Disconnect,
 }
 
-/// Publish/subscribe fan-out for [`ClientEvent`] values.
+/// Publish/subscribe fan-out for managed event values.
 ///
 /// `EventHub` is used by managed sessions internally and is also exported for
 /// callers that want the same bounded subscription behavior around their own
 /// event producer. Publishing clones each event once per subscriber.
-#[derive(Debug, Clone)]
-pub struct EventHub {
-    inner: Arc<HubInner>,
+#[derive(Debug)]
+pub struct EventHub<T = ClientEvent> {
+    inner: Arc<HubInner<T>>,
 }
 
 #[derive(Debug)]
-struct HubInner {
+struct HubInner<T> {
     next_id: AtomicU64,
-    subscribers: Mutex<HashMap<u64, Arc<SubscriberInner>>>,
+    subscribers: Mutex<HashMap<u64, Arc<SubscriberInner<T>>>>,
 }
 
 /// Handle for receiving managed client events.
@@ -68,26 +68,34 @@ struct HubInner {
 /// when that queue is full. Dropping the handle unregisters the subscriber.
 #[must_use = "dropping the subscription unregisters it"]
 #[derive(Debug)]
-pub struct EventSubscription {
+pub struct EventSubscription<T = ClientEvent> {
     id: u64,
-    hub: Weak<HubInner>,
-    inner: Arc<SubscriberInner>,
+    hub: Weak<HubInner<T>>,
+    inner: Arc<SubscriberInner<T>>,
 }
 
 #[derive(Debug)]
-struct SubscriberInner {
-    state: Mutex<SubscriberState>,
+struct SubscriberInner<T> {
+    state: Mutex<SubscriberState<T>>,
     available: Condvar,
     config: SubscriberConfig,
 }
 
 #[derive(Debug)]
-struct SubscriberState {
-    queue: VecDeque<ClientEvent>,
+struct SubscriberState<T> {
+    queue: VecDeque<T>,
     connected: bool,
 }
 
-impl EventHub {
+impl<T> Clone for EventHub<T> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl<T> EventHub<T> {
     /// Create an empty event hub with no subscribers.
     pub fn new() -> Self {
         Self {
@@ -104,7 +112,7 @@ impl EventHub {
     pub fn subscribe(
         &self,
         config: SubscriberConfig,
-    ) -> Result<EventSubscription, crate::ClientError> {
+    ) -> Result<EventSubscription<T>, crate::ClientError> {
         if config.capacity == 0 {
             return Err(crate::ClientError::InvalidConfig {
                 reason: "subscriber capacity must be greater than zero".to_owned(),
@@ -133,13 +141,41 @@ impl EventHub {
         })
     }
 
+    /// Disconnect all subscribers after leaving their already queued events
+    /// available to drain.
+    pub fn disconnect_all(&self) {
+        let subscribers: Vec<Arc<SubscriberInner<T>>> = self
+            .inner
+            .subscribers
+            .lock()
+            .expect("event hub mutex poisoned")
+            .drain()
+            .map(|(_, subscriber)| subscriber)
+            .collect();
+
+        for subscriber in subscribers {
+            subscriber.disconnect();
+        }
+    }
+
+    #[cfg(test)]
+    fn subscriber_count(&self) -> usize {
+        self.inner
+            .subscribers
+            .lock()
+            .expect("event hub mutex poisoned")
+            .len()
+    }
+}
+
+impl<T: Clone> EventHub<T> {
     /// Publish an event to all currently connected subscribers.
     ///
     /// Slow subscribers are handled according to their
     /// [`SubscriberOverflow`] policy. Publishing does not block waiting for a
     /// subscriber to consume queued events.
-    pub fn publish(&self, event: ClientEvent) {
-        let subscribers: Vec<(u64, Arc<SubscriberInner>)> = self
+    pub fn publish(&self, event: T) {
+        let subscribers: Vec<(u64, Arc<SubscriberInner<T>>)> = self
             .inner
             .subscribers
             .lock()
@@ -170,47 +206,21 @@ impl EventHub {
             subscribers.remove(&id);
         }
     }
-
-    /// Disconnect all subscribers after leaving their already queued events
-    /// available to drain.
-    pub fn disconnect_all(&self) {
-        let subscribers: Vec<Arc<SubscriberInner>> = self
-            .inner
-            .subscribers
-            .lock()
-            .expect("event hub mutex poisoned")
-            .drain()
-            .map(|(_, subscriber)| subscriber)
-            .collect();
-
-        for subscriber in subscribers {
-            subscriber.disconnect();
-        }
-    }
-
-    #[cfg(test)]
-    fn subscriber_count(&self) -> usize {
-        self.inner
-            .subscribers
-            .lock()
-            .expect("event hub mutex poisoned")
-            .len()
-    }
 }
 
-impl Default for EventHub {
+impl<T> Default for EventHub<T> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EventSubscription {
+impl<T> EventSubscription<T> {
     /// Block until the next queued event is available.
     ///
     /// If the subscription is disconnected, this returns
     /// [`EventSubscriptionError::Disconnected`] after any already queued events
     /// have been drained.
-    pub fn recv(&self) -> Result<ClientEvent, EventSubscriptionError> {
+    pub fn recv(&self) -> Result<T, EventSubscriptionError> {
         let mut state = self.inner.state.lock().expect("subscriber mutex poisoned");
         loop {
             if let Some(event) = state.queue.pop_front() {
@@ -233,7 +243,7 @@ impl EventSubscription {
     /// is queued. If the subscription is disconnected, this returns
     /// [`EventSubscriptionError::Disconnected`] after any already queued events
     /// have been drained.
-    pub fn try_recv(&self) -> Result<Option<ClientEvent>, EventSubscriptionError> {
+    pub fn try_recv(&self) -> Result<Option<T>, EventSubscriptionError> {
         let mut state = self.inner.state.lock().expect("subscriber mutex poisoned");
         if let Some(event) = state.queue.pop_front() {
             return Ok(Some(event));
@@ -245,7 +255,7 @@ impl EventSubscription {
     }
 }
 
-impl Drop for EventSubscription {
+impl<T> Drop for EventSubscription<T> {
     fn drop(&mut self) {
         self.inner.disconnect();
         if let Some(hub) = self.hub.upgrade() {
@@ -257,8 +267,8 @@ impl Drop for EventSubscription {
     }
 }
 
-impl SubscriberInner {
-    fn publish(&self, event: ClientEvent) -> bool {
+impl<T> SubscriberInner<T> {
+    fn publish(&self, event: T) -> bool {
         let mut state = self.state.lock().expect("subscriber mutex poisoned");
         if !state.connected {
             return false;
@@ -411,7 +421,7 @@ mod tests {
 
     #[test]
     fn dropping_subscription_unregisters_from_hub() {
-        let hub = EventHub::new();
+        let hub: EventHub = EventHub::new();
         let sub = hub.subscribe(SubscriberConfig::default()).unwrap();
         assert_eq!(hub.subscriber_count(), 1);
 
@@ -422,7 +432,7 @@ mod tests {
 
     #[test]
     fn disconnect_all_wakes_blocking_receivers() {
-        let hub = EventHub::new();
+        let hub: EventHub = EventHub::new();
         let sub = hub.subscribe(SubscriberConfig::default()).unwrap();
         hub.disconnect_all();
 

@@ -1,13 +1,17 @@
 #![allow(unsafe_code)]
 use std::{
     io, mem,
-    net::{SocketAddr, UdpSocket},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
     os::fd::AsRawFd,
     ptr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{metadata::ReceiveMeta, receive::ReceivedDatagram, timing::ClientTimestamp};
+use crate::{
+    metadata::ReceiveMeta,
+    receive::{ReceivedDatagram, ReceivedDatagramFrom},
+    timing::ClientTimestamp,
+};
 
 const CONTROL_LEN: usize = 128;
 
@@ -87,6 +91,61 @@ pub(crate) fn recv_datagram(
     })
 }
 
+pub(crate) fn recv_datagram_from(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagramFrom, io::Error> {
+    let mut control = ControlBuffer::new();
+    let mut name: libc::sockaddr_storage = unsafe { mem::zeroed() };
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr().cast(),
+        iov_len: buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+    msg.msg_name = (&mut name as *mut libc::sockaddr_storage).cast();
+    msg.msg_namelen = mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = control.as_mut_ptr().cast();
+    msg.msg_controllen = control.len();
+
+    let len = unsafe {
+        // SAFETY: `msg` points to one writable iovec backed by `buf`, a
+        // writable source-address buffer, and a writable control buffer. All
+        // buffers live until `recvmsg` returns. The socket file descriptor is
+        // borrowed from a valid `UdpSocket`.
+        libc::recvmsg(socket.as_raw_fd(), &mut msg, 0)
+    };
+    if len < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = usize::try_from(len).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "recvmsg returned an unrepresentable datagram length",
+        )
+    })?;
+    let received_at = ClientTimestamp::now();
+    let source = unsafe {
+        // SAFETY: `name` and `msg_namelen` were initialized by a successful
+        // `recvmsg` call above.
+        socket_addr_from_storage(&name, msg.msg_namelen)?
+    };
+    let meta = unsafe {
+        // SAFETY: `msg` was initialized by a successful `recvmsg` call. The
+        // parser only reads cmsghdr entries within `msg_controllen` and ignores
+        // short or unrelated control messages.
+        parse_receive_meta(&msg)
+    };
+
+    Ok(ReceivedDatagramFrom {
+        len,
+        source,
+        received_at,
+        meta,
+    })
+}
+
 unsafe fn parse_receive_meta(msg: &libc::msghdr) -> ReceiveMeta {
     let mut meta = ReceiveMeta::default();
     let mut cmsg = libc::CMSG_FIRSTHDR(msg);
@@ -106,6 +165,52 @@ unsafe fn parse_receive_meta(msg: &libc::msghdr) -> ReceiveMeta {
         cmsg = libc::CMSG_NXTHDR(msg, cmsg);
     }
     meta
+}
+
+unsafe fn socket_addr_from_storage(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> io::Result<SocketAddr> {
+    match i32::from(storage.ss_family) {
+        libc::AF_INET => {
+            if usize::try_from(len).unwrap_or(0) < mem::size_of::<libc::sockaddr_in>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "short IPv4 source address from recvmsg",
+                ));
+            }
+            let addr = ptr::read_unaligned(
+                (storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>(),
+            );
+            let ip = Ipv4Addr::from(u32::from_be(addr.sin_addr.s_addr));
+            let port = u16::from_be(addr.sin_port);
+            Ok(SocketAddr::V4(SocketAddrV4::new(ip, port)))
+        }
+        libc::AF_INET6 => {
+            if usize::try_from(len).unwrap_or(0) < mem::size_of::<libc::sockaddr_in6>() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "short IPv6 source address from recvmsg",
+                ));
+            }
+            let addr = ptr::read_unaligned(
+                (storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>(),
+            );
+            let ip = Ipv6Addr::from(addr.sin6_addr.s6_addr);
+            let port = u16::from_be(addr.sin6_port);
+            let flowinfo = u32::from_be(addr.sin6_flowinfo);
+            Ok(SocketAddr::V6(SocketAddrV6::new(
+                ip,
+                port,
+                flowinfo,
+                addr.sin6_scope_id,
+            )))
+        }
+        family => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported source address family from recvmsg: {family}"),
+        )),
+    }
 }
 
 fn is_traffic_class_cmsg(cmsg: &libc::cmsghdr) -> bool {
