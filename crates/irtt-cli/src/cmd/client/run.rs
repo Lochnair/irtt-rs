@@ -285,7 +285,11 @@ fn run_group_stream(
         managed_targets,
         SubscriberConfig {
             capacity: 16_384,
-            overflow: SubscriberOverflow::Disconnect,
+            // CLI output is best-effort under sustained backpressure. Dropping
+            // stale rows keeps continuous runs attached to the running group
+            // instead of turning a full output queue into a disconnected
+            // subscriber and a potentially blocking join.
+            overflow: SubscriberOverflow::DropOldest,
         },
     )?;
 

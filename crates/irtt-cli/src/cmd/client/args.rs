@@ -399,6 +399,57 @@ mod tests {
     }
 
     #[test]
+    fn duplicate_resolved_target_addresses_are_rejected() {
+        let args = parse(&["127.0.0.1:2112", "127.0.0.1"]).unwrap();
+        let err = args.resolved_managed_targets().unwrap_err();
+
+        assert!(err.contains("duplicate resolved target address 127.0.0.1:2112"));
+    }
+
+    #[test]
+    fn target_normalization_matches_single_target_forms() {
+        assert_eq!(normalize_target_addr("127.0.0.1"), "127.0.0.1:2112");
+        assert_eq!(normalize_target_addr("127.0.0.1:1234"), "127.0.0.1:1234");
+        assert_eq!(normalize_target_addr("example.com"), "example.com:2112");
+        assert_eq!(
+            normalize_target_addr("example.com:1234"),
+            "example.com:1234"
+        );
+        assert_eq!(normalize_target_addr("[::1]"), "[::1]:2112");
+        assert_eq!(normalize_target_addr("[::1]:1234"), "[::1]:1234");
+        assert_eq!(normalize_target_addr("::1"), "[::1]:2112");
+    }
+
+    #[test]
+    fn target_resolution_respects_family_filters() {
+        let config = ClientConfig::default();
+        assert_eq!(
+            resolve_cli_target("127.0.0.1", &config).unwrap(),
+            "127.0.0.1:2112".parse().unwrap()
+        );
+        assert_eq!(
+            resolve_cli_target("[::1]", &config).unwrap(),
+            "[::1]:2112".parse().unwrap()
+        );
+        assert_eq!(
+            resolve_cli_target("::1", &config).unwrap(),
+            "[::1]:2112".parse().unwrap()
+        );
+
+        let mut ipv4_only = ClientConfig::default();
+        ipv4_only.socket_config.ipv4_only = true;
+        assert!(resolve_cli_target("127.0.0.1", &ipv4_only)
+            .unwrap()
+            .is_ipv4());
+        assert!(resolve_cli_target("::1", &ipv4_only).is_err());
+
+        let mut ipv6_only = ClientConfig::default();
+        ipv6_only.socket_config.ipv6_only = true;
+        assert!(resolve_cli_target("::1", &ipv6_only).unwrap().is_ipv6());
+        assert!(resolve_cli_target("127.0.0.1", &ipv6_only).is_err());
+    }
+
+    #[test]
     fn invalid_labelled_target_syntax_is_rejected() {
         assert!(parse(&["--target", "missing-equals"]).is_err());
         assert!(parse(&["--target", "=127.0.0.1:2112"]).is_err());

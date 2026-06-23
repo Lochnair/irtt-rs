@@ -29,6 +29,101 @@ impl FakeServer {
 }
 
 #[test]
+fn list_columns_succeeds_without_target() {
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .arg("--list-columns")
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Available event columns:"), "{stdout}");
+    assert!(stdout.contains("target"), "{stdout}");
+}
+
+#[test]
+fn single_target_default_table_omits_target_and_accepts_pacing() {
+    let server = start_echo_server(test_params(
+        Some(Duration::from_millis(30)),
+        Duration::from_millis(10),
+    ));
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--pacing",
+            "burst",
+            "--header",
+            "always",
+            &server.addr.to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let header = stdout.lines().next().unwrap_or_default();
+    assert!(!header.split_whitespace().any(|column| column == "target"));
+}
+
+#[test]
+fn single_target_custom_target_column_renders_positional_label() {
+    let server = start_echo_server(test_params(
+        Some(Duration::from_millis(30)),
+        Duration::from_millis(10),
+    ));
+    let target = server.addr.to_string();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--format",
+            "csv",
+            "--columns",
+            "target,seq",
+            "--header",
+            "never",
+            &target,
+        ])
+        .output()
+        .unwrap();
+
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.starts_with(&format!("{target},"))),
+        "{stdout}"
+    );
+}
+
+#[test]
 fn multi_target_csv_emits_rows_for_both_labels() {
     let params = test_params(Some(Duration::from_millis(40)), Duration::from_millis(10));
     let a = start_echo_server(params.clone());
