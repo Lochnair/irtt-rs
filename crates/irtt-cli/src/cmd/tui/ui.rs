@@ -642,7 +642,7 @@ fn draw_large(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Sn
 
     frame.render_widget(header(state, HeaderDensity::Large), top[0]);
     frame.render_widget(packet_panel(state, snapshot, top[1].height), top[1]);
-    frame.render_widget(timing_panel(snapshot), middle[0]);
+    frame.render_widget(timing_panel(state, snapshot), middle[0]);
     render_graph_area(frame, middle[1], state);
     frame.render_widget(recent_events_panel(state, bottom[0].height), bottom[0]);
     frame.render_widget(sample_panel(state, snapshot), bottom[1]);
@@ -683,6 +683,9 @@ enum HeaderDensity {
 
 fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
     let selected = state.selected_target();
+    let selected_label = selected
+        .map(|target| target.label.as_str())
+        .unwrap_or("target");
     let remote = selected
         .and_then(|target| target.remote.as_deref())
         .unwrap_or("-");
@@ -711,7 +714,11 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
                 state.status.label()
             )),
         ]),
-        Line::from(format!("remote: {remote}")),
+        Line::from(if state.is_multi_target() {
+            format!("first target: {selected_label}  remote: {remote}")
+        } else {
+            format!("remote: {remote}")
+        }),
     ];
     match density {
         HeaderDensity::Large => {
@@ -745,8 +752,11 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
 }
 
 fn full_graph_header(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
-    let remote = state
-        .selected_target()
+    let selected = state.selected_target();
+    let selected_label = selected
+        .map(|target| target.label.as_str())
+        .unwrap_or("target");
+    let remote = selected
         .and_then(|target| target.remote.as_deref())
         .unwrap_or("-");
     let elapsed = format_duration(state.started_at.elapsed());
@@ -757,13 +767,27 @@ fn full_graph_header(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static
         .map(|sample| format_ns_i128(Some(sample.effective_ns)))
         .unwrap_or_else(|| "-".to_owned());
 
+    let target_context = if state.is_multi_target() {
+        format!("first target {selected_label} remote {remote}")
+    } else {
+        format!("remote {remote}")
+    };
+
     Paragraph::new(Line::from(format!(
-        "irtt-rs  {}  remote {remote}  elapsed {elapsed}  sent {}  replies {}  last {last}",
+        "irtt-rs  {}  {target_context}  elapsed {elapsed}  sent {}  replies {}  last {last}",
         state.status.label(),
         format_count(packets.packets_sent),
         format_count(packets.unique_replies)
     )))
-    .block(Block::default().title("session").borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(if state.is_multi_target() {
+                "session - first target"
+            } else {
+                "session"
+            })
+            .borders(Borders::ALL),
+    )
 }
 
 fn packet_panel(state: &TuiState, snapshot: &Snapshot, panel_height: u16) -> Paragraph<'static> {
@@ -852,7 +876,7 @@ fn target_table_panel(state: &TuiState, panel_height: u16) -> Paragraph<'static>
         .wrap(Wrap { trim: false })
 }
 
-fn timing_panel(snapshot: &Snapshot) -> Paragraph<'_> {
+fn timing_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
     let mut lines = vec![Line::from(format!(
         "{:<18} {:>5} {:>9} {:>9} {:>9} {:>9}",
         "metric", "n", "min", "mean", "max", "stddev"
@@ -878,7 +902,15 @@ fn timing_panel(snapshot: &Snapshot) -> Paragraph<'_> {
     push_time_line(&mut lines, "timer error", &snapshot.timer_error);
 
     Paragraph::new(lines)
-        .block(Block::default().title("timing").borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(if state.is_multi_target() {
+                    "timing - first target"
+                } else {
+                    "timing"
+                })
+                .borders(Borders::ALL),
+        )
         .wrap(Wrap { trim: false })
 }
 
@@ -1291,7 +1323,15 @@ fn sample_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
         )),
         Line::from(format!("last warning: {warning}")),
     ])
-    .block(Block::default().title("sample").borders(Borders::ALL))
+    .block(
+        Block::default()
+            .title(if state.is_multi_target() {
+                "sample - first target"
+            } else {
+                "sample"
+            })
+            .borders(Borders::ALL),
+    )
     .wrap(Wrap { trim: true })
 }
 
@@ -1769,6 +1809,57 @@ mod tests {
             .last_warning
             .as_deref()
             .is_some_and(|warning| warning.contains("WrongToken")));
+    }
+
+    #[test]
+    fn multi_target_global_status_waits_for_all_targets_terminal() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+
+        state.process_target_event(&target_event(
+            "a",
+            ClientEvent::NoTestCompleted {
+                remote: remote(),
+                negotiated: NegotiatedParams {
+                    params: irtt_proto::Params::default(),
+                    restrictions: Vec::new(),
+                },
+                at: ts(Duration::ZERO),
+            },
+        ));
+
+        assert_eq!(state.targets[0].status, TargetStatus::NoTest);
+        assert_eq!(state.targets[1].status, TargetStatus::Opening);
+        assert_eq!(state.status, TuiStatus::Running);
+
+        state.process_target_event(&target_event(
+            "b",
+            ClientEvent::SessionClosed {
+                remote: remote(),
+                token: 0xabc,
+                at: ts(Duration::ZERO),
+            },
+        ));
+
+        assert_eq!(state.targets[1].status, TargetStatus::Closed);
+        assert_eq!(state.status, TuiStatus::Complete);
+    }
+
+    #[test]
+    fn reset_clears_graph_history_for_all_targets() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+
+        state.process_target_event(&target_event("a", reply(1, 1_000_000)));
+        state.process_target_event(&target_event("b", reply(2, 2_000_000)));
+        state.clear_visible_history();
+
+        assert!(state.targets[0].graph_history.is_empty());
+        assert!(state.targets[1].graph_history.is_empty());
+        assert_eq!(
+            state.recent_events.back().map(String::as_str),
+            Some("visible graph history reset")
+        );
     }
 
     #[test]

@@ -169,7 +169,7 @@ fn run_group_tui(
     let mut saw_target_event = false;
     let mut last_event_at = Instant::now();
 
-    loop {
+    let exit = loop {
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
             session.stop();
@@ -195,19 +195,25 @@ fn run_group_tui(
             }
             Ok(None) => {
                 if interrupted {
-                    break;
+                    break GroupLoopExit::Interrupted;
                 }
                 if terminal_targets.len() >= expected_target_count {
-                    break;
+                    break GroupLoopExit::AllTargetsTerminal;
                 }
                 if should_join_group_after_idle(&args, saw_target_event, last_event_at) {
-                    break;
+                    break GroupLoopExit::IdleGraceElapsed;
                 }
                 wait_for_tui_activity(None, next_render, state, terminal, shutdown_requested)?;
                 thread::sleep(IDLE_SLEEP);
             }
-            Err(EventSubscriptionError::Disconnected) => break,
+            Err(EventSubscriptionError::Disconnected) => {
+                break GroupLoopExit::SubscriptionDisconnected
+            }
         }
+    };
+
+    if exit.should_stop_before_join() {
+        session.stop();
     }
 
     if interrupted {
@@ -224,12 +230,39 @@ fn run_group_tui(
     }
 
     if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
-        return Err("managed client group was cancelled".into());
+        return match exit {
+            GroupLoopExit::IdleGraceElapsed => {
+                Err("managed client group stayed idle before all targets completed".into())
+            }
+            GroupLoopExit::SubscriptionDisconnected => {
+                Err("managed client group event subscription disconnected before completion".into())
+            }
+            GroupLoopExit::Interrupted | GroupLoopExit::AllTargetsTerminal => {
+                Err("managed client group was cancelled".into())
+            }
+        };
     }
 
     state.set_status(TuiStatus::Complete);
     render_if_due(terminal, state, next_render, true)?;
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupLoopExit {
+    Interrupted,
+    AllTargetsTerminal,
+    IdleGraceElapsed,
+    SubscriptionDisconnected,
+}
+
+impl GroupLoopExit {
+    fn should_stop_before_join(self) -> bool {
+        matches!(
+            self,
+            Self::Interrupted | Self::IdleGraceElapsed | Self::SubscriptionDisconnected
+        )
+    }
 }
 
 fn is_terminal_target_event(event: &ClientEvent) -> bool {
@@ -347,4 +380,53 @@ fn tui_wait_duration(
         next_render.saturating_duration_since(now)
     };
     send_wait.min(render_wait).min(TUI_WAIT_SLICE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> TuiArgs {
+        let mut argv = vec!["irtt-tui"];
+        argv.extend_from_slice(args);
+        TuiArgs::try_parse_from(argv).unwrap()
+    }
+
+    #[test]
+    fn continuous_multi_target_idle_does_not_stop_after_events() {
+        let args = parse(&["127.0.0.1:2112", "127.0.0.2:2112"]);
+        let old_event_at = Instant::now() - estimated_group_completion_grace(&args) - IDLE_SLEEP;
+
+        assert!(!should_join_group_after_idle(&args, true, old_event_at));
+    }
+
+    #[test]
+    fn finite_or_unopened_group_can_leave_after_idle_grace() {
+        let finite = parse(&["--duration", "1s", "127.0.0.1:2112", "127.0.0.2:2112"]);
+        let finite_old_event_at =
+            Instant::now() - estimated_group_completion_grace(&finite) - IDLE_SLEEP;
+        assert!(should_join_group_after_idle(
+            &finite,
+            true,
+            finite_old_event_at
+        ));
+
+        let continuous = parse(&["127.0.0.1:2112", "127.0.0.2:2112"]);
+        let unopened_old_event_at =
+            Instant::now() - estimated_group_completion_grace(&continuous) - IDLE_SLEEP;
+        assert!(should_join_group_after_idle(
+            &continuous,
+            false,
+            unopened_old_event_at
+        ));
+    }
+
+    #[test]
+    fn protective_group_exits_stop_before_joining() {
+        assert!(GroupLoopExit::Interrupted.should_stop_before_join());
+        assert!(GroupLoopExit::IdleGraceElapsed.should_stop_before_join());
+        assert!(GroupLoopExit::SubscriptionDisconnected.should_stop_before_join());
+        assert!(!GroupLoopExit::AllTargetsTerminal.should_stop_before_join());
+    }
 }
