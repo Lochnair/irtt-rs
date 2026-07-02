@@ -550,6 +550,60 @@ impl GraphMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultiTargetGraphMetric {
+    EffectiveRtt,
+    RawRtt,
+    AdjustedRtt,
+    ServerProcessing,
+}
+
+impl MultiTargetGraphMetric {
+    fn from_graph_mode(mode: GraphMode) -> Self {
+        match mode {
+            GraphMode::Rtt => Self::EffectiveRtt,
+            GraphMode::OneWay => Self::RawRtt,
+            GraphMode::Combined => Self::AdjustedRtt,
+            GraphMode::Split => Self::ServerProcessing,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::EffectiveRtt => "effective RTT per target",
+            Self::RawRtt => "raw RTT per target",
+            Self::AdjustedRtt => "adjusted RTT per target",
+            Self::ServerProcessing => "server processing per target",
+        }
+    }
+
+    fn title(self) -> &'static str {
+        match self {
+            Self::EffectiveRtt => "RTT history - effective per target",
+            Self::RawRtt => "RTT history - raw per target",
+            Self::AdjustedRtt => "RTT history - adjusted per target",
+            Self::ServerProcessing => "server processing - per target",
+        }
+    }
+
+    fn empty_message(self) -> &'static str {
+        match self {
+            Self::EffectiveRtt | Self::RawRtt => "waiting for primary replies",
+            Self::AdjustedRtt => "waiting for adjusted RTT samples",
+            Self::ServerProcessing => "waiting for server processing samples",
+        }
+    }
+
+    fn value_ns(self, sample: &GraphSample) -> Option<i128> {
+        match self {
+            Self::EffectiveRtt => Some(sample.effective_ns),
+            Self::RawRtt => Some(sample.raw_ns),
+            Self::AdjustedRtt => sample.adjusted_ns,
+            Self::ServerProcessing => sample.server_processing_ns,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GraphSample {
     seq: u32,
     effective_ns: i128,
@@ -853,27 +907,36 @@ fn target_table_panel(state: &TuiState, panel_height: u16) -> Paragraph<'static>
         "target", "status", "last", "loss", "dup", "late", "warn"
     ))];
 
-    for target in state.targets.iter().take(visible) {
+    for (idx, target) in state.targets.iter().enumerate().take(visible) {
         let snapshot = target.stats.snapshot();
         let last = target
             .last_sample
             .map(|sample| format_ns_i128(Some(sample.effective_ns)))
             .unwrap_or_else(|| "-".to_owned());
-        lines.push(Line::from(format!(
-            "{:<16} {:<8} {:>9} {:>5} {:>4} {:>4} {:>4}",
-            truncate(&target.label, 16),
-            target.status.label(),
-            last,
-            format_count(snapshot.loss.lost_packets),
-            format_count(snapshot.packets.duplicates),
-            format_count(snapshot.packets.late_packets),
-            format_count(snapshot.events.warning_events)
-        )));
+        lines.push(Line::from(vec![
+            target_label_span(&target.label, idx, 16),
+            Span::raw(format!(
+                " {:<8} {:>9} {:>5} {:>4} {:>4} {:>4}",
+                target.status.label(),
+                last,
+                format_count(snapshot.loss.lost_packets),
+                format_count(snapshot.packets.duplicates),
+                format_count(snapshot.packets.late_packets),
+                format_count(snapshot.events.warning_events)
+            )),
+        ]));
     }
 
     Paragraph::new(lines)
         .block(Block::default().title("targets").borders(Borders::ALL))
         .wrap(Wrap { trim: false })
+}
+
+fn target_label_span(label: &str, target_idx: usize, width: usize) -> Span<'static> {
+    Span::styled(
+        format!("{:<width$}", truncate(label, width), width = width),
+        target_style(target_idx).add_modifier(Modifier::BOLD),
+    )
 }
 
 fn timing_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
@@ -958,21 +1021,18 @@ fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let metric = MultiTargetGraphMetric::from_graph_mode(state.graph_mode);
     let capacity = visible_sample_capacity(area.width);
     let series = state
         .targets
         .iter()
         .enumerate()
-        .filter_map(|(idx, target)| target_rtt_series(target, idx, capacity))
+        .filter_map(|(idx, target)| target_metric_series(target, idx, capacity, metric))
         .collect::<Vec<_>>();
     if series.is_empty() {
         frame.render_widget(
-            Paragraph::new("waiting for primary replies")
-                .block(
-                    Block::default()
-                        .title("RTT history - per target")
-                        .borders(Borders::ALL),
-                )
+            Paragraph::new(metric.empty_message())
+                .block(Block::default().title(metric.title()).borders(Borders::ALL))
                 .wrap(Wrap { trim: true }),
             area,
         );
@@ -981,18 +1041,12 @@ fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState
 
     let x_max = series
         .iter()
-        .map(|series| series.data.len().saturating_sub(1))
-        .max()
-        .unwrap_or(1)
-        .max(1) as f64;
+        .flat_map(|series| series.data.iter().map(|(x, _)| *x))
+        .fold(1.0, f64::max);
     let (min_y, max_y) = chart_y_bounds(&series);
     let datasets = chart_datasets(&series);
     let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title("RTT history - per target")
-                .borders(Borders::ALL),
-        )
+        .block(Block::default().title(metric.title()).borders(Borders::ALL))
         .x_axis(
             Axis::default()
                 .bounds([0.0, x_max])
@@ -1155,10 +1209,11 @@ fn chart_series(value: GraphValue, visible: &[&GraphSample]) -> Option<ChartSeri
     })
 }
 
-fn target_rtt_series(
+fn target_metric_series(
     target: &TuiTargetState,
     target_idx: usize,
     capacity: usize,
+    metric: MultiTargetGraphMetric,
 ) -> Option<ChartSeries> {
     let start = target.graph_history.len().saturating_sub(capacity);
     let data = target
@@ -1166,7 +1221,11 @@ fn target_rtt_series(
         .iter()
         .skip(start)
         .enumerate()
-        .map(|(idx, sample)| (idx as f64, sample.effective_ns as f64 / 1_000_000.0))
+        .filter_map(|(idx, sample)| {
+            metric
+                .value_ns(sample)
+                .map(|ns| (idx as f64, ns as f64 / 1_000_000.0))
+        })
         .collect::<Vec<_>>();
 
     (!data.is_empty()).then_some(ChartSeries {
@@ -1342,22 +1401,19 @@ fn status_line(state: &TuiState) -> Paragraph<'_> {
     } else {
         ""
     };
-    let legend = if state.is_multi_target() {
-        Some(Line::from(format!("legend: {}", legend_text(state))))
+    let graph_label = if state.is_multi_target() {
+        MultiTargetGraphMetric::from_graph_mode(state.graph_mode).label()
     } else {
-        None
+        state.graph_mode.label()
     };
-    let mut lines = vec![Line::from(format!(
+    let lines = vec![Line::from(format!(
         "{}{}{} | graph {}{} | q quit | Ctrl-C quit | r reset | p pause | g graph | f full",
         state.status.label(),
         paused,
         quitting,
-        state.graph_mode.label(),
+        graph_label,
         if state.full_graph { " full" } else { "" }
     ))];
-    if let Some(legend) = legend {
-        lines.push(legend);
-    }
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
 }
 
@@ -1487,16 +1543,6 @@ fn truncate(value: &str, max_chars: usize) -> String {
         .take(max_chars.saturating_sub(1))
         .chain(std::iter::once('~'))
         .collect()
-}
-
-fn legend_text(state: &TuiState) -> String {
-    state
-        .targets
-        .iter()
-        .enumerate()
-        .map(|(idx, target)| format!("{} {}", idx + 1, target.label))
-        .collect::<Vec<_>>()
-        .join("  ")
 }
 
 fn format_seq(value: u32) -> String {
@@ -1991,6 +2037,126 @@ mod tests {
                 GraphValue::ServerToClient
             ]
         );
+    }
+
+    #[test]
+    fn multi_target_metric_series_uses_selected_sample_field() {
+        let mut target = TuiTargetState::new("alpha".to_owned(), stats_config(true));
+        target.push_graph_sample(GraphSample {
+            seq: 1,
+            effective_ns: 1_000_000,
+            raw_ns: 2_000_000,
+            adjusted_ns: Some(3_000_000),
+            client_to_server_ns: None,
+            server_to_client_ns: None,
+            server_processing_ns: Some(4_000_000),
+        });
+
+        assert_eq!(
+            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::EffectiveRtt)
+                .unwrap()
+                .data,
+            vec![(0.0, 1.0)]
+        );
+        assert_eq!(
+            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::RawRtt)
+                .unwrap()
+                .data,
+            vec![(0.0, 2.0)]
+        );
+        assert_eq!(
+            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::AdjustedRtt)
+                .unwrap()
+                .data,
+            vec![(0.0, 3.0)]
+        );
+        assert_eq!(
+            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::ServerProcessing)
+                .unwrap()
+                .data,
+            vec![(0.0, 4.0)]
+        );
+    }
+
+    #[test]
+    fn multi_target_metric_series_skips_missing_optional_samples() {
+        let mut target = TuiTargetState::new("alpha".to_owned(), stats_config(true));
+        target.push_graph_sample(GraphSample {
+            seq: 1,
+            effective_ns: 1_000_000,
+            raw_ns: 2_000_000,
+            adjusted_ns: None,
+            client_to_server_ns: None,
+            server_to_client_ns: None,
+            server_processing_ns: None,
+        });
+        target.push_graph_sample(GraphSample {
+            seq: 2,
+            effective_ns: 2_000_000,
+            raw_ns: 3_000_000,
+            adjusted_ns: Some(4_000_000),
+            client_to_server_ns: None,
+            server_to_client_ns: None,
+            server_processing_ns: Some(5_000_000),
+        });
+
+        assert_eq!(
+            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::AdjustedRtt)
+                .unwrap()
+                .data,
+            vec![(1.0, 4.0)]
+        );
+        assert_eq!(
+            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::ServerProcessing)
+                .unwrap()
+                .data,
+            vec![(1.0, 5.0)]
+        );
+    }
+
+    #[test]
+    fn multi_target_graph_mode_mapping_has_readable_labels_and_titles() {
+        let cases = [
+            (
+                GraphMode::Rtt,
+                MultiTargetGraphMetric::EffectiveRtt,
+                "effective RTT per target",
+                "RTT history - effective per target",
+            ),
+            (
+                GraphMode::OneWay,
+                MultiTargetGraphMetric::RawRtt,
+                "raw RTT per target",
+                "RTT history - raw per target",
+            ),
+            (
+                GraphMode::Combined,
+                MultiTargetGraphMetric::AdjustedRtt,
+                "adjusted RTT per target",
+                "RTT history - adjusted per target",
+            ),
+            (
+                GraphMode::Split,
+                MultiTargetGraphMetric::ServerProcessing,
+                "server processing per target",
+                "server processing - per target",
+            ),
+        ];
+
+        for (graph_mode, metric, label, title) in cases {
+            let mapped = MultiTargetGraphMetric::from_graph_mode(graph_mode);
+            assert_eq!(mapped, metric);
+            assert_eq!(mapped.label(), label);
+            assert_eq!(mapped.title(), title);
+        }
+    }
+
+    #[test]
+    fn target_label_span_uses_graph_series_style() {
+        let span = target_label_span("alpha-target", 3, 16);
+
+        assert_eq!(span.style, target_style(3).add_modifier(Modifier::BOLD));
+        assert_eq!(span.content.as_ref(), "alpha-target    ");
     }
 
     #[test]
