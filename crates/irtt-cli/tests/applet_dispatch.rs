@@ -44,6 +44,7 @@ fn canonical_without_applet_errors() {
     assert!(text.contains("server"));
 }
 
+#[cfg(feature = "client")]
 #[test]
 fn canonical_client_subcommand_dispatches_to_client() {
     let output = irtt_rs().args(["client", "--help"]).output().unwrap();
@@ -55,7 +56,21 @@ fn canonical_client_subcommand_dispatches_to_client() {
     assert!(text.contains("--columns <COLUMNS>"));
 }
 
+#[cfg(not(feature = "client"))]
+#[test]
+fn canonical_client_subcommand_reports_unavailable_when_disabled() {
+    let output = irtt_rs().args(["client", "--help"]).output().unwrap();
+    let text = output_text(&output);
+
+    assert!(!output.status.success());
+    assert!(
+        text.contains("client applet is not available; rebuild with the client feature"),
+        "{text}"
+    );
+}
+
 #[cfg(unix)]
+#[cfg(feature = "client")]
 #[test]
 fn client_applet_name_dispatches_to_client() {
     let output = irtt_rs_with_arg0("irtt-cli")
@@ -68,6 +83,22 @@ fn client_applet_name_dispatches_to_client() {
     assert!(text.contains("Minimal IRTT-compatible stream client"));
     assert!(text.contains("--format <FORMAT>"));
     assert!(text.contains("--columns <COLUMNS>"));
+}
+
+#[cfg(all(unix, not(feature = "client")))]
+#[test]
+fn client_applet_name_reports_unavailable_when_disabled() {
+    let output = irtt_rs_with_arg0("irtt-cli")
+        .arg("--help")
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+
+    assert!(!output.status.success());
+    assert!(
+        text.contains("client applet is not available; rebuild with the client feature"),
+        "{text}"
+    );
 }
 
 #[cfg(all(unix, feature = "tui"))]
