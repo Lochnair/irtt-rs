@@ -318,16 +318,12 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
                 state.toggle_pause();
                 force_render = true;
             }
-            KeyCode::Char('g') | KeyCode::Char('m') => {
-                state.cycle_graph_mode();
+            KeyCode::Char('g') => {
+                state.toggle_view();
                 force_render = true;
             }
-            KeyCode::Char('s') => {
-                state.cycle_graph_scale();
-                force_render = true;
-            }
-            KeyCode::Char('f') => {
-                state.toggle_full_graph();
+            KeyCode::Char('m') => {
+                state.cycle_graph_metric();
                 force_render = true;
             }
             KeyCode::Left => {

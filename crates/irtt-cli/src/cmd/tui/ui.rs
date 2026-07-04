@@ -93,10 +93,9 @@ pub(super) struct TuiState {
     targets: Vec<TuiTargetState>,
     recent_events: VecDeque<String>,
     last_warning: Option<String>,
-    graph_mode: GraphMode,
-    graph_scale: GraphScale,
+    graph_metric: GraphMetric,
     graph_viewport: GraphViewport,
-    full_graph: bool,
+    view: TuiView,
     pub(super) paused: bool,
     pub(super) quit_requested: bool,
 }
@@ -128,10 +127,9 @@ impl TuiState {
             targets,
             recent_events: VecDeque::with_capacity(RECENT_EVENT_LIMIT),
             last_warning: None,
-            graph_mode: GraphMode::Rtt,
-            graph_scale: GraphScale::Auto,
+            graph_metric: GraphMetric::EffectiveRtt,
             graph_viewport: GraphViewport::default(),
-            full_graph: false,
+            view: TuiView::Graph,
             paused: false,
             quit_requested: false,
         }
@@ -331,16 +329,12 @@ impl TuiState {
         self.paused = !self.paused;
     }
 
-    pub(super) fn cycle_graph_mode(&mut self) {
-        self.graph_mode = self.graph_mode.next();
+    pub(super) fn cycle_graph_metric(&mut self) {
+        self.graph_metric = self.graph_metric.next();
     }
 
-    pub(super) fn cycle_graph_scale(&mut self) {
-        self.graph_scale = self.graph_scale.next();
-    }
-
-    pub(super) fn toggle_full_graph(&mut self) {
-        self.full_graph = !self.full_graph;
+    pub(super) fn toggle_view(&mut self) {
+        self.view = self.view.next();
     }
 
     pub(super) fn pan_graph_left(&mut self) {
@@ -597,74 +591,16 @@ impl TuiStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GraphMode {
-    Rtt,
-    OneWay,
-    Combined,
-    Split,
+enum TuiView {
+    Graph,
+    Dashboard,
 }
 
-impl GraphMode {
+impl TuiView {
     fn next(self) -> Self {
         match self {
-            Self::Rtt => Self::OneWay,
-            Self::OneWay => Self::Combined,
-            Self::Combined => Self::Split,
-            Self::Split => Self::Rtt,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Rtt => "RTT",
-            Self::OneWay => "one-way",
-            Self::Combined => "combined",
-            Self::Split => "split",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum GraphScale {
-    Auto,
-    Ms100,
-    Ms250,
-    Ms500,
-    S1,
-    S2,
-}
-
-impl GraphScale {
-    fn next(self) -> Self {
-        match self {
-            Self::Auto => Self::Ms100,
-            Self::Ms100 => Self::Ms250,
-            Self::Ms250 => Self::Ms500,
-            Self::Ms500 => Self::S1,
-            Self::S1 => Self::S2,
-            Self::S2 => Self::Auto,
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Auto => "auto",
-            Self::Ms100 => "100ms",
-            Self::Ms250 => "250ms",
-            Self::Ms500 => "500ms",
-            Self::S1 => "1s",
-            Self::S2 => "2s",
-        }
-    }
-
-    fn fixed_upper_ms(self) -> Option<f64> {
-        match self {
-            Self::Auto => None,
-            Self::Ms100 => Some(100.0),
-            Self::Ms250 => Some(250.0),
-            Self::Ms500 => Some(500.0),
-            Self::S1 => Some(1_000.0),
-            Self::S2 => Some(2_000.0),
+            Self::Graph => Self::Dashboard,
+            Self::Dashboard => Self::Graph,
         }
     }
 }
@@ -842,38 +778,46 @@ fn duration_fraction(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MultiTargetGraphMetric {
+enum GraphMetric {
     EffectiveRtt,
     RawRtt,
     AdjustedRtt,
+    ClientToServer,
+    ServerToClient,
     ServerProcessing,
 }
 
-impl MultiTargetGraphMetric {
-    fn from_graph_mode(mode: GraphMode) -> Self {
-        match mode {
-            GraphMode::Rtt => Self::EffectiveRtt,
-            GraphMode::OneWay => Self::RawRtt,
-            GraphMode::Combined => Self::AdjustedRtt,
-            GraphMode::Split => Self::ServerProcessing,
+impl GraphMetric {
+    fn next(self) -> Self {
+        match self {
+            Self::EffectiveRtt => Self::RawRtt,
+            Self::RawRtt => Self::AdjustedRtt,
+            Self::AdjustedRtt => Self::ClientToServer,
+            Self::ClientToServer => Self::ServerToClient,
+            Self::ServerToClient => Self::ServerProcessing,
+            Self::ServerProcessing => Self::EffectiveRtt,
         }
     }
 
     fn label(self) -> &'static str {
         match self {
-            Self::EffectiveRtt => "effective RTT per target",
-            Self::RawRtt => "raw RTT per target",
-            Self::AdjustedRtt => "adjusted RTT per target",
-            Self::ServerProcessing => "server processing per target",
+            Self::EffectiveRtt => "effective RTT",
+            Self::RawRtt => "raw RTT",
+            Self::AdjustedRtt => "adjusted RTT",
+            Self::ClientToServer => "client to server",
+            Self::ServerToClient => "server to client",
+            Self::ServerProcessing => "server processing",
         }
     }
 
     fn title(self) -> &'static str {
         match self {
-            Self::EffectiveRtt => "RTT history - effective per target",
-            Self::RawRtt => "RTT history - raw per target",
-            Self::AdjustedRtt => "RTT history - adjusted per target",
-            Self::ServerProcessing => "server processing - per target",
+            Self::EffectiveRtt => "effective RTT",
+            Self::RawRtt => "raw RTT",
+            Self::AdjustedRtt => "adjusted RTT",
+            Self::ClientToServer => "client to server delay",
+            Self::ServerToClient => "server to client delay",
+            Self::ServerProcessing => "server processing",
         }
     }
 
@@ -881,6 +825,7 @@ impl MultiTargetGraphMetric {
         match self {
             Self::EffectiveRtt | Self::RawRtt => "waiting for primary replies",
             Self::AdjustedRtt => "waiting for adjusted RTT samples",
+            Self::ClientToServer | Self::ServerToClient => "waiting for one-way delay samples",
             Self::ServerProcessing => "waiting for server processing samples",
         }
     }
@@ -890,15 +835,31 @@ impl MultiTargetGraphMetric {
             Self::EffectiveRtt => Some(sample.effective_ns),
             Self::RawRtt => Some(sample.raw_ns),
             Self::AdjustedRtt => sample.adjusted_ns,
+            Self::ClientToServer => sample.client_to_server_ns,
+            Self::ServerToClient => sample.server_to_client_ns,
             Self::ServerProcessing => sample.server_processing_ns,
         }
     }
 
     fn axis_kind(self) -> ChartAxisKind {
         match self {
-            Self::EffectiveRtt | Self::RawRtt | Self::AdjustedRtt | Self::ServerProcessing => {
+            Self::EffectiveRtt | Self::RawRtt | Self::ServerProcessing => {
                 ChartAxisKind::NonNegative
             }
+            Self::AdjustedRtt | Self::ClientToServer | Self::ServerToClient => {
+                ChartAxisKind::Signed
+            }
+        }
+    }
+
+    fn style(self) -> Style {
+        match self {
+            Self::EffectiveRtt | Self::RawRtt | Self::AdjustedRtt => {
+                target_style(0).add_modifier(Modifier::BOLD)
+            }
+            Self::ClientToServer => Style::default().fg(Color::Magenta),
+            Self::ServerToClient => Style::default().fg(Color::LightBlue),
+            Self::ServerProcessing => Style::default().fg(Color::Green),
         }
     }
 }
@@ -941,15 +902,9 @@ pub(super) fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState) {
     }
 
     let snapshot = state.selected_snapshot();
-    if state.full_graph {
-        draw_full_graph(frame, area, state, &snapshot);
-        return;
-    }
-
-    if area.width >= 110 && area.height >= 32 {
-        draw_large(frame, area, state, &snapshot);
-    } else {
-        draw_compact(frame, area, state, &snapshot);
+    match state.view {
+        TuiView::Graph => draw_graph_view(frame, area, state, &snapshot),
+        TuiView::Dashboard => draw_dashboard_view(frame, area, state, &snapshot),
     }
 }
 
@@ -957,19 +912,32 @@ pub(super) fn should_render(now: Instant, next_render: Instant, paused: bool, fo
     force || (!paused && now >= next_render)
 }
 
-fn draw_full_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
+fn draw_graph_view(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
+    let header_height = if state.is_multi_target() { 7 } else { 3 };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
+            Constraint::Length(header_height),
             Constraint::Min(10),
             Constraint::Length(3),
         ])
         .split(area);
 
-    frame.render_widget(full_graph_header(state, snapshot), rows[0]);
+    if state.is_multi_target() {
+        frame.render_widget(target_table_panel(state, rows[0].height), rows[0]);
+    } else {
+        frame.render_widget(graph_summary_panel(state, snapshot), rows[0]);
+    }
     render_graph_area(frame, rows[1], state);
     frame.render_widget(status_line(state), rows[2]);
+}
+
+fn draw_dashboard_view(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
+    if area.width >= 110 && area.height >= 32 {
+        draw_large(frame, area, state, snapshot);
+    } else {
+        draw_compact(frame, area, state, snapshot);
+    }
 }
 
 fn draw_large(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
@@ -1106,7 +1074,7 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
         .wrap(Wrap { trim: true })
 }
 
-fn full_graph_header(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
+fn graph_summary_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
     let selected = state.selected_target();
     let selected_label = selected
         .map(|target| target.label.as_str())
@@ -1287,68 +1255,21 @@ fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
 
-    match state.graph_mode {
-        GraphMode::Split => render_split_graph(frame, area, state),
-        mode => {
-            let history = state
-                .selected_target()
-                .map(|target| &target.graph_history)
-                .expect("TuiState always has at least one target");
-            let visible = visible_history_window(history, viewport);
-            let series = graph_series(mode, &visible, viewport);
-            render_chart(
-                frame,
-                area,
-                &visible,
-                &series,
-                ChartRenderConfig {
-                    title: mode.title(),
-                    axis_kind: mode.axis_kind(),
-                    scale: state.graph_scale,
-                    viewport,
-                },
-            );
-        }
-    }
-}
-
-fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let viewport = state
-        .graph_viewport
-        .range(Instant::now(), state.newest_graph_sample_time());
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
-        .split(area);
     let history = state
         .selected_target()
         .map(|target| &target.graph_history)
         .expect("TuiState always has at least one target");
     let visible = visible_history_window(history, viewport);
-    let rtt = graph_series(GraphMode::Rtt, &visible, viewport);
-    let one_way = graph_series(GraphMode::OneWay, &visible, viewport);
+    let series = graph_series(state.graph_metric, &visible, viewport);
 
     render_chart(
         frame,
-        rows[0],
+        area,
         &visible,
-        &rtt,
+        &series,
         ChartRenderConfig {
-            title: GraphMode::Rtt.title(),
-            axis_kind: GraphMode::Rtt.axis_kind(),
-            scale: state.graph_scale,
-            viewport,
-        },
-    );
-    render_chart(
-        frame,
-        rows[1],
-        &visible,
-        &one_way,
-        ChartRenderConfig {
-            title: GraphMode::OneWay.title(),
-            axis_kind: GraphMode::OneWay.axis_kind(),
-            scale: state.graph_scale,
+            metric: state.graph_metric,
+            context: graph_context(state, viewport),
             viewport,
         },
     );
@@ -1360,7 +1281,7 @@ fn render_multi_target_graph(
     state: &TuiState,
     viewport: GraphViewportRange,
 ) {
-    let metric = MultiTargetGraphMetric::from_graph_mode(state.graph_mode);
+    let metric = state.graph_metric;
     let series = state
         .targets
         .iter()
@@ -1370,23 +1291,23 @@ fn render_multi_target_graph(
     if series.is_empty() {
         frame.render_widget(
             Paragraph::new(metric.empty_message())
-                .block(Block::default().title(metric.title()).borders(Borders::ALL))
+                .block(
+                    Block::default()
+                        .title(graph_chart_title(metric, &graph_context(state, viewport)))
+                        .borders(Borders::ALL),
+                )
                 .wrap(Wrap { trim: true }),
             area,
         );
         return;
     }
 
-    let (min_y, max_y) = chart_y_bounds(&series, metric.axis_kind(), state.graph_scale);
+    let (min_y, max_y) = chart_y_bounds(&series, metric.axis_kind());
     let datasets = chart_datasets(&series);
     let chart = Chart::new(datasets)
         .block(
             Block::default()
-                .title(format!(
-                    "{} ({})",
-                    metric.title(),
-                    state.graph_scale.label()
-                ))
+                .title(graph_chart_title(metric, &graph_context(state, viewport)))
                 .borders(Borders::ALL),
         )
         .x_axis(
@@ -1398,10 +1319,7 @@ fn render_multi_target_graph(
         .y_axis(
             Axis::default()
                 .bounds([min_y, max_y])
-                .labels(vec![
-                    Span::raw(format_ms_label(min_y)),
-                    Span::raw(format_ms_label(max_y)),
-                ])
+                .labels(y_axis_labels(min_y, max_y, y_axis_label_count(area.height)))
                 .style(Style::default().fg(Color::Gray)),
         );
     frame.render_widget(chart, area);
@@ -1410,31 +1328,30 @@ fn render_multi_target_graph(
 fn render_chart(
     frame: &mut Frame<'_>,
     area: Rect,
-    visible: &[&GraphSample],
+    _visible: &[&GraphSample],
     series: &[ChartSeries],
     config: ChartRenderConfig,
 ) {
     if series.is_empty() {
-        let note = if visible.is_empty() {
-            "waiting for primary replies"
-        } else {
-            "one-way data unavailable for negotiated timestamp mode"
-        };
         frame.render_widget(
-            Paragraph::new(note)
-                .block(Block::default().title(config.title).borders(Borders::ALL))
+            Paragraph::new(config.metric.empty_message())
+                .block(
+                    Block::default()
+                        .title(graph_chart_title(config.metric, &config.context))
+                        .borders(Borders::ALL),
+                )
                 .wrap(Wrap { trim: true }),
             area,
         );
         return;
     }
 
-    let (min_y, max_y) = chart_y_bounds(series, config.axis_kind, config.scale);
+    let (min_y, max_y) = chart_y_bounds(series, config.metric.axis_kind());
     let datasets = chart_datasets(series);
     let chart = Chart::new(datasets)
         .block(
             Block::default()
-                .title(format!("{} ({})", config.title, config.scale.label()))
+                .title(graph_chart_title(config.metric, &config.context))
                 .borders(Borders::ALL),
         )
         .x_axis(
@@ -1446,78 +1363,21 @@ fn render_chart(
         .y_axis(
             Axis::default()
                 .bounds([min_y, max_y])
-                .labels(vec![
-                    Span::raw(format_ms_label(min_y)),
-                    Span::raw(format_ms_label(max_y)),
-                ])
+                .labels(y_axis_labels(min_y, max_y, y_axis_label_count(area.height)))
                 .style(Style::default().fg(Color::Gray)),
         );
     frame.render_widget(chart, area);
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct ChartRenderConfig {
-    title: &'static str,
-    axis_kind: ChartAxisKind,
-    scale: GraphScale,
+    metric: GraphMetric,
+    context: String,
     viewport: GraphViewportRange,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GraphValue {
-    EffectiveRtt,
-    ClientToServer,
-    ServerToClient,
-}
-
-impl GraphValue {
-    fn name(self) -> &'static str {
-        match self {
-            Self::EffectiveRtt => "eff RTT",
-            Self::ClientToServer => "c2s",
-            Self::ServerToClient => "s2c",
-        }
-    }
-
-    fn style(self) -> Style {
-        match self {
-            Self::EffectiveRtt => target_style(0).add_modifier(Modifier::BOLD),
-            Self::ClientToServer => Style::default().fg(Color::Magenta),
-            Self::ServerToClient => Style::default().fg(Color::LightBlue),
-        }
-    }
-
-    fn value_ns(self, sample: &GraphSample) -> Option<i128> {
-        match self {
-            Self::EffectiveRtt => Some(sample.effective_ns),
-            Self::ClientToServer => sample.client_to_server_ns,
-            Self::ServerToClient => sample.server_to_client_ns,
-        }
-    }
-}
-
-impl GraphMode {
-    fn title(self) -> &'static str {
-        match self {
-            Self::Rtt => "RTT history — effective",
-            Self::OneWay => "one-way delay — c2s / s2c",
-            Self::Combined => "RTT + one-way correlation",
-            Self::Split => "split history",
-        }
-    }
-
-    fn axis_kind(self) -> ChartAxisKind {
-        match self {
-            Self::Rtt => ChartAxisKind::NonNegative,
-            Self::OneWay | Self::Split => ChartAxisKind::Signed,
-            Self::Combined => ChartAxisKind::Mixed,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
 struct ChartSeries {
-    value: Option<GraphValue>,
     name: String,
     style: Style,
     data: Vec<(f64, f64)>,
@@ -1527,7 +1387,6 @@ struct ChartSeries {
 enum ChartAxisKind {
     NonNegative,
     Signed,
-    Mixed,
 }
 
 fn visible_history_window(
@@ -1541,44 +1400,32 @@ fn visible_history_window(
 }
 
 fn graph_series(
-    mode: GraphMode,
+    metric: GraphMetric,
     visible: &[&GraphSample],
     viewport: GraphViewportRange,
 ) -> Vec<ChartSeries> {
-    let values: &[GraphValue] = match mode {
-        GraphMode::Rtt => &[GraphValue::EffectiveRtt],
-        GraphMode::OneWay => &[GraphValue::ClientToServer, GraphValue::ServerToClient],
-        GraphMode::Combined => &[
-            GraphValue::EffectiveRtt,
-            GraphValue::ClientToServer,
-            GraphValue::ServerToClient,
-        ],
-        GraphMode::Split => &[],
-    };
-    values
-        .iter()
-        .filter_map(|value| chart_series(*value, visible, viewport))
+    chart_series(metric, visible, viewport)
+        .into_iter()
         .collect()
 }
 
 fn chart_series(
-    value: GraphValue,
+    metric: GraphMetric,
     visible: &[&GraphSample],
     viewport: GraphViewportRange,
 ) -> Option<ChartSeries> {
     let data: Vec<(f64, f64)> = visible
         .iter()
         .filter_map(|sample| {
-            value
+            metric
                 .value_ns(sample)
                 .map(|ns| (sample_x(sample, viewport), ns as f64 / 1_000_000.0))
         })
         .collect();
 
     (!data.is_empty()).then_some(ChartSeries {
-        value: Some(value),
-        name: value.name().to_owned(),
-        style: value.style(),
+        name: metric.label().to_owned(),
+        style: metric.style(),
         data,
     })
 }
@@ -1587,7 +1434,7 @@ fn target_metric_series(
     target: &TuiTargetState,
     target_idx: usize,
     viewport: GraphViewportRange,
-    metric: MultiTargetGraphMetric,
+    metric: GraphMetric,
 ) -> Option<ChartSeries> {
     let data = target
         .graph_history
@@ -1601,7 +1448,6 @@ fn target_metric_series(
         .collect::<Vec<_>>();
 
     (!data.is_empty()).then_some(ChartSeries {
-        value: None,
         name: target.label.clone(),
         style: target_style(target_idx),
         data,
@@ -1643,23 +1489,15 @@ fn target_style(idx: usize) -> Style {
     Style::default().fg(COLORS[idx % COLORS.len()])
 }
 
-fn chart_y_bounds(
-    series: &[ChartSeries],
-    axis_kind: ChartAxisKind,
-    scale: GraphScale,
-) -> (f64, f64) {
-    if let Some(upper) = scale.fixed_upper_ms() {
-        return match axis_kind {
-            ChartAxisKind::NonNegative => (0.0, upper),
-            ChartAxisKind::Signed | ChartAxisKind::Mixed => (-upper, upper),
-        };
-    }
-
+fn chart_y_bounds(series: &[ChartSeries], axis_kind: ChartAxisKind) -> (f64, f64) {
     let mut values = series.iter().flat_map(|series| {
         series
             .data
             .iter()
-            .map(|(_, value)| y_bound_value(axis_kind, series.value, *value))
+            .map(|(_, value)| match axis_kind {
+                ChartAxisKind::NonNegative => (*value).max(0.0),
+                ChartAxisKind::Signed => *value,
+            })
             .filter(|value| value.is_finite())
     });
     let Some(first) = values.next() else {
@@ -1673,63 +1511,48 @@ fn chart_y_bounds(
     }
 
     match axis_kind {
-        ChartAxisKind::NonNegative => {
-            let upper = nice_non_negative_upper_ms(max_y.max(0.0));
-            (0.0, upper)
-        }
-        ChartAxisKind::Signed | ChartAxisKind::Mixed => signed_chart_y_bounds(min_y, max_y),
+        ChartAxisKind::NonNegative => padded_non_negative_chart_y_bounds(min_y, max_y),
+        ChartAxisKind::Signed => padded_signed_chart_y_bounds(min_y, max_y),
     }
 }
 
 fn default_y_bounds(axis_kind: ChartAxisKind) -> (f64, f64) {
     match axis_kind {
         ChartAxisKind::NonNegative => (0.0, 10.0),
-        ChartAxisKind::Signed | ChartAxisKind::Mixed => (-1.0, 1.0),
+        ChartAxisKind::Signed => (-1.0, 1.0),
     }
 }
 
-fn y_bound_value(axis_kind: ChartAxisKind, value_kind: Option<GraphValue>, value: f64) -> f64 {
-    match axis_kind {
-        ChartAxisKind::NonNegative => value.max(0.0),
-        ChartAxisKind::Signed => value,
-        ChartAxisKind::Mixed if value_kind == Some(GraphValue::EffectiveRtt) => value.max(0.0),
-        ChartAxisKind::Mixed => value,
-    }
-}
-
-fn signed_chart_y_bounds(mut min_y: f64, mut max_y: f64) -> (f64, f64) {
-    let span = max_y - min_y;
-    let pad = if span <= f64::EPSILON {
-        (max_y.abs() * 0.05).max(1.0)
+fn padded_non_negative_chart_y_bounds(min_y: f64, max_y: f64) -> (f64, f64) {
+    let pad = chart_y_padding(min_y, max_y);
+    let lower = (min_y - pad).max(0.0);
+    let upper = max_y + pad;
+    if lower < upper {
+        (lower, upper)
     } else {
-        (span * 0.1).max(1.0)
-    };
+        (0.0, pad.max(1.0))
+    }
+}
+
+fn padded_signed_chart_y_bounds(mut min_y: f64, mut max_y: f64) -> (f64, f64) {
+    let pad = chart_y_padding(min_y, max_y);
     min_y -= pad;
     max_y += pad;
     if min_y >= max_y {
-        (min_y - 1.0, max_y + 1.0)
+        (min_y - pad, max_y + pad)
     } else {
         (min_y, max_y)
     }
 }
 
-fn nice_non_negative_upper_ms(max_y: f64) -> f64 {
-    if !max_y.is_finite() || max_y <= 0.0 {
-        return 10.0;
+fn chart_y_padding(min_y: f64, max_y: f64) -> f64 {
+    const MIN_PADDING_MS: f64 = 0.1;
+    let span = max_y - min_y;
+    if span <= f64::EPSILON {
+        (max_y.abs() * 0.1).max(MIN_PADDING_MS)
+    } else {
+        (span * 0.1).max(MIN_PADDING_MS)
     }
-
-    nice_upper_ms((max_y * 1.1).max(10.0))
-}
-
-fn nice_upper_ms(value: f64) -> f64 {
-    let magnitude = 10_f64.powf(value.log10().floor());
-    for factor in [1.0, 2.0, 5.0, 10.0] {
-        let candidate = factor * magnitude;
-        if value <= candidate {
-            return candidate;
-        }
-    }
-    10.0 * magnitude
 }
 
 fn viewport_x_bounds(viewport: GraphViewportRange) -> [f64; 2] {
@@ -1743,13 +1566,71 @@ fn viewport_x_axis_labels(viewport: GraphViewportRange) -> Vec<Span<'static>> {
     ]
 }
 
-fn format_ms_label(value: f64) -> String {
-    if value.abs() < 10.0 {
-        format!("{value:.2}ms")
-    } else if value.abs() < 100.0 {
-        format!("{value:.1}ms")
+fn graph_context(state: &TuiState, viewport: GraphViewportRange) -> String {
+    format!(
+        "{} | window {}",
+        graph_viewport_status(state),
+        format_duration(viewport.window)
+    )
+}
+
+fn graph_chart_title(metric: GraphMetric, context: &str) -> String {
+    format!("{} | {context}", metric.title())
+}
+
+fn y_axis_label_count(height: u16) -> usize {
+    let inner = height.saturating_sub(2);
+    if inner >= 14 {
+        7
+    } else if inner >= 9 {
+        5
+    } else if inner >= 5 {
+        3
     } else {
-        format!("{value:.0}ms")
+        2
+    }
+}
+
+fn y_axis_labels(min_y: f64, max_y: f64, label_count: usize) -> Vec<Span<'static>> {
+    let label_count = label_count.max(2);
+    let step = (max_y - min_y) / (label_count - 1) as f64;
+    (0..label_count)
+        .map(|idx| Span::raw(format_axis_time_ms(min_y + step * idx as f64)))
+        .collect()
+}
+
+fn format_axis_time_ms(value_ms: f64) -> String {
+    let value_ms = if value_ms.abs() < 0.000_5 {
+        0.0
+    } else {
+        value_ms
+    };
+    let sign = if value_ms < 0.0 { "-" } else { "" };
+    let abs_ms = value_ms.abs();
+    if abs_ms < 1.0 {
+        let us = abs_ms * 1_000.0;
+        if us < 10.0 {
+            format!("{sign}{us:.1}us")
+        } else {
+            format!("{sign}{us:.0}us")
+        }
+    } else if abs_ms < 1_000.0 {
+        if abs_ms < 10.0 {
+            format!("{sign}{abs_ms:.2}ms")
+        } else if abs_ms < 100.0 {
+            format!("{sign}{abs_ms:.1}ms")
+        } else {
+            format!("{sign}{abs_ms:.0}ms")
+        }
+    } else {
+        let secs = abs_ms / 1_000.0;
+        if secs < 10.0 {
+            format!("{sign}{secs:.2}s")
+        } else if secs < 100.0 {
+            format!("{sign}{secs:.1}s")
+        } else {
+            format!("{sign}{secs:.0}s")
+        }
     }
 }
 
@@ -1836,25 +1717,25 @@ fn status_line(state: &TuiState) -> Paragraph<'_> {
     } else {
         ""
     };
-    let graph_label = if state.is_multi_target() {
-        MultiTargetGraphMetric::from_graph_mode(state.graph_mode).label()
-    } else {
-        state.graph_mode.label()
+    let view_hint = match state.view {
+        TuiView::Graph => "g dashboard",
+        TuiView::Dashboard => "g graph",
     };
-    let mode = graph_viewport_status(state);
-    let layout = if state.full_graph { " | full" } else { "" };
     let controls = if state.graph_viewport.mode == GraphViewportMode::Follow {
-        " | q quit | r reset | p pause | m/g metric | s scale | f full | arrows pan | +/- zoom"
+        format!(
+            "q quit | r reset | p pause | {view_hint} | m metric | arrows pan | +/- zoom | 0 reset window"
+        )
     } else {
-        " | End live | ←/→ pan | PgUp/PgDn page | +/- zoom | q quit"
+        format!(
+            "q quit | End live | {view_hint} | m metric | arrows pan | PgUp/PgDn page | +/- zoom | 0 reset window"
+        )
     };
     let lines = vec![Line::from(format!(
-        "{}{}{} | {mode} | window {} | metric {graph_label}{layout} | scale {}{controls}",
+        "{}{}{} | {}",
         state.status.label(),
         paused,
         quitting,
-        format_duration(state.graph_viewport.window),
-        state.graph_scale.label()
+        controls
     ))];
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
 }
@@ -2104,9 +1985,8 @@ mod tests {
 
     fn series(data: Vec<(f64, f64)>) -> ChartSeries {
         ChartSeries {
-            value: Some(GraphValue::EffectiveRtt),
-            name: GraphValue::EffectiveRtt.name().to_owned(),
-            style: GraphValue::EffectiveRtt.style(),
+            name: GraphMetric::EffectiveRtt.label().to_owned(),
+            style: GraphMetric::EffectiveRtt.style(),
             data,
         }
     }
@@ -2434,101 +2314,84 @@ mod tests {
     }
 
     #[test]
-    fn rtt_chart_bounds_clamp_low_latency_samples_to_zero() {
-        let series = [series(vec![(0.0, 9.8), (1.0, 10.0), (2.0, 10.2)])];
-        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::NonNegative, GraphScale::Auto);
-
-        assert_eq!(min_y, 0.0);
-        assert_eq!(max_y, 20.0);
-    }
-
-    #[test]
-    fn rtt_chart_bounds_round_auto_upper_to_nice_ceiling() {
-        let series = [series(vec![(0.0, 8.0), (1.0, 426.0)])];
-        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::NonNegative, GraphScale::Auto);
-
-        assert_eq!(min_y, 0.0);
-        assert_eq!(max_y, 500.0);
-    }
-
-    #[test]
-    fn rtt_chart_bounds_handle_empty_zero_and_negative_values() {
-        assert_eq!(
-            chart_y_bounds(&[], ChartAxisKind::NonNegative, GraphScale::Auto),
-            (0.0, 10.0)
+    fn chart_bounds_use_only_viewport_local_series_data() {
+        let start = Instant::now();
+        let history: VecDeque<_> = [
+            GraphSample {
+                timestamp: start,
+                seq: 1,
+                effective_ns: 1_000_000_000,
+                raw_ns: 1_000_000_000,
+                adjusted_ns: Some(1_000_000_000),
+                client_to_server_ns: None,
+                server_to_client_ns: None,
+                server_processing_ns: None,
+            },
+            GraphSample {
+                timestamp: start + Duration::from_secs(10),
+                seq: 2,
+                effective_ns: 10_000_000,
+                raw_ns: 10_000_000,
+                adjusted_ns: Some(10_000_000),
+                client_to_server_ns: None,
+                server_to_client_ns: None,
+                server_processing_ns: None,
+            },
+        ]
+        .into();
+        let viewport = viewport(
+            start + Duration::from_secs(5),
+            start + Duration::from_secs(15),
         );
+        let visible = visible_history_window(&history, viewport);
+        let plotted = graph_series(GraphMetric::EffectiveRtt, &visible, viewport);
 
-        let zero = [series(vec![(0.0, 0.0), (1.0, 0.0)])];
-        assert_eq!(
-            chart_y_bounds(&zero, ChartAxisKind::NonNegative, GraphScale::Auto),
-            (0.0, 10.0)
-        );
+        let (_min_y, max_y) = chart_y_bounds(&plotted, GraphMetric::EffectiveRtt.axis_kind());
 
-        let negative = [series(vec![(0.0, -3.0), (1.0, -1.5), (2.0, 0.5)])];
-        let (min_y, max_y) =
-            chart_y_bounds(&negative, ChartAxisKind::NonNegative, GraphScale::Auto);
-        assert_eq!(min_y, 0.0);
-        assert_eq!(max_y, 10.0);
+        assert!(max_y < 20.0, "max_y={max_y}");
     }
 
     #[test]
-    fn signed_chart_bounds_preserve_negative_values() {
+    fn non_negative_chart_bounds_do_not_pad_below_zero() {
+        let series = [series(vec![(0.0, 0.05), (1.0, 0.08), (2.0, 0.1)])];
+        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::NonNegative);
+
+        assert_eq!(min_y, 0.0);
+        assert!(max_y > 0.1, "max_y={max_y}");
+    }
+
+    #[test]
+    fn signed_chart_bounds_can_include_negative_values() {
         let series = [series(vec![(0.0, -3.0), (1.0, -1.5), (2.0, 0.5)])];
-        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::Signed, GraphScale::Auto);
+        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::Signed);
 
         assert!(min_y < -3.0, "min_y={min_y}");
         assert!(max_y > 0.5, "max_y={max_y}");
     }
 
     #[test]
-    fn mixed_chart_bounds_ignore_negative_effective_rtt_for_axis_floor() {
-        let rtt_series = ChartSeries {
-            value: Some(GraphValue::EffectiveRtt),
-            name: GraphValue::EffectiveRtt.name().to_owned(),
-            style: GraphValue::EffectiveRtt.style(),
-            data: vec![(0.0, -3.0), (1.0, 0.5)],
-        };
-        let one_way_series = ChartSeries {
-            value: Some(GraphValue::ClientToServer),
-            name: GraphValue::ClientToServer.name().to_owned(),
-            style: GraphValue::ClientToServer.style(),
-            data: vec![(0.0, 2.0)],
-        };
+    fn chart_bounds_handle_empty_and_flat_series() {
+        assert_eq!(chart_y_bounds(&[], ChartAxisKind::NonNegative), (0.0, 10.0));
+        assert_eq!(chart_y_bounds(&[], ChartAxisKind::Signed), (-1.0, 1.0));
 
-        let (min_y, max_y) = chart_y_bounds(
-            &[rtt_series, one_way_series],
-            ChartAxisKind::Mixed,
-            GraphScale::Auto,
-        );
-
-        assert!(min_y >= -1.0, "min_y={min_y}");
-        assert!(max_y > 2.0, "max_y={max_y}");
-    }
-
-    #[test]
-    fn fixed_chart_bounds_use_selected_common_range() {
-        let series = [series(vec![(0.0, 12.0), (1.0, 426.0)])];
-        assert_eq!(
-            chart_y_bounds(&series, ChartAxisKind::NonNegative, GraphScale::Ms500),
-            (0.0, 500.0)
-        );
-        assert_eq!(
-            chart_y_bounds(&series, ChartAxisKind::Signed, GraphScale::Ms100),
-            (-100.0, 100.0)
-        );
-    }
-
-    #[test]
-    fn signed_chart_bounds_handle_empty_and_flat_series() {
-        assert_eq!(
-            chart_y_bounds(&[], ChartAxisKind::Signed, GraphScale::Auto),
-            (-1.0, 1.0)
-        );
         let flat = [series(vec![(0.0, 12.0), (1.0, 12.0)])];
-        let (min_y, max_y) = chart_y_bounds(&flat, ChartAxisKind::Signed, GraphScale::Auto);
+        let (min_y, max_y) = chart_y_bounds(&flat, ChartAxisKind::Signed);
         assert!(min_y < 12.0, "min_y={min_y}");
         assert!(max_y > 12.0, "max_y={max_y}");
-        assert!(min_y > 0.0, "min_y={min_y}");
+    }
+
+    #[test]
+    fn y_axis_tick_labels_use_label_count_minus_one_spacing() {
+        let labels = y_axis_labels(-1.0, 1.0, 5);
+        let rendered = labels
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rendered,
+            vec!["-1.00ms", "-500us", "0.0us", "500us", "1.00ms"]
+        );
     }
 
     #[test]
@@ -2537,48 +2400,27 @@ mod tests {
         let visible: Vec<_> = visible_samples.iter().collect();
         let viewport = viewport_for_visible(&visible);
 
-        let one_way = graph_series(GraphMode::OneWay, &visible, viewport);
-        let rtt = graph_series(GraphMode::Rtt, &visible, viewport);
+        let one_way = graph_series(GraphMetric::ClientToServer, &visible, viewport);
+        let rtt = graph_series(GraphMetric::EffectiveRtt, &visible, viewport);
 
         assert!(one_way.is_empty());
-        assert_eq!(
-            rtt.iter()
-                .filter_map(|series| series.value)
-                .collect::<Vec<_>>(),
-            vec![GraphValue::EffectiveRtt]
-        );
+        assert_eq!(rtt.len(), 1);
+        assert_eq!(rtt[0].name, "effective RTT");
     }
 
     #[test]
-    fn graph_modes_use_readable_default_series() {
+    fn graph_metrics_use_readable_default_series() {
         let visible_samples = [graph_sample_with_timing(1, 3_000_000)];
         let visible: Vec<_> = visible_samples.iter().collect();
         let viewport = viewport_for_visible(&visible);
 
         assert_eq!(
-            graph_series(GraphMode::Rtt, &visible, viewport)
-                .iter()
-                .filter_map(|series| series.value)
-                .collect::<Vec<_>>(),
-            vec![GraphValue::EffectiveRtt]
+            graph_series(GraphMetric::EffectiveRtt, &visible, viewport)[0].data,
+            vec![(0.0, 3.0)]
         );
         assert_eq!(
-            graph_series(GraphMode::OneWay, &visible, viewport)
-                .iter()
-                .filter_map(|series| series.value)
-                .collect::<Vec<_>>(),
-            vec![GraphValue::ClientToServer, GraphValue::ServerToClient]
-        );
-        assert_eq!(
-            graph_series(GraphMode::Combined, &visible, viewport)
-                .iter()
-                .filter_map(|series| series.value)
-                .collect::<Vec<_>>(),
-            vec![
-                GraphValue::EffectiveRtt,
-                GraphValue::ClientToServer,
-                GraphValue::ServerToClient
-            ]
+            graph_series(GraphMetric::ClientToServer, &visible, viewport)[0].data,
+            vec![(0.0, 1.0)]
         );
     }
 
@@ -2599,32 +2441,27 @@ mod tests {
         let viewport = viewport(timestamp, timestamp + Duration::from_secs(1));
 
         assert_eq!(
-            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::EffectiveRtt)
+            target_metric_series(&target, 0, viewport, GraphMetric::EffectiveRtt)
                 .unwrap()
                 .data,
             vec![(0.0, 1.0)]
         );
         assert_eq!(
-            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::RawRtt)
+            target_metric_series(&target, 0, viewport, GraphMetric::RawRtt)
                 .unwrap()
                 .data,
             vec![(0.0, 2.0)]
         );
         assert_eq!(
-            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::AdjustedRtt)
+            target_metric_series(&target, 0, viewport, GraphMetric::AdjustedRtt)
                 .unwrap()
                 .data,
             vec![(0.0, 3.0)]
         );
         assert_eq!(
-            target_metric_series(
-                &target,
-                0,
-                viewport,
-                MultiTargetGraphMetric::ServerProcessing
-            )
-            .unwrap()
-            .data,
+            target_metric_series(&target, 0, viewport, GraphMetric::ServerProcessing)
+                .unwrap()
+                .data,
             vec![(0.0, 4.0)]
         );
     }
@@ -2656,59 +2493,46 @@ mod tests {
         let viewport = viewport(start, start + Duration::from_secs(2));
 
         assert_eq!(
-            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::AdjustedRtt)
+            target_metric_series(&target, 0, viewport, GraphMetric::AdjustedRtt)
                 .unwrap()
                 .data,
             vec![(1.0, 4.0)]
         );
         assert_eq!(
-            target_metric_series(
-                &target,
-                0,
-                viewport,
-                MultiTargetGraphMetric::ServerProcessing
-            )
-            .unwrap()
-            .data,
+            target_metric_series(&target, 0, viewport, GraphMetric::ServerProcessing)
+                .unwrap()
+                .data,
             vec![(1.0, 5.0)]
         );
     }
 
     #[test]
-    fn multi_target_graph_mode_mapping_has_readable_labels_and_titles() {
+    fn graph_metric_cycling_walks_all_metrics() {
         let cases = [
-            (
-                GraphMode::Rtt,
-                MultiTargetGraphMetric::EffectiveRtt,
-                "effective RTT per target",
-                "RTT history - effective per target",
-            ),
-            (
-                GraphMode::OneWay,
-                MultiTargetGraphMetric::RawRtt,
-                "raw RTT per target",
-                "RTT history - raw per target",
-            ),
-            (
-                GraphMode::Combined,
-                MultiTargetGraphMetric::AdjustedRtt,
-                "adjusted RTT per target",
-                "RTT history - adjusted per target",
-            ),
-            (
-                GraphMode::Split,
-                MultiTargetGraphMetric::ServerProcessing,
-                "server processing per target",
-                "server processing - per target",
-            ),
+            GraphMetric::EffectiveRtt,
+            GraphMetric::RawRtt,
+            GraphMetric::AdjustedRtt,
+            GraphMetric::ClientToServer,
+            GraphMetric::ServerToClient,
+            GraphMetric::ServerProcessing,
+            GraphMetric::EffectiveRtt,
         ];
-
-        for (graph_mode, metric, label, title) in cases {
-            let mapped = MultiTargetGraphMetric::from_graph_mode(graph_mode);
-            assert_eq!(mapped, metric);
-            assert_eq!(mapped.label(), label);
-            assert_eq!(mapped.title(), title);
+        let mut state = TuiState::default();
+        for metric in cases {
+            assert_eq!(state.graph_metric, metric);
+            state.cycle_graph_metric();
         }
+    }
+
+    #[test]
+    fn view_toggle_switches_between_graph_and_dashboard() {
+        let mut state = TuiState::default();
+
+        assert_eq!(state.view, TuiView::Graph);
+        state.toggle_view();
+        assert_eq!(state.view, TuiView::Dashboard);
+        state.toggle_view();
+        assert_eq!(state.view, TuiView::Graph);
     }
 
     #[test]
@@ -2717,40 +2541,6 @@ mod tests {
 
         assert_eq!(span.style, target_style(3).add_modifier(Modifier::BOLD));
         assert_eq!(span.content.as_ref(), "alpha-target    ");
-    }
-
-    #[test]
-    fn graph_mode_cycling_walks_all_modes() {
-        let mut state = TuiState::default();
-
-        assert_eq!(state.graph_mode, GraphMode::Rtt);
-        state.cycle_graph_mode();
-        assert_eq!(state.graph_mode, GraphMode::OneWay);
-        state.cycle_graph_mode();
-        assert_eq!(state.graph_mode, GraphMode::Combined);
-        state.cycle_graph_mode();
-        assert_eq!(state.graph_mode, GraphMode::Split);
-        state.cycle_graph_mode();
-        assert_eq!(state.graph_mode, GraphMode::Rtt);
-    }
-
-    #[test]
-    fn graph_scale_cycling_walks_common_ranges_and_returns_to_auto() {
-        let mut state = TuiState::default();
-
-        assert_eq!(state.graph_scale, GraphScale::Auto);
-        state.cycle_graph_scale();
-        assert_eq!(state.graph_scale, GraphScale::Ms100);
-        state.cycle_graph_scale();
-        assert_eq!(state.graph_scale, GraphScale::Ms250);
-        state.cycle_graph_scale();
-        assert_eq!(state.graph_scale, GraphScale::Ms500);
-        state.cycle_graph_scale();
-        assert_eq!(state.graph_scale, GraphScale::S1);
-        state.cycle_graph_scale();
-        assert_eq!(state.graph_scale, GraphScale::S2);
-        state.cycle_graph_scale();
-        assert_eq!(state.graph_scale, GraphScale::Auto);
     }
 
     #[test]
