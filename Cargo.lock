@@ -700,7 +700,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-cli"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "clap",
  "crossterm",
@@ -713,7 +713,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-client"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "irtt-proto",
  "libc",
@@ -723,7 +723,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-proto"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "hmac",
  "md-5",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-stats"
-version = "0.3.0"
+version = "0.4.0"
 dependencies = [
  "irtt-client",
 ]
