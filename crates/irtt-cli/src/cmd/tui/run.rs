@@ -318,7 +318,7 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
                 state.toggle_pause();
                 force_render = true;
             }
-            KeyCode::Char('g') => {
+            KeyCode::Char('g') | KeyCode::Char('m') => {
                 state.cycle_graph_mode();
                 force_render = true;
             }
@@ -328,6 +328,42 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
             }
             KeyCode::Char('f') => {
                 state.toggle_full_graph();
+                force_render = true;
+            }
+            KeyCode::Left => {
+                state.pan_graph_left();
+                force_render = true;
+            }
+            KeyCode::Right => {
+                state.pan_graph_right();
+                force_render = true;
+            }
+            KeyCode::PageUp => {
+                state.pan_graph_page_left();
+                force_render = true;
+            }
+            KeyCode::PageDown => {
+                state.pan_graph_page_right();
+                force_render = true;
+            }
+            KeyCode::Home => {
+                state.jump_graph_oldest();
+                force_render = true;
+            }
+            KeyCode::End => {
+                state.jump_graph_live();
+                force_render = true;
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') => {
+                state.zoom_graph_in();
+                force_render = true;
+            }
+            KeyCode::Char('-') => {
+                state.zoom_graph_out();
+                force_render = true;
+            }
+            KeyCode::Char('0') => {
+                state.reset_graph_window();
                 force_render = true;
             }
             _ => {}

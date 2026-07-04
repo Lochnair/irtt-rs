@@ -26,11 +26,15 @@ use crate::{
     shared::client::{expected_probe_count, GroupPacingArg},
 };
 
-const HISTORY_LIMIT: usize = 240;
+const HISTORY_LIMIT: usize = 100_000;
 const RECENT_EVENT_LIMIT: usize = 80;
-const MIN_CHART_POINTS: usize = 12;
 const MIN_WIDTH: u16 = 56;
 const MIN_HEIGHT: u16 = 18;
+const DEFAULT_GRAPH_WINDOW: Duration = Duration::from_secs(60);
+const MIN_GRAPH_WINDOW: Duration = Duration::from_secs(5);
+const MAX_GRAPH_WINDOW: Duration = Duration::from_secs(60 * 60);
+const PAN_STEP_NUMERATOR: u32 = 1;
+const PAN_STEP_DENOMINATOR: u32 = 4;
 
 pub(super) struct TuiTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -91,6 +95,7 @@ pub(super) struct TuiState {
     last_warning: Option<String>,
     graph_mode: GraphMode,
     graph_scale: GraphScale,
+    graph_viewport: GraphViewport,
     full_graph: bool,
     pub(super) paused: bool,
     pub(super) quit_requested: bool,
@@ -125,6 +130,7 @@ impl TuiState {
             last_warning: None,
             graph_mode: GraphMode::Rtt,
             graph_scale: GraphScale::Auto,
+            graph_viewport: GraphViewport::default(),
             full_graph: false,
             paused: false,
             quit_requested: false,
@@ -202,6 +208,7 @@ impl TuiState {
                 }
                 ClientEvent::EchoReply {
                     seq,
+                    received_at,
                     rtt,
                     one_way,
                     server_timing,
@@ -217,6 +224,7 @@ impl TuiState {
                         .and_then(|timing| timing.processing)
                         .map(duration_ns);
                     target.push_graph_sample(GraphSample {
+                        timestamp: received_at.mono,
                         seq: *seq,
                         effective_ns: rtt.effective.as_nanos(),
                         raw_ns: duration_ns(rtt.raw),
@@ -315,6 +323,7 @@ impl TuiState {
         for target in &mut self.targets {
             target.graph_history.clear();
         }
+        self.graph_viewport.follow_live();
         self.push_event("visible graph history reset".to_owned());
     }
 
@@ -334,6 +343,52 @@ impl TuiState {
         self.full_graph = !self.full_graph;
     }
 
+    pub(super) fn pan_graph_left(&mut self) {
+        let oldest = self.oldest_graph_sample_time();
+        let newest = self.newest_graph_sample_time();
+        self.graph_viewport.pan_backward(oldest, newest);
+    }
+
+    pub(super) fn pan_graph_right(&mut self) {
+        let newest = self.newest_graph_sample_time();
+        self.graph_viewport.pan_forward(newest);
+    }
+
+    pub(super) fn pan_graph_page_left(&mut self) {
+        let oldest = self.oldest_graph_sample_time();
+        let newest = self.newest_graph_sample_time();
+        self.graph_viewport.page_backward(oldest, newest);
+    }
+
+    pub(super) fn pan_graph_page_right(&mut self) {
+        let newest = self.newest_graph_sample_time();
+        self.graph_viewport.page_forward(newest);
+    }
+
+    pub(super) fn jump_graph_oldest(&mut self) {
+        let oldest = self.oldest_graph_sample_time();
+        let newest = self.newest_graph_sample_time();
+        self.graph_viewport.jump_oldest(oldest, newest);
+    }
+
+    pub(super) fn jump_graph_live(&mut self) {
+        self.graph_viewport.follow_live();
+    }
+
+    pub(super) fn zoom_graph_in(&mut self) {
+        self.graph_viewport.zoom_in(self.newest_graph_sample_time());
+    }
+
+    pub(super) fn zoom_graph_out(&mut self) {
+        self.graph_viewport
+            .zoom_out(self.newest_graph_sample_time());
+    }
+
+    pub(super) fn reset_graph_window(&mut self) {
+        self.graph_viewport
+            .reset_window(self.newest_graph_sample_time());
+    }
+
     fn push_event(&mut self, event: String) {
         push_bounded(&mut self.recent_events, event, RECENT_EVENT_LIMIT);
     }
@@ -350,6 +405,20 @@ impl TuiState {
 
     fn is_multi_target(&self) -> bool {
         self.targets.len() > 1
+    }
+
+    fn oldest_graph_sample_time(&self) -> Option<Instant> {
+        self.targets
+            .iter()
+            .filter_map(|target| target.graph_history.front().map(|sample| sample.timestamp))
+            .min()
+    }
+
+    fn newest_graph_sample_time(&self) -> Option<Instant> {
+        self.targets
+            .iter()
+            .filter_map(|target| target.graph_history.back().map(|sample| sample.timestamp))
+            .max()
     }
 }
 
@@ -601,6 +670,178 @@ impl GraphScale {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphViewport {
+    mode: GraphViewportMode,
+    window: Duration,
+}
+
+impl Default for GraphViewport {
+    fn default() -> Self {
+        Self {
+            mode: GraphViewportMode::Follow,
+            window: DEFAULT_GRAPH_WINDOW,
+        }
+    }
+}
+
+impl GraphViewport {
+    fn range(self, now: Instant, newest_sample: Option<Instant>) -> GraphViewportRange {
+        let end = match self.mode {
+            GraphViewportMode::Follow => newest_sample.unwrap_or(now).max(now),
+            GraphViewportMode::Historical { end } => end,
+        };
+        GraphViewportRange {
+            start: end.checked_sub(self.window).unwrap_or(end),
+            end,
+            window: self.window,
+            is_live: matches!(self.mode, GraphViewportMode::Follow),
+        }
+    }
+
+    fn follow_live(&mut self) {
+        self.mode = GraphViewportMode::Follow;
+    }
+
+    fn pan_backward(&mut self, oldest: Option<Instant>, newest: Option<Instant>) {
+        self.pan_by(
+            -duration_fraction(self.window, PAN_STEP_NUMERATOR, PAN_STEP_DENOMINATOR),
+            oldest,
+            newest,
+        );
+    }
+
+    fn pan_forward(&mut self, newest: Option<Instant>) {
+        self.pan_by(
+            duration_fraction(self.window, PAN_STEP_NUMERATOR, PAN_STEP_DENOMINATOR),
+            None,
+            newest,
+        );
+    }
+
+    fn page_backward(&mut self, oldest: Option<Instant>, newest: Option<Instant>) {
+        self.pan_by(-signed_duration(self.window), oldest, newest);
+    }
+
+    fn page_forward(&mut self, newest: Option<Instant>) {
+        self.pan_by(signed_duration(self.window), None, newest);
+    }
+
+    fn jump_oldest(&mut self, oldest: Option<Instant>, newest: Option<Instant>) {
+        let Some(oldest) = oldest else {
+            return;
+        };
+        let live_end = newest.unwrap_or(oldest);
+        self.mode = GraphViewportMode::Historical {
+            end: (oldest + self.window).min(live_end),
+        };
+    }
+
+    fn zoom_in(&mut self, newest: Option<Instant>) {
+        self.set_window(duration_fraction(self.window, 2, 3).duration, newest);
+    }
+
+    fn zoom_out(&mut self, newest: Option<Instant>) {
+        self.set_window(duration_fraction(self.window, 3, 2).duration, newest);
+    }
+
+    fn reset_window(&mut self, newest: Option<Instant>) {
+        self.set_window(DEFAULT_GRAPH_WINDOW, newest);
+    }
+
+    fn set_window(&mut self, window: Duration, newest: Option<Instant>) {
+        self.window = window.clamp(MIN_GRAPH_WINDOW, MAX_GRAPH_WINDOW);
+        if let GraphViewportMode::Historical { end } = &mut self.mode {
+            if let Some(newest) = newest {
+                *end = (*end).min(newest);
+            }
+        }
+    }
+
+    fn pan_by(
+        &mut self,
+        delta: SignedViewportDuration,
+        oldest: Option<Instant>,
+        newest: Option<Instant>,
+    ) {
+        let Some(newest) = newest else {
+            return;
+        };
+        let current_end = match self.mode {
+            GraphViewportMode::Follow => newest,
+            GraphViewportMode::Historical { end } => end,
+        };
+        let mut end = delta.apply(current_end);
+        if let Some(oldest) = oldest {
+            end = end.max(oldest + self.window);
+        }
+        end = end.min(newest);
+        self.mode = GraphViewportMode::Historical { end };
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GraphViewportMode {
+    Follow,
+    Historical { end: Instant },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GraphViewportRange {
+    start: Instant,
+    end: Instant,
+    window: Duration,
+    is_live: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SignedViewportDuration {
+    duration: Duration,
+    negative: bool,
+}
+
+impl SignedViewportDuration {
+    fn apply(self, instant: Instant) -> Instant {
+        if self.negative {
+            instant.checked_sub(self.duration).unwrap_or(instant)
+        } else {
+            instant + self.duration
+        }
+    }
+}
+
+impl std::ops::Neg for SignedViewportDuration {
+    type Output = Self;
+
+    fn neg(self) -> Self::Output {
+        Self {
+            duration: self.duration,
+            negative: !self.negative,
+        }
+    }
+}
+
+fn signed_duration(duration: Duration) -> SignedViewportDuration {
+    SignedViewportDuration {
+        duration,
+        negative: false,
+    }
+}
+
+fn duration_fraction(
+    duration: Duration,
+    numerator: u32,
+    denominator: u32,
+) -> SignedViewportDuration {
+    let nanos =
+        duration.as_nanos().saturating_mul(u128::from(numerator)) / u128::from(denominator.max(1));
+    let nanos = nanos.max(1).min(u128::from(u64::MAX));
+    SignedViewportDuration {
+        duration: Duration::from_nanos(nanos as u64),
+        negative: false,
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultiTargetGraphMetric {
     EffectiveRtt,
     RawRtt,
@@ -664,6 +905,7 @@ impl MultiTargetGraphMetric {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct GraphSample {
+    timestamp: Instant,
     seq: u32,
     effective_ns: i128,
     raw_ns: i128,
@@ -1037,8 +1279,11 @@ fn timing_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
 }
 
 fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let viewport = state
+        .graph_viewport
+        .range(Instant::now(), state.newest_graph_sample_time());
     if state.is_multi_target() {
-        render_multi_target_graph(frame, area, state);
+        render_multi_target_graph(frame, area, state, viewport);
         return;
     }
 
@@ -1049,22 +1294,28 @@ fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .selected_target()
                 .map(|target| &target.graph_history)
                 .expect("TuiState always has at least one target");
-            let visible = visible_history_window(history, area.width);
-            let series = graph_series(mode, &visible);
+            let visible = visible_history_window(history, viewport);
+            let series = graph_series(mode, &visible, viewport);
             render_chart(
                 frame,
                 area,
-                mode.title(),
                 &visible,
                 &series,
-                mode.axis_kind(),
-                state.graph_scale,
+                ChartRenderConfig {
+                    title: mode.title(),
+                    axis_kind: mode.axis_kind(),
+                    scale: state.graph_scale,
+                    viewport,
+                },
             );
         }
     }
 }
 
 fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let viewport = state
+        .graph_viewport
+        .range(Instant::now(), state.newest_graph_sample_time());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -1073,38 +1324,48 @@ fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .selected_target()
         .map(|target| &target.graph_history)
         .expect("TuiState always has at least one target");
-    let visible = visible_history_window(history, area.width);
-    let rtt = graph_series(GraphMode::Rtt, &visible);
-    let one_way = graph_series(GraphMode::OneWay, &visible);
+    let visible = visible_history_window(history, viewport);
+    let rtt = graph_series(GraphMode::Rtt, &visible, viewport);
+    let one_way = graph_series(GraphMode::OneWay, &visible, viewport);
 
     render_chart(
         frame,
         rows[0],
-        GraphMode::Rtt.title(),
         &visible,
         &rtt,
-        GraphMode::Rtt.axis_kind(),
-        state.graph_scale,
+        ChartRenderConfig {
+            title: GraphMode::Rtt.title(),
+            axis_kind: GraphMode::Rtt.axis_kind(),
+            scale: state.graph_scale,
+            viewport,
+        },
     );
     render_chart(
         frame,
         rows[1],
-        GraphMode::OneWay.title(),
         &visible,
         &one_way,
-        GraphMode::OneWay.axis_kind(),
-        state.graph_scale,
+        ChartRenderConfig {
+            title: GraphMode::OneWay.title(),
+            axis_kind: GraphMode::OneWay.axis_kind(),
+            scale: state.graph_scale,
+            viewport,
+        },
     );
 }
 
-fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+fn render_multi_target_graph(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    state: &TuiState,
+    viewport: GraphViewportRange,
+) {
     let metric = MultiTargetGraphMetric::from_graph_mode(state.graph_mode);
-    let capacity = visible_sample_capacity(area.width);
     let series = state
         .targets
         .iter()
         .enumerate()
-        .filter_map(|(idx, target)| target_metric_series(target, idx, capacity, metric))
+        .filter_map(|(idx, target)| target_metric_series(target, idx, viewport, metric))
         .collect::<Vec<_>>();
     if series.is_empty() {
         frame.render_widget(
@@ -1116,10 +1377,6 @@ fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState
         return;
     }
 
-    let x_max = series
-        .iter()
-        .flat_map(|series| series.data.iter().map(|(x, _)| *x))
-        .fold(1.0, f64::max);
     let (min_y, max_y) = chart_y_bounds(&series, metric.axis_kind(), state.graph_scale);
     let datasets = chart_datasets(&series);
     let chart = Chart::new(datasets)
@@ -1134,8 +1391,8 @@ fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState
         )
         .x_axis(
             Axis::default()
-                .bounds([0.0, x_max])
-                .labels(vec![Span::raw("old"), Span::raw("new")])
+                .bounds(viewport_x_bounds(viewport))
+                .labels(viewport_x_axis_labels(viewport))
                 .style(Style::default().fg(Color::Gray)),
         )
         .y_axis(
@@ -1153,11 +1410,9 @@ fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState
 fn render_chart(
     frame: &mut Frame<'_>,
     area: Rect,
-    title: &'static str,
     visible: &[&GraphSample],
     series: &[ChartSeries],
-    axis_kind: ChartAxisKind,
-    scale: GraphScale,
+    config: ChartRenderConfig,
 ) {
     if series.is_empty() {
         let note = if visible.is_empty() {
@@ -1167,26 +1422,25 @@ fn render_chart(
         };
         frame.render_widget(
             Paragraph::new(note)
-                .block(Block::default().title(title).borders(Borders::ALL))
+                .block(Block::default().title(config.title).borders(Borders::ALL))
                 .wrap(Wrap { trim: true }),
             area,
         );
         return;
     }
 
-    let (min_y, max_y) = chart_y_bounds(series, axis_kind, scale);
-    let x_max = visible.len().saturating_sub(1).max(1) as f64;
+    let (min_y, max_y) = chart_y_bounds(series, config.axis_kind, config.scale);
     let datasets = chart_datasets(series);
     let chart = Chart::new(datasets)
         .block(
             Block::default()
-                .title(format!("{title} ({})", scale.label()))
+                .title(format!("{} ({})", config.title, config.scale.label()))
                 .borders(Borders::ALL),
         )
         .x_axis(
             Axis::default()
-                .bounds([0.0, x_max])
-                .labels(x_axis_labels(visible))
+                .bounds(viewport_x_bounds(config.viewport))
+                .labels(viewport_x_axis_labels(config.viewport))
                 .style(Style::default().fg(Color::Gray)),
         )
         .y_axis(
@@ -1199,6 +1453,14 @@ fn render_chart(
                 .style(Style::default().fg(Color::Gray)),
         );
     frame.render_widget(chart, area);
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ChartRenderConfig {
+    title: &'static str,
+    axis_kind: ChartAxisKind,
+    scale: GraphScale,
+    viewport: GraphViewportRange,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1268,18 +1530,21 @@ enum ChartAxisKind {
     Mixed,
 }
 
-fn visible_sample_capacity(chart_width: u16) -> usize {
-    let derived = usize::from(chart_width.saturating_sub(10)).max(MIN_CHART_POINTS);
-    derived.min(HISTORY_LIMIT)
+fn visible_history_window(
+    history: &VecDeque<GraphSample>,
+    viewport: GraphViewportRange,
+) -> Vec<&GraphSample> {
+    history
+        .iter()
+        .filter(|sample| sample.timestamp >= viewport.start && sample.timestamp <= viewport.end)
+        .collect()
 }
 
-fn visible_history_window(history: &VecDeque<GraphSample>, chart_width: u16) -> Vec<&GraphSample> {
-    let capacity = visible_sample_capacity(chart_width);
-    let start = history.len().saturating_sub(capacity);
-    history.iter().skip(start).collect()
-}
-
-fn graph_series(mode: GraphMode, visible: &[&GraphSample]) -> Vec<ChartSeries> {
+fn graph_series(
+    mode: GraphMode,
+    visible: &[&GraphSample],
+    viewport: GraphViewportRange,
+) -> Vec<ChartSeries> {
     let values: &[GraphValue] = match mode {
         GraphMode::Rtt => &[GraphValue::EffectiveRtt],
         GraphMode::OneWay => &[GraphValue::ClientToServer, GraphValue::ServerToClient],
@@ -1292,18 +1557,21 @@ fn graph_series(mode: GraphMode, visible: &[&GraphSample]) -> Vec<ChartSeries> {
     };
     values
         .iter()
-        .filter_map(|value| chart_series(*value, visible))
+        .filter_map(|value| chart_series(*value, visible, viewport))
         .collect()
 }
 
-fn chart_series(value: GraphValue, visible: &[&GraphSample]) -> Option<ChartSeries> {
+fn chart_series(
+    value: GraphValue,
+    visible: &[&GraphSample],
+    viewport: GraphViewportRange,
+) -> Option<ChartSeries> {
     let data: Vec<(f64, f64)> = visible
         .iter()
-        .enumerate()
-        .filter_map(|(idx, sample)| {
+        .filter_map(|sample| {
             value
                 .value_ns(sample)
-                .map(|ns| (idx as f64, ns as f64 / 1_000_000.0))
+                .map(|ns| (sample_x(sample, viewport), ns as f64 / 1_000_000.0))
         })
         .collect();
 
@@ -1318,19 +1586,17 @@ fn chart_series(value: GraphValue, visible: &[&GraphSample]) -> Option<ChartSeri
 fn target_metric_series(
     target: &TuiTargetState,
     target_idx: usize,
-    capacity: usize,
+    viewport: GraphViewportRange,
     metric: MultiTargetGraphMetric,
 ) -> Option<ChartSeries> {
-    let start = target.graph_history.len().saturating_sub(capacity);
     let data = target
         .graph_history
         .iter()
-        .skip(start)
-        .enumerate()
-        .filter_map(|(idx, sample)| {
+        .filter(|sample| sample.timestamp >= viewport.start && sample.timestamp <= viewport.end)
+        .filter_map(|sample| {
             metric
                 .value_ns(sample)
-                .map(|ns| (idx as f64, ns as f64 / 1_000_000.0))
+                .map(|ns| (sample_x(sample, viewport), ns as f64 / 1_000_000.0))
         })
         .collect::<Vec<_>>();
 
@@ -1340,6 +1606,13 @@ fn target_metric_series(
         style: target_style(target_idx),
         data,
     })
+}
+
+fn sample_x(sample: &GraphSample, viewport: GraphViewportRange) -> f64 {
+    sample
+        .timestamp
+        .saturating_duration_since(viewport.start)
+        .as_secs_f64()
 }
 
 fn chart_datasets(series: &[ChartSeries]) -> Vec<Dataset<'_>> {
@@ -1459,14 +1732,14 @@ fn nice_upper_ms(value: f64) -> f64 {
     10.0 * magnitude
 }
 
-fn x_axis_labels(visible: &[&GraphSample]) -> Vec<Span<'static>> {
-    let Some(first) = visible.first() else {
-        return Vec::new();
-    };
-    let last = visible.last().unwrap_or(first);
+fn viewport_x_bounds(viewport: GraphViewportRange) -> [f64; 2] {
+    [0.0, viewport.window.as_secs_f64().max(1.0)]
+}
+
+fn viewport_x_axis_labels(viewport: GraphViewportRange) -> Vec<Span<'static>> {
     vec![
-        Span::raw(format!("#{}", first.seq)),
-        Span::raw(format!("#{}", last.seq)),
+        Span::raw(format!("-{}", format_duration(viewport.window))),
+        Span::raw(if viewport.is_live { "live" } else { "end" }),
     ]
 }
 
@@ -1568,16 +1841,36 @@ fn status_line(state: &TuiState) -> Paragraph<'_> {
     } else {
         state.graph_mode.label()
     };
+    let mode = graph_viewport_status(state);
+    let layout = if state.full_graph { " | full" } else { "" };
+    let controls = if state.graph_viewport.mode == GraphViewportMode::Follow {
+        " | q quit | r reset | p pause | m/g metric | s scale | f full | arrows pan | +/- zoom"
+    } else {
+        " | End live | ←/→ pan | PgUp/PgDn page | +/- zoom | q quit"
+    };
     let lines = vec![Line::from(format!(
-        "{}{}{} | graph {}{} scale {} | q quit | Ctrl-C quit | r reset | p pause | g graph | s scale | f full",
+        "{}{}{} | {mode} | window {} | metric {graph_label}{layout} | scale {}{controls}",
         state.status.label(),
         paused,
         quitting,
-        graph_label,
-        if state.full_graph { " full" } else { "" },
+        format_duration(state.graph_viewport.window),
         state.graph_scale.label()
     ))];
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
+}
+
+fn graph_viewport_status(state: &TuiState) -> String {
+    match state.graph_viewport.mode {
+        GraphViewportMode::Follow => "live".to_owned(),
+        GraphViewportMode::Historical { end } => {
+            let now = Instant::now();
+            let live_end = state.newest_graph_sample_time().unwrap_or(now).max(now);
+            format!(
+                "history -{}",
+                format_duration(live_end.saturating_duration_since(end))
+            )
+        }
+    }
 }
 
 fn push_time_line(lines: &mut Vec<Line<'_>>, label: &str, stats: &TimeStats) {
@@ -1785,6 +2078,7 @@ mod tests {
 
     fn graph_sample(seq: u32, effective_ns: i128) -> GraphSample {
         GraphSample {
+            timestamp: Instant::now() + Duration::from_secs(u64::from(seq)),
             seq,
             effective_ns,
             raw_ns: effective_ns + 1_000,
@@ -1797,6 +2091,7 @@ mod tests {
 
     fn graph_sample_with_timing(seq: u32, effective_ns: i128) -> GraphSample {
         GraphSample {
+            timestamp: Instant::now() + Duration::from_secs(u64::from(seq)),
             seq,
             effective_ns,
             raw_ns: effective_ns + 1_000,
@@ -1814,6 +2109,23 @@ mod tests {
             style: GraphValue::EffectiveRtt.style(),
             data,
         }
+    }
+
+    fn viewport(start: Instant, end: Instant) -> GraphViewportRange {
+        GraphViewportRange {
+            start,
+            end,
+            window: end
+                .saturating_duration_since(start)
+                .max(Duration::from_secs(1)),
+            is_live: true,
+        }
+    }
+
+    fn viewport_for_visible(visible: &[&GraphSample]) -> GraphViewportRange {
+        let start = visible.first().unwrap().timestamp;
+        let end = visible.last().unwrap().timestamp;
+        viewport(start, end)
     }
 
     fn primary_target(state: &TuiState) -> &TuiTargetState {
@@ -2110,17 +2422,15 @@ mod tests {
     }
 
     #[test]
-    fn visible_window_length_scales_with_chart_width_and_remains_bounded() {
+    fn visible_window_selects_samples_inside_viewport() {
         let history: VecDeque<_> = (0..300).map(|seq| graph_sample(seq, seq.into())).collect();
+        let start = history[100].timestamp;
+        let end = history[120].timestamp;
 
-        let narrow = visible_history_window(&history, 20);
-        let wide = visible_history_window(&history, 80);
-        let huge = visible_history_window(&history, 1_000);
+        let visible = visible_history_window(&history, viewport(start, end));
 
-        assert_eq!(narrow.len(), MIN_CHART_POINTS);
-        assert!(wide.len() > narrow.len(), "wide={}", wide.len());
-        assert_eq!(huge.len(), HISTORY_LIMIT);
-        assert_eq!(huge.first().unwrap().seq, 60);
+        assert_eq!(visible.first().unwrap().seq, 100);
+        assert_eq!(visible.last().unwrap().seq, 120);
     }
 
     #[test]
@@ -2225,9 +2535,10 @@ mod tests {
     fn optional_missing_one_way_series_are_omitted_not_zero_filled() {
         let visible_samples = [graph_sample(1, 2_000_000)];
         let visible: Vec<_> = visible_samples.iter().collect();
+        let viewport = viewport_for_visible(&visible);
 
-        let one_way = graph_series(GraphMode::OneWay, &visible);
-        let rtt = graph_series(GraphMode::Rtt, &visible);
+        let one_way = graph_series(GraphMode::OneWay, &visible, viewport);
+        let rtt = graph_series(GraphMode::Rtt, &visible, viewport);
 
         assert!(one_way.is_empty());
         assert_eq!(
@@ -2242,23 +2553,24 @@ mod tests {
     fn graph_modes_use_readable_default_series() {
         let visible_samples = [graph_sample_with_timing(1, 3_000_000)];
         let visible: Vec<_> = visible_samples.iter().collect();
+        let viewport = viewport_for_visible(&visible);
 
         assert_eq!(
-            graph_series(GraphMode::Rtt, &visible)
+            graph_series(GraphMode::Rtt, &visible, viewport)
                 .iter()
                 .filter_map(|series| series.value)
                 .collect::<Vec<_>>(),
             vec![GraphValue::EffectiveRtt]
         );
         assert_eq!(
-            graph_series(GraphMode::OneWay, &visible)
+            graph_series(GraphMode::OneWay, &visible, viewport)
                 .iter()
                 .filter_map(|series| series.value)
                 .collect::<Vec<_>>(),
             vec![GraphValue::ClientToServer, GraphValue::ServerToClient]
         );
         assert_eq!(
-            graph_series(GraphMode::Combined, &visible)
+            graph_series(GraphMode::Combined, &visible, viewport)
                 .iter()
                 .filter_map(|series| series.value)
                 .collect::<Vec<_>>(),
@@ -2273,7 +2585,9 @@ mod tests {
     #[test]
     fn multi_target_metric_series_uses_selected_sample_field() {
         let mut target = TuiTargetState::new("alpha".to_owned(), stats_config(true));
+        let timestamp = Instant::now();
         target.push_graph_sample(GraphSample {
+            timestamp,
             seq: 1,
             effective_ns: 1_000_000,
             raw_ns: 2_000_000,
@@ -2282,29 +2596,35 @@ mod tests {
             server_to_client_ns: None,
             server_processing_ns: Some(4_000_000),
         });
+        let viewport = viewport(timestamp, timestamp + Duration::from_secs(1));
 
         assert_eq!(
-            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::EffectiveRtt)
+            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::EffectiveRtt)
                 .unwrap()
                 .data,
             vec![(0.0, 1.0)]
         );
         assert_eq!(
-            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::RawRtt)
+            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::RawRtt)
                 .unwrap()
                 .data,
             vec![(0.0, 2.0)]
         );
         assert_eq!(
-            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::AdjustedRtt)
+            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::AdjustedRtt)
                 .unwrap()
                 .data,
             vec![(0.0, 3.0)]
         );
         assert_eq!(
-            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::ServerProcessing)
-                .unwrap()
-                .data,
+            target_metric_series(
+                &target,
+                0,
+                viewport,
+                MultiTargetGraphMetric::ServerProcessing
+            )
+            .unwrap()
+            .data,
             vec![(0.0, 4.0)]
         );
     }
@@ -2312,7 +2632,9 @@ mod tests {
     #[test]
     fn multi_target_metric_series_skips_missing_optional_samples() {
         let mut target = TuiTargetState::new("alpha".to_owned(), stats_config(true));
+        let start = Instant::now();
         target.push_graph_sample(GraphSample {
+            timestamp: start,
             seq: 1,
             effective_ns: 1_000_000,
             raw_ns: 2_000_000,
@@ -2322,6 +2644,7 @@ mod tests {
             server_processing_ns: None,
         });
         target.push_graph_sample(GraphSample {
+            timestamp: start + Duration::from_secs(1),
             seq: 2,
             effective_ns: 2_000_000,
             raw_ns: 3_000_000,
@@ -2330,17 +2653,23 @@ mod tests {
             server_to_client_ns: None,
             server_processing_ns: Some(5_000_000),
         });
+        let viewport = viewport(start, start + Duration::from_secs(2));
 
         assert_eq!(
-            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::AdjustedRtt)
+            target_metric_series(&target, 0, viewport, MultiTargetGraphMetric::AdjustedRtt)
                 .unwrap()
                 .data,
             vec![(1.0, 4.0)]
         );
         assert_eq!(
-            target_metric_series(&target, 0, 10, MultiTargetGraphMetric::ServerProcessing)
-                .unwrap()
-                .data,
+            target_metric_series(
+                &target,
+                0,
+                viewport,
+                MultiTargetGraphMetric::ServerProcessing
+            )
+            .unwrap()
+            .data,
             vec![(1.0, 5.0)]
         );
     }
