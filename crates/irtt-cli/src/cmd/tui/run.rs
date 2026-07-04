@@ -322,6 +322,10 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
                 state.cycle_graph_mode();
                 force_render = true;
             }
+            KeyCode::Char('s') => {
+                state.cycle_graph_scale();
+                force_render = true;
+            }
             KeyCode::Char('f') => {
                 state.toggle_full_graph();
                 force_render = true;

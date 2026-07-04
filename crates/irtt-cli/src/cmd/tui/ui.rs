@@ -90,6 +90,7 @@ pub(super) struct TuiState {
     recent_events: VecDeque<String>,
     last_warning: Option<String>,
     graph_mode: GraphMode,
+    graph_scale: GraphScale,
     full_graph: bool,
     pub(super) paused: bool,
     pub(super) quit_requested: bool,
@@ -123,6 +124,7 @@ impl TuiState {
             recent_events: VecDeque::with_capacity(RECENT_EVENT_LIMIT),
             last_warning: None,
             graph_mode: GraphMode::Rtt,
+            graph_scale: GraphScale::Auto,
             full_graph: false,
             paused: false,
             quit_requested: false,
@@ -322,6 +324,10 @@ impl TuiState {
 
     pub(super) fn cycle_graph_mode(&mut self) {
         self.graph_mode = self.graph_mode.next();
+    }
+
+    pub(super) fn cycle_graph_scale(&mut self) {
+        self.graph_scale = self.graph_scale.next();
     }
 
     pub(super) fn toggle_full_graph(&mut self) {
@@ -550,6 +556,51 @@ impl GraphMode {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GraphScale {
+    Auto,
+    Ms100,
+    Ms250,
+    Ms500,
+    S1,
+    S2,
+}
+
+impl GraphScale {
+    fn next(self) -> Self {
+        match self {
+            Self::Auto => Self::Ms100,
+            Self::Ms100 => Self::Ms250,
+            Self::Ms250 => Self::Ms500,
+            Self::Ms500 => Self::S1,
+            Self::S1 => Self::S2,
+            Self::S2 => Self::Auto,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Ms100 => "100ms",
+            Self::Ms250 => "250ms",
+            Self::Ms500 => "500ms",
+            Self::S1 => "1s",
+            Self::S2 => "2s",
+        }
+    }
+
+    fn fixed_upper_ms(self) -> Option<f64> {
+        match self {
+            Self::Auto => None,
+            Self::Ms100 => Some(100.0),
+            Self::Ms250 => Some(250.0),
+            Self::Ms500 => Some(500.0),
+            Self::S1 => Some(1_000.0),
+            Self::S2 => Some(2_000.0),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MultiTargetGraphMetric {
     EffectiveRtt,
     RawRtt,
@@ -599,6 +650,14 @@ impl MultiTargetGraphMetric {
             Self::RawRtt => Some(sample.raw_ns),
             Self::AdjustedRtt => sample.adjusted_ns,
             Self::ServerProcessing => sample.server_processing_ns,
+        }
+    }
+
+    fn axis_kind(self) -> ChartAxisKind {
+        match self {
+            Self::EffectiveRtt | Self::RawRtt | Self::AdjustedRtt | Self::ServerProcessing => {
+                ChartAxisKind::NonNegative
+            }
         }
     }
 }
@@ -992,7 +1051,15 @@ fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 .expect("TuiState always has at least one target");
             let visible = visible_history_window(history, area.width);
             let series = graph_series(mode, &visible);
-            render_chart(frame, area, mode.title(), &visible, &series);
+            render_chart(
+                frame,
+                area,
+                mode.title(),
+                &visible,
+                &series,
+                mode.axis_kind(),
+                state.graph_scale,
+            );
         }
     }
 }
@@ -1010,13 +1077,23 @@ fn render_split_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let rtt = graph_series(GraphMode::Rtt, &visible);
     let one_way = graph_series(GraphMode::OneWay, &visible);
 
-    render_chart(frame, rows[0], GraphMode::Rtt.title(), &visible, &rtt);
+    render_chart(
+        frame,
+        rows[0],
+        GraphMode::Rtt.title(),
+        &visible,
+        &rtt,
+        GraphMode::Rtt.axis_kind(),
+        state.graph_scale,
+    );
     render_chart(
         frame,
         rows[1],
         GraphMode::OneWay.title(),
         &visible,
         &one_way,
+        GraphMode::OneWay.axis_kind(),
+        state.graph_scale,
     );
 }
 
@@ -1043,10 +1120,18 @@ fn render_multi_target_graph(frame: &mut Frame<'_>, area: Rect, state: &TuiState
         .iter()
         .flat_map(|series| series.data.iter().map(|(x, _)| *x))
         .fold(1.0, f64::max);
-    let (min_y, max_y) = chart_y_bounds(&series);
+    let (min_y, max_y) = chart_y_bounds(&series, metric.axis_kind(), state.graph_scale);
     let datasets = chart_datasets(&series);
     let chart = Chart::new(datasets)
-        .block(Block::default().title(metric.title()).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(format!(
+                    "{} ({})",
+                    metric.title(),
+                    state.graph_scale.label()
+                ))
+                .borders(Borders::ALL),
+        )
         .x_axis(
             Axis::default()
                 .bounds([0.0, x_max])
@@ -1071,6 +1156,8 @@ fn render_chart(
     title: &'static str,
     visible: &[&GraphSample],
     series: &[ChartSeries],
+    axis_kind: ChartAxisKind,
+    scale: GraphScale,
 ) {
     if series.is_empty() {
         let note = if visible.is_empty() {
@@ -1087,11 +1174,15 @@ fn render_chart(
         return;
     }
 
-    let (min_y, max_y) = chart_y_bounds(series);
+    let (min_y, max_y) = chart_y_bounds(series, axis_kind, scale);
     let x_max = visible.len().saturating_sub(1).max(1) as f64;
     let datasets = chart_datasets(series);
     let chart = Chart::new(datasets)
-        .block(Block::default().title(title).borders(Borders::ALL))
+        .block(
+            Block::default()
+                .title(format!("{title} ({})", scale.label()))
+                .borders(Borders::ALL),
+        )
         .x_axis(
             Axis::default()
                 .bounds([0.0, x_max])
@@ -1152,6 +1243,14 @@ impl GraphMode {
             Self::Split => "split history",
         }
     }
+
+    fn axis_kind(self) -> ChartAxisKind {
+        match self {
+            Self::Rtt => ChartAxisKind::NonNegative,
+            Self::OneWay | Self::Split => ChartAxisKind::Signed,
+            Self::Combined => ChartAxisKind::Mixed,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1160,6 +1259,13 @@ struct ChartSeries {
     name: String,
     style: Style,
     data: Vec<(f64, f64)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChartAxisKind {
+    NonNegative,
+    Signed,
+    Mixed,
 }
 
 fn visible_sample_capacity(chart_width: u16) -> usize {
@@ -1264,16 +1370,27 @@ fn target_style(idx: usize) -> Style {
     Style::default().fg(COLORS[idx % COLORS.len()])
 }
 
-fn chart_y_bounds(series: &[ChartSeries]) -> (f64, f64) {
+fn chart_y_bounds(
+    series: &[ChartSeries],
+    axis_kind: ChartAxisKind,
+    scale: GraphScale,
+) -> (f64, f64) {
+    if let Some(upper) = scale.fixed_upper_ms() {
+        return match axis_kind {
+            ChartAxisKind::NonNegative => (0.0, upper),
+            ChartAxisKind::Signed | ChartAxisKind::Mixed => (-upper, upper),
+        };
+    }
+
     let mut values = series.iter().flat_map(|series| {
         series
             .data
             .iter()
-            .map(|(_, value)| *value)
+            .map(|(_, value)| y_bound_value(axis_kind, series.value, *value))
             .filter(|value| value.is_finite())
     });
     let Some(first) = values.next() else {
-        return (0.0, 1.0);
+        return default_y_bounds(axis_kind);
     };
 
     let (mut min_y, mut max_y) = (first, first);
@@ -1282,6 +1399,32 @@ fn chart_y_bounds(series: &[ChartSeries]) -> (f64, f64) {
         max_y = max_y.max(value);
     }
 
+    match axis_kind {
+        ChartAxisKind::NonNegative => {
+            let upper = nice_non_negative_upper_ms(max_y.max(0.0));
+            (0.0, upper)
+        }
+        ChartAxisKind::Signed | ChartAxisKind::Mixed => signed_chart_y_bounds(min_y, max_y),
+    }
+}
+
+fn default_y_bounds(axis_kind: ChartAxisKind) -> (f64, f64) {
+    match axis_kind {
+        ChartAxisKind::NonNegative => (0.0, 10.0),
+        ChartAxisKind::Signed | ChartAxisKind::Mixed => (-1.0, 1.0),
+    }
+}
+
+fn y_bound_value(axis_kind: ChartAxisKind, value_kind: Option<GraphValue>, value: f64) -> f64 {
+    match axis_kind {
+        ChartAxisKind::NonNegative => value.max(0.0),
+        ChartAxisKind::Signed => value,
+        ChartAxisKind::Mixed if value_kind == Some(GraphValue::EffectiveRtt) => value.max(0.0),
+        ChartAxisKind::Mixed => value,
+    }
+}
+
+fn signed_chart_y_bounds(mut min_y: f64, mut max_y: f64) -> (f64, f64) {
     let span = max_y - min_y;
     let pad = if span <= f64::EPSILON {
         (max_y.abs() * 0.05).max(1.0)
@@ -1295,6 +1438,25 @@ fn chart_y_bounds(series: &[ChartSeries]) -> (f64, f64) {
     } else {
         (min_y, max_y)
     }
+}
+
+fn nice_non_negative_upper_ms(max_y: f64) -> f64 {
+    if !max_y.is_finite() || max_y <= 0.0 {
+        return 10.0;
+    }
+
+    nice_upper_ms((max_y * 1.1).max(10.0))
+}
+
+fn nice_upper_ms(value: f64) -> f64 {
+    let magnitude = 10_f64.powf(value.log10().floor());
+    for factor in [1.0, 2.0, 5.0, 10.0] {
+        let candidate = factor * magnitude;
+        if value <= candidate {
+            return candidate;
+        }
+    }
+    10.0 * magnitude
 }
 
 fn x_axis_labels(visible: &[&GraphSample]) -> Vec<Span<'static>> {
@@ -1407,12 +1569,13 @@ fn status_line(state: &TuiState) -> Paragraph<'_> {
         state.graph_mode.label()
     };
     let lines = vec![Line::from(format!(
-        "{}{}{} | graph {}{} | q quit | Ctrl-C quit | r reset | p pause | g graph | f full",
+        "{}{}{} | graph {}{} scale {} | q quit | Ctrl-C quit | r reset | p pause | g graph | s scale | f full",
         state.status.label(),
         paused,
         quitting,
         graph_label,
-        if state.full_graph { " full" } else { "" }
+        if state.full_graph { " full" } else { "" },
+        state.graph_scale.label()
     ))];
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
 }
@@ -1961,30 +2124,98 @@ mod tests {
     }
 
     #[test]
-    fn chart_bounds_use_visible_positive_cluster_without_zero() {
-        let series = [series(vec![(0.0, 42.0), (1.0, 43.0), (2.0, 44.0)])];
-        let (min_y, max_y) = chart_y_bounds(&series);
+    fn rtt_chart_bounds_clamp_low_latency_samples_to_zero() {
+        let series = [series(vec![(0.0, 9.8), (1.0, 10.0), (2.0, 10.2)])];
+        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::NonNegative, GraphScale::Auto);
 
-        assert!(min_y > 0.0, "min_y={min_y}");
-        assert!(min_y < 42.0, "min_y={min_y}");
-        assert!(max_y > 44.0, "max_y={max_y}");
+        assert_eq!(min_y, 0.0);
+        assert_eq!(max_y, 20.0);
     }
 
     #[test]
-    fn chart_bounds_preserve_negative_values() {
+    fn rtt_chart_bounds_round_auto_upper_to_nice_ceiling() {
+        let series = [series(vec![(0.0, 8.0), (1.0, 426.0)])];
+        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::NonNegative, GraphScale::Auto);
+
+        assert_eq!(min_y, 0.0);
+        assert_eq!(max_y, 500.0);
+    }
+
+    #[test]
+    fn rtt_chart_bounds_handle_empty_zero_and_negative_values() {
+        assert_eq!(
+            chart_y_bounds(&[], ChartAxisKind::NonNegative, GraphScale::Auto),
+            (0.0, 10.0)
+        );
+
+        let zero = [series(vec![(0.0, 0.0), (1.0, 0.0)])];
+        assert_eq!(
+            chart_y_bounds(&zero, ChartAxisKind::NonNegative, GraphScale::Auto),
+            (0.0, 10.0)
+        );
+
+        let negative = [series(vec![(0.0, -3.0), (1.0, -1.5), (2.0, 0.5)])];
+        let (min_y, max_y) =
+            chart_y_bounds(&negative, ChartAxisKind::NonNegative, GraphScale::Auto);
+        assert_eq!(min_y, 0.0);
+        assert_eq!(max_y, 10.0);
+    }
+
+    #[test]
+    fn signed_chart_bounds_preserve_negative_values() {
         let series = [series(vec![(0.0, -3.0), (1.0, -1.5), (2.0, 0.5)])];
-        let (min_y, max_y) = chart_y_bounds(&series);
+        let (min_y, max_y) = chart_y_bounds(&series, ChartAxisKind::Signed, GraphScale::Auto);
 
         assert!(min_y < -3.0, "min_y={min_y}");
         assert!(max_y > 0.5, "max_y={max_y}");
     }
 
     #[test]
-    fn chart_bounds_handle_empty_and_flat_series() {
-        assert_eq!(chart_y_bounds(&[]), (0.0, 1.0));
+    fn mixed_chart_bounds_ignore_negative_effective_rtt_for_axis_floor() {
+        let rtt_series = ChartSeries {
+            value: Some(GraphValue::EffectiveRtt),
+            name: GraphValue::EffectiveRtt.name().to_owned(),
+            style: GraphValue::EffectiveRtt.style(),
+            data: vec![(0.0, -3.0), (1.0, 0.5)],
+        };
+        let one_way_series = ChartSeries {
+            value: Some(GraphValue::ClientToServer),
+            name: GraphValue::ClientToServer.name().to_owned(),
+            style: GraphValue::ClientToServer.style(),
+            data: vec![(0.0, 2.0)],
+        };
 
+        let (min_y, max_y) = chart_y_bounds(
+            &[rtt_series, one_way_series],
+            ChartAxisKind::Mixed,
+            GraphScale::Auto,
+        );
+
+        assert!(min_y >= -1.0, "min_y={min_y}");
+        assert!(max_y > 2.0, "max_y={max_y}");
+    }
+
+    #[test]
+    fn fixed_chart_bounds_use_selected_common_range() {
+        let series = [series(vec![(0.0, 12.0), (1.0, 426.0)])];
+        assert_eq!(
+            chart_y_bounds(&series, ChartAxisKind::NonNegative, GraphScale::Ms500),
+            (0.0, 500.0)
+        );
+        assert_eq!(
+            chart_y_bounds(&series, ChartAxisKind::Signed, GraphScale::Ms100),
+            (-100.0, 100.0)
+        );
+    }
+
+    #[test]
+    fn signed_chart_bounds_handle_empty_and_flat_series() {
+        assert_eq!(
+            chart_y_bounds(&[], ChartAxisKind::Signed, GraphScale::Auto),
+            (-1.0, 1.0)
+        );
         let flat = [series(vec![(0.0, 12.0), (1.0, 12.0)])];
-        let (min_y, max_y) = chart_y_bounds(&flat);
+        let (min_y, max_y) = chart_y_bounds(&flat, ChartAxisKind::Signed, GraphScale::Auto);
         assert!(min_y < 12.0, "min_y={min_y}");
         assert!(max_y > 12.0, "max_y={max_y}");
         assert!(min_y > 0.0, "min_y={min_y}");
@@ -2172,6 +2403,25 @@ mod tests {
         assert_eq!(state.graph_mode, GraphMode::Split);
         state.cycle_graph_mode();
         assert_eq!(state.graph_mode, GraphMode::Rtt);
+    }
+
+    #[test]
+    fn graph_scale_cycling_walks_common_ranges_and_returns_to_auto() {
+        let mut state = TuiState::default();
+
+        assert_eq!(state.graph_scale, GraphScale::Auto);
+        state.cycle_graph_scale();
+        assert_eq!(state.graph_scale, GraphScale::Ms100);
+        state.cycle_graph_scale();
+        assert_eq!(state.graph_scale, GraphScale::Ms250);
+        state.cycle_graph_scale();
+        assert_eq!(state.graph_scale, GraphScale::Ms500);
+        state.cycle_graph_scale();
+        assert_eq!(state.graph_scale, GraphScale::S1);
+        state.cycle_graph_scale();
+        assert_eq!(state.graph_scale, GraphScale::S2);
+        state.cycle_graph_scale();
+        assert_eq!(state.graph_scale, GraphScale::Auto);
     }
 
     #[test]
