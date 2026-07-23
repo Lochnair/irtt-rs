@@ -15,7 +15,7 @@ categories = ["network-programming"]
 irtt-proto.workspace = true
 libc = { version = "0.2.186", optional = true }
 socket2 = { version = "0.6.4", features = ["all"] }
-thiserror = "2.0.18"
+thiserror = "2.0.19"
 
 [features]
 default = []
