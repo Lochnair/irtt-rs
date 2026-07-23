@@ -21,6 +21,8 @@
 
   "labels": ["dependencies"],
 
+  "ignorePaths": [".github/workflows/release.yml"],
+
   "lockFileMaintenance": {
     "enabled": true,
     "schedule": ["before 10am on monday"],
