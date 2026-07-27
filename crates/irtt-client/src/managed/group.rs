@@ -2300,6 +2300,84 @@ mod tests {
     }
 
     #[test]
+    fn silent_opening_peer_times_out_all_attempts_and_publishes_once() {
+        let silent_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = silent_peer.local_addr().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut config = group_config(
+            None,
+            Duration::from_millis(10),
+            ManagedGroupPacing::Staggered,
+        );
+        config.client.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("silent", remote)],
+            SubscriberConfig {
+                capacity: 8,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let (join_tx, join_rx) = mpsc::sync_channel(1);
+        let joiner = thread::spawn(move || {
+            join_tx.send(session.join()).unwrap();
+        });
+        let mut events = Vec::new();
+        loop {
+            match sub.try_recv() {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Ok(None) => panic!("timed out waiting for silent opening peer completion"),
+                Err(EventSubscriptionError::Disconnected) => break,
+            }
+        }
+
+        let outcome = join_rx
+            .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+            .expect("timed out joining silent opening peer group")
+            .unwrap();
+        joiner.join().unwrap();
+        assert_eq!(sub.try_recv(), Err(EventSubscriptionError::Disconnected));
+
+        silent_peer.set_nonblocking(true).unwrap();
+        let mut open_attempts = 0;
+        let mut packet = [0_u8; 2048];
+        loop {
+            match silent_peer.recv_from(&mut packet) {
+                Ok((size, _)) => {
+                    assert!(size > 3);
+                    assert_ne!(packet[3] & FLAG_OPEN, 0);
+                    open_attempts += 1;
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(err) => panic!("failed reading queued open request: {err}"),
+            }
+        }
+        assert_eq!(open_attempts, 2);
+
+        let terminal_outcomes = events
+            .iter()
+            .filter_map(|event| match event {
+                ManagedGroupEvent::TargetFinished(outcome) => Some(outcome.clone()),
+                ManagedGroupEvent::Client(_) => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(terminal_outcomes.len(), 1);
+        let published = &terminal_outcomes[0];
+        let failure = match &published.end_reason {
+            ManagedTargetEndReason::OpenFailed(failure) => failure,
+            reason => panic!("expected OpenFailed, got {reason:?}"),
+        };
+        assert_eq!(failure.kind, ManagedTargetFailureKind::OpeningTimeout);
+        assert!(failure.message.contains("all open requests timed out"));
+        assert_eq!(outcome.total_target_outcomes, 1);
+        assert_eq!(outcome.failed_target_outcomes, 1);
+        assert_eq!(outcome.targets, vec![published.clone()]);
+    }
+
+    #[test]
     fn runtime_failure_publishes_terminal_outcome() {
         let interval = Duration::from_millis(10);
         let server = start_silent_runtime_server(test_params(None, interval));
