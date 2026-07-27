@@ -49,7 +49,9 @@ pub enum SubscriberOverflow {
 ///
 /// `EventHub` is used by managed sessions internally and is also exported for
 /// callers that want the same bounded subscription behavior around their own
-/// event producer. Publishing clones each event once per subscriber.
+/// event producer. Publishing clones each event once per subscriber. Once
+/// sealed with [`disconnect_all`](Self::disconnect_all), the hub cannot accept
+/// new subscribers or publish more events.
 #[derive(Debug)]
 pub struct EventHub<T = ClientEvent> {
     inner: Arc<HubInner<T>>,
@@ -58,7 +60,13 @@ pub struct EventHub<T = ClientEvent> {
 #[derive(Debug)]
 struct HubInner<T> {
     next_id: AtomicU64,
-    subscribers: Mutex<HashMap<u64, Arc<SubscriberInner<T>>>>,
+    state: Mutex<HubState<T>>,
+}
+
+#[derive(Debug)]
+struct HubState<T> {
+    subscribers: HashMap<u64, Arc<SubscriberInner<T>>>,
+    sealed: bool,
 }
 
 /// Handle for receiving managed client events.
@@ -101,7 +109,10 @@ impl<T> EventHub<T> {
         Self {
             inner: Arc::new(HubInner {
                 next_id: AtomicU64::new(1),
-                subscribers: Mutex::new(HashMap::new()),
+                state: Mutex::new(HubState {
+                    subscribers: HashMap::new(),
+                    sealed: false,
+                }),
             }),
         }
     }
@@ -119,6 +130,11 @@ impl<T> EventHub<T> {
             });
         }
 
+        let mut hub_state = self.inner.state.lock().expect("event hub mutex poisoned");
+        if hub_state.sealed {
+            return Err(crate::ClientError::AlreadyClosed);
+        }
+
         let id = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
         let inner = Arc::new(SubscriberInner {
             state: Mutex::new(SubscriberState {
@@ -128,11 +144,7 @@ impl<T> EventHub<T> {
             available: Condvar::new(),
             config,
         });
-        self.inner
-            .subscribers
-            .lock()
-            .expect("event hub mutex poisoned")
-            .insert(id, inner.clone());
+        hub_state.subscribers.insert(id, inner.clone());
 
         Ok(EventSubscription {
             id,
@@ -141,17 +153,20 @@ impl<T> EventHub<T> {
         })
     }
 
-    /// Disconnect all subscribers after leaving their already queued events
-    /// available to drain.
+    /// Permanently seal the hub and disconnect all subscribers.
+    ///
+    /// Already queued events remain available to drain. Future subscriptions
+    /// fail with [`crate::ClientError::AlreadyClosed`].
     pub fn disconnect_all(&self) {
-        let subscribers: Vec<Arc<SubscriberInner<T>>> = self
-            .inner
-            .subscribers
-            .lock()
-            .expect("event hub mutex poisoned")
-            .drain()
-            .map(|(_, subscriber)| subscriber)
-            .collect();
+        let subscribers: Vec<Arc<SubscriberInner<T>>> = {
+            let mut state = self.inner.state.lock().expect("event hub mutex poisoned");
+            state.sealed = true;
+            state
+                .subscribers
+                .drain()
+                .map(|(_, subscriber)| subscriber)
+                .collect()
+        };
 
         for subscriber in subscribers {
             subscriber.disconnect();
@@ -161,9 +176,10 @@ impl<T> EventHub<T> {
     #[cfg(test)]
     fn subscriber_count(&self) -> usize {
         self.inner
-            .subscribers
+            .state
             .lock()
             .expect("event hub mutex poisoned")
+            .subscribers
             .len()
     }
 }
@@ -177,9 +193,10 @@ impl<T: Clone> EventHub<T> {
     pub fn publish(&self, event: T) {
         let subscribers: Vec<(u64, Arc<SubscriberInner<T>>)> = self
             .inner
-            .subscribers
+            .state
             .lock()
             .expect("event hub mutex poisoned")
+            .subscribers
             .iter()
             .map(|(id, subscriber)| (*id, subscriber.clone()))
             .collect();
@@ -197,13 +214,9 @@ impl<T: Clone> EventHub<T> {
             return;
         }
 
-        let mut subscribers = self
-            .inner
-            .subscribers
-            .lock()
-            .expect("event hub mutex poisoned");
+        let mut subscribers = self.inner.state.lock().expect("event hub mutex poisoned");
         for id in disconnected {
-            subscribers.remove(&id);
+            subscribers.subscribers.remove(&id);
         }
     }
 }
@@ -259,9 +272,10 @@ impl<T> Drop for EventSubscription<T> {
     fn drop(&mut self) {
         self.inner.disconnect();
         if let Some(hub) = self.hub.upgrade() {
-            hub.subscribers
+            hub.state
                 .lock()
                 .expect("event hub mutex poisoned")
+                .subscribers
                 .remove(&self.id);
         }
     }
@@ -440,6 +454,34 @@ mod tests {
             sub.recv().unwrap_err(),
             EventSubscriptionError::Disconnected
         );
+    }
+
+    #[test]
+    fn sealed_hub_drains_queued_events_then_disconnects() {
+        let hub = EventHub::new();
+        let sub = hub.subscribe(SubscriberConfig::default()).unwrap();
+        hub.publish(event(1));
+
+        hub.disconnect_all();
+        hub.publish(event(2));
+
+        assert_eq!(event_message(sub.recv().unwrap()), "event-1");
+        assert_eq!(
+            sub.recv().unwrap_err(),
+            EventSubscriptionError::Disconnected
+        );
+    }
+
+    #[test]
+    fn subscribing_after_hub_is_sealed_fails() {
+        let hub: EventHub = EventHub::new();
+        hub.disconnect_all();
+        hub.disconnect_all();
+
+        assert!(matches!(
+            hub.subscribe(SubscriberConfig::default()),
+            Err(crate::ClientError::AlreadyClosed)
+        ));
     }
 
     #[test]
