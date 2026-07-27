@@ -1,11 +1,12 @@
 #![cfg(feature = "client")]
 
 use std::{
+    io::Read,
     net::{SocketAddr, UdpSocket},
-    process::Command,
+    process::{Command, Output, Stdio},
     thread,
     thread::JoinHandle,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use irtt_proto::{
@@ -169,6 +170,117 @@ fn multi_target_csv_emits_rows_for_both_labels() {
     );
 }
 
+#[test]
+fn continuous_mixed_success_and_open_failure_exits_and_reports_failure() {
+    let params = test_params(None, Duration::from_millis(10));
+    let success = start_peer_close_server(params.clone());
+    let failure = start_open_failure_server(params);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "0s",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "target,seq",
+        "--header",
+        "never",
+        "--target",
+        &format!("success={}", success.addr),
+        "--target",
+        &format!("failure={}", failure.addr),
+    ]);
+
+    let output = run_with_timeout(command, Duration::from_secs(3));
+    success.join();
+    failure.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stdout.lines().any(|line| line.starts_with("success,")),
+        "{stdout}"
+    );
+    assert!(stderr.contains("target failure failed"), "{stderr}");
+    assert!(stderr.contains("zero token without close flag"), "{stderr}");
+}
+
+#[test]
+fn all_open_failures_exit_nonzero_with_diagnostics() {
+    let params = test_params(None, Duration::from_millis(10));
+    let a = start_open_failure_server(params.clone());
+    let b = start_open_failure_server(params);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "0s",
+        "--interval",
+        "10ms",
+        "--target",
+        &format!("a={}", a.addr),
+        "--target",
+        &format!("b={}", b.addr),
+    ]);
+
+    let output = run_with_timeout(command, Duration::from_secs(3));
+    a.join();
+    b.join();
+
+    assert!(
+        !output.status.success(),
+        "status={:?}\nstdout={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("target a failed"), "{stderr}");
+    assert!(stderr.contains("target b failed"), "{stderr}");
+    assert!(
+        stderr.contains("no managed target completed successfully"),
+        "{stderr}"
+    );
+}
+
+fn run_with_timeout(mut command: Command, timeout: Duration) -> Output {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + timeout;
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            return child.wait_with_output().unwrap();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                let _ = pipe.read_to_end(&mut stdout);
+            }
+            if let Some(mut pipe) = child.stderr.take() {
+                let _ = pipe.read_to_end(&mut stderr);
+            }
+            let _ = child.wait();
+            panic!(
+                "CLI timed out after {timeout:?}\nstdout={}\nstderr={}",
+                String::from_utf8_lossy(&stdout),
+                String::from_utf8_lossy(&stderr)
+            );
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn start_echo_server(params: Params) -> FakeServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
@@ -201,6 +313,50 @@ fn start_echo_server(params: Params) -> FakeServer {
                 )
                 .unwrap();
         }
+    });
+    FakeServer { addr, done }
+}
+
+fn start_peer_close_server(params: Params) -> FakeServer {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let addr = socket.local_addr().unwrap();
+    let done = thread::spawn(move || {
+        let (_, peer) = recv_request(&socket);
+        socket
+            .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+            .unwrap();
+        let (packet, peer) = recv_request(&socket);
+        let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+        socket
+            .send_to(
+                &echo_reply_packet(
+                    TOKEN,
+                    seq,
+                    &params,
+                    &TimestampFields::default(),
+                    FLAG_REPLY | FLAG_CLOSE,
+                ),
+                peer,
+            )
+            .unwrap();
+    });
+    FakeServer { addr, done }
+}
+
+fn start_open_failure_server(params: Params) -> FakeServer {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let addr = socket.local_addr().unwrap();
+    let done = thread::spawn(move || {
+        let (_, peer) = recv_request(&socket);
+        socket
+            .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, 0, &params), peer)
+            .unwrap();
     });
     FakeServer { addr, done }
 }

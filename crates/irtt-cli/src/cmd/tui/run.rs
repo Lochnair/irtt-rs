@@ -193,6 +193,7 @@ fn run_group_tui(
                     }
                     ManagedGroupEvent::TargetFinished(target) => {
                         terminal_targets.insert(target.id.as_str().to_owned());
+                        state.process_target_outcome(&target);
                     }
                 }
                 render_if_due(terminal, state, next_render, false)?;
@@ -230,8 +231,18 @@ fn run_group_tui(
 
     let outcome = session.join()?;
     while let Ok(Some(group_event)) = events.try_recv() {
-        if let ManagedGroupEvent::Client(target_event) = group_event {
-            state.process_target_event(&target_event);
+        match group_event {
+            ManagedGroupEvent::Client(target_event) => state.process_target_event(&target_event),
+            ManagedGroupEvent::TargetFinished(target) => {
+                if terminal_targets.insert(target.id.as_str().to_owned()) {
+                    state.process_target_outcome(&target);
+                }
+            }
+        }
+    }
+    for target in &outcome.targets {
+        if terminal_targets.insert(target.id.as_str().to_owned()) {
+            state.process_target_outcome(target);
         }
     }
 
@@ -247,6 +258,23 @@ fn run_group_tui(
                 Err("managed client group was cancelled".into())
             }
         };
+    }
+    let successful_targets = outcome
+        .targets
+        .iter()
+        .filter(|target| target.is_success())
+        .count();
+    let failed_targets = outcome
+        .targets
+        .iter()
+        .filter(|target| target.end_reason.failure().is_some())
+        .count();
+    if !interrupted && successful_targets == 0 && failed_targets > 0 {
+        state.set_status(TuiStatus::Error);
+        render_if_due(terminal, state, next_render, true)?;
+        return Err(
+            format!("no managed target completed successfully ({failed_targets} failed)").into(),
+        );
     }
 
     state.set_status(TuiStatus::Complete);

@@ -211,6 +211,13 @@ pub struct ManagedTargetOutcome {
     pub warning_events: u64,
 }
 
+impl ManagedTargetOutcome {
+    /// Return whether this target completed successfully.
+    pub fn is_success(&self) -> bool {
+        self.end_reason.is_success()
+    }
+}
+
 /// Reason an individual target stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedTargetEndReason {
@@ -288,6 +295,19 @@ pub enum ManagedTargetFailureKind {
     InvalidConfiguration,
     /// A managed worker failed internally.
     InternalWorker,
+}
+
+impl fmt::Display for ManagedTargetFailureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::OpeningTimeout => "opening timeout",
+            Self::OpeningProtocol => "opening protocol/authentication/negotiation",
+            Self::Socket => "socket",
+            Self::RuntimeProtocol => "runtime protocol",
+            Self::InvalidConfiguration => "invalid configuration",
+            Self::InternalWorker => "internal worker",
+        })
+    }
 }
 
 fn classify_target_failure(error: &ClientError, opening: bool) -> ManagedTargetFailureKind {

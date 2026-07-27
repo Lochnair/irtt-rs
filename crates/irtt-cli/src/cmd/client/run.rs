@@ -10,7 +10,8 @@ use std::{
 
 use irtt_client::{
     ClientEvent, EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
-    ManagedGroupEndReason, ManagedGroupEvent, SubscriberConfig, SubscriberOverflow, TargetEvent,
+    ManagedGroupEndReason, ManagedGroupEvent, ManagedTargetOutcome, SubscriberConfig,
+    SubscriberOverflow, TargetEvent,
 };
 #[cfg(all(test, feature = "stats"))]
 use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
@@ -347,6 +348,7 @@ fn run_group_stream(
                         }
                     }
                     ManagedGroupEvent::TargetFinished(target) => {
+                        report_target_failure(&target);
                         terminal_targets.insert(target.id.as_str().to_owned());
                     }
                 }
@@ -374,24 +376,51 @@ fn run_group_stream(
 
     let outcome = session.join()?;
     while let Ok(Some(group_event)) = events.try_recv() {
-        if let ManagedGroupEvent::Client(target_event) = group_event {
-            #[cfg(feature = "stats")]
-            {
-                let label = target_event.target.as_str();
-                let stats = stats
-                    .entry(label.to_owned())
-                    .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
-                print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
+        match group_event {
+            ManagedGroupEvent::Client(target_event) => {
+                #[cfg(feature = "stats")]
+                {
+                    let label = target_event.target.as_str();
+                    let stats = stats
+                        .entry(label.to_owned())
+                        .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
+                    print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
+                }
+                #[cfg(not(feature = "stats"))]
+                {
+                    print_target_event_with_stats(&mut stream_output, &target_event)?;
+                }
             }
-            #[cfg(not(feature = "stats"))]
-            {
-                print_target_event_with_stats(&mut stream_output, &target_event)?;
+            ManagedGroupEvent::TargetFinished(target) => {
+                if terminal_targets.insert(target.id.as_str().to_owned()) {
+                    report_target_failure(&target);
+                }
             }
         }
     }
 
     if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
         return Err("managed client group was cancelled".into());
+    }
+    for target in &outcome.targets {
+        if terminal_targets.insert(target.id.as_str().to_owned()) {
+            report_target_failure(target);
+        }
+    }
+    let successful_targets = outcome
+        .targets
+        .iter()
+        .filter(|target| target.is_success())
+        .count();
+    let failed_targets = outcome
+        .targets
+        .iter()
+        .filter(|target| target.end_reason.failure().is_some())
+        .count();
+    if !interrupted && successful_targets == 0 && failed_targets > 0 {
+        return Err(
+            format!("no managed target completed successfully ({failed_targets} failed)").into(),
+        );
     }
 
     let print_final_summary = should_print_final_summary(continuous, interrupted);
@@ -413,6 +442,15 @@ fn run_group_stream(
     }
     stream_output.out.flush()?;
     Ok(())
+}
+
+fn report_target_failure(target: &ManagedTargetOutcome) {
+    if let Some(failure) = target.end_reason.failure() {
+        eprintln!(
+            "irtt-rs: target {} failed ({}): {}",
+            target.id, failure.kind, failure.message
+        );
+    }
 }
 
 fn estimated_group_completion_grace(args: &ClientArgs) -> Duration {

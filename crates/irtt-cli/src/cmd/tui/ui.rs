@@ -9,7 +9,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use irtt_client::{ClientEvent, NegotiatedParams, SignedDuration, TargetEvent};
+use irtt_client::{
+    ClientEvent, ManagedTargetEndReason, ManagedTargetOutcome, NegotiatedParams, SignedDuration,
+    TargetEvent,
+};
 use irtt_stats::{Snapshot, StatsCollector, TimeStats};
 use ratatui::{
     backend::CrosstermBackend,
@@ -161,6 +164,82 @@ impl TuiState {
             idx
         };
         self.process_event_for_target(idx, &event.event);
+    }
+
+    pub(super) fn process_target_outcome(&mut self, outcome: &ManagedTargetOutcome) {
+        let label = outcome.id.as_str();
+        let idx = if let Some(idx) = self.target_index.get(label).copied() {
+            idx
+        } else {
+            let idx = self.targets.len();
+            self.targets.push(TuiTargetState::new(
+                label.to_owned(),
+                stats_config(self.config.duration.is_none()),
+            ));
+            self.target_index.insert(label.to_owned(), idx);
+            idx
+        };
+
+        let (status, recent, warning) = match &outcome.end_reason {
+            ManagedTargetEndReason::TestComplete => {
+                (TargetStatus::Closed, "test completed".to_owned(), None)
+            }
+            ManagedTargetEndReason::PeerClosed => (
+                TargetStatus::Closed,
+                "session closed by peer".to_owned(),
+                None,
+            ),
+            ManagedTargetEndReason::NoTestComplete => (
+                TargetStatus::NoTest,
+                "no-test negotiation completed".to_owned(),
+                None,
+            ),
+            ManagedTargetEndReason::Cancelled => {
+                (TargetStatus::Cancelled, "target cancelled".to_owned(), None)
+            }
+            ManagedTargetEndReason::Removed => {
+                (TargetStatus::Removed, "target removed".to_owned(), None)
+            }
+            ManagedTargetEndReason::OpenFailed(failure)
+            | ManagedTargetEndReason::Failed(failure) => {
+                let message = format!("{}: {}", failure.kind, failure.message);
+                (
+                    TargetStatus::Failed,
+                    format!("target failed: {message}"),
+                    Some(message),
+                )
+            }
+        };
+
+        if let Some(target) = self.targets.get_mut(idx) {
+            target.remote = Some(outcome.remote.to_string());
+            target.status = status;
+            if let Some(warning) = &warning {
+                target.last_warning = Some(warning.clone());
+            }
+        }
+        if let Some(warning) = warning {
+            self.last_warning = Some(warning);
+        }
+        self.push_event(format!("{label}: {recent}"));
+
+        if self
+            .targets
+            .iter()
+            .all(|target| target.status.is_terminal())
+        {
+            self.status = if self.targets.iter().any(|target| target.status.is_success()) {
+                TuiStatus::Complete
+            } else if self
+                .targets
+                .iter()
+                .any(|target| target.status == TargetStatus::Failed)
+            {
+                TuiStatus::Error
+            } else {
+                TuiStatus::Complete
+            };
+        }
     }
 
     fn process_event_for_target(&mut self, target_idx: usize, event: &ClientEvent) {
@@ -456,6 +535,8 @@ pub(super) enum TargetStatus {
     Closed,
     Failed,
     NoTest,
+    Cancelled,
+    Removed,
     Unknown,
 }
 
@@ -467,12 +548,21 @@ impl TargetStatus {
             Self::Closed => "closed",
             Self::Failed => "failed",
             Self::NoTest => "no-test",
+            Self::Cancelled => "cancelled",
+            Self::Removed => "removed",
             Self::Unknown => "unknown",
         }
     }
 
     fn is_terminal(self) -> bool {
-        matches!(self, Self::Closed | Self::Failed | Self::NoTest)
+        matches!(
+            self,
+            Self::Closed | Self::Failed | Self::NoTest | Self::Cancelled | Self::Removed
+        )
+    }
+
+    fn is_success(self) -> bool {
+        matches!(self, Self::Closed | Self::NoTest)
     }
 }
 
@@ -2019,6 +2109,19 @@ mod tests {
         }
     }
 
+    fn target_outcome(label: &str, end_reason: ManagedTargetEndReason) -> ManagedTargetOutcome {
+        ManagedTargetOutcome {
+            id: TargetId::from(label),
+            remote: remote(),
+            end_reason,
+            packets_sent: 0,
+            replies_received: 0,
+            duplicates: 0,
+            late: 0,
+            warning_events: 0,
+        }
+    }
+
     #[test]
     fn formats_signed_durations_and_missing_values() {
         assert_eq!(format_ns_i128(Some(-1_500_000)), "-1.5ms");
@@ -2244,6 +2347,71 @@ mod tests {
 
         assert_eq!(state.targets[1].status, TargetStatus::Closed);
         assert_eq!(state.status, TuiStatus::Complete);
+    }
+
+    #[test]
+    fn terminal_failure_marks_the_correct_target_failed() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+        let failure = irtt_client::ManagedTargetFailure {
+            kind: irtt_client::ManagedTargetFailureKind::OpeningTimeout,
+            message: "all open requests timed out".to_owned(),
+        };
+
+        state.process_target_outcome(&target_outcome(
+            "b",
+            ManagedTargetEndReason::OpenFailed(failure),
+        ));
+
+        assert_eq!(state.targets[0].status, TargetStatus::Opening);
+        assert_eq!(state.targets[1].status, TargetStatus::Failed);
+        assert!(state.targets[1]
+            .last_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("opening timeout")));
+    }
+
+    #[test]
+    fn mixed_terminal_outcomes_preserve_success_and_show_failure() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+        state.process_target_outcome(&target_outcome("a", ManagedTargetEndReason::PeerClosed));
+        state.process_target_outcome(&target_outcome(
+            "b",
+            ManagedTargetEndReason::Failed(irtt_client::ManagedTargetFailure {
+                kind: irtt_client::ManagedTargetFailureKind::RuntimeProtocol,
+                message: "pending probe limit exceeded".to_owned(),
+            }),
+        ));
+
+        assert_eq!(state.targets[0].status, TargetStatus::Closed);
+        assert_eq!(state.targets[1].status, TargetStatus::Failed);
+        assert_eq!(state.status, TuiStatus::Complete);
+        assert!(state
+            .last_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("pending probe limit")));
+    }
+
+    #[test]
+    fn all_failed_terminal_outcomes_set_error_status() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+        for label in ["a", "b"] {
+            state.process_target_outcome(&target_outcome(
+                label,
+                ManagedTargetEndReason::OpenFailed(irtt_client::ManagedTargetFailure {
+                    kind: irtt_client::ManagedTargetFailureKind::OpeningProtocol,
+                    message: "server returned a zero connection token".to_owned(),
+                }),
+            ));
+        }
+
+        assert_eq!(state.status, TuiStatus::Error);
+        assert!(state
+            .targets
+            .iter()
+            .all(|target| target.status == TargetStatus::Failed));
     }
 
     #[test]
