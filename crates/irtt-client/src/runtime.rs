@@ -32,6 +32,7 @@ pub(crate) struct SessionRuntime {
     negotiated: Option<NegotiatedParams>,
     phase: ClientPhase,
     session: Option<ActiveSession>,
+    final_packets_sent: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -65,6 +66,7 @@ impl SessionRuntime {
             negotiated: None,
             phase: ClientPhase::Connected,
             session: None,
+            final_packets_sent: 0,
         })
     }
 
@@ -346,13 +348,7 @@ impl SessionRuntime {
         let packet =
             encode_close_request(&CloseRequest { token }, self.config.hmac_key.as_deref())?;
         send(&packet)?;
-        self.phase = ClientPhase::Closed {
-            source: CloseSource::Local,
-        };
-        if let Some(session) = self.session.as_mut() {
-            session.timed_out.clear();
-        }
-        self.session = None;
+        self.transition_to_closed(CloseSource::Local);
 
         Ok(vec![ClientEvent::SessionClosed {
             remote: self.remote,
@@ -389,7 +385,7 @@ impl SessionRuntime {
     pub(crate) fn packets_sent(&self) -> u64 {
         self.session
             .as_ref()
-            .map_or(0, |session| session.packets_sent)
+            .map_or(self.final_packets_sent, |session| session.packets_sent)
     }
 
     pub(crate) fn is_open(&self) -> bool {
@@ -620,18 +616,20 @@ impl SessionRuntime {
     }
 
     fn close_from_peer(&mut self, token: u64, now: ClientTimestamp, events: &mut Vec<ClientEvent>) {
-        self.phase = ClientPhase::Closed {
-            source: CloseSource::Peer,
-        };
-        if let Some(session) = self.session.as_mut() {
-            session.timed_out.clear();
-        }
-        self.session = None;
+        self.transition_to_closed(CloseSource::Peer);
         events.push(ClientEvent::SessionClosed {
             remote: self.remote,
             token,
             at: now,
         });
+    }
+
+    fn transition_to_closed(&mut self, source: CloseSource) {
+        if let Some(mut session) = self.session.take() {
+            session.timed_out.clear();
+            self.final_packets_sent = session.packets_sent;
+        }
+        self.phase = ClientPhase::Closed { source };
     }
 }
 

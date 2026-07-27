@@ -72,6 +72,8 @@ pub enum SessionEndReason {
     /// The negotiated finite test duration completed and the client closed the
     /// session normally.
     TestComplete,
+    /// The peer ended the session with an authenticated close-flagged reply.
+    PeerClosed,
     /// Cancellation was requested through [`ManagedClientSession::stop`] or by
     /// dropping the session handle.
     Cancelled,
@@ -267,12 +269,16 @@ fn run_client(
         publish_events(&hub, &mut counters, close_events);
     }
 
+    let end_reason = if cancelled {
+        SessionEndReason::Cancelled
+    } else if client.is_peer_closed() {
+        SessionEndReason::PeerClosed
+    } else {
+        SessionEndReason::TestComplete
+    };
+
     Ok(SessionOutcome {
-        end_reason: if cancelled {
-            SessionEndReason::Cancelled
-        } else {
-            SessionEndReason::TestComplete
-        },
+        end_reason,
         packets_sent,
         replies_received: counters.replies_received,
         duplicates: counters.duplicates,
@@ -683,6 +689,8 @@ mod tests {
         server.join();
 
         assert_eq!(outcome.end_reason, SessionEndReason::TestComplete);
+        assert!(outcome.packets_sent > 0);
+        assert!(outcome.replies_received > 0);
         assert!(events
             .iter()
             .any(|event| matches!(event, ClientEvent::SessionStarted { .. })));
@@ -716,6 +724,9 @@ mod tests {
         server.join();
 
         assert_eq!(outcome.end_reason, SessionEndReason::TestComplete);
+        assert_eq!(outcome.packets_sent, 1);
+        assert_eq!(outcome.replies_received, 0);
+        assert_eq!(outcome.late, 1);
         assert!(events
             .iter()
             .any(|event| matches!(event, ClientEvent::EchoLoss { seq: 0, .. })));
@@ -755,7 +766,9 @@ mod tests {
         let outcome = session.join().unwrap();
         server.join();
 
-        assert_eq!(outcome.end_reason, SessionEndReason::TestComplete);
+        assert_eq!(outcome.end_reason, SessionEndReason::PeerClosed);
+        assert_eq!(outcome.packets_sent, 1);
+        assert_eq!(outcome.replies_received, 1);
         assert!(events
             .iter()
             .any(|event| matches!(event, ClientEvent::EchoReply { .. })));
@@ -786,6 +799,8 @@ mod tests {
         server.join();
 
         assert_eq!(outcome.end_reason, SessionEndReason::Cancelled);
+        assert!(outcome.packets_sent > 0);
+        assert!(outcome.replies_received > 0);
         assert!(events
             .iter()
             .any(|event| matches!(event, ClientEvent::SessionClosed { .. })));
@@ -834,5 +849,6 @@ mod tests {
         done.join().unwrap();
 
         assert_eq!(outcome.end_reason, SessionEndReason::NoTestComplete);
+        assert_eq!(outcome.packets_sent, 0);
     }
 }

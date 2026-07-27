@@ -975,6 +975,10 @@ fn poll_active_timeouts(shared: &GroupShared, now: Instant) {
         ) {
             continue;
         }
+        if target.runtime.is_peer_closed() {
+            target.mark_finished(ManagedTargetEndReason::PeerClosed);
+            continue;
+        }
         match target.runtime.poll_timeouts_at(now) {
             Ok(events) => publish_events(&shared.hub, &mut target, events),
             Err(err) => target.mark_finished(ManagedTargetEndReason::Failed {
@@ -1501,6 +1505,46 @@ mod tests {
         }
     }
 
+    fn start_peer_close_server(params: Params) -> FakeServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & FLAG_OPEN, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+
+            let (echo, peer) = recv_request_timeout(&socket).expect("missing echo request");
+            let seq = u32::from_le_bytes(echo[12..16].try_into().unwrap());
+            tx.send(ServerObservation::Echo {
+                seq,
+                at: Instant::now(),
+            })
+            .unwrap();
+            socket
+                .send_to(
+                    &echo_reply_packet_with_flags(
+                        TOKEN,
+                        seq,
+                        &params,
+                        &TimestampFields::default(),
+                        FLAG_REPLY | flags::FLAG_CLOSE,
+                    ),
+                    peer,
+                )
+                .unwrap();
+        });
+        FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        }
+    }
+
     fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
         let mut buf = [0_u8; 2048];
         socket
@@ -1524,12 +1568,22 @@ mod tests {
         params: &Params,
         timestamps: &TimestampFields,
     ) -> Vec<u8> {
+        echo_reply_packet_with_flags(token, seq, params, timestamps, FLAG_REPLY)
+    }
+
+    fn echo_reply_packet_with_flags(
+        token: u64,
+        seq: u32,
+        params: &Params,
+        timestamps: &TimestampFields,
+        flags: u8,
+    ) -> Vec<u8> {
         let layout = PacketLayout::echo(false, params);
         let packet_len = echo_packet_len(false, params).unwrap();
         let mut packet = Vec::with_capacity(packet_len);
 
         packet.extend_from_slice(&MAGIC);
-        packet.push(FLAG_REPLY);
+        packet.push(flags);
         packet.extend_from_slice(&token.to_le_bytes());
         packet.extend_from_slice(&seq.to_le_bytes());
 
@@ -1704,6 +1758,10 @@ mod tests {
             ManagedGroupEndReason::AllTargetsComplete
         );
         assert_eq!(outcome.targets.len(), 2);
+        assert!(outcome
+            .targets
+            .iter()
+            .all(|target| target.packets_sent > 0 && target.replies_received > 0));
         for id in [TargetId::from("a"), TargetId::from("b")] {
             assert!(events.iter().any(|event| {
                 event.target == id && matches!(event.event, ClientEvent::SessionStarted { .. })
@@ -1715,6 +1773,31 @@ mod tests {
                 event.target == id && matches!(event.event, ClientEvent::EchoReply { .. })
             }));
         }
+    }
+
+    #[test]
+    fn peer_close_preserves_group_outcome_counters_and_provenance() {
+        let interval = Duration::from_millis(10);
+        let server = start_peer_close_server(test_params(None, interval));
+
+        let session = ManagedClientGroup::start(
+            group_config(None, interval, ManagedGroupPacing::Staggered),
+            vec![target("peer", server.addr)],
+        )
+        .unwrap();
+
+        let outcome = session.join().unwrap();
+        server.join();
+
+        assert_eq!(
+            outcome.end_reason,
+            ManagedGroupEndReason::AllTargetsComplete
+        );
+        assert_eq!(outcome.targets.len(), 1);
+        let target = &outcome.targets[0];
+        assert_eq!(target.end_reason, ManagedTargetEndReason::PeerClosed);
+        assert_eq!(target.packets_sent, 1);
+        assert_eq!(target.replies_received, 1);
     }
 
     #[test]
