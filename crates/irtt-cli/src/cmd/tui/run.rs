@@ -7,8 +7,9 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use irtt_client::{
-    EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig, ManagedGroupEndReason,
-    ManagedGroupEvent, SubscriberConfig, SubscriberOverflow,
+    EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
+    ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, SubscriberConfig,
+    SubscriberOverflow,
 };
 
 use crate::{
@@ -154,6 +155,7 @@ fn run_group_tui(
     let group_config = ManagedClientGroupConfig {
         client: config,
         pacing: args.pacing.into(),
+        completion: ManagedGroupCompletionPolicy::AllTargetsComplete,
     };
     let (session, events) = ManagedClientGroup::start_with_subscription(
         group_config,

@@ -104,6 +104,20 @@ pub enum ManagedGroupPacing {
     Burst,
 }
 
+/// Policy controlling when a managed group completes naturally.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ManagedGroupCompletionPolicy {
+    /// Complete after a non-empty desired target set reaches terminal outcomes.
+    ///
+    /// Replacing the desired set with an empty set leaves the group alive and
+    /// idle so a later [`ManagedClientGroupSession::update_targets`] call can
+    /// resume probing.
+    #[default]
+    AllTargetsComplete,
+    /// Remain alive until explicit cancellation, including after all targets finish.
+    ExplicitCancellation,
+}
+
 /// Configuration for a managed multi-target client group.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ManagedClientGroupConfig {
@@ -116,6 +130,8 @@ pub struct ManagedClientGroupConfig {
     pub client: ClientConfig,
     /// Coordinated group pacing mode.
     pub pacing: ManagedGroupPacing,
+    /// Policy controlling natural group completion.
+    pub completion: ManagedGroupCompletionPolicy,
 }
 
 /// Target-scoped managed event.
@@ -388,6 +404,7 @@ impl ManagedClientGroup {
                 (target.id.clone(), target.remote)
             };
             registry.remotes.insert(remote, id.clone());
+            registry.desired.insert(id.clone());
             registry.targets.insert(id, state);
         }
 
@@ -458,7 +475,8 @@ impl ManagedClientGroupSession {
     /// The update is authoritative. Existing targets with the same
     /// [`TargetId`], remote address, and auth setting remain running. In v1,
     /// changing the remote address or auth for an existing target id is
-    /// rejected instead of mutating the active session in place.
+    /// rejected instead of mutating the active session in place. An empty set
+    /// removes every target but leaves the group alive and idle.
     pub fn update_targets(&self, targets: Vec<ManagedTargetConfig>) -> Result<(), ClientError> {
         let (reply_tx, reply_rx) = mpsc::channel();
         self.control_tx
@@ -538,6 +556,7 @@ impl Drop for GroupSchedulerCleanup {
 
 #[derive(Debug, Default)]
 struct TargetRegistry {
+    desired: HashSet<TargetId>,
     targets: HashMap<TargetId, Arc<Mutex<TargetState>>>,
     remotes: HashMap<SocketAddr, TargetId>,
 }
@@ -677,7 +696,7 @@ fn run_group_scheduler(
         finish_completed_targets(&socket, &shared, now);
         collect_finished_targets(&shared, &mut records);
 
-        if registry_is_empty(&shared) {
+        if group_should_complete(&shared, config.completion) {
             return Ok(ManagedGroupOutcome {
                 end_reason: ManagedGroupEndReason::AllTargetsComplete,
                 targets: records,
@@ -908,11 +927,9 @@ fn apply_target_update(
     records: &mut Vec<ManagedTargetOutcome>,
 ) -> Result<(), ClientError> {
     validate_open_timeouts(&config.open_timeouts)?;
-    if targets.is_empty() {
-        remove_all_targets(socket, shared, records, ManagedTargetEndReason::Removed);
-        return Ok(());
+    if !targets.is_empty() {
+        validate_target_configs(&targets, Some(shared.family_remote))?;
     }
-    validate_target_configs(&targets, Some(shared.family_remote))?;
 
     let desired_ids: HashSet<TargetId> = targets.iter().map(|target| target.id.clone()).collect();
     let mut additions = Vec::new();
@@ -980,6 +997,7 @@ fn apply_target_update(
             registry.remotes.insert(remote, id.clone());
             registry.targets.insert(id, target);
         }
+        registry.desired = desired_ids;
         removed
     };
 
@@ -1243,19 +1261,6 @@ fn cancel_remaining_targets(
     }
 }
 
-fn remove_all_targets(
-    socket: &UdpSocket,
-    shared: &GroupShared,
-    records: &mut Vec<ManagedTargetOutcome>,
-    reason: ManagedTargetEndReason,
-) {
-    let targets = drain_registry(shared);
-    for target in targets {
-        let outcome = close_target(socket, &shared.hub, target, reason.clone());
-        record_target_outcome(shared, records, outcome);
-    }
-}
-
 fn record_target_outcome(
     shared: &GroupShared,
     records: &mut Vec<ManagedTargetOutcome>,
@@ -1344,13 +1349,15 @@ fn all_targets(shared: &GroupShared) -> Vec<Arc<Mutex<TargetState>>> {
         .collect()
 }
 
-fn registry_is_empty(shared: &GroupShared) -> bool {
-    shared
+fn group_should_complete(shared: &GroupShared, completion: ManagedGroupCompletionPolicy) -> bool {
+    if completion == ManagedGroupCompletionPolicy::ExplicitCancellation {
+        return false;
+    }
+    let registry = shared
         .registry
         .lock()
-        .expect("target registry mutex poisoned")
-        .targets
-        .is_empty()
+        .expect("target registry mutex poisoned");
+    !registry.desired.is_empty() && registry.targets.is_empty()
 }
 
 #[derive(Debug)]
@@ -1584,6 +1591,7 @@ mod tests {
                 ..ClientConfig::default()
             },
             pacing,
+            completion: ManagedGroupCompletionPolicy::AllTargetsComplete,
         }
     }
 
@@ -2451,6 +2459,174 @@ mod tests {
             .iter()
             .any(|target| target.id.as_str() == "b"
                 && target.end_reason == ManagedTargetEndReason::Removed));
+    }
+
+    #[test]
+    fn start_rejects_empty_target_set_with_documented_error() {
+        let err = ManagedClientGroup::start(
+            group_config(
+                None,
+                Duration::from_millis(20),
+                ManagedGroupPacing::Staggered,
+            ),
+            Vec::new(),
+        )
+        .unwrap_err();
+
+        assert!(matches!(err, ClientError::InvalidConfig { .. }));
+        assert!(err
+            .to_string()
+            .contains("managed client group requires at least one target"));
+    }
+
+    #[test]
+    fn dynamic_group_can_remove_to_empty_and_add_targets_again() {
+        let interval = Duration::from_millis(20);
+        let params = test_params(None, interval);
+        let a = start_echo_server(params.clone(), Duration::ZERO);
+        let b = start_echo_server(params, Duration::ZERO);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Burst);
+        config.completion = ManagedGroupCompletionPolicy::ExplicitCancellation;
+
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("a", a.addr)],
+            SubscriberConfig {
+                capacity: 128,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        while {
+            let event = recv_event_with_timeout(&sub);
+            event.target.as_str() != "a" || !matches!(event.event, ClientEvent::EchoReply { .. })
+        } {}
+
+        session.update_targets(Vec::new()).unwrap();
+        let removal_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            match sub.try_recv() {
+                Ok(Some(ManagedGroupEvent::TargetFinished(outcome)))
+                    if outcome.id.as_str() == "a"
+                        && outcome.end_reason == ManagedTargetEndReason::Removed =>
+                {
+                    break;
+                }
+                Ok(Some(_)) | Ok(None) if Instant::now() < removal_deadline => {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                result => panic!("timed out waiting for removed outcome: {result:?}"),
+            }
+        }
+
+        session.update_targets(vec![target("b", b.addr)]).unwrap();
+        while {
+            let event = recv_event_with_timeout(&sub);
+            event.target.as_str() != "b" || !matches!(event.event, ClientEvent::EchoReply { .. })
+        } {}
+
+        session.stop();
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
+        a.join();
+        b.join();
+
+        assert_eq!(outcome.end_reason, ManagedGroupEndReason::Cancelled);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::TargetFinished(ManagedTargetOutcome {
+                id,
+                end_reason: ManagedTargetEndReason::Cancelled,
+                ..
+            }) if id.as_str() == "b"
+        )));
+    }
+
+    #[test]
+    fn removing_final_target_keeps_control_channel_responsive() {
+        let interval = Duration::from_millis(20);
+        let server = start_echo_server(test_params(None, interval), Duration::ZERO);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.completion = ManagedGroupCompletionPolicy::ExplicitCancellation;
+        let session = ManagedClientGroup::start(config, vec![target("only", server.addr)]).unwrap();
+
+        session.update_targets(Vec::new()).unwrap();
+        session.update_targets(Vec::new()).unwrap();
+        let idle_subscription = session
+            .subscribe(SubscriberConfig {
+                capacity: 4,
+                overflow: SubscriberOverflow::DropNewest,
+            })
+            .expect("an idle dynamic group must still accept subscribers");
+
+        session.stop();
+        let outcome = session.join().unwrap();
+        server.join();
+
+        assert_eq!(outcome.end_reason, ManagedGroupEndReason::Cancelled);
+        assert_eq!(
+            idle_subscription.try_recv(),
+            Err(EventSubscriptionError::Disconnected)
+        );
+    }
+
+    #[test]
+    fn explicit_cancellation_while_idle_publishes_removal_and_disconnects() {
+        let interval = Duration::from_millis(20);
+        let server = start_echo_server(test_params(None, interval), Duration::ZERO);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.completion = ManagedGroupCompletionPolicy::ExplicitCancellation;
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("idle", server.addr)],
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        session.update_targets(Vec::new()).unwrap();
+        session.stop();
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
+        server.join();
+
+        assert_eq!(outcome.end_reason, ManagedGroupEndReason::Cancelled);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::TargetFinished(ManagedTargetOutcome {
+                id,
+                end_reason: ManagedTargetEndReason::Removed,
+                ..
+            }) if id.as_str() == "idle"
+        )));
+    }
+
+    #[test]
+    fn finite_static_group_still_completes_naturally() {
+        let interval = Duration::from_millis(10);
+        let duration = Duration::from_millis(30);
+        let server = start_echo_server(test_params(Some(duration), interval), Duration::ZERO);
+        let session = ManagedClientGroup::start(
+            group_config(Some(duration), interval, ManagedGroupPacing::Staggered),
+            vec![target("finite", server.addr)],
+        )
+        .unwrap();
+
+        let outcome = session.join().unwrap();
+        server.join();
+
+        assert_eq!(
+            outcome.end_reason,
+            ManagedGroupEndReason::AllTargetsComplete
+        );
+        assert_eq!(outcome.targets.len(), 1);
+        assert_eq!(
+            outcome.targets[0].end_reason,
+            ManagedTargetEndReason::TestComplete
+        );
     }
 
     #[test]

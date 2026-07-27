@@ -10,8 +10,8 @@ use std::{
 
 use irtt_client::{
     ClientEvent, EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
-    ManagedGroupEndReason, ManagedGroupEvent, ManagedTargetOutcome, SubscriberConfig,
-    SubscriberOverflow, TargetEvent,
+    ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, ManagedTargetOutcome,
+    SubscriberConfig, SubscriberOverflow, TargetEvent,
 };
 #[cfg(all(test, feature = "stats"))]
 use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
@@ -279,6 +279,7 @@ fn run_group_stream(
     let group_config = ManagedClientGroupConfig {
         client: config,
         pacing: args.pacing.into(),
+        completion: ManagedGroupCompletionPolicy::AllTargetsComplete,
     };
 
     let (session, events) = ManagedClientGroup::start_with_subscription(
