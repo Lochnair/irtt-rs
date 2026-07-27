@@ -261,16 +261,8 @@ fn run_group_tui(
             }
         };
     }
-    let successful_targets = outcome
-        .targets
-        .iter()
-        .filter(|target| target.is_success())
-        .count();
-    let failed_targets = outcome
-        .targets
-        .iter()
-        .filter(|target| target.end_reason.failure().is_some())
-        .count();
+    let successful_targets = outcome.successful_target_outcomes;
+    let failed_targets = outcome.failed_target_outcomes;
     if !interrupted && successful_targets == 0 && failed_targets > 0 {
         state.set_status(TuiStatus::Error);
         render_if_due(terminal, state, next_render, true)?;

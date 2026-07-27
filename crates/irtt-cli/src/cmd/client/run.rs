@@ -408,16 +408,8 @@ fn run_group_stream(
             report_target_failure(target);
         }
     }
-    let successful_targets = outcome
-        .targets
-        .iter()
-        .filter(|target| target.is_success())
-        .count();
-    let failed_targets = outcome
-        .targets
-        .iter()
-        .filter(|target| target.end_reason.failure().is_some())
-        .count();
+    let successful_targets = outcome.successful_target_outcomes;
+    let failed_targets = outcome.failed_target_outcomes;
     if !interrupted && successful_targets == 0 && failed_targets > 0 {
         return Err(
             format!("no managed target completed successfully ({failed_targets} failed)").into(),

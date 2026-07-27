@@ -9,6 +9,7 @@ pub use group::{
     ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, ManagedGroupOutcome,
     ManagedGroupPacing, ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure,
     ManagedTargetFailureKind, ManagedTargetOutcome, TargetEvent, TargetEventSubscription, TargetId,
+    MANAGED_GROUP_OUTCOME_HISTORY_LIMIT,
 };
 pub use hub::{EventHub, EventSubscription, SubscriberConfig, SubscriberOverflow};
 pub use runner::{ManagedClient, ManagedClientSession, SessionEndReason, SessionOutcome};

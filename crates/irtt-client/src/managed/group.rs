@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     fmt,
     hash::{Hash, Hasher},
     net::{SocketAddr, UdpSocket},
@@ -29,6 +29,8 @@ const GROUP_FINAL_DRAIN: Duration = Duration::from_millis(100);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
 const RECV_BUFFER_SIZE: usize = 65_536;
+/// Maximum number of recent target outcomes retained in [`ManagedGroupOutcome`].
+pub const MANAGED_GROUP_OUTCOME_HISTORY_LIMIT: usize = 256;
 
 /// Caller-owned target identity for managed multi-target probing.
 #[derive(Clone, Eq)]
@@ -193,8 +195,21 @@ pub struct ManagedClientGroupSession {
 pub struct ManagedGroupOutcome {
     /// Why the group scheduler stopped.
     pub end_reason: ManagedGroupEndReason,
-    /// Per-target lifecycle records. These are not RTT/loss summaries.
+    /// Recent per-target lifecycle records in completion order.
+    ///
+    /// This snapshot retains at most [`MANAGED_GROUP_OUTCOME_HISTORY_LIMIT`]
+    /// entries. Every outcome is published as
+    /// [`ManagedGroupEvent::TargetFinished`] before an older snapshot entry can
+    /// be evicted.
     pub targets: Vec<ManagedTargetOutcome>,
+    /// Total number of target incarnations that reached a terminal outcome.
+    pub total_target_outcomes: u64,
+    /// Number of target outcomes classified as successful.
+    pub successful_target_outcomes: u64,
+    /// Number of target outcomes carrying structured failure details.
+    pub failed_target_outcomes: u64,
+    /// Number of older outcomes omitted from [`Self::targets`].
+    pub discarded_target_outcomes: u64,
 }
 
 /// Reason the managed group stopped.
@@ -595,6 +610,43 @@ struct TargetCounters {
     warning_events: u64,
 }
 
+#[derive(Debug, Default)]
+struct TargetOutcomeHistory {
+    recent: VecDeque<ManagedTargetOutcome>,
+    total: u64,
+    successful: u64,
+    failed: u64,
+    discarded: u64,
+}
+
+impl TargetOutcomeHistory {
+    fn record(&mut self, outcome: ManagedTargetOutcome) {
+        self.total = self.total.saturating_add(1);
+        if outcome.is_success() {
+            self.successful = self.successful.saturating_add(1);
+        }
+        if outcome.end_reason.failure().is_some() {
+            self.failed = self.failed.saturating_add(1);
+        }
+        if self.recent.len() == MANAGED_GROUP_OUTCOME_HISTORY_LIMIT {
+            self.recent.pop_front();
+            self.discarded = self.discarded.saturating_add(1);
+        }
+        self.recent.push_back(outcome);
+    }
+
+    fn into_group_outcome(self, end_reason: ManagedGroupEndReason) -> ManagedGroupOutcome {
+        ManagedGroupOutcome {
+            end_reason,
+            targets: self.recent.into_iter().collect(),
+            total_target_outcomes: self.total,
+            successful_target_outcomes: self.successful,
+            failed_target_outcomes: self.failed,
+            discarded_target_outcomes: self.discarded,
+        }
+    }
+}
+
 impl TargetState {
     fn new(
         group_config: &ClientConfig,
@@ -667,7 +719,7 @@ fn run_group_scheduler(
     control_rx: mpsc::Receiver<ControlMessage>,
     mut next_order: u64,
 ) -> Result<ManagedGroupOutcome, ClientError> {
-    let mut records = Vec::new();
+    let mut records = TargetOutcomeHistory::default();
     let mut pacing = PacingRuntime::new(config.pacing);
     let mut pending_control = None;
 
@@ -684,10 +736,7 @@ fn run_group_scheduler(
 
         if shared.cancellation.is_cancelled() {
             cancel_remaining_targets(&socket, &shared, &mut records);
-            return Ok(ManagedGroupOutcome {
-                end_reason: ManagedGroupEndReason::Cancelled,
-                targets: records,
-            });
+            return Ok(records.into_group_outcome(ManagedGroupEndReason::Cancelled));
         }
 
         let now = Instant::now();
@@ -697,10 +746,7 @@ fn run_group_scheduler(
         collect_finished_targets(&shared, &mut records);
 
         if group_should_complete(&shared, config.completion) {
-            return Ok(ManagedGroupOutcome {
-                end_reason: ManagedGroupEndReason::AllTargetsComplete,
-                targets: records,
-            });
+            return Ok(records.into_group_outcome(ManagedGroupEndReason::AllTargetsComplete));
         }
 
         let active = active_targets(&shared);
@@ -891,7 +937,7 @@ fn drain_control_messages(
     control_rx: &mpsc::Receiver<ControlMessage>,
     first_message: Option<ControlMessage>,
     next_order: &mut u64,
-    records: &mut Vec<ManagedTargetOutcome>,
+    records: &mut TargetOutcomeHistory,
 ) {
     if let Some(message) = first_message {
         handle_control_message(config, socket, shared, next_order, records, message);
@@ -906,7 +952,7 @@ fn handle_control_message(
     socket: &UdpSocket,
     shared: &GroupShared,
     next_order: &mut u64,
-    records: &mut Vec<ManagedTargetOutcome>,
+    records: &mut TargetOutcomeHistory,
     message: ControlMessage,
 ) {
     match message {
@@ -924,7 +970,7 @@ fn apply_target_update(
     shared: &GroupShared,
     targets: Vec<ManagedTargetConfig>,
     next_order: &mut u64,
-    records: &mut Vec<ManagedTargetOutcome>,
+    records: &mut TargetOutcomeHistory,
 ) -> Result<(), ClientError> {
     validate_open_timeouts(&config.open_timeouts)?;
     if !targets.is_empty() {
@@ -1207,7 +1253,7 @@ fn send_echo_to_target(
     }
 }
 
-fn collect_finished_targets(shared: &GroupShared, records: &mut Vec<ManagedTargetOutcome>) {
+fn collect_finished_targets(shared: &GroupShared, records: &mut TargetOutcomeHistory) {
     let finished = {
         let mut registry = shared
             .registry
@@ -1247,7 +1293,7 @@ fn collect_finished_targets(shared: &GroupShared, records: &mut Vec<ManagedTarge
 fn cancel_remaining_targets(
     socket: &UdpSocket,
     shared: &GroupShared,
-    records: &mut Vec<ManagedTargetOutcome>,
+    records: &mut TargetOutcomeHistory,
 ) {
     let targets = drain_registry(shared);
     for target in targets {
@@ -1263,13 +1309,13 @@ fn cancel_remaining_targets(
 
 fn record_target_outcome(
     shared: &GroupShared,
-    records: &mut Vec<ManagedTargetOutcome>,
+    records: &mut TargetOutcomeHistory,
     outcome: ManagedTargetOutcome,
 ) {
     shared
         .hub
         .publish(ManagedGroupEvent::TargetFinished(outcome.clone()));
-    records.push(outcome);
+    records.record(outcome);
 }
 
 fn fail_all_targets(shared: &GroupShared, failure: ManagedTargetFailure) {
@@ -2602,6 +2648,61 @@ mod tests {
                 ..
             }) if id.as_str() == "idle"
         )));
+    }
+
+    #[test]
+    fn target_churn_retains_bounded_history_after_publishing_every_outcome() {
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        let mut config = group_config(
+            None,
+            Duration::from_millis(20),
+            ManagedGroupPacing::Staggered,
+        );
+        config.completion = ManagedGroupCompletionPolicy::ExplicitCancellation;
+        config.client.open_timeouts = vec![Duration::from_secs(5)];
+        let churn_count = MANAGED_GROUP_OUTCOME_HISTORY_LIMIT + 16;
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("churn", remote)],
+            SubscriberConfig {
+                capacity: churn_count + 8,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        session.update_targets(Vec::new()).unwrap();
+        for _ in 0..churn_count {
+            session
+                .update_targets(vec![target("churn", remote)])
+                .unwrap();
+            session.update_targets(Vec::new()).unwrap();
+        }
+
+        session.stop();
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
+        drop(sink);
+
+        let expected_total = u64::try_from(churn_count + 1).unwrap();
+        let published = events
+            .iter()
+            .filter(|event| matches!(event, ManagedGroupEvent::TargetFinished(_)))
+            .count();
+        assert_eq!(published, churn_count + 1);
+        assert_eq!(outcome.total_target_outcomes, expected_total);
+        assert_eq!(outcome.successful_target_outcomes, 0);
+        assert_eq!(outcome.failed_target_outcomes, 0);
+        assert_eq!(outcome.targets.len(), MANAGED_GROUP_OUTCOME_HISTORY_LIMIT);
+        assert_eq!(
+            outcome.discarded_target_outcomes,
+            expected_total - u64::try_from(MANAGED_GROUP_OUTCOME_HISTORY_LIMIT).unwrap()
+        );
+        assert!(outcome
+            .targets
+            .iter()
+            .all(|target| target.end_reason == ManagedTargetEndReason::Removed));
     }
 
     #[test]

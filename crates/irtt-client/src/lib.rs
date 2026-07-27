@@ -82,6 +82,7 @@ pub use managed::{
     ManagedGroupPacing, ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure,
     ManagedTargetFailureKind, ManagedTargetOutcome, SessionEndReason, SessionOutcome,
     SubscriberConfig, SubscriberOverflow, TargetEvent, TargetEventSubscription, TargetId,
+    MANAGED_GROUP_OUTCOME_HISTORY_LIMIT,
 };
 pub use session::{NegotiatedParams, NegotiationRestriction};
 pub use timing::ClientTimestamp;
