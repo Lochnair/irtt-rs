@@ -97,6 +97,10 @@ pub struct ManagedTargetConfig {
 }
 
 /// Group send pacing strategy.
+///
+/// Both modes keep an absolute cadence. If a scheduler delay spans multiple
+/// slots, missed historical slots are skipped instead of sent as a catch-up
+/// burst.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ManagedGroupPacing {
     /// Send active targets one at a time, spaced approximately interval / N.
@@ -362,6 +366,10 @@ fn classify_target_failure(error: &ClientError, opening: bool) -> ManagedTargetF
 
 impl ManagedClientGroup {
     /// Start a managed group without creating an initial event subscription.
+    ///
+    /// At least one initial target is required to choose the address family for
+    /// the shared socket. After startup, [`ManagedClientGroupSession::update_targets`]
+    /// may replace the desired set with an empty set.
     pub fn start(
         config: ManagedClientGroupConfig,
         targets: Vec<ManagedTargetConfig>,
@@ -370,6 +378,9 @@ impl ManagedClientGroup {
     }
 
     /// Start a managed group and subscribe before worker threads run.
+    ///
+    /// As with [`start`](Self::start), construction requires at least one
+    /// initial target.
     pub fn start_with_subscription(
         config: ManagedClientGroupConfig,
         targets: Vec<ManagedTargetConfig>,
@@ -514,6 +525,11 @@ impl ManagedClientGroupSession {
     }
 
     /// Wait for the scheduler and receive threads to finish.
+    ///
+    /// The returned outcome contains aggregate counts plus a bounded recent
+    /// target-outcome snapshot. Authoritative outcomes are published through
+    /// [`ManagedGroupEvent::TargetFinished`] before the subscription is sealed,
+    /// and queued events remain drainable after this method returns.
     pub fn join(mut self) -> Result<ManagedGroupOutcome, ClientError> {
         let scheduler = self.scheduler.take().expect(
             "ManagedClientGroupSession invariant violated: scheduler handle missing before join",

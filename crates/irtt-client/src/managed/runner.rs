@@ -25,7 +25,8 @@ const IDLE_SLEEP: Duration = Duration::from_millis(1);
 /// The managed API owns the lower-level [`Client`](crate::Client) loop: it
 /// opens the session, sends probes at the negotiated interval, receives
 /// datagrams, publishes [`ClientEvent`] values, and closes the session when the
-/// run completes or is cancelled.
+/// run completes or is cancelled. Delayed workers skip missed pacing slots
+/// instead of sending catch-up bursts.
 #[derive(Debug)]
 pub struct ManagedClient;
 

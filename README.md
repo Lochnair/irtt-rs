@@ -217,6 +217,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 The client library emits structured events for session lifecycle, sent probes, successful replies, loss, duplicates, late replies, warnings, and shutdown.
 
+For shared-socket multi-target integrations, `ManagedClientGroup` publishes
+`ManagedGroupEvent::TargetFinished` exactly once for every terminal target
+incarnation, including open/runtime failures, removal, cancellation, no-test
+completion, and peer closure. Consumers can use `ManagedTargetEndReason` and
+`ManagedTargetFailureKind` for outcome and exit decisions without parsing
+diagnostic text.
+
+`ManagedGroupCompletionPolicy::AllTargetsComplete` supports finite static
+groups. `ExplicitCancellation` supports long-lived controllers; replacing the
+desired set with an empty vector removes current targets but leaves the group
+idle and ready for a later `update_targets` call. `join()` reports aggregate
+outcome counts and retains only the 256 most recent target outcomes, so
+long-running target churn remains bounded.
+
+Managed event subscriptions remain bounded and nonblocking. When using a
+dropping overflow policy, check `EventSubscription::dropped_events()` before
+trusting a complete statistical summary.
+
 ## Binaries and features
 
 | Build                   | Binaries                          |
