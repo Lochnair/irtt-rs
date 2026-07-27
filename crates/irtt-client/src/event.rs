@@ -66,9 +66,10 @@ pub enum ClientEvent {
         /// Client timestamp when the open reply was accepted.
         at: ClientTimestamp,
     },
-    /// The client sent a close request and considers the session closed.
+    /// The session closed locally or through an authenticated peer close.
     ///
-    /// This is a local lifecycle event, not an acknowledgement from the server.
+    /// For a peer close-flagged echo reply, the reply's measurement or
+    /// classification event is emitted immediately before this event.
     /// Managed sessions disconnect event subscribers after the worker exits,
     /// while leaving already queued events available to drain.
     SessionClosed {

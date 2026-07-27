@@ -503,30 +503,74 @@ impl SessionRuntime {
             }]);
         }
 
-        let session = self.session.as_mut().expect("session must exist when Open");
-
         let wire_seq = reply.sequence;
+        let should_close = flags::has(reply.flags, flags::FLAG_CLOSE);
+        let mut events = {
+            let session = self.session.as_mut().expect("session must exist when Open");
 
-        if let Some(pending) = session.pending.remove(wire_seq) {
-            let rtt = compute_rtt(&pending.sent_at, &now, &reply.timestamps);
-            let server_timing = build_server_timing(&reply.timestamps);
-            let one_way = compute_one_way(&pending.sent_at, &now, &reply.timestamps);
-            let received_stats = build_received_stats(&reply);
-            let is_late = session
-                .highest_received_seq
-                .is_some_and(|h| sequence_is_before(wire_seq, h));
-            let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
+            if let Some(pending) = session.pending.remove(wire_seq) {
+                let rtt = compute_rtt(&pending.sent_at, &now, &reply.timestamps);
+                let server_timing = build_server_timing(&reply.timestamps);
+                let one_way = compute_one_way(&pending.sent_at, &now, &reply.timestamps);
+                let received_stats = build_received_stats(&reply);
+                let is_late = session
+                    .highest_received_seq
+                    .is_some_and(|h| sequence_is_before(wire_seq, h));
+                let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
 
-            update_highest_received(&mut session.highest_received_seq, wire_seq);
-            session.completed.insert(wire_seq);
+                update_highest_received(&mut session.highest_received_seq, wire_seq);
+                session.completed.insert(wire_seq);
 
-            let mut events = Vec::new();
-            if is_late {
-                events.push(ClientEvent::LateReply {
+                if is_late {
+                    vec![ClientEvent::LateReply {
+                        seq: wire_seq,
+                        highest_seen,
+                        remote: self.remote,
+                        sent_at: Some(pending.sent_at),
+                        received_at: now,
+                        rtt: Some(rtt),
+                        server_timing,
+                        one_way,
+                        received_stats,
+                        bytes: packet_len,
+                        packet_meta: meta.into(),
+                    }]
+                } else {
+                    vec![ClientEvent::EchoReply {
+                        seq: wire_seq,
+                        remote: self.remote,
+                        sent_at: pending.sent_at,
+                        received_at: now,
+                        rtt,
+                        server_timing,
+                        one_way,
+                        received_stats,
+                        bytes: packet_len,
+                        packet_meta: meta.into(),
+                    }]
+                }
+            } else if session.completed.contains(wire_seq) {
+                update_highest_received(&mut session.highest_received_seq, wire_seq);
+                vec![ClientEvent::DuplicateReply {
+                    seq: wire_seq,
+                    remote: self.remote,
+                    received_at: now,
+                    bytes: packet_len,
+                }]
+            } else if let Some(timed_out) = session.timed_out.remove(wire_seq) {
+                let rtt = compute_rtt(&timed_out.sent_at, &now, &reply.timestamps);
+                let server_timing = build_server_timing(&reply.timestamps);
+                let one_way = compute_one_way(&timed_out.sent_at, &now, &reply.timestamps);
+                let received_stats = build_received_stats(&reply);
+                let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
+                update_highest_received(&mut session.highest_received_seq, wire_seq);
+                session.completed.insert(wire_seq);
+
+                vec![ClientEvent::LateReply {
                     seq: wire_seq,
                     highest_seen,
                     remote: self.remote,
-                    sent_at: Some(pending.sent_at),
+                    sent_at: Some(timed_out.sent_at),
                     received_at: now,
                     rtt: Some(rtt),
                     server_timing,
@@ -534,85 +578,39 @@ impl SessionRuntime {
                     received_stats,
                     bytes: packet_len,
                     packet_meta: meta.into(),
-                });
-            } else {
-                events.push(ClientEvent::EchoReply {
+                }]
+            } else if session
+                .highest_received_seq
+                .is_some_and(|h| sequence_is_before(wire_seq, h))
+            {
+                vec![ClientEvent::LateReply {
                     seq: wire_seq,
+                    highest_seen: session.highest_received_seq.unwrap(),
                     remote: self.remote,
-                    sent_at: pending.sent_at,
+                    sent_at: None,
                     received_at: now,
-                    rtt,
-                    server_timing,
-                    one_way,
-                    received_stats,
+                    rtt: None,
+                    server_timing: build_server_timing(&reply.timestamps),
+                    one_way: None,
+                    received_stats: build_received_stats(&reply),
                     bytes: packet_len,
                     packet_meta: meta.into(),
-                });
+                }]
+            } else {
+                vec![ClientEvent::Warning {
+                    kind: WarningKind::UntrackedReply,
+                    message: format!(
+                        "dropped reply with untracked seq {wire_seq} (no pending or completed entry)"
+                    ),
+                    at: now,
+                }]
             }
-            if flags::has(reply.flags, flags::FLAG_CLOSE) {
-                self.close_from_peer(token, now, &mut events);
-            }
-            Ok(events)
-        } else if session.completed.contains(wire_seq) {
-            update_highest_received(&mut session.highest_received_seq, wire_seq);
-            Ok(vec![ClientEvent::DuplicateReply {
-                seq: wire_seq,
-                remote: self.remote,
-                received_at: now,
-                bytes: packet_len,
-            }])
-        } else if let Some(timed_out) = session.timed_out.remove(wire_seq) {
-            let rtt = compute_rtt(&timed_out.sent_at, &now, &reply.timestamps);
-            let server_timing = build_server_timing(&reply.timestamps);
-            let one_way = compute_one_way(&timed_out.sent_at, &now, &reply.timestamps);
-            let received_stats = build_received_stats(&reply);
-            let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
-            update_highest_received(&mut session.highest_received_seq, wire_seq);
-            session.completed.insert(wire_seq);
+        };
 
-            let mut events = vec![ClientEvent::LateReply {
-                seq: wire_seq,
-                highest_seen,
-                remote: self.remote,
-                sent_at: Some(timed_out.sent_at),
-                received_at: now,
-                rtt: Some(rtt),
-                server_timing,
-                one_way,
-                received_stats,
-                bytes: packet_len,
-                packet_meta: meta.into(),
-            }];
-            if flags::has(reply.flags, flags::FLAG_CLOSE) {
-                self.close_from_peer(token, now, &mut events);
-            }
-            Ok(events)
-        } else if session
-            .highest_received_seq
-            .is_some_and(|h| sequence_is_before(wire_seq, h))
-        {
-            Ok(vec![ClientEvent::LateReply {
-                seq: wire_seq,
-                highest_seen: session.highest_received_seq.unwrap(),
-                remote: self.remote,
-                sent_at: None,
-                received_at: now,
-                rtt: None,
-                server_timing: build_server_timing(&reply.timestamps),
-                one_way: None,
-                received_stats: build_received_stats(&reply),
-                bytes: packet_len,
-                packet_meta: meta.into(),
-            }])
-        } else {
-            Ok(vec![ClientEvent::Warning {
-                kind: WarningKind::UntrackedReply,
-                message: format!(
-                    "dropped reply with untracked seq {wire_seq} (no pending or completed entry)"
-                ),
-                at: now,
-            }])
+        if should_close {
+            self.close_from_peer(token, now, &mut events);
         }
+        Ok(events)
     }
 
     fn close_from_peer(&mut self, token: u64, now: ClientTimestamp, events: &mut Vec<ClientEvent>) {

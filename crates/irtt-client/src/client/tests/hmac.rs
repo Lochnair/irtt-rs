@@ -112,7 +112,14 @@ fn bad_hmac_reply_is_dropped() {
                     .unwrap(),
             );
             let ts = TimestampFields::default();
-            let reply_packet = echo_reply_packet(TOKEN, seq, &params, &ts, Some(&wrong_key));
+            let reply_packet = echo_reply_packet_with_flags(
+                TOKEN,
+                seq,
+                &params,
+                &ts,
+                Some(&wrong_key),
+                FLAG_REPLY | flags::FLAG_CLOSE,
+            );
             socket.send_to(&reply_packet, peer).unwrap();
         }
     });
@@ -131,6 +138,8 @@ fn bad_hmac_reply_is_dropped() {
     let events = client.recv_once().unwrap();
     assert_eq!(events.len(), 1);
     assert!(matches!(&events[0], ClientEvent::Warning { .. }));
+    assert!(!client.is_peer_closed());
+    client.close().unwrap();
     server.join();
 }
 
