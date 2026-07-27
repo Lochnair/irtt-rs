@@ -73,7 +73,9 @@ struct HubState<T> {
 ///
 /// Each subscription has its own bounded queue configured by
 /// [`SubscriberConfig`]. The configured [`SubscriberOverflow`] policy applies
-/// when that queue is full. Dropping the handle unregisters the subscriber.
+/// when that queue is full. Use [`dropped_events`](Self::dropped_events) to
+/// detect incomplete consumption. Dropping the handle unregisters the
+/// subscriber.
 #[must_use = "dropping the subscription unregisters it"]
 #[derive(Debug)]
 pub struct EventSubscription<T = ClientEvent> {
@@ -93,6 +95,7 @@ struct SubscriberInner<T> {
 struct SubscriberState<T> {
     queue: VecDeque<T>,
     connected: bool,
+    dropped_events: u64,
 }
 
 impl<T> Clone for EventHub<T> {
@@ -140,6 +143,7 @@ impl<T> EventHub<T> {
             state: Mutex::new(SubscriberState {
                 queue: VecDeque::with_capacity(config.capacity),
                 connected: true,
+                dropped_events: 0,
             }),
             available: Condvar::new(),
             config,
@@ -266,6 +270,19 @@ impl<T> EventSubscription<T> {
         }
         Ok(None)
     }
+
+    /// Return the number of events discarded by this subscription's overflow
+    /// policy.
+    ///
+    /// The count is monotonic for the lifetime of the subscription and remains
+    /// available after the hub is sealed or the subscription disconnects.
+    pub fn dropped_events(&self) -> u64 {
+        self.inner
+            .state
+            .lock()
+            .expect("subscriber mutex poisoned")
+            .dropped_events
+    }
 }
 
 impl<T> Drop for EventSubscription<T> {
@@ -295,14 +312,22 @@ impl<T> SubscriberInner<T> {
         }
 
         match self.config.overflow {
-            SubscriberOverflow::DropNewest => true,
+            SubscriberOverflow::DropNewest => {
+                state.dropped_events = state.dropped_events.saturating_add(1);
+                true
+            }
             SubscriberOverflow::DropOldest => {
                 state.queue.pop_front();
                 state.queue.push_back(event);
+                state.dropped_events = state.dropped_events.saturating_add(1);
                 self.available.notify_one();
                 true
             }
             SubscriberOverflow::Disconnect => {
+                let discarded = u64::try_from(state.queue.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_add(1);
+                state.dropped_events = state.dropped_events.saturating_add(discarded);
                 state.queue.clear();
                 state.connected = false;
                 self.available.notify_all();
@@ -369,20 +394,23 @@ mod tests {
                 SubscriberOverflow::DropNewest,
                 Ok(Some("event-1")),
                 Ok(None),
+                1,
             ),
             (
                 SubscriberOverflow::DropOldest,
                 Ok(Some("event-2")),
                 Ok(None),
+                1,
             ),
             (
                 SubscriberOverflow::Disconnect,
                 Err(EventSubscriptionError::Disconnected),
                 Err(EventSubscriptionError::Disconnected),
+                2,
             ),
         ];
 
-        for (overflow, first_expected, second_expected) in cases {
+        for (overflow, first_expected, second_expected, expected_drops) in cases {
             let hub = EventHub::new();
             let sub = hub
                 .subscribe(SubscriberConfig {
@@ -396,7 +424,30 @@ mod tests {
 
             assert_next(&sub, first_expected);
             assert_next(&sub, second_expected);
+            assert_eq!(sub.dropped_events(), expected_drops);
         }
+    }
+
+    #[test]
+    fn drop_oldest_counter_accumulates_and_survives_hub_seal() {
+        let hub = EventHub::new();
+        let sub = hub
+            .subscribe(SubscriberConfig {
+                capacity: 2,
+                overflow: SubscriberOverflow::DropOldest,
+            })
+            .unwrap();
+
+        for n in 1..=5 {
+            hub.publish(event(n));
+        }
+        hub.disconnect_all();
+
+        assert_eq!(sub.dropped_events(), 3);
+        assert_next(&sub, Ok(Some("event-4")));
+        assert_next(&sub, Ok(Some("event-5")));
+        assert_next(&sub, Err(EventSubscriptionError::Disconnected));
+        assert_eq!(sub.dropped_events(), 3);
     }
 
     #[test]

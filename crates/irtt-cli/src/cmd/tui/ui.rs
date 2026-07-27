@@ -96,6 +96,7 @@ pub(super) struct TuiState {
     targets: Vec<TuiTargetState>,
     recent_events: VecDeque<String>,
     last_warning: Option<String>,
+    dropped_events: u64,
     graph_metric: GraphMetric,
     graph_viewport: GraphViewport,
     view: TuiView,
@@ -130,6 +131,7 @@ impl TuiState {
             targets,
             recent_events: VecDeque::with_capacity(RECENT_EVENT_LIMIT),
             last_warning: None,
+            dropped_events: 0,
             graph_metric: GraphMetric::EffectiveRtt,
             graph_viewport: GraphViewport::default(),
             view: TuiView::Graph,
@@ -384,6 +386,17 @@ impl TuiState {
 
     pub(super) fn set_status(&mut self, status: TuiStatus) {
         self.status = status;
+    }
+
+    pub(super) fn mark_dropped_events(&mut self, dropped_events: u64) {
+        if dropped_events == 0 {
+            return;
+        }
+        self.dropped_events = dropped_events;
+        let warning =
+            format!("dropped {dropped_events} managed group events; statistics may be incomplete");
+        self.last_warning = Some(warning.clone());
+        self.push_event(format!("warning {warning}"));
     }
 
     pub(super) fn set_error(&mut self, message: String) {
@@ -1811,6 +1824,11 @@ fn status_line(state: &TuiState) -> Paragraph<'_> {
         TuiView::Graph => "g dashboard",
         TuiView::Dashboard => "g graph",
     };
+    let incomplete = if state.dropped_events > 0 {
+        format!(" incomplete:dropped={}", state.dropped_events)
+    } else {
+        String::new()
+    };
     let controls = if state.graph_viewport.mode == GraphViewportMode::Follow {
         format!(
             "q quit | r reset | p pause | {view_hint} | m metric | arrows pan | +/- zoom | 0 reset window"
@@ -1821,10 +1839,11 @@ fn status_line(state: &TuiState) -> Paragraph<'_> {
         )
     };
     let lines = vec![Line::from(format!(
-        "{}{}{} | {}",
+        "{}{}{}{} | {}",
         state.status.label(),
         paused,
         quitting,
+        incomplete,
         controls
     ))];
     Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
@@ -2449,6 +2468,23 @@ mod tests {
             .back()
             .unwrap()
             .contains("warning WrongToken: wrong token"));
+    }
+
+    #[test]
+    fn dropped_events_mark_tui_statistics_incomplete() {
+        let mut state = TuiState::default();
+
+        state.mark_dropped_events(9);
+
+        assert_eq!(state.dropped_events, 9);
+        assert!(state
+            .last_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("statistics may be incomplete")));
+        assert!(state
+            .recent_events
+            .back()
+            .is_some_and(|event| event.contains("dropped 9 managed group events")));
     }
 
     #[test]

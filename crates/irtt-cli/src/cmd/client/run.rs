@@ -399,6 +399,9 @@ fn run_group_stream(
             }
         }
     }
+    if let Some(warning) = dropped_event_warning(events.dropped_events()) {
+        eprintln!("{warning}");
+    }
 
     if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
         return Err("managed client group was cancelled".into());
@@ -444,6 +447,14 @@ fn report_target_failure(target: &ManagedTargetOutcome) {
             target.id, failure.kind, failure.message
         );
     }
+}
+
+fn dropped_event_warning(dropped_events: u64) -> Option<String> {
+    (dropped_events > 0).then(|| {
+        format!(
+            "irtt-rs: warning: dropped {dropped_events} managed group events; output and statistics may be incomplete"
+        )
+    })
 }
 
 fn estimated_group_completion_grace(args: &ClientArgs) -> Duration {
@@ -596,6 +607,14 @@ mod tests {
         verbose: bool,
     ) -> OutputConfig {
         OutputConfig::new(format, columns, header, verbose, false).unwrap()
+    }
+
+    #[test]
+    fn dropped_event_warning_marks_statistics_incomplete() {
+        assert_eq!(dropped_event_warning(0), None);
+        let warning = dropped_event_warning(7).unwrap();
+        assert!(warning.contains("dropped 7 managed group events"));
+        assert!(warning.contains("statistics may be incomplete"));
     }
 
     #[test]

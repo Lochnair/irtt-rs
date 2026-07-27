@@ -242,6 +242,7 @@ fn run_group_tui(
             }
         }
     }
+    state.mark_dropped_events(events.dropped_events());
     for target in &outcome.targets {
         if terminal_targets.insert(target.id.as_str().to_owned()) {
             state.process_target_outcome(target);
