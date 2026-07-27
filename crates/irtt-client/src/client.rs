@@ -163,6 +163,29 @@ impl Client {
     /// Returns an empty event list when the socket read would block or times
     /// out. Malformed or unrelated datagrams are reported as warning events.
     pub fn recv_once(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+        self.socket
+            .set_read_timeout(self.runtime.config().socket_config.recv_timeout)?;
+        self.recv_once_inner()
+    }
+
+    pub(crate) fn recv_once_until(
+        &mut self,
+        deadline: Option<Instant>,
+        max_wait: Duration,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
+        let Some(timeout) = bounded_receive_timeout(
+            deadline,
+            self.runtime.config().socket_config.recv_timeout,
+            max_wait,
+            Instant::now(),
+        ) else {
+            return Ok(Vec::new());
+        };
+        self.socket.set_read_timeout(Some(timeout))?;
+        self.recv_once_inner()
+    }
+
+    fn recv_once_inner(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         let datagram = match recv_datagram(&self.socket, &mut self.recv_buffer) {
             Ok(datagram) => datagram,
             Err(err)
@@ -186,9 +209,11 @@ impl Client {
     /// Receive and classify datagrams until a receive produces no events or the
     /// receive budget is exhausted.
     pub fn recv_available(&mut self, budget: RecvBudget) -> Result<Vec<ClientEvent>, ClientError> {
+        self.socket
+            .set_read_timeout(self.runtime.config().socket_config.recv_timeout)?;
         let mut all_events = Vec::new();
         for _ in 0..budget.max_packets {
-            let events = self.recv_once()?;
+            let events = self.recv_once_inner()?;
             if events.is_empty() {
                 break;
             }
@@ -243,6 +268,13 @@ impl Client {
         self.runtime.packets_sent()
     }
 
+    pub(crate) fn send_managed_probe(
+        &mut self,
+        scheduled_at: Instant,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
+        self.send_managed_probe_inner(scheduled_at, None)
+    }
+
     fn send_probe_inner(
         &mut self,
         override_ts: Option<ClientTimestamp>,
@@ -260,6 +292,26 @@ impl Client {
             })
         })
     }
+
+    fn send_managed_probe_inner(
+        &mut self,
+        scheduled_at: Instant,
+        override_ts: Option<ClientTimestamp>,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
+        let socket = &self.socket;
+        self.runtime
+            .send_probe_for_deadline(override_ts, scheduled_at, |packet| {
+                let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
+                let send_call_start = Instant::now();
+                let bytes = socket.send(packet)?;
+                let send_call = send_call_start.elapsed();
+                Ok(SendProbeResult {
+                    sent_at,
+                    bytes,
+                    send_call,
+                })
+            })
+    }
 }
 
 #[cfg(test)]
@@ -267,6 +319,34 @@ impl Client {
     fn send_probe_at(&mut self, ts: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
         self.send_probe_inner(Some(ts))
     }
+
+    fn send_managed_probe_at(
+        &mut self,
+        scheduled_at: Instant,
+        ts: ClientTimestamp,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
+        self.send_managed_probe_inner(scheduled_at, Some(ts))
+    }
+}
+
+fn bounded_receive_timeout(
+    deadline: Option<Instant>,
+    configured_timeout: Option<Duration>,
+    max_wait: Duration,
+    now: Instant,
+) -> Option<Duration> {
+    if max_wait.is_zero() {
+        return None;
+    }
+    let mut timeout = configured_timeout.unwrap_or(max_wait).min(max_wait);
+    if let Some(deadline) = deadline {
+        let remaining = deadline.checked_duration_since(now)?;
+        if remaining.is_zero() {
+            return None;
+        }
+        timeout = timeout.min(remaining);
+    }
+    (!timeout.is_zero()).then_some(timeout)
 }
 
 #[cfg(test)]

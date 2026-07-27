@@ -13,7 +13,7 @@ use crate::{
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
     receive::recv_datagram_from,
-    runtime::{params_from_config, SendProbeResult, SessionRuntime},
+    runtime::{advance_cadence, params_from_config, SendProbeResult, SessionRuntime},
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
@@ -149,6 +149,10 @@ pub struct TargetEvent {
 ///
 /// Per-session events are followed by exactly one [`TargetFinished`](Self::TargetFinished)
 /// event when that target incarnation reaches a terminal state.
+// ClientEvent intentionally owns its structured measurement payload. EventHub
+// queues are explicitly bounded, so preserving the direct event API does not
+// create unbounded retention.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManagedGroupEvent {
     /// A protocol lifecycle, measurement, or warning event from one target.
@@ -589,6 +593,8 @@ struct TargetState {
     final_reason: Option<ManagedTargetEndReason>,
 }
 
+type ScheduledTarget = (Arc<Mutex<TargetState>>, Instant);
+
 #[derive(Debug)]
 enum TargetStatus {
     Opening {
@@ -751,17 +757,17 @@ fn run_group_scheduler(
 
         let active = active_targets(&shared);
         pacing.reconcile(&active, now);
-        if pacing.send_due(&active, now, config.client.interval) {
+        if pacing.send_due(&active, now) {
             match config.pacing {
                 ManagedGroupPacing::Staggered => {
                     if let Some((target, scheduled_at)) =
-                        pacing.next_staggered(&active, config.client.interval)
+                        pacing.next_staggered(&active, config.client.interval, now)?
                     {
                         send_echo_to_target(&socket, &shared, target, scheduled_at);
                     }
                 }
                 ManagedGroupPacing::Burst => {
-                    if let Some(scheduled_at) = pacing.next_burst(config.client.interval) {
+                    if let Some(scheduled_at) = pacing.next_burst(config.client.interval, now)? {
                         for target in active {
                             send_echo_to_target(&socket, &shared, target, scheduled_at);
                         }
@@ -1227,7 +1233,7 @@ fn send_echo_to_target(
     let remote = target.remote;
     let result = target
         .runtime
-        .send_probe_for_deadline(scheduled_at, |packet| {
+        .send_probe_for_deadline(None, scheduled_at, |packet| {
             let sent_at = ClientTimestamp::now();
             let send_call_start = Instant::now();
             let bytes = socket.send_to(packet, remote)?;
@@ -1449,12 +1455,7 @@ impl PacingRuntime {
         }
     }
 
-    fn send_due(
-        &self,
-        active: &[Arc<Mutex<TargetState>>],
-        now: Instant,
-        _interval: Duration,
-    ) -> bool {
+    fn send_due(&self, active: &[Arc<Mutex<TargetState>>], now: Instant) -> bool {
         if active.is_empty() {
             return false;
         }
@@ -1470,31 +1471,49 @@ impl PacingRuntime {
         &mut self,
         active: &[Arc<Mutex<TargetState>>],
         interval: Duration,
-    ) -> Option<(Arc<Mutex<TargetState>>, Instant)> {
-        let scheduled_at = self.next_slot_at?;
+        now: Instant,
+    ) -> Result<Option<ScheduledTarget>, ClientError> {
+        let Some(next_slot_at) = self.next_slot_at else {
+            return Ok(None);
+        };
         if active.is_empty() {
             self.next_slot_at = None;
-            return None;
+            return Ok(None);
         }
+        let (scheduled_at, next_slot_at, first_index) =
+            advance_staggered_slot(next_slot_at, interval, active.len(), self.slot_index, now)?;
+        self.next_slot_at = Some(next_slot_at);
+
         for offset in 0..active.len() {
-            let index = (self.slot_index + offset) % active.len();
+            let index = (first_index + offset) % active.len();
             if !target_is_due_for_slot(&active[index], scheduled_at) {
                 continue;
             }
             let target = active[index].clone();
             self.slot_index = (index + 1) % active.len();
-            self.next_slot_at = Some(scheduled_at + divide_duration(interval, active.len()));
-            return Some((target, scheduled_at));
+            return Ok(Some((target, scheduled_at)));
         }
 
-        self.next_slot_at = active.iter().filter_map(target_next_send_deadline).min();
-        None
+        self.slot_index = (first_index + 1) % active.len();
+        if let Some(target_deadline) = active.iter().filter_map(target_next_send_deadline).min() {
+            self.next_slot_at = Some(self.next_slot_at.map_or(target_deadline, |group_deadline| {
+                group_deadline.min(target_deadline)
+            }));
+        }
+        Ok(None)
     }
 
-    fn next_burst(&mut self, interval: Duration) -> Option<Instant> {
-        let scheduled_at = self.next_burst_at?;
-        self.next_burst_at = Some(scheduled_at + interval);
-        Some(scheduled_at)
+    fn next_burst(
+        &mut self,
+        interval: Duration,
+        now: Instant,
+    ) -> Result<Option<Instant>, ClientError> {
+        let Some(next_burst_at) = self.next_burst_at else {
+            return Ok(None);
+        };
+        let (scheduled_at, next_burst_at, _) = advance_cadence(next_burst_at, interval, now)?;
+        self.next_burst_at = Some(next_burst_at);
+        Ok(Some(scheduled_at))
     }
 
     fn next_wakeup(&self) -> Option<Instant> {
@@ -1503,6 +1522,23 @@ impl PacingRuntime {
             ManagedGroupPacing::Burst => self.next_burst_at,
         }
     }
+}
+
+fn advance_staggered_slot(
+    next_slot_at: Instant,
+    interval: Duration,
+    active_len: usize,
+    slot_index: usize,
+    now: Instant,
+) -> Result<(Instant, Instant, usize), ClientError> {
+    debug_assert!(active_len > 0);
+    let spacing = divide_duration(interval, active_len);
+    let (scheduled_at, following_slot_at, skipped_slots) =
+        advance_cadence(next_slot_at, spacing, now)?;
+    let skipped_mod = usize::try_from(skipped_slots % active_len as u128)
+        .expect("staggered slot remainder fits usize");
+    let first_index = (slot_index + skipped_mod) % active_len;
+    Ok((scheduled_at, following_slot_at, first_index))
 }
 
 fn target_is_due_for_slot(target: &Arc<Mutex<TargetState>>, scheduled_at: Instant) -> bool {
@@ -2260,6 +2296,39 @@ mod tests {
             outcome.targets[0].end_reason,
             ManagedTargetEndReason::NoTestComplete
         );
+    }
+
+    #[test]
+    fn delayed_burst_pacing_emits_one_current_slot_and_advances_to_future() {
+        let interval = Duration::from_millis(10);
+        let first_slot = Instant::now();
+        let delayed_now = first_slot + Duration::from_millis(45);
+        let mut pacing = PacingRuntime::new(ManagedGroupPacing::Burst);
+        pacing.next_burst_at = Some(first_slot);
+
+        let scheduled_at = pacing.next_burst(interval, delayed_now).unwrap().unwrap();
+
+        assert_eq!(scheduled_at, first_slot + Duration::from_millis(40));
+        assert_eq!(
+            pacing.next_wakeup(),
+            Some(first_slot + Duration::from_millis(50))
+        );
+        assert!(pacing.next_wakeup().unwrap() > delayed_now);
+    }
+
+    #[test]
+    fn delayed_staggered_pacing_skips_historical_slots() {
+        let first_slot = Instant::now();
+        let delayed_now = first_slot + Duration::from_millis(35);
+
+        let (scheduled_at, next_slot_at, target_index) =
+            advance_staggered_slot(first_slot, Duration::from_millis(30), 3, 0, delayed_now)
+                .unwrap();
+
+        assert_eq!(scheduled_at, first_slot + Duration::from_millis(30));
+        assert_eq!(next_slot_at, first_slot + Duration::from_millis(40));
+        assert_eq!(target_index, 0);
+        assert!(next_slot_at > delayed_now);
     }
 
     #[test]

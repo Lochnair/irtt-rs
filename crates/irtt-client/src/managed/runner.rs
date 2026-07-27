@@ -19,7 +19,6 @@ const MANAGED_RECV_TIMEOUT: Duration = Duration::from_millis(20);
 const MANAGED_RECV_BUDGET: RecvBudget = RecvBudget { max_packets: 64 };
 const MANAGED_FINAL_DRAIN: Duration = Duration::from_millis(100);
 const IDLE_SLEEP: Duration = Duration::from_millis(1);
-const MAX_SLEEP: Duration = Duration::from_millis(20);
 
 /// Entry point for running a client session on a worker thread.
 ///
@@ -232,12 +231,9 @@ fn run_client(
             break;
         }
 
-        let now = Instant::now();
-        if client
-            .next_send_deadline()
-            .is_some_and(|deadline| deadline <= now)
-        {
-            let events = client.send_probe()?;
+        let send_deadline = client.next_send_deadline();
+        if let Some(deadline) = send_deadline.filter(|deadline| *deadline <= Instant::now()) {
+            let events = client.send_managed_probe(deadline)?;
             publish_events(&hub, &mut counters, events);
             continue;
         }
@@ -245,7 +241,7 @@ fn run_client(
         publish_events(
             &hub,
             &mut counters,
-            client.recv_available(MANAGED_RECV_BUDGET)?,
+            client.recv_once_until(send_deadline, MANAGED_RECV_TIMEOUT)?,
         );
         if client.is_peer_closed() {
             break;
@@ -255,8 +251,6 @@ fn run_client(
         if client.is_run_complete() {
             break;
         }
-
-        sleep_until_next_wakeup(client.next_send_deadline());
     }
 
     if !cancelled {
@@ -337,16 +331,6 @@ fn publish_events(hub: &EventHub, counters: &mut OutcomeCounters, events: Vec<Cl
     for event in events {
         counters.observe(&event);
         hub.publish(event);
-    }
-}
-
-fn sleep_until_next_wakeup(deadline: Option<Instant>) {
-    let sleep_for = deadline
-        .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
-        .map(|duration| duration.min(MAX_SLEEP))
-        .unwrap_or(IDLE_SLEEP);
-    if sleep_for > Duration::ZERO {
-        thread::sleep(sleep_for);
     }
 }
 

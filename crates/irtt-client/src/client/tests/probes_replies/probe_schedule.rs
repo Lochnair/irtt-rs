@@ -102,6 +102,129 @@ fn send_probe_respects_finite_duration_exclusive_end() {
 }
 
 #[test]
+fn managed_probe_skips_missed_schedule_slots() {
+    let interval = Duration::from_millis(10);
+    let params = Params {
+        protocol_version: 1,
+        duration_ns: 0,
+        interval_ns: 10_000_000,
+        received_stats: ReceivedStats::Both,
+        stamp_at: StampAt::Both,
+        clock: Clock::Both,
+        ..Params::default()
+    };
+    let server = echo_server(params);
+    let config = ClientConfig {
+        duration: None,
+        interval,
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let first_deadline = client.next_send_deadline().unwrap();
+    let delayed_send = ClientTimestamp {
+        mono: first_deadline + Duration::from_millis(45),
+        wall: SystemTime::now(),
+    };
+    let events = client
+        .send_managed_probe_at(first_deadline, delayed_send)
+        .unwrap();
+
+    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events[0],
+        ClientEvent::EchoSent {
+            seq: 0,
+            scheduled_at,
+            sent_at,
+            ..
+        } if scheduled_at == first_deadline + Duration::from_millis(40)
+            && sent_at == delayed_send
+    ));
+    assert_eq!(
+        client.next_send_deadline(),
+        Some(first_deadline + Duration::from_millis(50))
+    );
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
+fn managed_probe_skip_preserves_finite_run_end() {
+    let interval = Duration::from_millis(10);
+    let duration = Duration::from_millis(50);
+    let params = Params {
+        protocol_version: 1,
+        duration_ns: 50_000_000,
+        interval_ns: 10_000_000,
+        received_stats: ReceivedStats::Both,
+        stamp_at: StampAt::Both,
+        clock: Clock::Both,
+        ..Params::default()
+    };
+    let server = echo_server(params);
+    let config = ClientConfig {
+        duration: Some(duration),
+        interval,
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let first_deadline = client.next_send_deadline().unwrap();
+    let delayed_send = ClientTimestamp {
+        mono: first_deadline + Duration::from_millis(45),
+        wall: SystemTime::now(),
+    };
+    let first = client
+        .send_managed_probe_at(first_deadline, delayed_send)
+        .unwrap();
+    let second = client
+        .send_managed_probe_at(
+            first_deadline + duration,
+            ClientTimestamp {
+                mono: first_deadline + Duration::from_millis(46),
+                wall: SystemTime::now(),
+            },
+        )
+        .unwrap();
+
+    assert_eq!(first.len(), 1);
+    assert!(second.is_empty());
+    assert!(client.next_send_deadline().is_none());
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
+fn receive_wait_is_bounded_by_next_ten_millisecond_deadline() {
+    let now = Instant::now();
+    let deadline = now + Duration::from_millis(10);
+
+    assert_eq!(
+        bounded_receive_timeout(
+            Some(deadline),
+            Some(Duration::from_millis(20)),
+            Duration::from_millis(20),
+            now,
+        ),
+        Some(Duration::from_millis(10))
+    );
+    assert_eq!(
+        bounded_receive_timeout(
+            Some(now),
+            Some(Duration::from_millis(20)),
+            Duration::from_millis(20),
+            now,
+        ),
+        None
+    );
+}
+
+#[test]
 fn connect_rejects_invalid_probe_limits() {
     for config in [
         ClientConfig {

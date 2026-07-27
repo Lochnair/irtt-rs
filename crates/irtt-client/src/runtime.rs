@@ -152,24 +152,26 @@ impl SessionRuntime {
     where
         F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
     {
-        self.send_probe_inner(override_ts, None, send)
+        self.send_probe_inner(override_ts, None, false, send)
     }
 
     pub(crate) fn send_probe_for_deadline<F>(
         &mut self,
+        override_ts: Option<ClientTimestamp>,
         scheduled_at: Instant,
         send: F,
     ) -> Result<Vec<ClientEvent>, ClientError>
     where
         F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
     {
-        self.send_probe_inner(None, Some(scheduled_at), send)
+        self.send_probe_inner(override_ts, Some(scheduled_at), true, send)
     }
 
     fn send_probe_inner<F>(
         &mut self,
         override_ts: Option<ClientTimestamp>,
         scheduled_at_override: Option<Instant>,
+        skip_missed_slots: bool,
         send: F,
     ) -> Result<Vec<ClientEvent>, ClientError>
     where
@@ -218,7 +220,6 @@ impl SessionRuntime {
         };
         let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
         let send_result = send(&packet)?;
-        let timer_error = instant_abs_diff(send_result.sent_at.mono, scheduled_at);
 
         let session = self
             .session
@@ -251,17 +252,23 @@ impl SessionRuntime {
             .expect("negotiated must exist when Open");
         let interval_ns = u64::try_from(negotiated.params.interval_ns)
             .expect("validated positive negotiated interval");
+        let interval = Duration::from_nanos(interval_ns);
+        let (scheduled_at, next_send_at) = if skip_missed_slots {
+            let (scheduled_at, next_send_at, _) =
+                advance_cadence(scheduled_at, interval, send_result.sent_at.mono)?;
+            (scheduled_at, next_send_at)
+        } else {
+            (
+                scheduled_at,
+                next_probe_deadline(session.start_mono, interval_ns, session.packets_sent)?,
+            )
+        };
+        let timer_error = instant_abs_diff(send_result.sent_at.mono, scheduled_at);
         let session = self
             .session
             .as_mut()
             .expect("session must exist when phase is Open");
-        session.next_send_at = if let Some(scheduled_at) = scheduled_at_override {
-            scheduled_at
-                .checked_add(Duration::from_nanos(interval_ns))
-                .ok_or(ClientError::DurationOverflow)?
-        } else {
-            next_probe_deadline(session.start_mono, interval_ns, session.packets_sent)?
-        };
+        session.next_send_at = next_send_at;
 
         if let Some(end) = session.end_mono {
             if session.next_send_at >= end {
@@ -682,6 +689,54 @@ fn next_probe_deadline(
     start
         .checked_add(Duration::from_nanos(offset_ns))
         .ok_or(ClientError::DurationOverflow)
+}
+
+pub(crate) fn advance_cadence(
+    deadline: Instant,
+    interval: Duration,
+    now: Instant,
+) -> Result<(Instant, Instant, u128), ClientError> {
+    if interval.is_zero() {
+        return Err(ClientError::InvalidConfig {
+            reason: "probe interval must be greater than zero".to_owned(),
+        });
+    }
+
+    let elapsed_slots = now
+        .checked_duration_since(deadline)
+        .map_or(0, |elapsed| elapsed.as_nanos() / interval.as_nanos());
+    let scheduled_offset = duration_from_nanos(
+        interval
+            .as_nanos()
+            .checked_mul(elapsed_slots)
+            .ok_or(ClientError::DurationOverflow)?,
+    )?;
+    let next_offset = duration_from_nanos(
+        interval
+            .as_nanos()
+            .checked_mul(
+                elapsed_slots
+                    .checked_add(1)
+                    .ok_or(ClientError::DurationOverflow)?,
+            )
+            .ok_or(ClientError::DurationOverflow)?,
+    )?;
+    let scheduled_at = deadline
+        .checked_add(scheduled_offset)
+        .ok_or(ClientError::DurationOverflow)?;
+    let next_at = deadline
+        .checked_add(next_offset)
+        .ok_or(ClientError::DurationOverflow)?;
+    Ok((scheduled_at, next_at, elapsed_slots))
+}
+
+fn duration_from_nanos(nanos: u128) -> Result<Duration, ClientError> {
+    const NANOS_PER_SECOND: u128 = 1_000_000_000;
+    let seconds =
+        u64::try_from(nanos / NANOS_PER_SECOND).map_err(|_| ClientError::DurationOverflow)?;
+    let subsec_nanos = u32::try_from(nanos % NANOS_PER_SECOND)
+        .expect("nanosecond remainder is always less than one second");
+    Ok(Duration::new(seconds, subsec_nanos))
 }
 
 pub(crate) fn sequence_is_after(candidate: u32, current: u32) -> bool {
