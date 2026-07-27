@@ -7,8 +7,8 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use irtt_client::{
-    ClientEvent, EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
-    ManagedGroupEndReason, SubscriberConfig, SubscriberOverflow,
+    EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig, ManagedGroupEndReason,
+    ManagedGroupEvent, SubscriberConfig, SubscriberOverflow,
 };
 
 use crate::{
@@ -184,13 +184,17 @@ fn run_group_tui(
         }
 
         match events.try_recv() {
-            Ok(Some(target_event)) => {
+            Ok(Some(group_event)) => {
                 saw_target_event = true;
                 last_event_at = Instant::now();
-                if is_terminal_target_event(&target_event.event) {
-                    terminal_targets.insert(target_event.target.as_str().to_owned());
+                match group_event {
+                    ManagedGroupEvent::Client(target_event) => {
+                        state.process_target_event(&target_event);
+                    }
+                    ManagedGroupEvent::TargetFinished(target) => {
+                        terminal_targets.insert(target.id.as_str().to_owned());
+                    }
                 }
-                state.process_target_event(&target_event);
                 render_if_due(terminal, state, next_render, false)?;
             }
             Ok(None) => {
@@ -225,8 +229,10 @@ fn run_group_tui(
     render_if_due(terminal, state, next_render, true)?;
 
     let outcome = session.join()?;
-    while let Ok(Some(target_event)) = events.try_recv() {
-        state.process_target_event(&target_event);
+    while let Ok(Some(group_event)) = events.try_recv() {
+        if let ManagedGroupEvent::Client(target_event) = group_event {
+            state.process_target_event(&target_event);
+        }
     }
 
     if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
@@ -263,13 +269,6 @@ impl GroupLoopExit {
             Self::Interrupted | Self::IdleGraceElapsed | Self::SubscriptionDisconnected
         )
     }
-}
-
-fn is_terminal_target_event(event: &ClientEvent) -> bool {
-    matches!(
-        event,
-        ClientEvent::SessionClosed { .. } | ClientEvent::NoTestCompleted { .. }
-    )
 }
 
 fn estimated_group_completion_grace(args: &TuiArgs) -> Duration {

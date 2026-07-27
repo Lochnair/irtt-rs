@@ -10,7 +10,7 @@ use std::{
 
 use irtt_client::{
     ClientEvent, EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
-    ManagedGroupEndReason, SubscriberConfig, SubscriberOverflow, TargetEvent,
+    ManagedGroupEndReason, ManagedGroupEvent, SubscriberConfig, SubscriberOverflow, TargetEvent,
 };
 #[cfg(all(test, feature = "stats"))]
 use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
@@ -324,23 +324,31 @@ fn run_group_stream(
         }
 
         match events.try_recv() {
-            Ok(Some(target_event)) => {
+            Ok(Some(group_event)) => {
                 last_event_at = Instant::now();
                 saw_target_event = true;
-                let label = target_event.target.as_str();
-                if is_terminal_target_event(&target_event.event) {
-                    terminal_targets.insert(label.to_owned());
-                }
-                #[cfg(feature = "stats")]
-                {
-                    let stats = stats
-                        .entry(label.to_owned())
-                        .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
-                    print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
-                }
-                #[cfg(not(feature = "stats"))]
-                {
-                    print_target_event_with_stats(&mut stream_output, &target_event)?;
+                match group_event {
+                    ManagedGroupEvent::Client(target_event) => {
+                        #[cfg(feature = "stats")]
+                        {
+                            let label = target_event.target.as_str();
+                            let stats = stats
+                                .entry(label.to_owned())
+                                .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
+                            print_target_event_with_stats(
+                                &mut stream_output,
+                                &target_event,
+                                stats,
+                            )?;
+                        }
+                        #[cfg(not(feature = "stats"))]
+                        {
+                            print_target_event_with_stats(&mut stream_output, &target_event)?;
+                        }
+                    }
+                    ManagedGroupEvent::TargetFinished(target) => {
+                        terminal_targets.insert(target.id.as_str().to_owned());
+                    }
                 }
             }
             Ok(None) => {
@@ -365,18 +373,20 @@ fn run_group_stream(
     }
 
     let outcome = session.join()?;
-    while let Ok(Some(target_event)) = events.try_recv() {
-        let label = target_event.target.as_str();
-        #[cfg(feature = "stats")]
-        {
-            let stats = stats
-                .entry(label.to_owned())
-                .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
-            print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
-        }
-        #[cfg(not(feature = "stats"))]
-        {
-            print_target_event_with_stats(&mut stream_output, &target_event)?;
+    while let Ok(Some(group_event)) = events.try_recv() {
+        if let ManagedGroupEvent::Client(target_event) = group_event {
+            #[cfg(feature = "stats")]
+            {
+                let label = target_event.target.as_str();
+                let stats = stats
+                    .entry(label.to_owned())
+                    .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
+                print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
+            }
+            #[cfg(not(feature = "stats"))]
+            {
+                print_target_event_with_stats(&mut stream_output, &target_event)?;
+            }
         }
     }
 
@@ -403,13 +413,6 @@ fn run_group_stream(
     }
     stream_output.out.flush()?;
     Ok(())
-}
-
-fn is_terminal_target_event(event: &ClientEvent) -> bool {
-    matches!(
-        event,
-        ClientEvent::SessionClosed { .. } | ClientEvent::NoTestCompleted { .. }
-    )
 }
 
 fn estimated_group_completion_grace(args: &ClientArgs) -> Duration {

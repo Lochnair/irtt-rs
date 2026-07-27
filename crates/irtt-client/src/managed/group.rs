@@ -127,8 +127,30 @@ pub struct TargetEvent {
     pub event: ClientEvent,
 }
 
-/// Subscription type for target-scoped group events.
-pub type TargetEventSubscription = EventSubscription<TargetEvent>;
+/// Event published by a managed client group.
+///
+/// Per-session events are followed by exactly one [`TargetFinished`](Self::TargetFinished)
+/// event when that target incarnation reaches a terminal state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagedGroupEvent {
+    /// A protocol lifecycle, measurement, or warning event from one target.
+    Client(TargetEvent),
+    /// Authoritative terminal outcome for one target incarnation.
+    TargetFinished(ManagedTargetOutcome),
+}
+
+impl ManagedGroupEvent {
+    /// Return the target associated with this event.
+    pub fn target(&self) -> &TargetId {
+        match self {
+            Self::Client(event) => &event.target,
+            Self::TargetFinished(outcome) => &outcome.id,
+        }
+    }
+}
+
+/// Subscription type for managed group events.
+pub type TargetEventSubscription = EventSubscription<ManagedGroupEvent>;
 
 /// Entry point for running a shared-socket multi-target managed client group.
 #[derive(Debug)]
@@ -142,7 +164,7 @@ pub struct ManagedClientGroup;
 #[must_use = "dropping the session cancels the managed client group; call join() to wait for completion"]
 #[derive(Debug)]
 pub struct ManagedClientGroupSession {
-    hub: EventHub<TargetEvent>,
+    hub: EventHub<ManagedGroupEvent>,
     control_tx: mpsc::Sender<ControlMessage>,
     cancellation: CancellationToken,
     scheduler: Option<JoinHandle<Result<ManagedGroupOutcome, ClientError>>>,
@@ -202,10 +224,85 @@ pub enum ManagedTargetEndReason {
     NoTestComplete,
     /// The server closed the target session.
     PeerClosed,
-    /// Opening failed before a `ClientEvent` lifecycle event existed.
-    OpenFailed { message: String },
+    /// Opening failed before a session became active.
+    OpenFailed(ManagedTargetFailure),
     /// Runtime send/receive/close handling failed for this target.
-    Failed { message: String },
+    Failed(ManagedTargetFailure),
+}
+
+impl ManagedTargetEndReason {
+    /// Return whether this reason represents a successfully completed run.
+    pub fn is_success(&self) -> bool {
+        matches!(
+            self,
+            Self::TestComplete | Self::NoTestComplete | Self::PeerClosed
+        )
+    }
+
+    /// Return structured failure details, when this target failed.
+    pub fn failure(&self) -> Option<&ManagedTargetFailure> {
+        match self {
+            Self::OpenFailed(failure) | Self::Failed(failure) => Some(failure),
+            _ => None,
+        }
+    }
+}
+
+/// Structured failure details for a managed target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedTargetFailure {
+    /// Machine-readable failure category.
+    pub kind: ManagedTargetFailureKind,
+    /// Human-readable diagnostic suitable for logs and user interfaces.
+    pub message: String,
+}
+
+impl ManagedTargetFailure {
+    fn opening(error: &ClientError) -> Self {
+        Self {
+            kind: classify_target_failure(error, true),
+            message: error.to_string(),
+        }
+    }
+
+    fn runtime(error: &ClientError) -> Self {
+        Self {
+            kind: classify_target_failure(error, false),
+            message: error.to_string(),
+        }
+    }
+}
+
+/// Machine-readable category for a managed target failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManagedTargetFailureKind {
+    /// No valid open reply arrived before the configured attempts expired.
+    OpeningTimeout,
+    /// Opening failed during protocol parsing, authentication, or negotiation.
+    OpeningProtocol,
+    /// A socket or socket-option operation failed.
+    Socket,
+    /// Runtime protocol or session-state processing failed.
+    RuntimeProtocol,
+    /// Target or client configuration was invalid.
+    InvalidConfiguration,
+    /// A managed worker failed internally.
+    InternalWorker,
+}
+
+fn classify_target_failure(error: &ClientError, opening: bool) -> ManagedTargetFailureKind {
+    match error {
+        ClientError::OpenTimeout => ManagedTargetFailureKind::OpeningTimeout,
+        ClientError::Socket(_)
+        | ClientError::SocketOption { .. }
+        | ClientError::ReadTimeoutRestore { .. } => ManagedTargetFailureKind::Socket,
+        ClientError::InvalidConfig { .. }
+        | ClientError::OpenTimeoutTooSmall { .. }
+        | ClientError::NoOpenTimeouts => ManagedTargetFailureKind::InvalidConfiguration,
+        ClientError::WorkerPanicked => ManagedTargetFailureKind::InternalWorker,
+        _ if opening => ManagedTargetFailureKind::OpeningProtocol,
+        _ => ManagedTargetFailureKind::RuntimeProtocol,
+    }
 }
 
 impl ManagedClientGroup {
@@ -299,6 +396,9 @@ impl ManagedClientGroup {
         let scheduler_shared = shared.clone();
         let scheduler_config = config.clone();
         let scheduler = thread::spawn(move || {
+            let _cleanup = GroupSchedulerCleanup {
+                shared: scheduler_shared.clone(),
+            };
             run_group_scheduler(
                 scheduler_config,
                 send_socket,
@@ -361,28 +461,12 @@ impl ManagedClientGroupSession {
         let scheduler = self.scheduler.take().expect(
             "ManagedClientGroupSession invariant violated: scheduler handle missing before join",
         );
-        let scheduler_result = match scheduler.join() {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                self.cancellation.cancel();
-                self.hub.disconnect_all();
-                return Err(ClientError::WorkerPanicked);
-            }
-        };
-
-        self.cancellation.cancel();
-        let _ = self.control_tx.send(ControlMessage::Wake);
+        let scheduler_result = scheduler.join().unwrap_or(Err(ClientError::WorkerPanicked));
 
         let receiver = self.receiver.take().expect(
             "ManagedClientGroupSession invariant violated: receiver handle missing before join",
         );
-        let receiver_result = match receiver.join() {
-            Ok(outcome) => outcome,
-            Err(_) => {
-                self.hub.disconnect_all();
-                return Err(ClientError::WorkerPanicked);
-            }
-        };
+        let receiver_result = receiver.join().unwrap_or(Err(ClientError::WorkerPanicked));
 
         self.hub.disconnect_all();
         match (scheduler_result, receiver_result) {
@@ -412,12 +496,24 @@ enum ControlMessage {
 #[derive(Debug)]
 struct GroupShared {
     registry: Mutex<TargetRegistry>,
-    hub: EventHub<TargetEvent>,
+    hub: EventHub<ManagedGroupEvent>,
     cancellation: CancellationToken,
     control_tx: mpsc::Sender<ControlMessage>,
     requested_interval_ns: i64,
     requested_dscp: i64,
     family_remote: SocketAddr,
+}
+
+struct GroupSchedulerCleanup {
+    shared: Arc<GroupShared>,
+}
+
+impl Drop for GroupSchedulerCleanup {
+    fn drop(&mut self) {
+        self.shared.cancellation.cancel();
+        let _ = self.shared.control_tx.send(ControlMessage::Wake);
+        self.shared.hub.disconnect_all();
+    }
 }
 
 #[derive(Debug, Default)]
@@ -504,6 +600,9 @@ impl TargetState {
     }
 
     fn mark_finished(&mut self, reason: ManagedTargetEndReason) {
+        if self.final_reason.is_some() {
+            return;
+        }
         self.status = TargetStatus::Finished;
         self.final_reason = Some(reason);
     }
@@ -605,6 +704,12 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
                 continue;
             }
             Err(err) => {
+                let failure = ManagedTargetFailure {
+                    kind: ManagedTargetFailureKind::Socket,
+                    message: ClientError::Socket(std::io::Error::new(err.kind(), err.to_string()))
+                        .to_string(),
+                };
+                fail_all_targets(&shared, failure);
                 shared.cancellation.cancel();
                 let _ = shared.control_tx.send(ControlMessage::Wake);
                 return Err(ClientError::Socket(err));
@@ -645,9 +750,9 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
                             wake_scheduler = true;
                         }
                         Err(err) => {
-                            target.mark_finished(ManagedTargetEndReason::OpenFailed {
-                                message: err.to_string(),
-                            });
+                            target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                                ManagedTargetFailure::opening(&err),
+                            ));
                             wake_scheduler = true;
                         }
                     }
@@ -665,9 +770,9 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
                             }
                         }
                         Err(err) => {
-                            target.mark_finished(ManagedTargetEndReason::Failed {
-                                message: err.to_string(),
-                            });
+                            target.mark_finished(ManagedTargetEndReason::Failed(
+                                ManagedTargetFailure::runtime(&err),
+                            ));
                             wake_scheduler = true;
                         }
                     }
@@ -703,36 +808,40 @@ fn validate_group_negotiation(
 }
 
 fn publish_open_outcome(
-    hub: &EventHub<TargetEvent>,
+    hub: &EventHub<ManagedGroupEvent>,
     target: &mut TargetState,
     outcome: OpenOutcome,
 ) {
     match outcome {
         OpenOutcome::Started { event, .. } => {
             target.status = TargetStatus::Active;
-            hub.publish(TargetEvent {
+            hub.publish(ManagedGroupEvent::Client(TargetEvent {
                 target: target.id.clone(),
                 event,
-            });
+            }));
         }
         OpenOutcome::NoTestCompleted { event, .. } => {
             target.observe(&event);
-            hub.publish(TargetEvent {
+            hub.publish(ManagedGroupEvent::Client(TargetEvent {
                 target: target.id.clone(),
                 event,
-            });
+            }));
             target.mark_finished(ManagedTargetEndReason::NoTestComplete);
         }
     }
 }
 
-fn publish_events(hub: &EventHub<TargetEvent>, target: &mut TargetState, events: Vec<ClientEvent>) {
+fn publish_events(
+    hub: &EventHub<ManagedGroupEvent>,
+    target: &mut TargetState,
+    events: Vec<ClientEvent>,
+) {
     for event in events {
         target.observe(&event);
-        hub.publish(TargetEvent {
+        hub.publish(ManagedGroupEvent::Client(TargetEvent {
             target: target.id.clone(),
             event,
-        });
+        }));
     }
 }
 
@@ -855,12 +964,8 @@ fn apply_target_update(
     };
 
     for target in removed {
-        records.push(close_target(
-            socket,
-            &shared.hub,
-            target,
-            ManagedTargetEndReason::Removed,
-        ));
+        let outcome = close_target(socket, &shared.hub, target, ManagedTargetEndReason::Removed);
+        record_target_outcome(shared, records, outcome);
     }
 
     Ok(())
@@ -944,9 +1049,9 @@ fn drive_open_attempts(
         }
 
         if attempt >= config.open_timeouts.len() {
-            target.mark_finished(ManagedTargetEndReason::OpenFailed {
-                message: ClientError::OpenTimeout.to_string(),
-            });
+            target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                ManagedTargetFailure::opening(&ClientError::OpenTimeout),
+            ));
             continue;
         }
 
@@ -958,9 +1063,9 @@ fn drive_open_attempts(
                 };
             }
             Err(err) => {
-                target.mark_finished(ManagedTargetEndReason::Failed {
-                    message: ClientError::Socket(err).to_string(),
-                });
+                target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                    ManagedTargetFailure::opening(&ClientError::Socket(err)),
+                ));
             }
         }
     }
@@ -981,9 +1086,9 @@ fn poll_active_timeouts(shared: &GroupShared, now: Instant) {
         }
         match target.runtime.poll_timeouts_at(now) {
             Ok(events) => publish_events(&shared.hub, &mut target, events),
-            Err(err) => target.mark_finished(ManagedTargetEndReason::Failed {
-                message: err.to_string(),
-            }),
+            Err(err) => target.mark_finished(ManagedTargetEndReason::Failed(
+                ManagedTargetFailure::runtime(&err),
+            )),
         }
     }
 }
@@ -1058,9 +1163,9 @@ fn send_echo_to_target(
             // replies.
             publish_events(&shared.hub, &mut target, events);
         }
-        Err(err) => target.mark_finished(ManagedTargetEndReason::Failed {
-            message: err.to_string(),
-        }),
+        Err(err) => target.mark_finished(ManagedTargetEndReason::Failed(
+            ManagedTargetFailure::runtime(&err),
+        )),
     }
 }
 
@@ -1091,14 +1196,13 @@ fn collect_finished_targets(shared: &GroupShared, records: &mut Vec<ManagedTarge
 
     for target in finished {
         let target = target.lock().expect("target mutex poisoned");
-        let reason =
-            target
-                .final_reason
-                .clone()
-                .unwrap_or_else(|| ManagedTargetEndReason::Failed {
-                    message: "target finished without a reason".to_owned(),
-                });
-        records.push(target.outcome(reason));
+        let reason = target.final_reason.clone().unwrap_or_else(|| {
+            ManagedTargetEndReason::Failed(ManagedTargetFailure {
+                kind: ManagedTargetFailureKind::InternalWorker,
+                message: "target finished without a reason".to_owned(),
+            })
+        });
+        record_target_outcome(shared, records, target.outcome(reason));
     }
 }
 
@@ -1109,12 +1213,13 @@ fn cancel_remaining_targets(
 ) {
     let targets = drain_registry(shared);
     for target in targets {
-        records.push(close_target(
+        let outcome = close_target(
             socket,
             &shared.hub,
             target,
             ManagedTargetEndReason::Cancelled,
-        ));
+        );
+        record_target_outcome(shared, records, outcome);
     }
 }
 
@@ -1126,7 +1231,28 @@ fn remove_all_targets(
 ) {
     let targets = drain_registry(shared);
     for target in targets {
-        records.push(close_target(socket, &shared.hub, target, reason.clone()));
+        let outcome = close_target(socket, &shared.hub, target, reason.clone());
+        record_target_outcome(shared, records, outcome);
+    }
+}
+
+fn record_target_outcome(
+    shared: &GroupShared,
+    records: &mut Vec<ManagedTargetOutcome>,
+    outcome: ManagedTargetOutcome,
+) {
+    shared
+        .hub
+        .publish(ManagedGroupEvent::TargetFinished(outcome.clone()));
+    records.push(outcome);
+}
+
+fn fail_all_targets(shared: &GroupShared, failure: ManagedTargetFailure) {
+    for target in all_targets(shared) {
+        target
+            .lock()
+            .expect("target mutex poisoned")
+            .mark_finished(ManagedTargetEndReason::Failed(failure.clone()));
     }
 }
 
@@ -1141,7 +1267,7 @@ fn drain_registry(shared: &GroupShared) -> Vec<Arc<Mutex<TargetState>>> {
 
 fn close_target(
     socket: &UdpSocket,
-    hub: &EventHub<TargetEvent>,
+    hub: &EventHub<ManagedGroupEvent>,
     target: Arc<Mutex<TargetState>>,
     reason: ManagedTargetEndReason,
 ) -> ManagedTargetOutcome {
@@ -1153,7 +1279,7 @@ fn close_target(
 
 fn close_locked_target(
     socket: &UdpSocket,
-    hub: &EventHub<TargetEvent>,
+    hub: &EventHub<ManagedGroupEvent>,
     target: &mut TargetState,
     reason: ManagedTargetEndReason,
 ) {
@@ -1165,9 +1291,9 @@ fn close_locked_target(
         }) {
             Ok(events) => publish_events(hub, target, events),
             Err(err) => {
-                target.mark_finished(ManagedTargetEndReason::Failed {
-                    message: err.to_string(),
-                });
+                target.mark_finished(ManagedTargetEndReason::Failed(
+                    ManagedTargetFailure::runtime(&err),
+                ));
                 return;
             }
         }
@@ -1545,6 +1671,85 @@ mod tests {
         }
     }
 
+    fn start_open_failure_server(params: Params) -> FakeServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & FLAG_OPEN, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, 0, &params), peer)
+                .unwrap();
+        });
+        FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        }
+    }
+
+    fn start_no_test_server(params: Params) -> FakeServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & flags::FLAG_CLOSE, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(
+                    &open_reply(FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE, 0, &params),
+                    peer,
+                )
+                .unwrap();
+        });
+        FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        }
+    }
+
+    fn start_silent_runtime_server(params: Params) -> FakeServer {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & FLAG_OPEN, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(800)))
+                .unwrap();
+            while let Some((packet, _)) = recv_request_timeout(&socket) {
+                if packet[3] & flags::FLAG_CLOSE != 0 {
+                    tx.send(ServerObservation::Close { at: Instant::now() })
+                        .unwrap();
+                    break;
+                }
+                let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+                tx.send(ServerObservation::Echo {
+                    seq,
+                    at: Instant::now(),
+                })
+                .unwrap();
+            }
+        });
+        FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        }
+    }
+
     fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
         let mut buf = [0_u8; 2048];
         socket
@@ -1620,7 +1825,8 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
             match sub.try_recv() {
-                Ok(Some(event)) => return event,
+                Ok(Some(ManagedGroupEvent::Client(event))) => return event,
+                Ok(Some(ManagedGroupEvent::TargetFinished(_))) => {}
                 Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
                 Ok(None) => panic!("timed out waiting for group event"),
                 Err(err) => panic!("subscription ended while waiting for event: {err}"),
@@ -1632,8 +1838,24 @@ mod tests {
         let mut events = Vec::new();
         loop {
             match sub.try_recv() {
-                Ok(Some(event)) => events.push(event),
+                Ok(Some(ManagedGroupEvent::Client(event))) => events.push(event),
+                Ok(Some(ManagedGroupEvent::TargetFinished(_))) => {}
                 Ok(None) => thread::sleep(Duration::from_millis(1)),
+                Err(EventSubscriptionError::Disconnected) => return events,
+            }
+        }
+    }
+
+    fn collect_group_events_until_disconnected(
+        sub: &TargetEventSubscription,
+    ) -> Vec<ManagedGroupEvent> {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut events = Vec::new();
+        loop {
+            match sub.try_recv() {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(1)),
+                Ok(None) => panic!("timed out waiting for managed group disconnection"),
                 Err(EventSubscriptionError::Disconnected) => return events,
             }
         }
@@ -1798,6 +2020,172 @@ mod tests {
         assert_eq!(target.end_reason, ManagedTargetEndReason::PeerClosed);
         assert_eq!(target.packets_sent, 1);
         assert_eq!(target.replies_received, 1);
+    }
+
+    #[test]
+    fn mixed_peer_close_and_open_failure_publish_terminal_outcomes_and_disconnect() {
+        let interval = Duration::from_millis(10);
+        let params = test_params(None, interval);
+        let success = start_peer_close_server(params.clone());
+        let failure = start_open_failure_server(params);
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            group_config(None, interval, ManagedGroupPacing::Staggered),
+            vec![
+                target("success", success.addr),
+                target("failure", failure.addr),
+            ],
+            SubscriberConfig {
+                capacity: 64,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
+        success.join();
+        failure.join();
+
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::Client(TargetEvent {
+                target,
+                event: ClientEvent::EchoReply { .. },
+            }) if target.as_str() == "success"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::TargetFinished(target)
+                if target.id.as_str() == "success"
+                    && target.end_reason == ManagedTargetEndReason::PeerClosed
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::TargetFinished(target)
+                if target.id.as_str() == "failure"
+                    && matches!(
+                        &target.end_reason,
+                        ManagedTargetEndReason::OpenFailed(failure)
+                            if failure.kind == ManagedTargetFailureKind::OpeningProtocol
+                    )
+        )));
+        assert_eq!(outcome.targets.len(), 2);
+    }
+
+    #[test]
+    fn all_open_failures_publish_terminal_outcomes_and_disconnect() {
+        let interval = Duration::from_millis(10);
+        let params = test_params(None, interval);
+        let a = start_open_failure_server(params.clone());
+        let b = start_open_failure_server(params);
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            group_config(None, interval, ManagedGroupPacing::Burst),
+            vec![target("a", a.addr), target("b", b.addr)],
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
+        a.join();
+        b.join();
+
+        let failures = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ManagedGroupEvent::TargetFinished(ManagedTargetOutcome {
+                        end_reason: ManagedTargetEndReason::OpenFailed(_),
+                        ..
+                    })
+                )
+            })
+            .count();
+        assert_eq!(failures, 2);
+        assert_eq!(outcome.targets.len(), 2);
+        assert!(outcome
+            .targets
+            .iter()
+            .all(|target| target.end_reason.failure().is_some()));
+    }
+
+    #[test]
+    fn runtime_failure_publishes_terminal_outcome() {
+        let interval = Duration::from_millis(10);
+        let server = start_silent_runtime_server(test_params(None, interval));
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.client.max_pending_probes = 1;
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("runtime", server.addr)],
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
+        server.join();
+
+        let terminal = events
+            .iter()
+            .find_map(|event| match event {
+                ManagedGroupEvent::TargetFinished(outcome) => Some(outcome),
+                ManagedGroupEvent::Client(_) => None,
+            })
+            .expect("missing terminal outcome");
+        let failure = terminal
+            .end_reason
+            .failure()
+            .expect("runtime target should fail");
+        assert_eq!(failure.kind, ManagedTargetFailureKind::RuntimeProtocol);
+        assert!(failure.message.contains("pending probe limit"));
+        assert_eq!(outcome.targets, vec![terminal.clone()]);
+    }
+
+    #[test]
+    fn no_test_event_precedes_terminal_outcome() {
+        let interval = Duration::from_millis(10);
+        let server = start_no_test_server(test_params(Some(interval), interval));
+        let mut config = group_config(Some(interval), interval, ManagedGroupPacing::Staggered);
+        config.client.run_mode = crate::RunMode::NoTest;
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("no-test", server.addr)],
+            SubscriberConfig {
+                capacity: 8,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
+        server.join();
+
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::NoTestCompleted { .. },
+                    ..
+                }),
+                ManagedGroupEvent::TargetFinished(ManagedTargetOutcome {
+                    end_reason: ManagedTargetEndReason::NoTestComplete,
+                    ..
+                })
+            ]
+        ));
+        assert_eq!(
+            outcome.targets[0].end_reason,
+            ManagedTargetEndReason::NoTestComplete
+        );
     }
 
     #[test]
@@ -2004,9 +2392,10 @@ mod tests {
         let mut saw_a_after_update = false;
         let mut saw_c_after_update = false;
         let mut saw_b_echo_after_update = false;
+        let mut saw_b_removed = false;
         while Instant::now() < deadline && !(saw_a_after_update && saw_c_after_update) {
             match sub.try_recv() {
-                Ok(Some(event)) => {
+                Ok(Some(ManagedGroupEvent::Client(event))) => {
                     saw_a_after_update |= event.target.as_str() == "a"
                         && matches!(event.event, ClientEvent::EchoReply { .. });
                     saw_c_after_update |= event.target.as_str() == "c"
@@ -2016,6 +2405,10 @@ mod tests {
                             event.event,
                             ClientEvent::EchoSent { .. } | ClientEvent::EchoReply { .. }
                         );
+                }
+                Ok(Some(ManagedGroupEvent::TargetFinished(target))) => {
+                    saw_b_removed |= target.id.as_str() == "b"
+                        && target.end_reason == ManagedTargetEndReason::Removed;
                 }
                 Ok(None) => thread::sleep(Duration::from_millis(1)),
                 Err(err) => panic!("subscription ended unexpectedly: {err}"),
@@ -2032,6 +2425,7 @@ mod tests {
         assert!(saw_a_after_update);
         assert!(saw_c_after_update);
         assert!(!saw_b_echo_after_update);
+        assert!(saw_b_removed);
         assert!(outcome
             .targets
             .iter()
@@ -2046,20 +2440,38 @@ mod tests {
         let a = start_echo_server(params.clone(), Duration::ZERO);
         let b = start_echo_server(params, Duration::ZERO);
 
-        let session = ManagedClientGroup::start(
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
             group_config(None, interval, ManagedGroupPacing::Staggered),
             vec![target("a", a.addr), target("b", b.addr)],
+            SubscriberConfig {
+                capacity: 64,
+                overflow: SubscriberOverflow::DropNewest,
+            },
         )
         .unwrap();
 
         thread::sleep(Duration::from_millis(60));
         session.stop();
         session.stop();
+        let events = collect_group_events_until_disconnected(&sub);
         let outcome = session.join().unwrap();
         a.join();
         b.join();
 
         assert_eq!(outcome.end_reason, ManagedGroupEndReason::Cancelled);
         assert_eq!(outcome.targets.len(), 2);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ManagedGroupEvent::TargetFinished(ManagedTargetOutcome {
+                        end_reason: ManagedTargetEndReason::Cancelled,
+                        ..
+                    })
+                ))
+                .count(),
+            2
+        );
     }
 }

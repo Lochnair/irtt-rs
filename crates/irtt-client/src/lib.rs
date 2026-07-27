@@ -78,9 +78,10 @@ pub use event::{
 pub use managed::{
     CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientGroup,
     ManagedClientGroupConfig, ManagedClientGroupSession, ManagedClientSession,
-    ManagedGroupEndReason, ManagedGroupOutcome, ManagedGroupPacing, ManagedTargetConfig,
-    ManagedTargetEndReason, ManagedTargetOutcome, SessionEndReason, SessionOutcome,
-    SubscriberConfig, SubscriberOverflow, TargetEvent, TargetEventSubscription, TargetId,
+    ManagedGroupEndReason, ManagedGroupEvent, ManagedGroupOutcome, ManagedGroupPacing,
+    ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure, ManagedTargetFailureKind,
+    ManagedTargetOutcome, SessionEndReason, SessionOutcome, SubscriberConfig, SubscriberOverflow,
+    TargetEvent, TargetEventSubscription, TargetId,
 };
 pub use session::{NegotiatedParams, NegotiationRestriction};
 pub use timing::ClientTimestamp;
