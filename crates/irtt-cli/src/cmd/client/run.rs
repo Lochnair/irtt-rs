@@ -23,7 +23,9 @@ use super::{
 #[cfg(feature = "stats")]
 use crate::shared::client::expected_probe_count;
 use crate::shared::client::{
-    is_shutdown_requested, session::should_print_final_summary, ClientSession,
+    is_shutdown_requested,
+    session::{peer_close_run_error, should_print_final_summary},
+    ClientSession,
 };
 
 #[cfg(feature = "stats")]
@@ -152,6 +154,12 @@ pub fn run_stream(
     print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
     #[cfg(not(feature = "stats"))]
     print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
+    interrupted |= is_shutdown_requested(shutdown_requested);
+    let peer_close_error = peer_close_run_error(
+        continuous,
+        interrupted,
+        if session.is_peer_closed() { 1 } else { 0 },
+    );
     let print_final_summary = should_print_final_summary(continuous, interrupted);
     stream_output.print_final_summary = print_final_summary;
     stream_output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
@@ -160,6 +168,9 @@ pub fn run_stream(
     #[cfg(not(feature = "stats"))]
     stream_output.print_summary()?;
     stream_output.out.flush()?;
+    if let Some(error) = peer_close_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 
@@ -403,9 +414,7 @@ fn run_group_stream(
         eprintln!("{warning}");
     }
 
-    if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
-        return Err("managed client group was cancelled".into());
-    }
+    interrupted |= is_shutdown_requested(shutdown_requested);
     for target in &outcome.targets {
         if terminal_targets.insert(target.id.as_str().to_owned()) {
             report_target_failure(target);
@@ -413,11 +422,19 @@ fn run_group_stream(
     }
     let successful_targets = outcome.successful_target_outcomes;
     let failed_targets = outcome.failed_target_outcomes;
-    if !interrupted && successful_targets == 0 && failed_targets > 0 {
-        return Err(
-            format!("no managed target completed successfully ({failed_targets} failed)").into(),
-        );
-    }
+    let terminal_error = if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
+        Some("managed client group was cancelled".to_owned())
+    } else if let Some(error) =
+        peer_close_run_error(continuous, interrupted, outcome.peer_closed_target_outcomes)
+    {
+        Some(error)
+    } else if !interrupted && successful_targets == 0 && failed_targets > 0 {
+        Some(format!(
+            "no managed target completed successfully ({failed_targets} failed)"
+        ))
+    } else {
+        None
+    };
 
     let print_final_summary = should_print_final_summary(continuous, interrupted);
     stream_output.print_final_summary = print_final_summary;
@@ -437,6 +454,9 @@ fn run_group_stream(
         stream_output.print_summary()?;
     }
     stream_output.out.flush()?;
+    if let Some(error) = terminal_error {
+        return Err(error.into());
+    }
     Ok(())
 }
 

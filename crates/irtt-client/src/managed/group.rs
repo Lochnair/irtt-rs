@@ -214,6 +214,12 @@ pub struct ManagedGroupOutcome {
     pub total_target_outcomes: u64,
     /// Number of target outcomes classified as successful.
     pub successful_target_outcomes: u64,
+    /// Number of target outcomes that ended because the peer closed the session.
+    ///
+    /// Peer closure remains a successful library-level outcome and is also
+    /// included in [`Self::successful_target_outcomes`]. This aggregate covers
+    /// outcomes omitted from the bounded [`Self::targets`] snapshot.
+    pub peer_closed_target_outcomes: u64,
     /// Number of target outcomes carrying structured failure details.
     pub failed_target_outcomes: u64,
     /// Number of older outcomes omitted from [`Self::targets`].
@@ -637,6 +643,7 @@ struct TargetOutcomeHistory {
     recent: VecDeque<ManagedTargetOutcome>,
     total: u64,
     successful: u64,
+    peer_closed: u64,
     failed: u64,
     discarded: u64,
 }
@@ -646,6 +653,9 @@ impl TargetOutcomeHistory {
         self.total = self.total.saturating_add(1);
         if outcome.is_success() {
             self.successful = self.successful.saturating_add(1);
+        }
+        if matches!(&outcome.end_reason, ManagedTargetEndReason::PeerClosed) {
+            self.peer_closed = self.peer_closed.saturating_add(1);
         }
         if outcome.end_reason.failure().is_some() {
             self.failed = self.failed.saturating_add(1);
@@ -663,6 +673,7 @@ impl TargetOutcomeHistory {
             targets: self.recent.into_iter().collect(),
             total_target_outcomes: self.total,
             successful_target_outcomes: self.successful,
+            peer_closed_target_outcomes: self.peer_closed,
             failed_target_outcomes: self.failed,
             discarded_target_outcomes: self.discarded,
         }
@@ -2146,6 +2157,51 @@ mod tests {
         assert_eq!(target.end_reason, ManagedTargetEndReason::PeerClosed);
         assert_eq!(target.packets_sent, 1);
         assert_eq!(target.replies_received, 1);
+        assert_eq!(outcome.total_target_outcomes, 1);
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(outcome.peer_closed_target_outcomes, 1);
+        assert_eq!(outcome.failed_target_outcomes, 0);
+    }
+
+    #[test]
+    fn peer_close_aggregate_survives_bounded_recent_history() {
+        let remote: SocketAddr = "127.0.0.1:2112".parse().unwrap();
+        let mut history = TargetOutcomeHistory::default();
+        history.record(ManagedTargetOutcome {
+            id: TargetId::from("peer"),
+            remote,
+            end_reason: ManagedTargetEndReason::PeerClosed,
+            packets_sent: 1,
+            replies_received: 1,
+            duplicates: 0,
+            late: 0,
+            warning_events: 0,
+        });
+        for index in 0..MANAGED_GROUP_OUTCOME_HISTORY_LIMIT {
+            history.record(ManagedTargetOutcome {
+                id: TargetId::from(format!("removed-{index}")),
+                remote,
+                end_reason: ManagedTargetEndReason::Removed,
+                packets_sent: 0,
+                replies_received: 0,
+                duplicates: 0,
+                late: 0,
+                warning_events: 0,
+            });
+        }
+
+        let outcome = history.into_group_outcome(ManagedGroupEndReason::AllTargetsComplete);
+        let expected_total = u64::try_from(MANAGED_GROUP_OUTCOME_HISTORY_LIMIT + 1).unwrap();
+        assert_eq!(outcome.total_target_outcomes, expected_total);
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(outcome.peer_closed_target_outcomes, 1);
+        assert_eq!(outcome.failed_target_outcomes, 0);
+        assert_eq!(outcome.targets.len(), MANAGED_GROUP_OUTCOME_HISTORY_LIMIT);
+        assert_eq!(outcome.discarded_target_outcomes, 1);
+        assert!(outcome
+            .targets
+            .iter()
+            .all(|target| target.end_reason == ManagedTargetEndReason::Removed));
     }
 
     #[test]
@@ -2196,6 +2252,10 @@ mod tests {
                     )
         )));
         assert_eq!(outcome.targets.len(), 2);
+        assert_eq!(outcome.total_target_outcomes, 2);
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(outcome.peer_closed_target_outcomes, 1);
+        assert_eq!(outcome.failed_target_outcomes, 1);
     }
 
     #[test]
@@ -2778,6 +2838,7 @@ mod tests {
         assert_eq!(published, churn_count + 1);
         assert_eq!(outcome.total_target_outcomes, expected_total);
         assert_eq!(outcome.successful_target_outcomes, 0);
+        assert_eq!(outcome.peer_closed_target_outcomes, 0);
         assert_eq!(outcome.failed_target_outcomes, 0);
         assert_eq!(outcome.targets.len(), MANAGED_GROUP_OUTCOME_HISTORY_LIMIT);
         assert_eq!(

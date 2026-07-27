@@ -125,6 +125,76 @@ fn single_target_custom_target_column_renders_positional_label() {
 }
 
 #[test]
+fn finite_single_target_peer_close_exits_successfully() {
+    let server = start_peer_close_server(test_params(
+        Some(Duration::from_millis(40)),
+        Duration::from_millis(10),
+    ));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "40ms",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "seq",
+        "--header",
+        "never",
+        &server.addr.to_string(),
+    ]);
+
+    let output = run_with_timeout(command, Duration::from_secs(3));
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stdout.trim().is_empty(), "{stdout}");
+    assert!(!stderr.contains("peer closure"), "{stderr}");
+}
+
+#[test]
+fn continuous_single_target_peer_close_exits_nonzero() {
+    let server = start_peer_close_server(test_params(None, Duration::from_millis(10)));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "0s",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "seq",
+        "--header",
+        "never",
+        &server.addr.to_string(),
+    ]);
+
+    let output = run_with_timeout(command, Duration::from_secs(3));
+    server.join();
+
+    assert!(
+        !output.status.success(),
+        "status={:?}\nstdout={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stdout.trim().is_empty(), "{stdout}");
+    assert!(stderr.contains("continuous run"), "{stderr}");
+    assert!(stderr.contains("peer closure"), "{stderr}");
+}
+
+#[test]
 fn multi_target_csv_emits_rows_for_both_labels() {
     let params = test_params(Some(Duration::from_millis(40)), Duration::from_millis(10));
     let a = start_echo_server(params.clone());
@@ -171,9 +241,105 @@ fn multi_target_csv_emits_rows_for_both_labels() {
 }
 
 #[test]
-fn continuous_mixed_success_and_open_failure_exits_and_reports_failure() {
+fn finite_multi_target_peer_close_is_accepted_as_completion() {
+    let params = test_params(Some(Duration::from_millis(40)), Duration::from_millis(10));
+    let a = start_peer_close_server(params.clone());
+    let b = start_peer_close_server(params);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "40ms",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "target,seq",
+        "--header",
+        "never",
+        "--target",
+        &format!("a={}", a.addr),
+        "--target",
+        &format!("b={}", b.addr),
+    ]);
+
+    let output = run_with_timeout(command, Duration::from_secs(3));
+    a.join();
+    b.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stdout.lines().any(|line| line.starts_with("a,")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("b,")),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("peer closure"), "{stderr}");
+}
+
+#[test]
+fn continuous_all_peer_closed_targets_exit_nonzero() {
     let params = test_params(None, Duration::from_millis(10));
-    let success = start_peer_close_server(params.clone());
+    let a = start_peer_close_server(params.clone());
+    let b = start_peer_close_server(params);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "0s",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "target,seq",
+        "--header",
+        "never",
+        "--target",
+        &format!("a={}", a.addr),
+        "--target",
+        &format!("b={}", b.addr),
+    ]);
+
+    let output = run_with_timeout(command, Duration::from_secs(3));
+    a.join();
+    b.join();
+
+    assert!(
+        !output.status.success(),
+        "status={:?}\nstdout={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stdout.lines().any(|line| line.starts_with("a,")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("b,")),
+        "{stdout}"
+    );
+    assert!(stderr.contains("continuous run"), "{stderr}");
+    assert!(
+        stderr.contains("peer closure (2 target sessions)"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn continuous_mixed_peer_close_and_open_failure_exits_nonzero() {
+    let params = test_params(None, Duration::from_millis(10));
+    let peer_closed = start_peer_close_server(params.clone());
     let failure = start_open_failure_server(params);
     let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
     command.args([
@@ -188,29 +354,33 @@ fn continuous_mixed_success_and_open_failure_exits_and_reports_failure() {
         "--header",
         "never",
         "--target",
-        &format!("success={}", success.addr),
+        &format!("peer={}", peer_closed.addr),
         "--target",
         &format!("failure={}", failure.addr),
     ]);
 
     let output = run_with_timeout(command, Duration::from_secs(3));
-    success.join();
+    peer_closed.join();
     failure.join();
 
     assert!(
-        output.status.success(),
-        "status={:?}\nstderr={}",
+        !output.status.success(),
+        "status={:?}\nstdout={}",
         output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stdout)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stdout.lines().any(|line| line.starts_with("success,")),
+        stdout.lines().any(|line| line.starts_with("peer,")),
         "{stdout}"
     );
     assert!(stderr.contains("target failure failed"), "{stderr}");
     assert!(stderr.contains("zero token without close flag"), "{stderr}");
+    assert!(
+        stderr.contains("peer closure (1 target session)"),
+        "{stderr}"
+    );
 }
 
 #[test]

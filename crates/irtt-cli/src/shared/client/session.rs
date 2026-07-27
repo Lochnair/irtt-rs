@@ -106,6 +106,10 @@ impl ClientSession {
         self.client.close()
     }
 
+    pub fn is_peer_closed(&self) -> bool {
+        self.client.is_peer_closed()
+    }
+
     pub fn next_send_deadline(&self) -> Option<Instant> {
         self.client.next_send_deadline()
     }
@@ -137,6 +141,25 @@ pub fn should_drain_final(continuous: bool, interrupted: bool) -> bool {
 
 pub fn should_print_final_summary(continuous: bool, interrupted: bool) -> bool {
     !continuous || interrupted
+}
+
+pub fn peer_close_run_error(
+    continuous: bool,
+    interrupted: bool,
+    peer_closed_target_outcomes: u64,
+) -> Option<String> {
+    if !continuous || interrupted || peer_closed_target_outcomes == 0 {
+        return None;
+    }
+
+    let sessions = if peer_closed_target_outcomes == 1 {
+        "target session"
+    } else {
+        "target sessions"
+    };
+    Some(format!(
+        "continuous run ended because of peer closure ({peer_closed_target_outcomes} {sessions})"
+    ))
 }
 
 pub fn final_drain_duration(probe_timeout: Duration) -> Duration {
@@ -202,6 +225,21 @@ mod tests {
     }
 
     #[test]
+    fn peer_close_run_error_is_run_mode_and_interruption_aware() {
+        assert_eq!(peer_close_run_error(false, false, 1), None);
+        assert_eq!(peer_close_run_error(true, false, 0), None);
+        assert_eq!(peer_close_run_error(true, true, 1), None);
+        assert_eq!(
+            peer_close_run_error(true, false, 1).as_deref(),
+            Some("continuous run ended because of peer closure (1 target session)")
+        );
+        assert_eq!(
+            peer_close_run_error(true, false, 3).as_deref(),
+            Some("continuous run ended because of peer closure (3 target sessions)")
+        );
+    }
+
+    #[test]
     fn peer_close_followed_by_session_cleanup_is_successful() {
         let params = test_params(None, Duration::from_millis(10));
         let server = start_peer_close_server(params);
@@ -221,6 +259,7 @@ mod tests {
             .iter()
             .any(|event| matches!(event, ClientEvent::SessionClosed { .. })));
         assert!(!session.should_continue(&shutdown_requested));
+        assert!(session.is_peer_closed());
 
         session.drain_final(|_| {}).unwrap();
         assert!(session.poll_timeouts().unwrap().is_empty());

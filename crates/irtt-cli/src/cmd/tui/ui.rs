@@ -409,6 +409,12 @@ impl TuiState {
         self.push_event(format!("error {message}"));
     }
 
+    pub(super) fn set_run_error(&mut self, message: String) {
+        self.status = TuiStatus::Error;
+        self.last_warning = Some(message.clone());
+        self.push_event(format!("error {message}"));
+    }
+
     pub(super) fn clear_visible_history(&mut self) {
         for target in &mut self.targets {
             target.graph_history.clear();
@@ -2410,6 +2416,23 @@ mod tests {
             .last_warning
             .as_deref()
             .is_some_and(|warning| warning.contains("pending probe limit")));
+    }
+
+    #[test]
+    fn run_error_preserves_peer_closed_target_status() {
+        let mut state = TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned()]);
+        state.process_target_outcome(&target_outcome("a", ManagedTargetEndReason::PeerClosed));
+
+        state.set_run_error(
+            "continuous run ended because of peer closure (1 target session)".to_owned(),
+        );
+
+        assert_eq!(state.status, TuiStatus::Error);
+        assert_eq!(state.targets[0].status, TargetStatus::Closed);
+        assert!(state
+            .last_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("peer closure")));
     }
 
     #[test]

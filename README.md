@@ -139,6 +139,10 @@ Adjusted RTT can be negative when server processing exceeds the measured raw RTT
 
 Default table output prints a final summary after completed finite runs and interrupted continuous runs when the run policy permits it. CSV, TSV, and JSON Lines output do not print this summary.
 
+A peer closing a finite CLI or TUI run is accepted as a terminal outcome. In
+continuous mode, peer closure exits nonzero unless the user requested
+interruption, allowing a supervisor to restart the client.
+
 ## Terminal UI
 
 When built with the `tui` feature, `irtt-tui` provides a live cumulative dashboard:
@@ -229,7 +233,9 @@ groups. `ExplicitCancellation` supports long-lived controllers; replacing the
 desired set with an empty vector removes current targets but leaves the group
 idle and ready for a later `update_targets` call. `join()` reports aggregate
 outcome counts and retains only the 256 most recent target outcomes, so
-long-running target churn remains bounded.
+long-running target churn remains bounded. The aggregate
+`peer_closed_target_outcomes` count includes peer closures omitted from that
+recent snapshot.
 
 Managed event subscriptions remain bounded and nonblocking. When using a
 dropping overflow policy, check `EventSubscription::dropped_events()` before

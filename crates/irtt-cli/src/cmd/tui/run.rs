@@ -14,7 +14,7 @@ use irtt_client::{
 
 use crate::{
     cmd::tui::args::{ResolvedTuiTarget, TuiArgs},
-    shared::client::{is_shutdown_requested, ClientSession},
+    shared::client::{is_shutdown_requested, session::peer_close_run_error, ClientSession},
 };
 
 use super::ui::{should_render, TuiConfig, TuiState, TuiStatus, TuiTerminal};
@@ -129,6 +129,16 @@ pub fn run_tui(
 
     let events = session.close()?;
     state.process_events(&events);
+    interrupted |= is_shutdown_requested(shutdown_requested);
+    if let Some(error) = peer_close_run_error(
+        continuous,
+        interrupted,
+        if session.is_peer_closed() { 1 } else { 0 },
+    ) {
+        state.set_run_error(error.clone());
+        render_if_due(&mut terminal, &state, &mut next_render, true)?;
+        return Err(error.into());
+    }
     state.set_status(TuiStatus::Complete);
     render_if_due(&mut terminal, &state, &mut next_render, true)?;
     Ok(())
@@ -249,6 +259,7 @@ fn run_group_tui(
         }
     }
 
+    interrupted |= is_shutdown_requested(shutdown_requested);
     if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
         return match exit {
             GroupLoopExit::IdleGraceElapsed => {
@@ -261,6 +272,15 @@ fn run_group_tui(
                 Err("managed client group was cancelled".into())
             }
         };
+    }
+    if let Some(error) = peer_close_run_error(
+        args.is_continuous(),
+        interrupted,
+        outcome.peer_closed_target_outcomes,
+    ) {
+        state.set_run_error(error.clone());
+        render_if_due(terminal, state, next_render, true)?;
+        return Err(error.into());
     }
     let successful_targets = outcome.successful_target_outcomes;
     let failed_targets = outcome.failed_target_outcomes;
