@@ -2,29 +2,29 @@
 
 `irtt-rs` is a Rust implementation of an IRTT-compatible client.
 
-It is not the upstream IRTT project. For the original implementation, protocol background, and broader project documentation, see:
+It provides both a command-line client and a reusable Rust library for finite or continuous latency probing. It is intended for interactive diagnostics, scripting, monitoring, and integration into applications such as network autorate controllers.
 
-<https://github.com/heistp/irtt>
+This is not the upstream IRTT project. For the original implementation, protocol background, and broader documentation, see [heistp/irtt](https://github.com/heistp/irtt).
 
-## Status
+## Features
 
-This repository currently provides:
-
-- `irtt-rs`, the canonical multi-applet binary
-- `irtt-cli`, a stream/text IRTT-compatible client applet
-- `irtt-tui`, an optional terminal UI applet when built with the `tui` feature
-- `irtt-client`, a Rust library for running client sessions and consuming events
-- finite and continuous probe runs
-- table, CSV, TSV, and JSON Lines event-row output formats with selectable columns
-- optional local summary statistics
+* Finite and continuous probe sessions
+* Concurrent probing of multiple targets
+* Reusable client library with a structured event stream
+* Human-readable table output
+* CSV, TSV, and JSON Lines output for scripts and monitoring systems
+* Selectable output columns
+* Automatic final summaries for eligible table-output runs
+* Optional terminal UI
+* Router-friendly multi-applet binary layout
 
 Server support is not implemented.
-The installed binary is intentionally not named `irtt` to avoid conflicting or
-confusing overlap with upstream IRTT.
 
-## Install
+The installed dispatcher is named `irtt-rs` rather than `irtt` to avoid conflicting with or being mistaken for upstream IRTT.
 
-Requires Rust 1.85 or newer.
+## Installation
+
+The build requires Rust 1.88 or newer.
 
 From a local checkout:
 
@@ -34,192 +34,138 @@ cd irtt-rs
 cargo install --path crates/irtt-cli
 ```
 
-The default install provides the normal client-oriented binaries, including
-`irtt-rs` and `irtt-cli`. To install the TUI applet as a separate binary target:
+This installs:
+
+* `irtt-rs`, the canonical multi-applet dispatcher
+* `irtt-cli`, the stream and text client
+
+To also install the optional terminal UI:
 
 ```sh
 cargo install --path crates/irtt-cli --features tui
 ```
 
-Or run it directly without installing:
+## Quick start
+
+Probe a server using the default settings:
 
 ```sh
-cargo run -p irtt-cli --bin irtt-cli -- <server>
+irtt-cli netperf-eu.bufferbloat.net:2112
 ```
 
-For space-sensitive packaging, such as OpenWrt packages, distributors can ship
-only `irtt-rs` and symlink or hardlink enabled applet names such as `irtt-cli`
-and, when built with the `tui` feature, `irtt-tui` to it. Applet dispatch is
-based on the invoked binary name. Server support is not implemented.
-
-cargo-dist release archives are currently configured with the `full` feature
-set, so target archives bundle the enabled applet binaries: `irtt-rs`,
-`irtt-cli`, and `irtt-tui`. That is separate from space-sensitive package
-layouts, which may still ship one dispatcher binary plus applet-name symlinks
-or hardlinks. cargo-dist is not currently configured to create those links.
-
-## Build verification
-
-Useful local release/package sanity checks:
+Set the test duration and probe interval:
 
 ```sh
-cargo fmt --check
-cargo test -p irtt-cli
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p irtt-cli --release
-cargo build -p irtt-cli --no-default-features --release
-cargo build -p irtt-cli --features tui --release
-cargo build -p irtt-cli --all-features --release
+irtt-cli netperf-eu.bufferbloat.net:2112 \
+    --duration 30s \
+    --interval 100ms
 ```
 
-The no-default-features build only provides the `irtt-rs` dispatcher binary;
-the default build provides `irtt-rs` and `irtt-cli`; `tui`, `full`, and
-all-features builds also provide `irtt-tui`.
-
-## CLI usage
-
-Basic test:
+Run continuously until interrupted:
 
 ```sh
-irtt-cli <server>
+irtt-cli netperf-eu.bufferbloat.net:2112 --duration 0
 ```
 
-Set duration and interval:
+Use `Ctrl-C` to stop gracefully.
 
-```sh
-irtt-cli <server> --duration 30s --interval 100ms
-```
+## Multiple targets
 
-Run continuously:
-
-```sh
-irtt-cli <server> --duration 0
-```
-
-Probe multiple targets concurrently:
+Probe several targets concurrently:
 
 ```sh
 irtt-cli host-a:2112 host-b:2112
-irtt-cli --target ams=ams.example.com:2112 --target sg=sg.example.com:2112
+```
+
+Assign stable labels to targets:
+
+```sh
+irtt-cli \
+    --target ams=ams.example.com:2112 \
+    --target sg=sg.example.com:2112
+```
+
+Multi-target sessions use staggered pacing by default. To send each target's probes together:
+
+```sh
 irtt-cli host-a:2112 host-b:2112 --pacing burst
 ```
 
-For positional multi-target runs, the original target string is used as the
-logical target label. Repeated positional strings get a stable numeric suffix.
-For `--target label=host:port`, `label` is used in the `target` output column.
-Labels must be unique. `--pacing staggered|burst` selects managed group pacing
-for multi-target runs; the default is `staggered`.
+Target labels are included in the default multi-target output.
 
-Use a specific output format or column selection:
+## Output formats
+
+The CLI supports four event-row formats:
+
+* `table`: human-readable terminal output
+* `csv`: comma-separated output
+* `tsv`: tab-separated output
+* `jsonl`: one JSON object per event
+
+Examples:
 
 ```sh
 irtt-cli <server> --format table
 irtt-cli <server> --format jsonl
-irtt-cli <server> --format csv --columns event,seq,remote,effective_rtt_us
-irtt-cli host-a:2112 host-b:2112 --format csv --columns target,seq,effective_rtt_us
-irtt-cli <server> --format tsv --columns effective_rtt_us --header never
+irtt-cli <server> --format csv \
+    --columns event,seq,remote,effective_rtt_us
+```
+
+For a stream containing only effective RTT values in microseconds:
+
+```sh
+irtt-cli <server> \
+    --format tsv \
+    --columns effective_rtt_us \
+    --header never
+```
+
+List all available columns with:
+
+```sh
 irtt-cli --list-columns
 ```
 
-With the optional TUI feature, `irtt-tui` opens a live cumulative dashboard for
-interactive probing. It defaults to continuous probing, equivalent to
-`--duration 0`. Quit with `q` or `Ctrl-C`; the client will drain and close the
-session gracefully.
+Useful measurement fields include:
+
+* `raw_rtt_us`: client-observed send-to-receive RTT
+* `adjusted_rtt_us`: RTT adjusted for server processing when available
+* `effective_rtt_us`: adjusted RTT when available, otherwise raw RTT
+* `sd_us` and `rd_us`: send and receive one-way delay estimates
+* `ipdv_us`: inter-packet delay variation
+* `server_processing_us`: time spent processing the packet at the server
+
+Adjusted RTT can be negative when server processing exceeds the measured raw RTT. One-way delay estimates can be negative because of clock skew between the client and server.
+
+Default table output prints a final summary after completed finite runs and interrupted continuous runs when the run policy permits it. CSV, TSV, and JSON Lines output do not print this summary.
+
+## Terminal UI
+
+When built with the `tui` feature, `irtt-tui` provides a live cumulative dashboard:
 
 ```sh
 irtt-tui <server>
+```
+
+It runs continuously by default. A finite duration can be selected explicitly:
+
+```sh
 irtt-tui <server> --duration 30s
+```
+
+Multiple targets and pacing options work the same way as in `irtt-cli`:
+
+```sh
 irtt-tui host-a:2112 host-b:2112 --pacing burst
-irtt-tui --target ams=ams.example.com:2112 --target sg=sg.example.com:2112
-cargo run -p irtt-cli --features tui --bin irtt-tui -- <server>
 ```
 
-For available options:
-
-```sh
-irtt-cli --help
-irtt-tui --help   # when built or installed with the tui feature
-```
-
-## Event row output
-
-The stream client separates event row rendering from final summaries. Event rows
-are controlled by `--format`, `--columns`, and `--header`; final summaries remain
-separate table-style text and are printed for table output when the run policy
-allows a summary.
-
-Formats:
-
-- `table`: default, terminal-readable columns with a header
-- `csv`: comma-separated rows, intended for scripts
-- `tsv`: tab-separated rows, useful for one-value streams and shell pipelines
-- `jsonl`: one JSON object per event row, suitable for streaming consumers
-
-Headers are controlled with `--header auto|always|never`. In `auto`, table, CSV,
-and TSV print one header row; JSON Lines never prints a header.
-
-Columns are selected with `-c, --columns <COLUMNS>`, where `COLUMNS` is a
-comma-separated list. Use `--list-columns` to print the available names. Useful
-columns include:
-
-```text
-target, event, seq, remote, token, rtt, rtt_us, raw_rtt_us, effective_rtt_us,
-adjusted_rtt_us, rd, rd_us, sd, sd_us, ipdv, ipdv_us, proc,
-server_processing_us, bytes, send_call_us, timer_error_us, highest_seen,
-server_received, server_window, dscp, ecn, traffic_class, kernel_rx_ns,
-warning_kind, message, event_wall_ns, client_send_wall_ns,
-client_receive_wall_ns
-```
-
-Aliases are accepted for readability: `receive_delay` and `receive_delay_us`
-for `rd` and `rd_us`, `send_delay` and `send_delay_us` for `sd` and `sd_us`,
-`server_processing` for `proc`, `server_received_count` for
-`server_received`, and `server_received_window` for `server_window`.
-
-The default single-target table output favors readability with compact columns:
-`event,seq,rtt,rd,sd,ipdv,proc,message`. It omits `echo_sent` rows. Passing
-`--columns default` is the same as omitting `--columns`, including the default
-table row filtering. Multi-target defaults add `target` as the first column so
-rows can be attributed to a logical target label. Custom table column selections
-include all event rows. CSV, TSV, and JSONL default to all non-target columns
-for single-target export and include `target` by default for multi-target
-export; use `--columns all` explicitly to request every column in any format.
-Missing table values render as `-`; missing CSV and TSV values render as empty
-fields; missing JSONL values render as `null`.
-
-Use JSON Lines for structured event streaming:
-
-Example:
-
-```sh
-irtt-cli <server> --duration 0 --interval 250ms --format jsonl
-```
-
-Each line is one client event object, for example:
-
-```json
-{"event":"echo_reply","seq":4,"remote":"203.0.113.10:2112","token":null,"rtt":"12.1ms","rtt_us":12100,"raw_rtt_us":12400,"effective_rtt_us":12100,"adjusted_rtt_us":12100,"rd":"6.0ms","rd_us":6000,"sd":"6.1ms","sd_us":6100,"ipdv":"300.0µs","ipdv_us":300,"proc":"300.0µs","server_processing_us":300,"bytes":64,"send_call_us":null,"timer_error_us":null,"highest_seen":null,"server_received":5,"server_window":"0x1f","dscp":0,"ecn":0,"traffic_class":0,"kernel_rx_ns":null,"warning_kind":null,"message":null,"event_wall_ns":1760000000012400000,"client_send_wall_ns":1760000000000000000,"client_receive_wall_ns":1760000000012400000}
-```
-
-Consumers should match on the `event` property and read the columns they need.
-RTT, send-call, and timer-error `*_us` fields are reported in microseconds.
-`raw_rtt_us` is the measured client send-to-receive RTT. `effective_rtt_us` and
-`adjusted_rtt_us` are signed and may be negative when server processing exceeds
-the raw RTT or timing correction produces a negative adjusted value. When
-one-way delay fields are present, `sd_us` and `rd_us` are also signed
-microseconds and may be negative due to wall-clock skew.
-
-For consumers that only need effective RTT values in microseconds, use:
-
-```sh
-irtt-cli <server> --format tsv --columns effective_rtt_us --header never
-```
+Quit with `q` or `Ctrl-C`.
 
 ## Library usage
 
-`irtt-client` can be used directly from Rust code.
+`irtt-client` exposes the client session and event layer independently of CLI formatting and statistics.
 
-Example `Cargo.toml` dependency from a local checkout:
+Add it from a local checkout:
 
 ```toml
 [dependencies]
@@ -244,12 +190,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let (session, events) =
-        ManagedClient::start_with_subscription(config, SubscriberConfig::default())?;
+        ManagedClient::start_with_subscription(
+            config,
+            SubscriberConfig::default(),
+        )?;
 
     while let Ok(event) = events.recv() {
         match event {
             ClientEvent::EchoReply { seq, rtt, .. } => {
-                println!("seq={seq} rtt_us={}", rtt.effective.as_micros());
+                println!(
+                    "seq={seq} rtt_us={}",
+                    rtt.effective.as_micros()
+                );
             }
             ClientEvent::SessionClosed { .. } => break,
             _ => {}
@@ -262,3 +214,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 ```
+
+The client library emits structured events for session lifecycle, sent probes, successful replies, loss, duplicates, late replies, warnings, and shutdown.
+
+## Binaries and features
+
+| Build                   | Binaries                          |
+| ----------------------- | --------------------------------- |
+| `--no-default-features` | `irtt-rs`                         |
+| Default features        | `irtt-rs`, `irtt-cli`             |
+| `--features tui`        | `irtt-rs`, `irtt-cli`, `irtt-tui` |
+| `--all-features`        | `irtt-rs`, `irtt-cli`, `irtt-tui` |
+
+For available command-line options:
+
+```sh
+irtt-cli --help
+irtt-tui --help
+```
+
+## Development
+
+Common verification commands:
+
+```sh
+cargo fmt --check
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+cargo build -p irtt-cli --all-features --release
+```
+
+## Project status
+
+The client, event stream, machine-readable output, multi-target execution, local statistics, and optional TUI are implemented.
+
+Server support is not implemented.
