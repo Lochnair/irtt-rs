@@ -4,7 +4,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use irtt_client::{Client, ClientConfig, ClientEvent, OpenOutcome, RecvBudget};
+use irtt_client::{
+    Client, ClientConfig, ClientEvent, ManagedTargetEndReason, OpenOutcome, RecvBudget,
+};
 
 pub const RECV_BUDGET: RecvBudget = RecvBudget { max_packets: 16 };
 const MAX_FINAL_DRAIN: Duration = Duration::from_secs(30);
@@ -162,6 +164,22 @@ pub fn peer_close_run_error(
     ))
 }
 
+pub fn should_stop_group_on_peer_close(
+    continuous: bool,
+    interrupted: bool,
+    end_reason: &ManagedTargetEndReason,
+) -> bool {
+    continuous && !interrupted && matches!(end_reason, ManagedTargetEndReason::PeerClosed)
+}
+
+pub fn request_group_stop_once(stop_requested: &mut bool) -> bool {
+    if *stop_requested {
+        return false;
+    }
+    *stop_requested = true;
+    true
+}
+
 pub fn final_drain_duration(probe_timeout: Duration) -> Duration {
     probe_timeout.min(MAX_FINAL_DRAIN)
 }
@@ -237,6 +255,34 @@ mod tests {
             peer_close_run_error(true, false, 3).as_deref(),
             Some("continuous run ended because of peer closure (3 target sessions)")
         );
+    }
+
+    #[test]
+    fn grouped_peer_close_stop_policy_is_run_mode_and_interruption_aware() {
+        assert!(should_stop_group_on_peer_close(
+            true,
+            false,
+            &ManagedTargetEndReason::PeerClosed
+        ));
+        assert!(!should_stop_group_on_peer_close(
+            false,
+            false,
+            &ManagedTargetEndReason::PeerClosed
+        ));
+        assert!(!should_stop_group_on_peer_close(
+            true,
+            true,
+            &ManagedTargetEndReason::PeerClosed
+        ));
+        assert!(!should_stop_group_on_peer_close(
+            true,
+            false,
+            &ManagedTargetEndReason::TestComplete
+        ));
+
+        let mut stop_requested = false;
+        assert!(request_group_stop_once(&mut stop_requested));
+        assert!(!request_group_stop_once(&mut stop_requested));
     }
 
     #[test]

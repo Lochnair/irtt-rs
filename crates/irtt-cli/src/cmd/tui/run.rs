@@ -14,7 +14,11 @@ use irtt_client::{
 
 use crate::{
     cmd::tui::args::{ResolvedTuiTarget, TuiArgs},
-    shared::client::{is_shutdown_requested, session::peer_close_run_error, ClientSession},
+    shared::client::{
+        is_shutdown_requested,
+        session::{peer_close_run_error, request_group_stop_once, should_stop_group_on_peer_close},
+        ClientSession,
+    },
 };
 
 use super::ui::{should_render, TuiConfig, TuiState, TuiStatus, TuiTerminal};
@@ -177,6 +181,8 @@ fn run_group_tui(
     )?;
 
     let mut interrupted = false;
+    let mut stop_requested = false;
+    let mut peer_close_requested_stop = false;
     let mut terminal_targets = std::collections::HashSet::new();
     let mut saw_target_event = false;
     let mut last_event_at = Instant::now();
@@ -184,7 +190,9 @@ fn run_group_tui(
     let exit = loop {
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
-            session.stop();
+            if request_group_stop_once(&mut stop_requested) {
+                session.stop();
+            }
         }
 
         if handle_input(state, shutdown_requested)? {
@@ -192,7 +200,9 @@ fn run_group_tui(
         }
         if state.quit_requested {
             interrupted = true;
-            session.stop();
+            if request_group_stop_once(&mut stop_requested) {
+                session.stop();
+            }
         }
 
         match events.try_recv() {
@@ -206,6 +216,16 @@ fn run_group_tui(
                     ManagedGroupEvent::TargetFinished(target) => {
                         terminal_targets.insert(target.id.as_str().to_owned());
                         state.process_target_outcome(&target);
+                        if should_stop_group_on_peer_close(
+                            args.is_continuous(),
+                            interrupted,
+                            &target.end_reason,
+                        ) {
+                            peer_close_requested_stop = true;
+                            if request_group_stop_once(&mut stop_requested) {
+                                session.stop();
+                            }
+                        }
                     }
                 }
                 render_if_due(terminal, state, next_render, false)?;
@@ -229,7 +249,7 @@ fn run_group_tui(
         }
     };
 
-    if exit.should_stop_before_join() {
+    if exit.should_stop_before_join() && request_group_stop_once(&mut stop_requested) {
         session.stop();
     }
 
@@ -260,7 +280,22 @@ fn run_group_tui(
     }
 
     interrupted |= is_shutdown_requested(shutdown_requested);
-    if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
+    let peer_closed_target_outcomes = outcome
+        .peer_closed_target_outcomes
+        .max(u64::from(peer_close_requested_stop));
+    if let Some(error) = peer_close_run_error(
+        args.is_continuous(),
+        interrupted,
+        peer_closed_target_outcomes,
+    ) {
+        state.set_run_error(error.clone());
+        render_if_due(terminal, state, next_render, true)?;
+        return Err(error.into());
+    }
+    if outcome.end_reason == ManagedGroupEndReason::Cancelled
+        && !interrupted
+        && !peer_close_requested_stop
+    {
         return match exit {
             GroupLoopExit::IdleGraceElapsed => {
                 Err("managed client group stayed idle before all targets completed".into())
@@ -272,15 +307,6 @@ fn run_group_tui(
                 Err("managed client group was cancelled".into())
             }
         };
-    }
-    if let Some(error) = peer_close_run_error(
-        args.is_continuous(),
-        interrupted,
-        outcome.peer_closed_target_outcomes,
-    ) {
-        state.set_run_error(error.clone());
-        render_if_due(terminal, state, next_render, true)?;
-        return Err(error.into());
     }
     let successful_targets = outcome.successful_target_outcomes;
     let failed_targets = outcome.failed_target_outcomes;
@@ -506,5 +532,24 @@ mod tests {
         assert!(GroupLoopExit::IdleGraceElapsed.should_stop_before_join());
         assert!(GroupLoopExit::SubscriptionDisconnected.should_stop_before_join());
         assert!(!GroupLoopExit::AllTargetsTerminal.should_stop_before_join());
+    }
+
+    #[test]
+    fn continuous_group_peer_close_requests_stop_unless_interrupted() {
+        assert!(should_stop_group_on_peer_close(
+            true,
+            false,
+            &irtt_client::ManagedTargetEndReason::PeerClosed
+        ));
+        assert!(!should_stop_group_on_peer_close(
+            false,
+            false,
+            &irtt_client::ManagedTargetEndReason::PeerClosed
+        ));
+        assert!(!should_stop_group_on_peer_close(
+            true,
+            true,
+            &irtt_client::ManagedTargetEndReason::PeerClosed
+        ));
     }
 }

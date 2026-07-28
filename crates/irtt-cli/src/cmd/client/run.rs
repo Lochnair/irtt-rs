@@ -24,7 +24,10 @@ use super::{
 use crate::shared::client::expected_probe_count;
 use crate::shared::client::{
     is_shutdown_requested,
-    session::{peer_close_run_error, should_print_final_summary},
+    session::{
+        peer_close_run_error, request_group_stop_once, should_print_final_summary,
+        should_stop_group_on_peer_close,
+    },
     ClientSession,
 };
 
@@ -326,6 +329,8 @@ fn run_group_stream(
     };
 
     let mut interrupted = false;
+    let mut stop_requested = false;
+    let mut peer_close_requested_stop = false;
     let mut terminal_targets = HashSet::new();
     let mut last_event_at = Instant::now();
     let mut saw_target_event = false;
@@ -333,7 +338,9 @@ fn run_group_stream(
     loop {
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
-            session.stop();
+            if request_group_stop_once(&mut stop_requested) {
+                session.stop();
+            }
         }
 
         match events.try_recv() {
@@ -362,6 +369,16 @@ fn run_group_stream(
                     ManagedGroupEvent::TargetFinished(target) => {
                         report_target_failure(&target);
                         terminal_targets.insert(target.id.as_str().to_owned());
+                        if should_stop_group_on_peer_close(
+                            continuous,
+                            interrupted,
+                            &target.end_reason,
+                        ) {
+                            peer_close_requested_stop = true;
+                            if request_group_stop_once(&mut stop_requested) {
+                                session.stop();
+                            }
+                        }
                     }
                 }
             }
@@ -422,12 +439,18 @@ fn run_group_stream(
     }
     let successful_targets = outcome.successful_target_outcomes;
     let failed_targets = outcome.failed_target_outcomes;
-    let terminal_error = if outcome.end_reason == ManagedGroupEndReason::Cancelled && !interrupted {
-        Some("managed client group was cancelled".to_owned())
-    } else if let Some(error) =
-        peer_close_run_error(continuous, interrupted, outcome.peer_closed_target_outcomes)
+    let peer_closed_target_outcomes = outcome
+        .peer_closed_target_outcomes
+        .max(u64::from(peer_close_requested_stop));
+    let terminal_error = if let Some(error) =
+        peer_close_run_error(continuous, interrupted, peer_closed_target_outcomes)
     {
         Some(error)
+    } else if outcome.end_reason == ManagedGroupEndReason::Cancelled
+        && !interrupted
+        && !peer_close_requested_stop
+    {
+        Some("managed client group was cancelled".to_owned())
     } else if !interrupted && successful_targets == 0 && failed_targets > 0 {
         Some(format!(
             "no managed target completed successfully ({failed_targets} failed)"

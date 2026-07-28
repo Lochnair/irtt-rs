@@ -4,6 +4,7 @@ use std::{
     io::Read,
     net::{SocketAddr, UdpSocket},
     process::{Command, Output, Stdio},
+    sync::mpsc,
     thread,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -24,6 +25,24 @@ struct FakeServer {
 }
 
 impl FakeServer {
+    fn join(self) {
+        self.done.join().unwrap();
+    }
+}
+
+struct InterruptibleFakeServer {
+    addr: SocketAddr,
+    opened: mpsc::Receiver<()>,
+    done: JoinHandle<()>,
+}
+
+impl InterruptibleFakeServer {
+    fn wait_until_opened(&self) {
+        self.opened
+            .recv_timeout(Duration::from_secs(2))
+            .expect("timed out waiting for CLI to open target");
+    }
+
     fn join(self) {
         self.done.join().unwrap();
     }
@@ -337,10 +356,11 @@ fn continuous_all_peer_closed_targets_exit_nonzero() {
 }
 
 #[test]
-fn continuous_mixed_peer_close_and_open_failure_exits_nonzero() {
+fn continuous_partial_peer_close_stops_promptly_and_preserves_queued_rows() {
     let params = test_params(None, Duration::from_millis(10));
-    let peer_closed = start_peer_close_server(params.clone());
-    let failure = start_open_failure_server(params);
+    let (healthy_reply_tx, healthy_reply_rx) = mpsc::channel();
+    let healthy = start_echo_server_with_first_reply(params.clone(), healthy_reply_tx);
+    let peer_closed = start_gated_peer_close_server(params, vec![healthy_reply_rx]);
     let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
     command.args([
         "--duration",
@@ -354,14 +374,79 @@ fn continuous_mixed_peer_close_and_open_failure_exits_nonzero() {
         "--header",
         "never",
         "--target",
+        &format!("healthy={}", healthy.addr),
+        "--target",
         &format!("peer={}", peer_closed.addr),
+    ]);
+
+    let started_at = Instant::now();
+    let output = run_with_timeout(command, Duration::from_secs(2));
+    let elapsed = started_at.elapsed();
+    healthy.join();
+    peer_closed.join();
+
+    assert!(
+        !output.status.success(),
+        "status={:?}\nstdout={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        elapsed < Duration::from_secs(1),
+        "partial peer-close shutdown took {elapsed:?}"
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stdout.lines().any(|line| line.starts_with("healthy,")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("peer,")),
+        "{stdout}"
+    );
+    assert!(
+        stderr.contains("peer closure (1 target session)"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("managed client group was cancelled"),
+        "{stderr}"
+    );
+}
+
+#[test]
+fn continuous_mixed_peer_close_and_open_failure_exits_nonzero() {
+    let params = test_params(None, Duration::from_millis(10));
+    let (failure_tx, failure_rx) = mpsc::channel();
+    let (healthy_reply_tx, healthy_reply_rx) = mpsc::channel();
+    let failure = start_open_failure_server_with_signal(params.clone(), failure_tx);
+    let healthy = start_echo_server_with_first_reply(params.clone(), healthy_reply_tx);
+    let peer_closed = start_gated_peer_close_server(params, vec![failure_rx, healthy_reply_rx]);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "0s",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "target,seq",
+        "--header",
+        "never",
         "--target",
         &format!("failure={}", failure.addr),
+        "--target",
+        &format!("healthy={}", healthy.addr),
+        "--target",
+        &format!("peer={}", peer_closed.addr),
     ]);
 
     let output = run_with_timeout(command, Duration::from_secs(3));
-    peer_closed.join();
     failure.join();
+    healthy.join();
+    peer_closed.join();
 
     assert!(
         !output.status.success(),
@@ -375,12 +460,77 @@ fn continuous_mixed_peer_close_and_open_failure_exits_nonzero() {
         stdout.lines().any(|line| line.starts_with("peer,")),
         "{stdout}"
     );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("healthy,")),
+        "{stdout}"
+    );
     assert!(stderr.contains("target failure failed"), "{stderr}");
     assert!(stderr.contains("zero token without close flag"), "{stderr}");
     assert!(
         stderr.contains("peer closure (1 target session)"),
         "{stderr}"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_group_interruption_succeeds_without_peer_close_error() {
+    let params = test_params(None, Duration::from_millis(10));
+    let a = start_interruptible_echo_server(params.clone());
+    let b = start_interruptible_echo_server(params);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "0s",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "target,seq",
+        "--header",
+        "never",
+        "--target",
+        &format!("a={}", a.addr),
+        "--target",
+        &format!("b={}", b.addr),
+    ]);
+
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    a.wait_until_opened();
+    b.wait_until_opened();
+    thread::sleep(Duration::from_millis(50));
+    let signal_status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signal_status.success());
+    let output = wait_with_timeout(child, Duration::from_secs(2));
+    a.join();
+    b.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stdout.lines().any(|line| line.starts_with("a,")),
+        "{stdout}"
+    );
+    assert!(
+        stdout.lines().any(|line| line.starts_with("b,")),
+        "{stdout}"
+    );
+    assert!(stderr.contains("interrupted, closing group"), "{stderr}");
+    assert!(!stderr.contains("peer closure"), "{stderr}");
 }
 
 #[test]
@@ -420,11 +570,15 @@ fn all_open_failures_exit_nonzero_with_diagnostics() {
 }
 
 fn run_with_timeout(mut command: Command, timeout: Duration) -> Output {
-    let mut child = command
+    let child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    wait_with_timeout(child, timeout)
+}
+
+fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> Output {
     let deadline = Instant::now() + timeout;
     loop {
         if child.try_wait().unwrap().is_some() {
@@ -452,6 +606,20 @@ fn run_with_timeout(mut command: Command, timeout: Duration) -> Output {
 }
 
 fn start_echo_server(params: Params) -> FakeServer {
+    start_echo_server_inner(params, None)
+}
+
+fn start_echo_server_with_first_reply(
+    params: Params,
+    first_reply_tx: mpsc::Sender<()>,
+) -> FakeServer {
+    start_echo_server_inner(params, Some(first_reply_tx))
+}
+
+fn start_echo_server_inner(
+    params: Params,
+    mut first_reply_tx: Option<mpsc::Sender<()>>,
+) -> FakeServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -482,12 +650,62 @@ fn start_echo_server(params: Params) -> FakeServer {
                     peer,
                 )
                 .unwrap();
+            if let Some(tx) = first_reply_tx.take() {
+                tx.send(()).unwrap();
+            }
         }
     });
     FakeServer { addr, done }
 }
 
+fn start_interruptible_echo_server(params: Params) -> InterruptibleFakeServer {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (opened_tx, opened) = mpsc::channel();
+    let done = thread::spawn(move || {
+        let (_, peer) = recv_request(&socket);
+        opened_tx.send(()).unwrap();
+        socket
+            .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+            .unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+
+        while let Some((packet, peer)) = recv_request_timeout(&socket) {
+            let flags = packet[3];
+            if flags & FLAG_CLOSE != 0 {
+                break;
+            }
+            let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+            socket
+                .send_to(
+                    &echo_reply_packet(
+                        TOKEN,
+                        seq,
+                        &params,
+                        &TimestampFields::default(),
+                        FLAG_REPLY,
+                    ),
+                    peer,
+                )
+                .unwrap();
+        }
+    });
+    InterruptibleFakeServer { addr, opened, done }
+}
+
 fn start_peer_close_server(params: Params) -> FakeServer {
+    start_gated_peer_close_server(params, Vec::new())
+}
+
+fn start_gated_peer_close_server(
+    params: Params,
+    release_gates: Vec<mpsc::Receiver<()>>,
+) -> FakeServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -499,6 +717,10 @@ fn start_peer_close_server(params: Params) -> FakeServer {
             .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
             .unwrap();
         let (packet, peer) = recv_request(&socket);
+        for gate in release_gates {
+            gate.recv_timeout(Duration::from_secs(2))
+                .expect("timed out waiting to release peer-close reply");
+        }
         let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
         socket
             .send_to(
@@ -517,6 +739,20 @@ fn start_peer_close_server(params: Params) -> FakeServer {
 }
 
 fn start_open_failure_server(params: Params) -> FakeServer {
+    start_open_failure_server_inner(params, None)
+}
+
+fn start_open_failure_server_with_signal(
+    params: Params,
+    failure_tx: mpsc::Sender<()>,
+) -> FakeServer {
+    start_open_failure_server_inner(params, Some(failure_tx))
+}
+
+fn start_open_failure_server_inner(
+    params: Params,
+    failure_tx: Option<mpsc::Sender<()>>,
+) -> FakeServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(2)))
@@ -527,6 +763,9 @@ fn start_open_failure_server(params: Params) -> FakeServer {
         socket
             .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, 0, &params), peer)
             .unwrap();
+        if let Some(tx) = failure_tx {
+            tx.send(()).unwrap();
+        }
     });
     FakeServer { addr, done }
 }
@@ -535,6 +774,14 @@ fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0_u8; 2048];
     let (size, peer) = socket.recv_from(&mut buf).unwrap();
     (buf[..size].to_vec(), peer)
+}
+
+fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
+    let mut buf = [0_u8; 2048];
+    socket
+        .recv_from(&mut buf)
+        .ok()
+        .map(|(size, peer)| (buf[..size].to_vec(), peer))
 }
 
 fn open_reply(flags: u8, token: u64, params: &Params) -> Vec<u8> {
