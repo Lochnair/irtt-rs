@@ -16,7 +16,9 @@ use crate::{
     cmd::tui::args::{ResolvedTuiTarget, TuiArgs},
     shared::client::{
         is_shutdown_requested,
-        session::{peer_close_run_error, request_group_stop_once, should_stop_group_on_peer_close},
+        session::{
+            peer_close_run_error, request_group_stop_for_peer_close, request_group_stop_once,
+        },
     },
 };
 
@@ -200,6 +202,15 @@ fn run_group_tui(
                 session.stop();
             }
         }
+        if request_group_stop_for_peer_close(
+            args.is_continuous(),
+            interrupted,
+            session.peer_closed_target_count(),
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ) {
+            session.stop();
+        }
 
         match events.try_recv() {
             Ok(Some(group_event)) => {
@@ -212,15 +223,17 @@ fn run_group_tui(
                     ManagedGroupEvent::TargetFinished(target) => {
                         terminal_targets.insert(target.id.as_str().to_owned());
                         state.process_target_outcome(&target);
-                        if should_stop_group_on_peer_close(
+                        if request_group_stop_for_peer_close(
                             args.is_continuous(),
                             interrupted,
-                            &target.end_reason,
+                            u64::from(matches!(
+                                &target.end_reason,
+                                irtt_client::ManagedTargetEndReason::PeerClosed
+                            )),
+                            &mut peer_close_requested_stop,
+                            &mut stop_requested,
                         ) {
-                            peer_close_requested_stop = true;
-                            if request_group_stop_once(&mut stop_requested) {
-                                session.stop();
-                            }
+                            session.stop();
                         }
                     }
                 }
@@ -553,21 +566,41 @@ mod tests {
     }
 
     #[test]
-    fn continuous_group_peer_close_requests_stop_unless_interrupted() {
-        assert!(should_stop_group_on_peer_close(
+    fn continuous_group_reliable_peer_close_status_requests_stop_once() {
+        let mut peer_close_requested_stop = false;
+        let mut stop_requested = false;
+        assert!(request_group_stop_for_peer_close(
             true,
             false,
-            &irtt_client::ManagedTargetEndReason::PeerClosed
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
         ));
-        assert!(!should_stop_group_on_peer_close(
+        assert!(peer_close_requested_stop);
+        assert!(stop_requested);
+        assert!(!request_group_stop_for_peer_close(
+            true,
             false,
-            false,
-            &irtt_client::ManagedTargetEndReason::PeerClosed
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
         ));
-        assert!(!should_stop_group_on_peer_close(
+
+        let mut peer_close_requested_stop = false;
+        let mut stop_requested = false;
+        assert!(!request_group_stop_for_peer_close(
+            false,
+            false,
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ));
+        assert!(!request_group_stop_for_peer_close(
             true,
             true,
-            &irtt_client::ManagedTargetEndReason::PeerClosed
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
         ));
     }
 

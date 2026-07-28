@@ -26,8 +26,8 @@ use crate::shared::client::expected_probe_count;
 use crate::shared::client::{
     is_shutdown_requested,
     session::{
-        peer_close_run_error, request_group_stop_once, should_print_final_summary,
-        should_stop_group_on_peer_close,
+        peer_close_run_error, request_group_stop_for_peer_close, request_group_stop_once,
+        should_print_final_summary,
     },
 };
 
@@ -396,6 +396,15 @@ fn run_group_stream(
                 session.stop();
             }
         }
+        if request_group_stop_for_peer_close(
+            continuous,
+            interrupted,
+            session.peer_closed_target_count(),
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ) {
+            session.stop();
+        }
 
         match events.try_recv() {
             Ok(Some(group_event)) => {
@@ -423,15 +432,17 @@ fn run_group_stream(
                     ManagedGroupEvent::TargetFinished(target) => {
                         report_target_failure(&target);
                         terminal_targets.insert(target.id.as_str().to_owned());
-                        if should_stop_group_on_peer_close(
+                        if request_group_stop_for_peer_close(
                             continuous,
                             interrupted,
-                            &target.end_reason,
+                            u64::from(matches!(
+                                &target.end_reason,
+                                irtt_client::ManagedTargetEndReason::PeerClosed
+                            )),
+                            &mut peer_close_requested_stop,
+                            &mut stop_requested,
                         ) {
-                            peer_close_requested_stop = true;
-                            if request_group_stop_once(&mut stop_requested) {
-                                session.stop();
-                            }
+                            session.stop();
                         }
                     }
                 }

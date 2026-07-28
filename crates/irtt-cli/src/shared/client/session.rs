@@ -1,7 +1,5 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use irtt_client::ManagedTargetEndReason;
-
 pub fn is_shutdown_requested(shutdown_requested: &AtomicBool) -> bool {
     shutdown_requested.load(Ordering::Relaxed)
 }
@@ -29,12 +27,18 @@ pub fn peer_close_run_error(
     ))
 }
 
-pub fn should_stop_group_on_peer_close(
+pub fn request_group_stop_for_peer_close(
     continuous: bool,
     interrupted: bool,
-    end_reason: &ManagedTargetEndReason,
+    peer_closed_target_count: u64,
+    peer_close_requested_stop: &mut bool,
+    stop_requested: &mut bool,
 ) -> bool {
-    continuous && !interrupted && matches!(end_reason, ManagedTargetEndReason::PeerClosed)
+    if !continuous || interrupted || peer_closed_target_count == 0 {
+        return false;
+    }
+    *peer_close_requested_stop = true;
+    request_group_stop_once(stop_requested)
 }
 
 pub fn request_group_stop_once(stop_requested: &mut bool) -> bool {
@@ -65,30 +69,48 @@ mod tests {
     }
 
     #[test]
-    fn grouped_peer_close_stop_policy_is_run_mode_and_interruption_aware() {
-        assert!(should_stop_group_on_peer_close(
-            true,
-            false,
-            &ManagedTargetEndReason::PeerClosed
-        ));
-        assert!(!should_stop_group_on_peer_close(
-            false,
-            false,
-            &ManagedTargetEndReason::PeerClosed
-        ));
-        assert!(!should_stop_group_on_peer_close(
-            true,
-            true,
-            &ManagedTargetEndReason::PeerClosed
-        ));
-        assert!(!should_stop_group_on_peer_close(
-            true,
-            false,
-            &ManagedTargetEndReason::TestComplete
-        ));
-
+    fn grouped_peer_close_stop_policy_is_run_mode_and_one_shot() {
+        let mut peer_close_requested_stop = false;
         let mut stop_requested = false;
-        assert!(request_group_stop_once(&mut stop_requested));
-        assert!(!request_group_stop_once(&mut stop_requested));
+        assert!(!request_group_stop_for_peer_close(
+            false,
+            false,
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ));
+        assert!(!request_group_stop_for_peer_close(
+            true,
+            true,
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ));
+        assert!(!request_group_stop_for_peer_close(
+            true,
+            false,
+            0,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ));
+        assert!(!peer_close_requested_stop);
+        assert!(!stop_requested);
+
+        assert!(request_group_stop_for_peer_close(
+            true,
+            false,
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ));
+        assert!(peer_close_requested_stop);
+        assert!(stop_requested);
+        assert!(!request_group_stop_for_peer_close(
+            true,
+            false,
+            1,
+            &mut peer_close_requested_stop,
+            &mut stop_requested,
+        ));
     }
 }

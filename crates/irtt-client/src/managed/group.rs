@@ -3,7 +3,10 @@ use std::{
     fmt,
     hash::{Hash, Hasher},
     net::{SocketAddr, UdpSocket},
-    sync::{mpsc, Arc, Mutex},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -193,6 +196,7 @@ pub struct ManagedClientGroupSession {
     hub: EventHub<ManagedGroupEvent>,
     control_tx: mpsc::Sender<ControlMessage>,
     cancellation: CancellationToken,
+    peer_closed_target_count: Arc<AtomicU64>,
     scheduler: Option<JoinHandle<Result<ManagedGroupOutcome, ClientError>>>,
     receiver: Option<JoinHandle<Result<(), ClientError>>>,
 }
@@ -453,12 +457,14 @@ impl ManagedClientGroup {
             .transpose()?;
 
         let cancellation = CancellationToken::new();
+        let peer_closed_target_count = Arc::new(AtomicU64::new(0));
         let (control_tx, control_rx) = mpsc::channel();
         let shared = Arc::new(GroupShared {
             registry: Mutex::new(registry),
             hub: hub.clone(),
             cancellation: cancellation.clone(),
             control_tx: control_tx.clone(),
+            peer_closed_target_count: peer_closed_target_count.clone(),
             requested_interval_ns: requested.interval_ns,
             requested_dscp: requested.dscp,
             family_remote,
@@ -489,6 +495,7 @@ impl ManagedClientGroup {
                 hub,
                 control_tx,
                 cancellation,
+                peer_closed_target_count,
                 scheduler: Some(scheduler),
                 receiver: Some(receiver),
             },
@@ -528,6 +535,16 @@ impl ManagedClientGroupSession {
     pub fn stop(&self) {
         self.cancellation.cancel();
         let _ = self.control_tx.send(ControlMessage::Wake);
+    }
+
+    /// Return the number of scheduler-recorded peer-closed target incarnations.
+    ///
+    /// The count is monotonic and saturating for the lifetime of this group.
+    /// It becomes visible before the corresponding lossy
+    /// [`ManagedGroupEvent::TargetFinished`] publication and includes outcomes
+    /// no longer retained in the bounded recent outcome history.
+    pub fn peer_closed_target_count(&self) -> u64 {
+        self.peer_closed_target_count.load(Ordering::Acquire)
     }
 
     /// Wait for the scheduler and receive threads to finish.
@@ -578,6 +595,7 @@ struct GroupShared {
     hub: EventHub<ManagedGroupEvent>,
     cancellation: CancellationToken,
     control_tx: mpsc::Sender<ControlMessage>,
+    peer_closed_target_count: Arc<AtomicU64>,
     requested_interval_ns: i64,
     requested_dscp: i64,
     family_remote: SocketAddr,
@@ -1364,6 +1382,13 @@ fn record_target_outcome(
     records: &mut TargetOutcomeHistory,
     outcome: ManagedTargetOutcome,
 ) {
+    if matches!(&outcome.end_reason, ManagedTargetEndReason::PeerClosed) {
+        let _ = shared.peer_closed_target_count.fetch_update(
+            Ordering::Release,
+            Ordering::Relaxed,
+            |count| Some(count.saturating_add(1)),
+        );
+    }
     shared
         .hub
         .publish(ManagedGroupEvent::TargetFinished(outcome.clone()));
@@ -1842,6 +1867,7 @@ mod tests {
             hub,
             cancellation: CancellationToken::new(),
             control_tx,
+            peer_closed_target_count: Arc::new(AtomicU64::new(0)),
             requested_interval_ns: requested.interval_ns,
             requested_dscp: requested.dscp,
             family_remote: remote,
@@ -1863,6 +1889,23 @@ mod tests {
             id: TargetId::from(id),
             remote,
             auth: None,
+        }
+    }
+
+    fn target_outcome(
+        id: &str,
+        remote: SocketAddr,
+        end_reason: ManagedTargetEndReason,
+    ) -> ManagedTargetOutcome {
+        ManagedTargetOutcome {
+            id: TargetId::from(id),
+            remote,
+            end_reason,
+            packets_sent: 0,
+            replies_received: 0,
+            duplicates: 0,
+            late: 0,
+            warning_events: 0,
         }
     }
 
@@ -2307,6 +2350,11 @@ mod tests {
     #[test]
     fn receiver_peer_close_wins_send_and_removal_races() {
         let fixture = active_target_fixture();
+        let shared = shared_with_target(
+            &fixture.client_config,
+            fixture.hub.clone(),
+            fixture.target.clone(),
+        );
         {
             let mut target = fixture.target.lock().expect("target mutex poisoned");
             assert!(process_active_target_packet(
@@ -2322,12 +2370,7 @@ mod tests {
                 Some(ManagedTargetEndReason::PeerClosed)
             );
         }
-
-        let shared = shared_with_target(
-            &fixture.client_config,
-            fixture.hub.clone(),
-            fixture.target.clone(),
-        );
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 0);
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
 
         send_echo_to_target(&socket, &shared, fixture.target.clone(), Instant::now());
@@ -2339,6 +2382,7 @@ mod tests {
                 .final_reason,
             Some(ManagedTargetEndReason::PeerClosed)
         );
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 0);
 
         let mut next_order = 1;
         let mut records = TargetOutcomeHistory::default();
@@ -2351,7 +2395,9 @@ mod tests {
             &mut records,
         )
         .unwrap();
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 1);
         collect_finished_targets(&shared, &mut records);
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 1);
 
         let events = drain_available_group_events(&fixture.subscription);
         let terminal_sequence: Vec<&str> = events
@@ -2382,6 +2428,151 @@ mod tests {
         );
         assert_eq!(outcome.targets[0].packets_sent, 1);
         assert_eq!(outcome.targets[0].replies_received, 1);
+    }
+
+    #[test]
+    fn authoritative_status_counts_only_peer_closed_outcomes() {
+        let remote: SocketAddr = "127.0.0.1:2112".parse().unwrap();
+        let config = group_config(
+            None,
+            Duration::from_millis(10),
+            ManagedGroupPacing::Staggered,
+        )
+        .client;
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("active", remote), 0, Instant::now()).unwrap(),
+        ));
+        let hub = EventHub::new();
+        let shared = shared_with_target(&config, hub.clone(), target);
+        let mut records = TargetOutcomeHistory::default();
+
+        hub.publish(ManagedGroupEvent::Client(TargetEvent {
+            target: TargetId::from("active"),
+            event: ClientEvent::EchoLoss {
+                seq: 0,
+                sent_at: ClientTimestamp::now(),
+                timeout_at: Instant::now(),
+            },
+        }));
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 0);
+
+        let failure = ManagedTargetFailure {
+            kind: ManagedTargetFailureKind::RuntimeProtocol,
+            message: "test failure".to_owned(),
+        };
+        for (index, reason) in [
+            ManagedTargetEndReason::TestComplete,
+            ManagedTargetEndReason::NoTestComplete,
+            ManagedTargetEndReason::Removed,
+            ManagedTargetEndReason::Cancelled,
+            ManagedTargetEndReason::OpenFailed(failure.clone()),
+            ManagedTargetEndReason::Failed(failure),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            record_target_outcome(
+                &shared,
+                &mut records,
+                target_outcome(&format!("non-peer-{index}"), remote, reason),
+            );
+            assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 0);
+        }
+
+        record_target_outcome(
+            &shared,
+            &mut records,
+            target_outcome("peer", remote, ManagedTargetEndReason::PeerClosed),
+        );
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 1);
+
+        let outcome = records.into_group_outcome(ManagedGroupEndReason::AllTargetsComplete);
+        assert_eq!(outcome.total_target_outcomes, 7);
+        assert_eq!(outcome.peer_closed_target_outcomes, 1);
+    }
+
+    #[test]
+    fn drop_oldest_can_evict_peer_close_event_without_status_loss() {
+        let interval = Duration::from_millis(10);
+        let config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let peer_remote: SocketAddr = "127.0.0.1:2112".parse().unwrap();
+        let healthy_remote: SocketAddr = "127.0.0.1:2113".parse().unwrap();
+        let peer = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", peer_remote), 0, Instant::now()).unwrap(),
+        ));
+        peer.lock()
+            .expect("target mutex poisoned")
+            .mark_finished(ManagedTargetEndReason::PeerClosed);
+        let healthy = Arc::new(Mutex::new(
+            TargetState::new(
+                &config,
+                target("healthy", healthy_remote),
+                1,
+                Instant::now(),
+            )
+            .unwrap(),
+        ));
+        healthy.lock().expect("target mutex poisoned").status = TargetStatus::Active;
+
+        let hub = EventHub::new();
+        let subscription = hub
+            .subscribe(SubscriberConfig {
+                capacity: 1,
+                overflow: SubscriberOverflow::DropOldest,
+            })
+            .unwrap();
+        let shared = shared_with_target(&config, hub.clone(), peer);
+        {
+            let mut registry = shared
+                .registry
+                .lock()
+                .expect("target registry mutex poisoned");
+            registry.desired.insert(TargetId::from("healthy"));
+            registry
+                .remotes
+                .insert(healthy_remote, TargetId::from("healthy"));
+            registry
+                .targets
+                .insert(TargetId::from("healthy"), healthy.clone());
+        }
+
+        let mut records = TargetOutcomeHistory::default();
+        collect_finished_targets(&shared, &mut records);
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 1);
+        assert!(matches!(
+            healthy.lock().expect("target mutex poisoned").status,
+            TargetStatus::Active
+        ));
+
+        hub.publish(ManagedGroupEvent::Client(TargetEvent {
+            target: TargetId::from("healthy"),
+            event: ClientEvent::EchoLoss {
+                seq: 7,
+                sent_at: ClientTimestamp::now(),
+                timeout_at: Instant::now(),
+            },
+        }));
+
+        assert_eq!(subscription.dropped_events(), 1);
+        assert!(matches!(
+            subscription.try_recv(),
+            Ok(Some(ManagedGroupEvent::Client(TargetEvent {
+                target,
+                event: ClientEvent::EchoLoss { seq: 7, .. },
+            }))) if target.as_str() == "healthy"
+        ));
+        assert_eq!(subscription.try_recv(), Ok(None));
+        assert_eq!(shared.peer_closed_target_count.load(Ordering::Acquire), 1);
+        assert_eq!(records.peer_closed, 1);
+        assert_eq!(
+            shared
+                .registry
+                .lock()
+                .expect("target registry mutex poisoned")
+                .targets
+                .len(),
+            1
+        );
     }
 
     #[test]
