@@ -12,6 +12,7 @@ use crate::{
     config::{ClientAuthConfig, ClientConfig},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
+    metadata::ReceiveMeta,
     receive::recv_datagram_from,
     runtime::{advance_cadence, params_from_config, SendProbeResult, SessionRuntime},
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
@@ -875,27 +876,13 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
                     }
                 }
                 TargetStatus::Active | TargetStatus::Draining { .. } => {
-                    let was_draining = matches!(target.status, TargetStatus::Draining { .. });
-                    match target.runtime.process_received_echo_packet(
+                    wake_scheduler = process_active_target_packet(
+                        &shared.hub,
+                        &mut target,
                         packet,
                         datagram.received_at,
                         datagram.meta,
-                    ) {
-                        Ok(events) => {
-                            publish_events(&shared.hub, &mut target, events);
-                            if target.runtime.is_peer_closed()
-                                || (was_draining && !target.runtime.has_timed_out_metadata())
-                            {
-                                wake_scheduler = true;
-                            }
-                        }
-                        Err(err) => {
-                            target.mark_finished(ManagedTargetEndReason::Failed(
-                                ManagedTargetFailure::runtime(&err),
-                            ));
-                            wake_scheduler = true;
-                        }
-                    }
+                    );
                 }
                 TargetStatus::Finished => {}
             }
@@ -962,6 +949,36 @@ fn publish_events(
             target: target.id.clone(),
             event,
         }));
+    }
+}
+
+fn process_active_target_packet(
+    hub: &EventHub<ManagedGroupEvent>,
+    target: &mut TargetState,
+    packet: &[u8],
+    received_at: ClientTimestamp,
+    meta: ReceiveMeta,
+) -> bool {
+    let was_draining = matches!(target.status, TargetStatus::Draining { .. });
+    match target
+        .runtime
+        .process_received_echo_packet(packet, received_at, meta)
+    {
+        Ok(events) => {
+            publish_events(hub, target, events);
+            if target.runtime.is_peer_closed() {
+                target.mark_finished(ManagedTargetEndReason::PeerClosed);
+                true
+            } else {
+                was_draining && !target.runtime.has_timed_out_metadata()
+            }
+        }
+        Err(err) => {
+            target.mark_finished(ManagedTargetEndReason::Failed(
+                ManagedTargetFailure::runtime(&err),
+            ));
+            true
+        }
     }
 }
 
@@ -1742,6 +1759,105 @@ mod tests {
         }
     }
 
+    struct ActiveTargetFixture {
+        client_config: ClientConfig,
+        hub: EventHub<ManagedGroupEvent>,
+        subscription: TargetEventSubscription,
+        target: Arc<Mutex<TargetState>>,
+        reply: Vec<u8>,
+        close_reply: Vec<u8>,
+    }
+
+    fn active_target_fixture() -> ActiveTargetFixture {
+        let interval = Duration::from_millis(10);
+        let params = test_params(None, interval);
+        let client_config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let remote: SocketAddr = "127.0.0.1:2112".parse().unwrap();
+        let hub = EventHub::new();
+        let subscription = hub
+            .subscribe(SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            })
+            .unwrap();
+        let mut target =
+            TargetState::new(&client_config, target("peer", remote), 0, Instant::now()).unwrap();
+
+        let open_packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params);
+        let open_reply = target.runtime.decode_open_reply(&open_packet).unwrap();
+        let open_outcome = target
+            .runtime
+            .accept_open_reply(open_reply, ClientTimestamp::now(), |_| Ok(()))
+            .unwrap();
+        publish_open_outcome(&hub, &mut target, open_outcome);
+
+        let scheduled_at = Instant::now();
+        let sent_at = ClientTimestamp::now();
+        let sent_events = target
+            .runtime
+            .send_probe_for_deadline(Some(sent_at), scheduled_at, |packet| {
+                Ok(SendProbeResult {
+                    sent_at,
+                    bytes: packet.len(),
+                    send_call: Duration::ZERO,
+                })
+            })
+            .unwrap();
+        publish_events(&hub, &mut target, sent_events);
+
+        ActiveTargetFixture {
+            client_config,
+            hub,
+            subscription,
+            target: Arc::new(Mutex::new(target)),
+            reply: echo_reply_packet(TOKEN, 0, &params, &TimestampFields::default()),
+            close_reply: echo_reply_packet_with_flags(
+                TOKEN,
+                0,
+                &params,
+                &TimestampFields::default(),
+                FLAG_REPLY | flags::FLAG_CLOSE,
+            ),
+        }
+    }
+
+    fn shared_with_target(
+        client_config: &ClientConfig,
+        hub: EventHub<ManagedGroupEvent>,
+        target: Arc<Mutex<TargetState>>,
+    ) -> GroupShared {
+        let requested = params_from_config(client_config).unwrap();
+        let (id, remote) = {
+            let target = target.lock().expect("target mutex poisoned");
+            (target.id.clone(), target.remote)
+        };
+        let mut registry = TargetRegistry::default();
+        registry.desired.insert(id.clone());
+        registry.remotes.insert(remote, id.clone());
+        registry.targets.insert(id, target);
+        let (control_tx, _control_rx) = mpsc::channel();
+
+        GroupShared {
+            registry: Mutex::new(registry),
+            hub,
+            cancellation: CancellationToken::new(),
+            control_tx,
+            requested_interval_ns: requested.interval_ns,
+            requested_dscp: requested.dscp,
+            family_remote: remote,
+        }
+    }
+
+    fn drain_available_group_events(
+        subscription: &TargetEventSubscription,
+    ) -> Vec<ManagedGroupEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = subscription.try_recv().unwrap() {
+            events.push(event);
+        }
+        events
+    }
+
     fn target(id: &str, remote: SocketAddr) -> ManagedTargetConfig {
         ManagedTargetConfig {
             id: TargetId::from(id),
@@ -2186,6 +2302,121 @@ mod tests {
                 event.target == id && matches!(event.event, ClientEvent::EchoReply { .. })
             }));
         }
+    }
+
+    #[test]
+    fn receiver_peer_close_wins_send_and_removal_races() {
+        let fixture = active_target_fixture();
+        {
+            let mut target = fixture.target.lock().expect("target mutex poisoned");
+            assert!(process_active_target_packet(
+                &fixture.hub,
+                &mut target,
+                &fixture.close_reply,
+                ClientTimestamp::now(),
+                ReceiveMeta::default(),
+            ));
+            assert!(matches!(target.status, TargetStatus::Finished));
+            assert_eq!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::PeerClosed)
+            );
+        }
+
+        let shared = shared_with_target(
+            &fixture.client_config,
+            fixture.hub.clone(),
+            fixture.target.clone(),
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        send_echo_to_target(&socket, &shared, fixture.target.clone(), Instant::now());
+        assert_eq!(
+            fixture
+                .target
+                .lock()
+                .expect("target mutex poisoned")
+                .final_reason,
+            Some(ManagedTargetEndReason::PeerClosed)
+        );
+
+        let mut next_order = 1;
+        let mut records = TargetOutcomeHistory::default();
+        apply_target_update(
+            &fixture.client_config,
+            &socket,
+            &shared,
+            Vec::new(),
+            &mut next_order,
+            &mut records,
+        )
+        .unwrap();
+        collect_finished_targets(&shared, &mut records);
+
+        let events = drain_available_group_events(&fixture.subscription);
+        let terminal_sequence: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::EchoReply { .. },
+                    ..
+                }) => Some("reply"),
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::SessionClosed { .. },
+                    ..
+                }) => Some("closed"),
+                ManagedGroupEvent::TargetFinished(_) => Some("finished"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(terminal_sequence, ["reply", "closed", "finished"]);
+
+        let outcome = records.into_group_outcome(ManagedGroupEndReason::AllTargetsComplete);
+        assert_eq!(outcome.total_target_outcomes, 1);
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(outcome.peer_closed_target_outcomes, 1);
+        assert_eq!(outcome.failed_target_outcomes, 0);
+        assert_eq!(
+            outcome.targets[0].end_reason,
+            ManagedTargetEndReason::PeerClosed
+        );
+        assert_eq!(outcome.targets[0].packets_sent, 1);
+        assert_eq!(outcome.targets[0].replies_received, 1);
+    }
+
+    #[test]
+    fn receiver_non_close_reply_leaves_target_active() {
+        let fixture = active_target_fixture();
+        {
+            let mut target = fixture.target.lock().expect("target mutex poisoned");
+            assert!(!process_active_target_packet(
+                &fixture.hub,
+                &mut target,
+                &fixture.reply,
+                ClientTimestamp::now(),
+                ReceiveMeta::default(),
+            ));
+            assert!(matches!(target.status, TargetStatus::Active));
+            assert_eq!(target.final_reason, None);
+            assert_eq!(target.counters.replies_received, 1);
+            assert!(!target.runtime.is_peer_closed());
+        }
+
+        let events = drain_available_group_events(&fixture.subscription);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::Client(TargetEvent {
+                event: ClientEvent::EchoReply { .. },
+                ..
+            })
+        )));
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::Client(TargetEvent {
+                event: ClientEvent::SessionClosed { .. },
+                ..
+            }) | ManagedGroupEvent::TargetFinished(_)
+        )));
     }
 
     #[test]
