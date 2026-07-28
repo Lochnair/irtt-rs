@@ -9,9 +9,10 @@ use std::{
 };
 
 use irtt_client::{
-    ClientEvent, EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
-    ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, ManagedTargetOutcome,
-    SubscriberConfig, SubscriberOverflow, TargetEvent,
+    ClientEvent, EventSubscriptionError, ManagedClient, ManagedClientGroup,
+    ManagedClientGroupConfig, ManagedGroupCompletionPolicy, ManagedGroupEndReason,
+    ManagedGroupEvent, ManagedTargetOutcome, SessionEndReason, SubscriberConfig,
+    SubscriberOverflow, TargetEvent,
 };
 #[cfg(all(test, feature = "stats"))]
 use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
@@ -28,7 +29,6 @@ use crate::shared::client::{
         peer_close_run_error, request_group_stop_once, should_print_final_summary,
         should_stop_group_on_peer_close,
     },
-    ClientSession,
 };
 
 #[cfg(feature = "stats")]
@@ -49,6 +49,8 @@ const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
 
 const GROUP_IDLE_SLEEP: Duration = Duration::from_millis(5);
 const GROUP_COMPLETION_GRACE: Duration = Duration::from_secs(1);
+const MANAGED_EVENT_WAIT_SLICE: Duration = Duration::from_millis(20);
+const MANAGED_EVENT_CAPACITY: usize = 16_384;
 
 pub fn run_stream(
     args: ClientArgs,
@@ -103,66 +105,71 @@ pub fn run_stream(
         return Ok(());
     }
 
-    let mut session = ClientSession::connect(args.to_client_config(), continuous)?;
-
-    if is_shutdown_requested(shutdown_requested) {
-        return Ok(());
-    }
-
-    let events = session.open()?;
-    #[cfg(feature = "stats")]
-    print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
-    #[cfg(not(feature = "stats"))]
-    print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
-
+    let (session, events) = ManagedClient::start_with_subscription(
+        args.to_client_config(),
+        managed_event_subscriber_config(),
+    )?;
     let mut interrupted = false;
-    while session.should_continue(shutdown_requested) {
-        let events = session.step(shutdown_requested)?;
-        #[cfg(feature = "stats")]
-        print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
-        #[cfg(not(feature = "stats"))]
-        print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
-
+    loop {
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
+            session.stop();
             break;
         }
 
-        session.sleep_until_next_send();
+        match events.recv_timeout(MANAGED_EVENT_WAIT_SLICE) {
+            Ok(Some(event)) => {
+                #[cfg(feature = "stats")]
+                print_events_with_stats(
+                    &mut stream_output,
+                    std::slice::from_ref(&event),
+                    Some(target_label),
+                    &mut stats,
+                )?;
+                #[cfg(not(feature = "stats"))]
+                print_events_with_stats(
+                    &mut stream_output,
+                    std::slice::from_ref(&event),
+                    Some(target_label),
+                )?;
+            }
+            Ok(None) => {}
+            Err(EventSubscriptionError::Disconnected) => break,
+        }
     }
     interrupted |= is_shutdown_requested(shutdown_requested);
 
     if interrupted {
         eprintln!("interrupted, closing session...");
-    }
-
-    if session.should_drain_final(interrupted) {
-        session.drain_final(|events| {
+        drain_single_client_events(
+            &events,
+            &mut stream_output,
+            target_label,
             #[cfg(feature = "stats")]
-            let _ =
-                print_events_with_stats(&mut stream_output, events, Some(target_label), &mut stats);
-            #[cfg(not(feature = "stats"))]
-            let _ = print_events_with_stats(&mut stream_output, events, Some(target_label));
-        })?;
+            &mut stats,
+        )?;
     }
 
-    let events = session.poll_timeouts()?;
-    #[cfg(feature = "stats")]
-    print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
-    #[cfg(not(feature = "stats"))]
-    print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
+    let outcome = session.join();
+    drain_single_client_events(
+        &events,
+        &mut stream_output,
+        target_label,
+        #[cfg(feature = "stats")]
+        &mut stats,
+    )?;
+    if let Some(warning) = dropped_event_warning(events.dropped_events(), "managed client") {
+        eprintln!("{warning}");
+    }
 
-    let events = session.close()?;
-    #[cfg(feature = "stats")]
-    print_events_with_stats(&mut stream_output, &events, Some(target_label), &mut stats)?;
-    #[cfg(not(feature = "stats"))]
-    print_events_with_stats(&mut stream_output, &events, Some(target_label))?;
     interrupted |= is_shutdown_requested(shutdown_requested);
-    let peer_close_error = peer_close_run_error(
-        continuous,
-        interrupted,
-        if session.is_peer_closed() { 1 } else { 0 },
-    );
+    let peer_close_error = outcome.as_ref().ok().and_then(|outcome| {
+        peer_close_run_error(
+            continuous,
+            interrupted,
+            u64::from(outcome.end_reason == SessionEndReason::PeerClosed),
+        )
+    });
     let print_final_summary = should_print_final_summary(continuous, interrupted);
     stream_output.print_final_summary = print_final_summary;
     stream_output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
@@ -171,8 +178,55 @@ pub fn run_stream(
     #[cfg(not(feature = "stats"))]
     stream_output.print_summary()?;
     stream_output.out.flush()?;
+    if let Err(error) = outcome {
+        return Err(error.into());
+    }
     if let Some(error) = peer_close_error {
         return Err(error.into());
+    }
+    Ok(())
+}
+
+fn managed_event_subscriber_config() -> SubscriberConfig {
+    SubscriberConfig {
+        capacity: MANAGED_EVENT_CAPACITY,
+        // CLI output is best-effort under sustained backpressure. Dropping
+        // stale rows keeps the managed worker independent from output speed,
+        // while dropped_events() makes incomplete output visible.
+        overflow: SubscriberOverflow::DropOldest,
+    }
+}
+
+#[cfg(feature = "stats")]
+fn drain_single_client_events<W: Write>(
+    events: &irtt_client::EventSubscription,
+    stream_output: &mut StreamOutput<'_, W>,
+    target_label: &str,
+    stats: &mut StatsCollector,
+) -> io::Result<()> {
+    while let Ok(Some(event)) = events.try_recv() {
+        print_events_with_stats(
+            stream_output,
+            std::slice::from_ref(&event),
+            Some(target_label),
+            stats,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "stats"))]
+fn drain_single_client_events<W: Write>(
+    events: &irtt_client::EventSubscription,
+    stream_output: &mut StreamOutput<'_, W>,
+    target_label: &str,
+) -> io::Result<()> {
+    while let Ok(Some(event)) = events.try_recv() {
+        print_events_with_stats(
+            stream_output,
+            std::slice::from_ref(&event),
+            Some(target_label),
+        )?;
     }
     Ok(())
 }
@@ -300,7 +354,7 @@ fn run_group_stream(
         group_config,
         managed_targets,
         SubscriberConfig {
-            capacity: 16_384,
+            capacity: MANAGED_EVENT_CAPACITY,
             // CLI output is best-effort under sustained backpressure. Dropping
             // stale rows keeps continuous runs attached to the running group
             // instead of turning a full output queue into a disconnected
@@ -427,7 +481,7 @@ fn run_group_stream(
             }
         }
     }
-    if let Some(warning) = dropped_event_warning(events.dropped_events()) {
+    if let Some(warning) = dropped_event_warning(events.dropped_events(), "managed group") {
         eprintln!("{warning}");
     }
 
@@ -492,10 +546,15 @@ fn report_target_failure(target: &ManagedTargetOutcome) {
     }
 }
 
-fn dropped_event_warning(dropped_events: u64) -> Option<String> {
+fn dropped_event_warning(dropped_events: u64, source: &str) -> Option<String> {
     (dropped_events > 0).then(|| {
+        let event_word = if dropped_events == 1 {
+            "event"
+        } else {
+            "events"
+        };
         format!(
-            "irtt-rs: warning: dropped {dropped_events} managed group events; output and statistics may be incomplete"
+            "irtt-rs: warning: dropped {dropped_events} {source} {event_word}; output and statistics may be incomplete"
         )
     })
 }
@@ -654,10 +713,55 @@ mod tests {
 
     #[test]
     fn dropped_event_warning_marks_statistics_incomplete() {
-        assert_eq!(dropped_event_warning(0), None);
-        let warning = dropped_event_warning(7).unwrap();
+        assert_eq!(dropped_event_warning(0, "managed client"), None);
+        let warning = dropped_event_warning(7, "managed group").unwrap();
         assert!(warning.contains("dropped 7 managed group events"));
         assert!(warning.contains("statistics may be incomplete"));
+    }
+
+    #[test]
+    fn single_client_drain_preserves_final_queue_and_surfaces_overflow() {
+        let hub = irtt_client::EventHub::new();
+        let events = hub
+            .subscribe(SubscriberConfig {
+                capacity: 1,
+                overflow: SubscriberOverflow::DropOldest,
+            })
+            .unwrap();
+        hub.publish(reply_event(1, 1_000));
+        hub.publish(reply_event(2, 2_000));
+        hub.disconnect_all();
+
+        let mut stats = StatsCollector::new(StatsConfig::finite());
+        let mut out = Vec::new();
+        {
+            let mut stream_output = StreamOutput {
+                config: output_config(
+                    crate::cmd::client::OutputFormat::Csv,
+                    Some("event,seq"),
+                    crate::cmd::client::HeaderMode::Never,
+                    false,
+                ),
+                header_printed: false,
+                print_final_summary: false,
+                show_running_only_summary_note: false,
+                out: &mut out,
+            };
+            drain_single_client_events(&events, &mut stream_output, "target", &mut stats).unwrap();
+        }
+
+        let rendered = String::from_utf8(out).unwrap();
+        assert_eq!(rendered.trim(), "echo_reply,2");
+        assert_eq!(events.dropped_events(), 1);
+        assert!(
+            dropped_event_warning(events.dropped_events(), "managed client")
+                .unwrap()
+                .contains("dropped 1 managed client event")
+        );
+        assert_eq!(
+            events.try_recv().unwrap_err(),
+            EventSubscriptionError::Disconnected
+        );
     }
 
     #[test]

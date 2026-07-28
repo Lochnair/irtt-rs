@@ -169,9 +169,9 @@ pub enum EventSubscriptionError {
     /// The subscription can no longer receive new events.
     ///
     /// Already queued events are delivered first. After the queue is drained,
-    /// `recv` and `try_recv` return this error when the hub disconnects the
-    /// subscriber, the hub is shut down, or the subscription is disconnected by
-    /// its overflow policy.
+    /// `recv`, `recv_timeout`, and `try_recv` return this error when the hub
+    /// disconnects the subscriber, the hub is shut down, or the subscription is
+    /// disconnected by its overflow policy.
     #[error("event subscription is disconnected")]
     Disconnected,
 }

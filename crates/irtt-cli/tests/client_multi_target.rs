@@ -48,6 +48,19 @@ impl InterruptibleFakeServer {
     }
 }
 
+struct ObservedFakeServer {
+    addr: SocketAddr,
+    probes: mpsc::Receiver<Instant>,
+    done: JoinHandle<()>,
+}
+
+impl ObservedFakeServer {
+    fn join(self) -> Vec<Instant> {
+        self.done.join().unwrap();
+        self.probes.try_iter().collect()
+    }
+}
+
 #[test]
 fn list_columns_succeeds_without_target() {
     let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
@@ -144,6 +157,56 @@ fn single_target_custom_target_column_renders_positional_label() {
 }
 
 #[test]
+fn single_target_ten_millisecond_cadence_uses_managed_deadlines() {
+    let duration = Duration::from_millis(90);
+    let interval = Duration::from_millis(10);
+    let server = start_observed_echo_server(test_params(Some(duration), interval));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "90ms",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "event,seq",
+        "--header",
+        "never",
+        &server.addr.to_string(),
+    ]);
+
+    let output = run_with_timeout(command, Duration::from_secs(3));
+    let probe_times = server.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let sent_rows = stdout
+        .lines()
+        .filter(|line| line.starts_with("echo_sent,"))
+        .count();
+    assert!(
+        (7..=11).contains(&sent_rows),
+        "expected about 9 probes at 10 ms cadence, got {sent_rows}\n{stdout}"
+    );
+    assert_eq!(sent_rows, probe_times.len(), "{stdout}");
+    assert!(
+        !probe_times
+            .windows(3)
+            .any(|window| window[2].duration_since(window[0]) < Duration::from_millis(5)),
+        "managed pacing emitted a catch-up burst: {probe_times:?}"
+    );
+    assert!(stdout
+        .lines()
+        .any(|line| line.starts_with("session_closed,")));
+}
+
+#[test]
 fn finite_single_target_peer_close_exits_successfully() {
     let server = start_peer_close_server(test_params(
         Some(Duration::from_millis(40)),
@@ -211,6 +274,57 @@ fn continuous_single_target_peer_close_exits_nonzero() {
     assert!(!stdout.trim().is_empty(), "{stdout}");
     assert!(stderr.contains("continuous run"), "{stderr}");
     assert!(stderr.contains("peer closure"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn continuous_single_target_interruption_drains_final_events_and_succeeds() {
+    let params = test_params(None, Duration::from_millis(10));
+    let server = start_interruptible_echo_server(params);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    command.args([
+        "--duration",
+        "0s",
+        "--interval",
+        "10ms",
+        "--format",
+        "csv",
+        "--columns",
+        "event,seq",
+        "--header",
+        "never",
+        &server.addr.to_string(),
+    ]);
+
+    let child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    server.wait_until_opened();
+    thread::sleep(Duration::from_millis(50));
+    let signal_status = Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .unwrap();
+    assert!(signal_status.success());
+    let output = wait_with_timeout(child, Duration::from_secs(2));
+    server.join();
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.lines().any(|line| line.starts_with("echo_reply,")));
+    assert!(stdout
+        .lines()
+        .any(|line| line.starts_with("session_closed,")));
+    assert!(stderr.contains("interrupted, closing session"), "{stderr}");
+    assert!(!stderr.contains("peer closure"), "{stderr}");
 }
 
 #[test]
@@ -656,6 +770,44 @@ fn start_echo_server_inner(
         }
     });
     FakeServer { addr, done }
+}
+
+fn start_observed_echo_server(params: Params) -> ObservedFakeServer {
+    let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    let addr = socket.local_addr().unwrap();
+    let (probe_tx, probes) = mpsc::channel();
+    let done = thread::spawn(move || {
+        let (_, peer) = recv_request(&socket);
+        socket
+            .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+            .unwrap();
+
+        loop {
+            let (packet, peer) = recv_request(&socket);
+            let flags = packet[3];
+            if flags & FLAG_CLOSE != 0 {
+                break;
+            }
+            probe_tx.send(Instant::now()).unwrap();
+            let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
+            socket
+                .send_to(
+                    &echo_reply_packet(
+                        TOKEN,
+                        seq,
+                        &params,
+                        &TimestampFields::default(),
+                        FLAG_REPLY,
+                    ),
+                    peer,
+                )
+                .unwrap();
+        }
+    });
+    ObservedFakeServer { addr, probes, done }
 }
 
 fn start_interruptible_echo_server(params: Params) -> InterruptibleFakeServer {

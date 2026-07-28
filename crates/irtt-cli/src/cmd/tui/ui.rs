@@ -140,12 +140,6 @@ impl TuiState {
         }
     }
 
-    pub(super) fn process_events(&mut self, events: &[ClientEvent]) {
-        for event in events {
-            self.process_event(event);
-        }
-    }
-
     pub(super) fn process_event(&mut self, event: &ClientEvent) {
         self.process_event_for_target(0, event);
     }
@@ -388,13 +382,31 @@ impl TuiState {
         self.status = status;
     }
 
-    pub(super) fn mark_dropped_events(&mut self, dropped_events: u64) {
+    #[cfg(test)]
+    pub(super) fn status(&self) -> TuiStatus {
+        self.status
+    }
+
+    pub(super) fn mark_dropped_client_events(&mut self, dropped_events: u64) {
+        self.mark_dropped_events(dropped_events, "managed client");
+    }
+
+    pub(super) fn mark_dropped_group_events(&mut self, dropped_events: u64) {
+        self.mark_dropped_events(dropped_events, "managed group");
+    }
+
+    fn mark_dropped_events(&mut self, dropped_events: u64, source: &str) {
         if dropped_events == 0 {
             return;
         }
         self.dropped_events = dropped_events;
+        let event_word = if dropped_events == 1 {
+            "event"
+        } else {
+            "events"
+        };
         let warning =
-            format!("dropped {dropped_events} managed group events; statistics may be incomplete");
+            format!("dropped {dropped_events} {source} {event_word}; statistics may be incomplete");
         self.last_warning = Some(warning.clone());
         self.push_event(format!("warning {warning}"));
     }
@@ -2497,7 +2509,7 @@ mod tests {
     fn dropped_events_mark_tui_statistics_incomplete() {
         let mut state = TuiState::default();
 
-        state.mark_dropped_events(9);
+        state.mark_dropped_group_events(9);
 
         assert_eq!(state.dropped_events, 9);
         assert!(state
@@ -2508,6 +2520,19 @@ mod tests {
             .recent_events
             .back()
             .is_some_and(|event| event.contains("dropped 9 managed group events")));
+    }
+
+    #[test]
+    fn dropped_single_client_events_are_visible() {
+        let mut state = TuiState::default();
+
+        state.mark_dropped_client_events(3);
+
+        assert_eq!(state.dropped_events, 3);
+        assert!(state
+            .recent_events
+            .back()
+            .is_some_and(|event| event.contains("dropped 3 managed client events")));
     }
 
     #[test]

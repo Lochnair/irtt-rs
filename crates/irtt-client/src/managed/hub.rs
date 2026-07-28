@@ -4,6 +4,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, Condvar, Mutex, Weak,
     },
+    time::{Duration, Instant},
 };
 
 use crate::{error::EventSubscriptionError, event::ClientEvent};
@@ -251,6 +252,39 @@ impl<T> EventSubscription<T> {
                 .available
                 .wait(state)
                 .expect("subscriber mutex poisoned");
+        }
+    }
+
+    /// Wait up to `timeout` for the next queued event.
+    ///
+    /// Returns `Ok(None)` when the timeout elapses while the subscription
+    /// remains connected. If the subscription is disconnected, this returns
+    /// [`EventSubscriptionError::Disconnected`] after any already queued events
+    /// have been drained.
+    pub fn recv_timeout(&self, timeout: Duration) -> Result<Option<T>, EventSubscriptionError> {
+        let started_at = Instant::now();
+        let mut state = self.inner.state.lock().expect("subscriber mutex poisoned");
+        loop {
+            if let Some(event) = state.queue.pop_front() {
+                return Ok(Some(event));
+            }
+            if !state.connected {
+                return Err(EventSubscriptionError::Disconnected);
+            }
+
+            let Some(wait_for) = timeout.checked_sub(started_at.elapsed()) else {
+                return Ok(None);
+            };
+            if wait_for.is_zero() {
+                return Ok(None);
+            }
+
+            let (next_state, _) = self
+                .inner
+                .available
+                .wait_timeout(state, wait_for)
+                .expect("subscriber mutex poisoned");
+            state = next_state;
         }
     }
 
@@ -503,6 +537,25 @@ mod tests {
 
         assert_eq!(
             sub.recv().unwrap_err(),
+            EventSubscriptionError::Disconnected
+        );
+    }
+
+    #[test]
+    fn timed_receive_drains_queued_events_and_observes_disconnect() {
+        let hub = EventHub::new();
+        let sub = hub.subscribe(SubscriberConfig::default()).unwrap();
+
+        assert_eq!(sub.recv_timeout(Duration::ZERO).unwrap(), None);
+        hub.publish(event(1));
+        hub.disconnect_all();
+
+        assert_eq!(
+            event_message(sub.recv_timeout(Duration::from_secs(1)).unwrap().unwrap()),
+            "event-1"
+        );
+        assert_eq!(
+            sub.recv_timeout(Duration::from_secs(1)).unwrap_err(),
             EventSubscriptionError::Disconnected
         );
     }

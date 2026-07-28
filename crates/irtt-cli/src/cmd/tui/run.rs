@@ -7,9 +7,9 @@ use std::{
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use irtt_client::{
-    EventSubscriptionError, ManagedClientGroup, ManagedClientGroupConfig,
-    ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, SubscriberConfig,
-    SubscriberOverflow,
+    EventSubscription, EventSubscriptionError, ManagedClient, ManagedClientGroup,
+    ManagedClientGroupConfig, ManagedGroupCompletionPolicy, ManagedGroupEndReason,
+    ManagedGroupEvent, SessionEndReason, SubscriberConfig, SubscriberOverflow,
 };
 
 use crate::{
@@ -17,7 +17,6 @@ use crate::{
     shared::client::{
         is_shutdown_requested,
         session::{peer_close_run_error, request_group_stop_once, should_stop_group_on_peer_close},
-        ClientSession,
     },
 };
 
@@ -27,6 +26,7 @@ const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_WAIT_SLICE: Duration = Duration::from_millis(20);
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
 const GROUP_COMPLETION_GRACE: Duration = Duration::from_secs(1);
+const MANAGED_EVENT_CAPACITY: usize = 16_384;
 
 pub fn run_tui(
     args: TuiArgs,
@@ -61,7 +61,10 @@ pub fn run_tui(
         );
     }
 
-    let mut session = match ClientSession::connect(args.to_client_config(), continuous) {
+    let (session, events) = match ManagedClient::start_with_subscription(
+        args.to_client_config(),
+        managed_event_subscriber_config(),
+    ) {
         Ok(session) => session,
         Err(err) => {
             state.set_error(err.to_string());
@@ -70,43 +73,33 @@ pub fn run_tui(
         }
     };
 
-    if is_shutdown_requested(shutdown_requested) {
-        return Ok(());
-    }
-
-    let events = session.open()?;
-    state.process_events(&events);
-    render_if_due(&mut terminal, &state, &mut next_render, true)?;
-
     let mut interrupted = false;
-    // Keep this in lockstep with run_stream: send due probes, drain available
-    // replies, poll timeouts, sleep toward the next absolute send deadline,
-    // then perform the same final drain, timeout poll, and close sequence.
-    while session.should_continue(shutdown_requested) {
+    loop {
+        if is_shutdown_requested(shutdown_requested) {
+            interrupted = true;
+            session.stop();
+            break;
+        }
+
         if handle_input(&mut state, shutdown_requested)? {
             render_if_due(&mut terminal, &state, &mut next_render, true)?;
         }
         if state.quit_requested {
             interrupted = true;
+            session.stop();
             break;
         }
 
-        let events = session.step(shutdown_requested)?;
-        state.process_events(&events);
-
-        if is_shutdown_requested(shutdown_requested) {
-            interrupted = true;
-            break;
+        match events.recv_timeout(managed_tui_wait_duration(&next_render, state.paused)) {
+            Ok(Some(event)) => {
+                state.process_event(&event);
+                render_if_due(&mut terminal, &state, &mut next_render, false)?;
+            }
+            Ok(None) => {
+                render_if_due(&mut terminal, &state, &mut next_render, false)?;
+            }
+            Err(EventSubscriptionError::Disconnected) => break,
         }
-
-        render_if_due(&mut terminal, &state, &mut next_render, false)?;
-        wait_for_tui_activity(
-            session.next_send_deadline(),
-            &mut next_render,
-            &mut state,
-            &mut terminal,
-            shutdown_requested,
-        )?;
     }
     interrupted |= is_shutdown_requested(shutdown_requested);
 
@@ -115,29 +108,32 @@ pub fn run_tui(
         render_if_due(&mut terminal, &state, &mut next_render, true)?;
     }
 
-    if session.should_drain_final(interrupted) {
+    if interrupted {
         state.set_status(TuiStatus::Draining);
-        let mut drain_render = Instant::now();
-        session.drain_final(|events| {
-            state.process_events(events);
-            let _ = render_if_due(&mut terminal, &state, &mut drain_render, false);
-        })?;
+        drain_single_tui_events(&events, &mut state);
         render_if_due(&mut terminal, &state, &mut next_render, true)?;
     }
-
-    let events = session.poll_timeouts()?;
-    state.process_events(&events);
 
     state.set_status(TuiStatus::Closing);
     render_if_due(&mut terminal, &state, &mut next_render, true)?;
 
-    let events = session.close()?;
-    state.process_events(&events);
+    let outcome = session.join();
+    drain_single_tui_events(&events, &mut state);
+    state.mark_dropped_client_events(events.dropped_events());
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            state.set_error(err.to_string());
+            render_if_due(&mut terminal, &state, &mut next_render, true)?;
+            return Err(Box::new(err));
+        }
+    };
+
     interrupted |= is_shutdown_requested(shutdown_requested);
     if let Some(error) = peer_close_run_error(
         continuous,
         interrupted,
-        if session.is_peer_closed() { 1 } else { 0 },
+        u64::from(outcome.end_reason == SessionEndReason::PeerClosed),
     ) {
         state.set_run_error(error.clone());
         render_if_due(&mut terminal, &state, &mut next_render, true)?;
@@ -175,7 +171,7 @@ fn run_group_tui(
         group_config,
         managed_targets,
         SubscriberConfig {
-            capacity: 16_384,
+            capacity: MANAGED_EVENT_CAPACITY,
             overflow: SubscriberOverflow::DropOldest,
         },
     )?;
@@ -272,7 +268,7 @@ fn run_group_tui(
             }
         }
     }
-    state.mark_dropped_events(events.dropped_events());
+    state.mark_dropped_group_events(events.dropped_events());
     for target in &outcome.targets {
         if terminal_targets.insert(target.id.as_str().to_owned()) {
             state.process_target_outcome(target);
@@ -451,6 +447,28 @@ fn render_if_due(
     Ok(())
 }
 
+fn managed_event_subscriber_config() -> SubscriberConfig {
+    SubscriberConfig {
+        capacity: MANAGED_EVENT_CAPACITY,
+        overflow: SubscriberOverflow::DropOldest,
+    }
+}
+
+fn drain_single_tui_events(events: &EventSubscription, state: &mut TuiState) {
+    while let Ok(Some(event)) = events.try_recv() {
+        state.process_event(&event);
+    }
+}
+
+fn managed_tui_wait_duration(next_render: &Instant, paused: bool) -> Duration {
+    let render_wait = if paused {
+        TUI_WAIT_SLICE
+    } else {
+        next_render.saturating_duration_since(Instant::now())
+    };
+    render_wait.min(TUI_WAIT_SLICE)
+}
+
 fn wait_for_tui_activity(
     next_send_deadline: Option<Instant>,
     next_render: &mut Instant,
@@ -551,5 +569,31 @@ mod tests {
             true,
             &irtt_client::ManagedTargetEndReason::PeerClosed
         ));
+    }
+
+    #[test]
+    fn single_target_managed_drain_consumes_queued_terminal_event() {
+        let hub = irtt_client::EventHub::new();
+        let events = hub
+            .subscribe(SubscriberConfig {
+                capacity: 4,
+                overflow: SubscriberOverflow::DropOldest,
+            })
+            .unwrap();
+        hub.publish(irtt_client::ClientEvent::SessionClosed {
+            remote: "127.0.0.1:2112".parse().unwrap(),
+            token: 7,
+            at: irtt_client::ClientTimestamp::now(),
+        });
+        hub.disconnect_all();
+        let mut state = TuiState::new(TuiConfig::default());
+
+        drain_single_tui_events(&events, &mut state);
+
+        assert_eq!(state.status(), TuiStatus::Complete);
+        assert_eq!(
+            events.try_recv().unwrap_err(),
+            EventSubscriptionError::Disconnected
+        );
     }
 }

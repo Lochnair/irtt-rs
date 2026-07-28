@@ -358,7 +358,7 @@ impl OutcomeCounters {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::NegotiationPolicy, SubscriberOverflow};
+    use crate::{config::NegotiationPolicy, EventSubscriptionError, SubscriberOverflow};
     use irtt_proto::{
         echo_packet_len,
         flags::{self, FLAG_OPEN, FLAG_REPLY},
@@ -685,6 +685,42 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| matches!(event, ClientEvent::SessionClosed { .. })));
+    }
+
+    #[test]
+    fn joining_before_consuming_preserves_queued_final_events() {
+        let duration = Duration::from_millis(25);
+        let server = start_echo_server(test_params(Some(duration), Duration::from_millis(10)));
+        let (session, sub) = ManagedClient::start_with_subscription(
+            config(server.addr, Some(duration)),
+            SubscriberConfig {
+                capacity: 32,
+                overflow: SubscriberOverflow::DropOldest,
+            },
+        )
+        .unwrap();
+
+        let outcome = session.join().unwrap();
+        let mut events = Vec::new();
+        loop {
+            match sub.try_recv() {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => panic!("joined managed subscription remained connected"),
+                Err(EventSubscriptionError::Disconnected) => break,
+            }
+        }
+        server.join();
+
+        assert_eq!(outcome.end_reason, SessionEndReason::TestComplete);
+        assert_eq!(sub.dropped_events(), 0);
+        assert!(matches!(
+            events.first(),
+            Some(ClientEvent::SessionStarted { .. })
+        ));
+        assert!(matches!(
+            events.last(),
+            Some(ClientEvent::SessionClosed { .. })
+        ));
     }
 
     #[test]
