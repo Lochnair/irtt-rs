@@ -465,6 +465,12 @@ mod tests {
             let Some((packet, peer)) = recv_request_timeout(&socket) else {
                 return;
             };
+            assert_eq!(packet[3] & flags::FLAG_CLOSE, 0);
+            assert!(
+                packet.len() >= 16,
+                "echo request too short: {}",
+                packet.len()
+            );
             let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
             thread::sleep(delay);
             let ts = TimestampFields {
@@ -725,10 +731,12 @@ mod tests {
 
     #[test]
     fn finite_managed_run_drains_late_reply_after_timeout_before_close() {
-        let duration = Duration::from_millis(1);
-        let params = test_params(Some(duration), Duration::from_millis(10));
+        let interval = Duration::from_millis(100);
+        let duration = interval;
+        let params = test_params(Some(duration), interval);
         let server = start_delayed_reply_server(params, Duration::from_millis(60));
         let mut cfg = config(server.addr, Some(duration));
+        cfg.interval = interval;
         cfg.probe_timeout = Duration::from_millis(20);
 
         let (session, sub) = ManagedClient::start_with_subscription(

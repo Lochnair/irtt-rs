@@ -2084,6 +2084,65 @@ mod tests {
         }
     }
 
+    fn start_gated_reply_server(params: Params) -> (FakeServer, mpsc::SyncSender<()>) {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::sync_channel(0);
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & FLAG_OPEN, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(800)))
+                .unwrap();
+
+            let (echo, peer) = recv_request_timeout(&socket).expect("missing echo request");
+            assert_eq!(echo[3] & flags::FLAG_CLOSE, 0);
+            assert!(echo.len() >= 16, "echo request too short: {}", echo.len());
+            let seq = u32::from_le_bytes(echo[12..16].try_into().unwrap());
+            tx.send(ServerObservation::Echo {
+                seq,
+                at: Instant::now(),
+            })
+            .unwrap();
+            release_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("timed out waiting to release delayed reply");
+
+            let timestamps = TimestampFields {
+                recv_wall: Some(1_000_000_000),
+                recv_mono: Some(100_000),
+                send_wall: Some(1_001_000_000),
+                send_mono: Some(1_100_000),
+                ..Default::default()
+            };
+            socket
+                .send_to(&echo_reply_packet(TOKEN, seq, &params, &timestamps), peer)
+                .unwrap();
+
+            while let Some((packet, _)) = recv_request_timeout(&socket) {
+                if packet[3] & flags::FLAG_CLOSE != 0 {
+                    tx.send(ServerObservation::Close { at: Instant::now() })
+                        .unwrap();
+                    break;
+                }
+            }
+        });
+        (
+            FakeServer {
+                addr,
+                _observations: rx,
+                done,
+            },
+            release_tx,
+        )
+    }
+
     fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
         let mut buf = [0_u8; 2048];
         socket
@@ -2193,6 +2252,36 @@ mod tests {
                 Err(EventSubscriptionError::Disconnected) => return events,
             }
         }
+    }
+
+    fn final_drain_event_sequence(events: &[ManagedGroupEvent]) -> Vec<&'static str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::SessionStarted { .. },
+                    ..
+                }) => Some("started"),
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::EchoSent { seq: 0, .. },
+                    ..
+                }) => Some("sent"),
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::EchoLoss { seq: 0, .. },
+                    ..
+                }) => Some("loss"),
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::LateReply { seq: 0, .. },
+                    ..
+                }) => Some("late"),
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::SessionClosed { .. },
+                    ..
+                }) => Some("closed"),
+                ManagedGroupEvent::TargetFinished(_) => Some("finished"),
+                _ => None,
+            })
+            .collect()
     }
 
     fn join_group_with_timeout(
@@ -3502,6 +3591,200 @@ mod tests {
             .targets
             .iter()
             .all(|target| target.end_reason == ManagedTargetEndReason::Removed));
+    }
+
+    #[test]
+    fn finite_group_drains_late_reply_during_final_drain() {
+        let interval = Duration::from_millis(100);
+        let duration = interval;
+        let params = test_params(Some(duration), interval);
+        let (server, release_reply) = start_gated_reply_server(params);
+        let target = target("late", server.addr);
+        let mut config = group_config(Some(duration), interval, ManagedGroupPacing::Staggered);
+        config.client.probe_timeout = Duration::from_millis(20);
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target.clone()],
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let mut events = Vec::new();
+        loop {
+            let event = sub
+                .recv_timeout(Duration::from_secs(2))
+                .expect("subscription disconnected before EchoLoss")
+                .expect("timed out waiting for EchoLoss");
+            let saw_loss = matches!(
+                &event,
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::EchoLoss { seq: 0, .. },
+                    ..
+                })
+            );
+            events.push(event);
+            if saw_loss {
+                break;
+            }
+        }
+
+        // EchoLoss is published before this scheduler iteration transitions the
+        // target to Draining. A synchronous no-op update is handled at the next
+        // loop head, so its return proves that transition completed before the
+        // server releases the retained reply.
+        session.update_targets(vec![target]).unwrap();
+        release_reply.send(()).unwrap();
+        let outcome = join_group_with_timeout(session, Duration::from_secs(1));
+        events.extend(collect_group_events_until_disconnected(&sub));
+        server.join();
+
+        assert_eq!(
+            final_drain_event_sequence(&events),
+            ["started", "sent", "loss", "late", "closed", "finished"]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ManagedGroupEvent::Client(TargetEvent {
+                        event: ClientEvent::EchoLoss { seq: 0, .. },
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    ManagedGroupEvent::Client(TargetEvent {
+                        event: ClientEvent::LateReply {
+                            seq: 0,
+                            sent_at: Some(_),
+                            rtt: Some(_),
+                            ..
+                        },
+                        ..
+                    })
+                ))
+                .count(),
+            1
+        );
+
+        assert_eq!(
+            outcome.end_reason,
+            ManagedGroupEndReason::AllTargetsComplete
+        );
+        assert_eq!(outcome.targets.len(), 1);
+        let target = &outcome.targets[0];
+        assert_eq!(target.end_reason, ManagedTargetEndReason::TestComplete);
+        assert_eq!(target.packets_sent, 1);
+        assert_eq!(target.replies_received, 0);
+        assert_eq!(target.duplicates, 0);
+        assert_eq!(target.late, 1);
+        assert_eq!(target.warning_events, 0);
+        assert_eq!(outcome.total_target_outcomes, 1);
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(outcome.peer_closed_target_outcomes, 0);
+        assert_eq!(outcome.failed_target_outcomes, 0);
+        assert_eq!(outcome.discarded_target_outcomes, 0);
+        assert_eq!(
+            events.iter().find_map(|event| match event {
+                ManagedGroupEvent::TargetFinished(target) => Some(target),
+                _ => None,
+            }),
+            Some(target)
+        );
+        assert_eq!(sub.dropped_events(), 0);
+        assert_eq!(sub.try_recv(), Err(EventSubscriptionError::Disconnected));
+    }
+
+    #[test]
+    fn finite_group_final_drain_expires_without_late_reply() {
+        let interval = Duration::from_millis(100);
+        let duration = interval;
+        let server = start_silent_runtime_server(test_params(Some(duration), interval));
+        let mut config = group_config(Some(duration), interval, ManagedGroupPacing::Staggered);
+        config.client.probe_timeout = Duration::from_millis(20);
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("silent", server.addr)],
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        let outcome = join_group_with_timeout(session, Duration::from_secs(1));
+        let events = collect_group_events_until_disconnected(&sub);
+        server.join();
+
+        assert_eq!(
+            final_drain_event_sequence(&events),
+            ["started", "sent", "loss", "closed", "finished"]
+        );
+        assert!(!events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::Client(TargetEvent {
+                event: ClientEvent::LateReply { .. },
+                ..
+            })
+        )));
+        let timeout_at = events
+            .iter()
+            .find_map(|event| match event {
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::EchoLoss { timeout_at, .. },
+                    ..
+                }) => Some(*timeout_at),
+                _ => None,
+            })
+            .expect("missing EchoLoss");
+        let closed_at = events
+            .iter()
+            .find_map(|event| match event {
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::SessionClosed { at, .. },
+                    ..
+                }) => Some(at.mono),
+                _ => None,
+            })
+            .expect("missing SessionClosed");
+        assert!(closed_at >= timeout_at + GROUP_FINAL_DRAIN);
+
+        assert_eq!(
+            outcome.end_reason,
+            ManagedGroupEndReason::AllTargetsComplete
+        );
+        assert_eq!(outcome.targets.len(), 1);
+        let target = &outcome.targets[0];
+        assert_eq!(target.end_reason, ManagedTargetEndReason::TestComplete);
+        assert_eq!(target.packets_sent, 1);
+        assert_eq!(target.replies_received, 0);
+        assert_eq!(target.duplicates, 0);
+        assert_eq!(target.late, 0);
+        assert_eq!(target.warning_events, 0);
+        assert_eq!(outcome.total_target_outcomes, 1);
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(outcome.peer_closed_target_outcomes, 0);
+        assert_eq!(outcome.failed_target_outcomes, 0);
+        assert_eq!(outcome.discarded_target_outcomes, 0);
+        assert_eq!(
+            events.iter().find_map(|event| match event {
+                ManagedGroupEvent::TargetFinished(target) => Some(target),
+                _ => None,
+            }),
+            Some(target)
+        );
+        assert_eq!(sub.dropped_events(), 0);
+        assert_eq!(sub.try_recv(), Err(EventSubscriptionError::Disconnected));
     }
 
     #[test]
