@@ -26,7 +26,6 @@ use super::{
 
 const GROUP_RECV_TIMEOUT: Duration = Duration::from_millis(20);
 const GROUP_FINAL_DRAIN: Duration = Duration::from_millis(100);
-const IDLE_SLEEP: Duration = Duration::from_millis(1);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
 const RECV_BUFFER_SIZE: usize = 65_536;
 /// Maximum number of recent target outcomes retained in [`ManagedGroupOutcome`].
@@ -876,6 +875,7 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
                     }
                 }
                 TargetStatus::Active | TargetStatus::Draining { .. } => {
+                    let was_draining = matches!(target.status, TargetStatus::Draining { .. });
                     match target.runtime.process_received_echo_packet(
                         packet,
                         datagram.received_at,
@@ -883,7 +883,9 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
                     ) {
                         Ok(events) => {
                             publish_events(&shared.hub, &mut target, events);
-                            if target.runtime.is_peer_closed() {
+                            if target.runtime.is_peer_closed()
+                                || (was_draining && !target.runtime.has_timed_out_metadata())
+                            {
                                 wake_scheduler = true;
                             }
                         }
@@ -1589,19 +1591,42 @@ fn wait_for_next_scheduler_wakeup(
 ) -> Option<ControlMessage> {
     let open_deadline = next_open_deadline(shared);
     let pacing_deadline = (!active.is_empty()).then(|| pacing.next_wakeup()).flatten();
-    let deadline = [open_deadline, pacing_deadline].into_iter().flatten().min();
-    let sleep_for = deadline
-        .and_then(|deadline| deadline.checked_duration_since(Instant::now()))
-        .map(|duration| duration.min(MAX_SLEEP))
-        .unwrap_or(IDLE_SLEEP);
+    let drain_deadline = next_drain_deadline(shared);
+    let deadline = [open_deadline, pacing_deadline, drain_deadline]
+        .into_iter()
+        .flatten()
+        .min();
 
-    match control_rx.recv_timeout(sleep_for) {
-        Ok(message) => Some(message),
-        Err(mpsc::RecvTimeoutError::Timeout) => None,
-        Err(mpsc::RecvTimeoutError::Disconnected) => {
-            shared.cancellation.cancel();
-            None
+    wait_for_scheduler_control(control_rx, &shared.cancellation, deadline)
+}
+
+fn wait_for_scheduler_control(
+    control_rx: &mpsc::Receiver<ControlMessage>,
+    cancellation: &CancellationToken,
+    deadline: Option<Instant>,
+) -> Option<ControlMessage> {
+    match deadline {
+        Some(deadline) => {
+            let sleep_for = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default()
+                .min(MAX_SLEEP);
+            match control_rx.recv_timeout(sleep_for) {
+                Ok(message) => Some(message),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    cancellation.cancel();
+                    None
+                }
+            }
         }
+        None => match control_rx.recv() {
+            Ok(message) => Some(message),
+            Err(_) => {
+                cancellation.cancel();
+                None
+            }
+        },
     }
 }
 
@@ -1612,6 +1637,19 @@ fn next_open_deadline(shared: &GroupShared) -> Option<Instant> {
             let target = target.lock().expect("target mutex poisoned");
             match target.status {
                 TargetStatus::Opening { next_send_at, .. } => Some(next_send_at),
+                _ => None,
+            }
+        })
+        .min()
+}
+
+fn next_drain_deadline(shared: &GroupShared) -> Option<Instant> {
+    all_targets(shared)
+        .into_iter()
+        .filter_map(|target| {
+            let target = target.lock().expect("target mutex poisoned");
+            match target.status {
+                TargetStatus::Draining { deadline } => Some(deadline),
                 _ => None,
             }
         })
@@ -1996,6 +2034,22 @@ mod tests {
                 Err(EventSubscriptionError::Disconnected) => return events,
             }
         }
+    }
+
+    fn join_group_with_timeout(
+        session: ManagedClientGroupSession,
+        timeout: Duration,
+    ) -> ManagedGroupOutcome {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let joiner = thread::spawn(move || {
+            result_tx.send(session.join()).unwrap();
+        });
+        let outcome = result_rx
+            .recv_timeout(timeout)
+            .expect("timed out joining managed group")
+            .unwrap();
+        joiner.join().unwrap();
+        outcome
     }
 
     fn sent_events_after_start(events: &[TargetEvent]) -> Vec<(&TargetId, Instant)> {
@@ -2486,6 +2540,69 @@ mod tests {
     }
 
     #[test]
+    fn scheduler_without_deadline_blocks_until_control_message() {
+        let (control_tx, control_rx) = mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let worker_cancellation = cancellation.clone();
+        let (started_tx, started_rx) = mpsc::sync_channel(0);
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            result_tx
+                .send(wait_for_scheduler_control(
+                    &control_rx,
+                    &worker_cancellation,
+                    None,
+                ))
+                .unwrap();
+        });
+
+        started_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("scheduler wait did not start");
+        assert!(matches!(
+            result_rx.recv_timeout(Duration::from_millis(30)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        control_tx.send(ControlMessage::Wake).unwrap();
+        assert!(matches!(
+            result_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("control message did not wake scheduler"),
+            Some(ControlMessage::Wake)
+        ));
+        worker.join().unwrap();
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn scheduler_control_disconnection_cancels_blocking_wait() {
+        let (control_tx, control_rx) = mpsc::channel();
+        let cancellation = CancellationToken::new();
+        drop(control_tx);
+
+        assert!(wait_for_scheduler_control(&control_rx, &cancellation, None).is_none());
+        assert!(cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn scheduler_deadline_wakes_without_control_message() {
+        let (_control_tx, control_rx) = mpsc::channel();
+        let cancellation = CancellationToken::new();
+        let started_at = Instant::now();
+
+        assert!(wait_for_scheduler_control(
+            &control_rx,
+            &cancellation,
+            Some(started_at + Duration::from_millis(10)),
+        )
+        .is_none());
+        assert!(started_at.elapsed() >= Duration::from_millis(5));
+        assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
     fn staggered_pacing_does_not_burst_active_targets() {
         let duration = Duration::from_millis(170);
         let interval = Duration::from_millis(80);
@@ -2788,6 +2905,7 @@ mod tests {
                 result => panic!("timed out waiting for removed outcome: {result:?}"),
             }
         }
+        assert_eq!(sub.recv_timeout(Duration::from_millis(30)), Ok(None));
 
         session.update_targets(vec![target("b", b.addr)]).unwrap();
         while {
@@ -2797,7 +2915,7 @@ mod tests {
 
         session.stop();
         let events = collect_group_events_until_disconnected(&sub);
-        let outcome = session.join().unwrap();
+        let outcome = join_group_with_timeout(session, Duration::from_secs(1));
         a.join();
         b.join();
 
@@ -2828,9 +2946,13 @@ mod tests {
                 overflow: SubscriberOverflow::DropNewest,
             })
             .expect("an idle dynamic group must still accept subscribers");
+        assert_eq!(
+            idle_subscription.recv_timeout(Duration::from_millis(30)),
+            Ok(None)
+        );
 
         session.stop();
-        let outcome = session.join().unwrap();
+        let outcome = join_group_with_timeout(session, Duration::from_secs(1));
         server.join();
 
         assert_eq!(outcome.end_reason, ManagedGroupEndReason::Cancelled);
@@ -2859,10 +2981,41 @@ mod tests {
         session.update_targets(Vec::new()).unwrap();
         session.stop();
         let events = collect_group_events_until_disconnected(&sub);
-        let outcome = session.join().unwrap();
+        let outcome = join_group_with_timeout(session, Duration::from_secs(1));
         server.join();
 
         assert_eq!(outcome.end_reason, ManagedGroupEndReason::Cancelled);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ManagedGroupEvent::TargetFinished(ManagedTargetOutcome {
+                id,
+                end_reason: ManagedTargetEndReason::Removed,
+                ..
+            }) if id.as_str() == "idle"
+        )));
+    }
+
+    #[test]
+    fn dropping_idle_dynamic_group_wakes_scheduler_and_disconnects() {
+        let interval = Duration::from_millis(20);
+        let server = start_echo_server(test_params(None, interval), Duration::ZERO);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.completion = ManagedGroupCompletionPolicy::ExplicitCancellation;
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("idle", server.addr)],
+            SubscriberConfig {
+                capacity: 16,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+
+        session.update_targets(Vec::new()).unwrap();
+        drop(session);
+        let events = collect_group_events_until_disconnected(&sub);
+        server.join();
+
         assert!(events.iter().any(|event| matches!(
             event,
             ManagedGroupEvent::TargetFinished(ManagedTargetOutcome {
