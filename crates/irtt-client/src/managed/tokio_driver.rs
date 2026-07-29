@@ -17,6 +17,7 @@ use tokio::{
 };
 
 const COMMAND_CAPACITY: usize = 1;
+const COMMAND_BUDGET: usize = 8;
 const EVENT_CAPACITY: usize = 16;
 
 /// Result produced by either the async managed driver or its blocking owner.
@@ -117,6 +118,9 @@ pub enum ManagedRunError {
     /// The dedicated worker thread panicked.
     #[error("managed client worker thread panicked")]
     WorkerPanicked,
+    /// The control revision cannot advance without wrapping.
+    #[error("managed client control revision overflowed")]
+    ControlRevisionOverflow,
 }
 
 /// Failure returned while submitting or acknowledging a control command.
@@ -134,6 +138,9 @@ pub enum ManagedCommandError {
     /// The task ended before acknowledging an accepted command.
     #[error("managed client command acknowledgement was disconnected")]
     AcknowledgementDisconnected,
+    /// The accepted command could not receive a distinct control revision.
+    #[error("managed client control revision overflowed")]
+    ControlRevisionOverflow,
 }
 
 /// Acknowledgement for an applied control barrier.
@@ -269,6 +276,8 @@ struct DriverResources {
     status: watch::Sender<Arc<ManagedStatus>>,
     stop_latch: Arc<StopLatch>,
     control_revision: u64,
+    #[cfg(test)]
+    status_at_terminal_event: Option<Arc<std::sync::Mutex<Vec<Arc<ManagedStatus>>>>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -292,6 +301,8 @@ pub struct ManagedClientTask {
     blocking_worker: bool,
     #[cfg(test)]
     panic_on_poll: bool,
+    #[cfg(test)]
+    stop_after_command_receive: bool,
 }
 
 impl ManagedClientTask {
@@ -317,10 +328,29 @@ impl ManagedClientTask {
         }
     }
 
-    fn apply_command(&mut self, command: ManagedCommand) {
+    fn publish_terminal_event(resources: &DriverResources, event: ManagedEvent) {
+        if let Some(events) = &resources.events {
+            let _ = events.send(event);
+        }
+        #[cfg(test)]
+        if let Some(observations) = &resources.status_at_terminal_event {
+            let status = Arc::clone(&resources.status.borrow());
+            observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(status);
+        }
+    }
+
+    fn apply_command(
+        &mut self,
+        command: ManagedCommand,
+    ) -> Result<(), oneshot::Sender<Result<ManagedCommandAck, ManagedCommandError>>> {
         match command {
             ManagedCommand::Barrier { ack } => {
-                let revision = self.resources().control_revision.saturating_add(1);
+                let Some(revision) = self.resources().control_revision.checked_add(1) else {
+                    return Err(ack);
+                };
                 self.resources_mut().control_revision = revision;
                 self.publish_status(ManagedStatus::Running {
                     control_revision: revision,
@@ -330,10 +360,10 @@ impl ManagedClientTask {
             }
             ManagedCommand::Wakeup => {}
         }
+        Ok(())
     }
 
-    fn reject_queued_commands(&mut self) {
-        let resources = self.resources_mut();
+    fn reject_queued_commands(resources: &mut DriverResources) {
         resources.commands.close();
         while let Ok(command) = resources.commands.try_recv() {
             if let ManagedCommand::Barrier { ack } = command {
@@ -342,29 +372,39 @@ impl ManagedClientTask {
         }
     }
 
-    fn disconnect_queued_commands(&mut self) {
-        let resources = self.resources_mut();
+    fn disconnect_queued_commands(resources: &mut DriverResources) {
         resources.commands.close();
         while resources.commands.try_recv().is_ok() {}
     }
 
     fn finish_gracefully(&mut self) -> Poll<ManagedTaskResult> {
         self.state = DriverState::Sealing;
-        self.resources().stop_latch.close();
-        let revision = self.resources().control_revision;
-        self.publish_status(ManagedStatus::Stopping {
-            control_revision: revision,
-        });
-        self.publish_event(ManagedEvent::Stopping);
-        self.reject_queued_commands();
+        let outcome = {
+            let resources = self
+                .resources
+                .as_mut()
+                .expect("managed task resources missing before graceful completion");
+            resources.stop_latch.close();
+            Self::reject_queued_commands(resources);
 
-        let outcome = ManagedOutcome {
-            control_revision: revision,
+            let revision = resources.control_revision;
+            let stopping = ManagedStatus::Stopping {
+                control_revision: revision,
+            };
+            let _ = resources.status.send_replace(Arc::new(stopping));
+            Self::publish_terminal_event(resources, ManagedEvent::Stopping);
+
+            let outcome = ManagedOutcome {
+                control_revision: revision,
+            };
+            let completed = ManagedStatus::Completed(outcome.clone());
+            let _ = resources.status.send_replace(Arc::new(completed));
+            Self::publish_terminal_event(resources, ManagedEvent::Completed(outcome.clone()));
+            resources.events.take();
+            outcome
         };
-        self.publish_event(ManagedEvent::Completed(outcome.clone()));
-        self.publish_status(ManagedStatus::Completed(outcome.clone()));
-        self.resources_mut().events.take();
-        self.resources.take();
+
+        drop(self.resources.take());
         self.state = DriverState::Finished;
         self.abandonment_guard_armed = false;
         Poll::Ready(Ok(outcome))
@@ -372,14 +412,18 @@ impl ManagedClientTask {
 
     fn seal_failure(&mut self, error: ManagedRunError) {
         self.state = DriverState::Sealing;
-        self.resources().stop_latch.close();
-        self.disconnect_queued_commands();
-        self.publish_event(ManagedEvent::Failed {
-            error: error.clone(),
-        });
-        self.publish_status(ManagedStatus::Failed { error });
-        self.resources_mut().events.take();
-        self.resources.take();
+        if let Some(resources) = self.resources.as_mut() {
+            resources.stop_latch.close();
+            Self::disconnect_queued_commands(resources);
+            let failed = ManagedStatus::Failed {
+                error: error.clone(),
+            };
+            let _ = resources.status.send_replace(Arc::new(failed));
+            Self::publish_terminal_event(resources, ManagedEvent::Failed { error });
+            resources.events.take();
+        }
+
+        drop(self.resources.take());
         self.state = DriverState::Finished;
         self.abandonment_guard_armed = false;
     }
@@ -396,12 +440,17 @@ impl ManagedClientTask {
 
     fn seal_abandoned(&mut self) {
         self.state = DriverState::Sealing;
-        self.resources().stop_latch.close();
-        self.disconnect_queued_commands();
-        self.publish_event(ManagedEvent::Abandoned);
-        self.publish_status(ManagedStatus::Abandoned);
-        self.resources_mut().events.take();
-        self.resources.take();
+        if let Some(resources) = self.resources.as_mut() {
+            resources.stop_latch.close();
+            Self::disconnect_queued_commands(resources);
+            let _ = resources
+                .status
+                .send_replace(Arc::new(ManagedStatus::Abandoned));
+            Self::publish_terminal_event(resources, ManagedEvent::Abandoned);
+            resources.events.take();
+        }
+
+        drop(self.resources.take());
         self.state = DriverState::Finished;
         self.abandonment_guard_armed = false;
     }
@@ -420,13 +469,15 @@ impl Future for ManagedClientTask {
 
         match task.state {
             DriverState::NotStarted => {
+                if !task.resources().stop_latch.is_open() {
+                    return task.finish_gracefully();
+                }
                 if runtime::Handle::try_current().is_err() {
                     return task.finish_failure(ManagedRunError::NoRuntime);
                 }
                 task.state = DriverState::Running;
-                task.publish_status(ManagedStatus::Running {
-                    control_revision: 0,
-                });
+                let control_revision = task.resources().control_revision;
+                task.publish_status(ManagedStatus::Running { control_revision });
                 task.publish_event(ManagedEvent::Started);
             }
             DriverState::Running => {}
@@ -438,7 +489,7 @@ impl Future for ManagedClientTask {
             }
         }
 
-        loop {
+        for _ in 0..COMMAND_BUDGET {
             if !task.resources().stop_latch.is_open() {
                 return task.finish_gracefully();
             }
@@ -452,14 +503,28 @@ impl Future for ManagedClientTask {
                 }
             };
 
+            #[cfg(test)]
+            if task.stop_after_command_receive {
+                task.stop_after_command_receive = false;
+                task.resources().stop_latch.close();
+            }
+
             if !task.resources().stop_latch.is_open() {
                 if let ManagedCommand::Barrier { ack } = command {
                     let _ = ack.send(Err(ManagedCommandError::Stopping));
                 }
                 return task.finish_gracefully();
             }
-            task.apply_command(command);
+            if let Err(ack) = task.apply_command(command) {
+                let error = ManagedRunError::ControlRevisionOverflow;
+                task.seal_failure(error.clone());
+                let _ = ack.send(Err(ManagedCommandError::ControlRevisionOverflow));
+                return Poll::Ready(Err(error));
+            }
         }
+
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
@@ -499,7 +564,18 @@ impl ManagedClient {
         ),
         ManagedStartError,
     > {
-        let (command_sender, commands) = mpsc::channel(COMMAND_CAPACITY);
+        Ok(Self::construct_async(COMMAND_CAPACITY, 0))
+    }
+
+    fn construct_async(
+        command_capacity: usize,
+        control_revision: u64,
+    ) -> (
+        ManagedClientTask,
+        ManagedClientHandle,
+        ManagedEventSubscription,
+    ) {
+        let (command_sender, commands) = mpsc::channel(command_capacity);
         let (event_sender, initial_events) = broadcast::channel(EVENT_CAPACITY);
         let (status_sender, status) = watch::channel(Arc::new(ManagedStatus::NotStarted));
         let stop_latch = Arc::new(StopLatch::new());
@@ -521,14 +597,18 @@ impl ManagedClient {
                 events: Some(event_sender),
                 status: status_sender,
                 stop_latch,
-                control_revision: 0,
+                control_revision,
+                #[cfg(test)]
+                status_at_terminal_event: None,
             }),
             abandonment_guard_armed: true,
             blocking_worker: false,
             #[cfg(test)]
             panic_on_poll: false,
+            #[cfg(test)]
+            stop_after_command_receive: false,
         };
-        Ok((task, handle, initial_events))
+        (task, handle, initial_events)
     }
 
     /// Start the same managed task on a dedicated current-thread Tokio runtime.
@@ -601,9 +681,13 @@ fn run_blocking_task(task: ManagedClientTask) -> ManagedTaskResult {
 mod tests {
     use std::{
         future::{poll_fn, Future},
+        panic::{catch_unwind, AssertUnwindSafe},
         pin::pin,
-        sync::mpsc as std_mpsc,
-        task::{Context, Poll, Waker},
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            mpsc as std_mpsc, Arc, Mutex,
+        },
+        task::{Context, Poll, Wake, Waker},
         thread,
         time::Duration,
     };
@@ -611,8 +695,8 @@ mod tests {
     use tokio::{runtime::Builder, sync::broadcast::error::TryRecvError};
 
     use super::{
-        ManagedClient, ManagedCommandError, ManagedEvent, ManagedOutcome, ManagedRunError,
-        ManagedStatus, ManagedSubscribeError,
+        ManagedClient, ManagedClientTask, ManagedCommandError, ManagedEvent, ManagedOutcome,
+        ManagedRunError, ManagedStatus, ManagedSubscribeError, COMMAND_BUDGET,
     };
 
     fn runtime() -> tokio::runtime::Runtime {
@@ -621,6 +705,51 @@ mod tests {
             .enable_time()
             .build()
             .unwrap()
+    }
+
+    fn runtime_without_drivers() -> tokio::runtime::Runtime {
+        Builder::new_current_thread().build().unwrap()
+    }
+
+    #[derive(Default)]
+    struct WakeCounter {
+        wakes: AtomicUsize,
+    }
+
+    impl Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.wakes.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn poll_once(
+        mut task: std::pin::Pin<&mut ManagedClientTask>,
+        wakes: &Arc<WakeCounter>,
+    ) -> Poll<super::ManagedTaskResult> {
+        let waker = Waker::from(Arc::clone(wakes));
+        let mut context = Context::from_waker(&waker);
+        task.as_mut().poll(&mut context)
+    }
+
+    fn record_terminal_statuses(
+        task: &mut ManagedClientTask,
+    ) -> Arc<Mutex<Vec<Arc<ManagedStatus>>>> {
+        let statuses = Arc::new(Mutex::new(Vec::new()));
+        task.resources_mut().status_at_terminal_event = Some(Arc::clone(&statuses));
+        statuses
+    }
+
+    fn recorded_statuses(statuses: &Arc<Mutex<Vec<Arc<ManagedStatus>>>>) -> Vec<ManagedStatus> {
+        statuses
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|status| status.as_ref().clone())
+            .collect()
     }
 
     #[test]
@@ -633,17 +762,40 @@ mod tests {
     }
 
     #[test]
-    fn task_constructed_outside_tokio_runs_inside_current_thread_runtime() {
-        let (task, handle, _events) = ManagedClient::start_async().unwrap();
+    fn pre_stopped_task_completes_without_starting_inside_tokio() {
+        let (task, handle, mut events) = ManagedClient::start_async().unwrap();
         handle.stop();
-        let outcome = runtime().block_on(task).unwrap();
+        let outcome = runtime_without_drivers().block_on(task).unwrap();
         assert_eq!(outcome.control_revision, 0);
-        assert_eq!(*handle.status(), ManagedStatus::Completed(outcome));
+        assert_eq!(*handle.status(), ManagedStatus::Completed(outcome.clone()));
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Stopping));
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Completed(outcome)));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
+    }
+
+    #[test]
+    fn pre_stopped_task_completes_without_tokio() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let (task, handle, mut events) = ManagedClient::start_async().unwrap();
+        handle.stop();
+        let mut task = pin!(task);
+        let waker = Waker::noop();
+        let mut context = Context::from_waker(waker);
+
+        let Poll::Ready(Ok(outcome)) = task.as_mut().poll(&mut context) else {
+            panic!("pre-stopped task did not complete gracefully");
+        };
+        assert_eq!(outcome.control_revision, 0);
+        assert_eq!(*handle.status(), ManagedStatus::Completed(outcome.clone()));
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Stopping));
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Completed(outcome)));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
     }
 
     #[test]
     fn first_poll_without_tokio_is_a_durable_startup_failure() {
-        let (task, handle, _events) = ManagedClient::start_async().unwrap();
+        let (mut task, handle, mut events) = ManagedClient::start_async().unwrap();
+        let observed_statuses = record_terminal_statuses(&mut task);
         let mut task = pin!(task);
         let waker = Waker::noop();
         let mut context = Context::from_waker(waker);
@@ -658,16 +810,34 @@ mod tests {
                 error: ManagedRunError::NoRuntime
             }
         );
+        assert_eq!(
+            events.try_recv(),
+            Ok(ManagedEvent::Failed {
+                error: ManagedRunError::NoRuntime
+            })
+        );
+        assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
+        assert_eq!(
+            recorded_statuses(&observed_statuses),
+            vec![ManagedStatus::Failed {
+                error: ManagedRunError::NoRuntime
+            }]
+        );
     }
 
     #[test]
     fn never_polled_task_drop_records_abandoned() {
-        let (task, handle, mut events) = ManagedClient::start_async().unwrap();
+        let (mut task, handle, mut events) = ManagedClient::start_async().unwrap();
+        let observed_statuses = record_terminal_statuses(&mut task);
         drop(task);
 
         assert_eq!(*handle.status(), ManagedStatus::Abandoned);
         assert_eq!(events.try_recv(), Ok(ManagedEvent::Abandoned));
         assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
+        assert_eq!(
+            recorded_statuses(&observed_statuses),
+            vec![ManagedStatus::Abandoned]
+        );
     }
 
     #[test]
@@ -701,6 +871,18 @@ mod tests {
     }
 
     #[test]
+    fn drop_with_already_released_resources_does_not_reseal_or_panic() {
+        let (task, handle, _events) = ManagedClient::start_async().unwrap();
+        handle.stop();
+        let mut task = Box::pin(task);
+        let outcome = runtime_without_drivers().block_on(&mut task).unwrap();
+        task.as_mut().get_mut().abandonment_guard_armed = true;
+
+        assert!(catch_unwind(AssertUnwindSafe(|| drop(task))).is_ok());
+        assert_eq!(*handle.status(), ManagedStatus::Completed(outcome));
+    }
+
+    #[test]
     fn handle_requests_but_cannot_drive_completion() {
         let (task, handle, _events) = ManagedClient::start_async().unwrap();
         handle.stop();
@@ -728,6 +910,19 @@ mod tests {
             task.await.unwrap().unwrap()
         });
         assert_eq!(**status.borrow(), ManagedStatus::Completed(outcome));
+    }
+
+    #[test]
+    fn final_handle_drop_before_first_poll_does_not_start_task() {
+        let (task, handle, mut events) = ManagedClient::start_async().unwrap();
+        let status = handle.status.clone();
+        drop(handle);
+
+        let outcome = runtime_without_drivers().block_on(task).unwrap();
+        assert_eq!(**status.borrow(), ManagedStatus::Completed(outcome.clone()));
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Stopping));
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Completed(outcome)));
+        assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
     }
 
     #[test]
@@ -813,15 +1008,190 @@ mod tests {
     }
 
     #[test]
-    fn existing_events_drain_after_terminal_sender_drop() {
-        let (task, handle, mut events) = ManagedClient::start_async().unwrap();
-        handle.stop();
-        let outcome = runtime().block_on(task).unwrap();
+    fn command_budget_limits_each_poll_and_self_wakes() {
+        let command_count = COMMAND_BUDGET + 1;
+        let (task, handle, _events) = ManagedClient::construct_async(command_count, 0);
+        let receipts: Vec<_> = (0..command_count)
+            .map(|_| handle.barrier().unwrap())
+            .collect();
+        let mut task = pin!(task);
+        let wakes = Arc::new(WakeCounter::default());
+        let runtime = runtime_without_drivers();
+        let runtime_guard = runtime.enter();
 
+        assert!(poll_once(task.as_mut(), &wakes).is_pending());
+        assert_eq!(
+            *handle.status(),
+            ManagedStatus::Running {
+                control_revision: COMMAND_BUDGET as u64
+            }
+        );
+        assert_eq!(wakes.wakes.load(Ordering::Relaxed), 1);
+
+        assert!(poll_once(task.as_mut(), &wakes).is_pending());
+        assert_eq!(
+            *handle.status(),
+            ManagedStatus::Running {
+                control_revision: command_count as u64
+            }
+        );
+        assert_eq!(wakes.wakes.load(Ordering::Relaxed), 1);
+
+        handle.stop();
+        let Poll::Ready(Ok(outcome)) = poll_once(task.as_mut(), &wakes) else {
+            panic!("stopped task did not complete");
+        };
+        assert_eq!(outcome.control_revision, command_count as u64);
+        drop(runtime_guard);
+
+        for (index, receipt) in receipts.into_iter().enumerate() {
+            assert_eq!(
+                runtime.block_on(receipt).unwrap().revision,
+                index as u64 + 1
+            );
+        }
+    }
+
+    #[test]
+    fn idle_poll_registers_receiver_without_self_waking() {
+        let (task, handle, _events) = ManagedClient::start_async().unwrap();
+        let mut task = pin!(task);
+        let wakes = Arc::new(WakeCounter::default());
+        let runtime = runtime_without_drivers();
+        let runtime_guard = runtime.enter();
+
+        assert!(poll_once(task.as_mut(), &wakes).is_pending());
+        assert_eq!(wakes.wakes.load(Ordering::Relaxed), 0);
+
+        handle.stop();
+        assert_eq!(wakes.wakes.load(Ordering::Relaxed), 1);
+        assert!(poll_once(task.as_mut(), &wakes).is_ready());
+        drop(runtime_guard);
+    }
+
+    #[test]
+    fn stop_wins_while_command_queue_is_refilled() {
+        let command_capacity = COMMAND_BUDGET * 2;
+        let (task, handle, _events) = ManagedClient::construct_async(command_capacity, 0);
+        let mut initial_receipts: Vec<_> = (0..command_capacity)
+            .map(|_| handle.barrier().unwrap())
+            .collect();
+        let mut task = pin!(task);
+        let wakes = Arc::new(WakeCounter::default());
+        let runtime = runtime_without_drivers();
+        let runtime_guard = runtime.enter();
+
+        assert!(poll_once(task.as_mut(), &wakes).is_pending());
+        assert_eq!(
+            *handle.status(),
+            ManagedStatus::Running {
+                control_revision: COMMAND_BUDGET as u64
+            }
+        );
+
+        let refilled_receipts: Vec<_> = (0..COMMAND_BUDGET)
+            .map(|_| handle.barrier().unwrap())
+            .collect();
+        handle.stop();
+        assert_eq!(handle.barrier().err(), Some(ManagedCommandError::Stopping));
+        let Poll::Ready(Ok(outcome)) = poll_once(task.as_mut(), &wakes) else {
+            panic!("stop did not preempt the refilled command queue");
+        };
+        assert_eq!(outcome.control_revision, COMMAND_BUDGET as u64);
+        drop(runtime_guard);
+
+        let rejected_receipts = initial_receipts.split_off(COMMAND_BUDGET);
+        for (index, receipt) in initial_receipts.into_iter().enumerate() {
+            assert_eq!(
+                runtime.block_on(receipt).unwrap().revision,
+                index as u64 + 1
+            );
+        }
+        for receipt in rejected_receipts.into_iter().chain(refilled_receipts) {
+            assert_eq!(
+                runtime.block_on(receipt),
+                Err(ManagedCommandError::Stopping)
+            );
+        }
+    }
+
+    #[test]
+    fn stop_after_receive_rejects_command_before_application() {
+        let (mut task, handle, mut events) = ManagedClient::start_async().unwrap();
+        let receipt = handle.barrier().unwrap();
+        task.stop_after_command_receive = true;
+
+        let outcome = runtime_without_drivers().block_on(task).unwrap();
+        assert_eq!(outcome.control_revision, 0);
+        assert_eq!(
+            runtime_without_drivers().block_on(receipt),
+            Err(ManagedCommandError::Stopping)
+        );
         assert_eq!(events.try_recv(), Ok(ManagedEvent::Started));
         assert_eq!(events.try_recv(), Ok(ManagedEvent::Stopping));
         assert_eq!(events.try_recv(), Ok(ManagedEvent::Completed(outcome)));
         assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
+    }
+
+    #[test]
+    fn control_revision_overflow_fails_without_applying_command() {
+        let (mut task, handle, mut events) = ManagedClient::construct_async(1, u64::MAX);
+        let observed_statuses = record_terminal_statuses(&mut task);
+        let receipt = handle.barrier().unwrap();
+
+        assert_eq!(
+            runtime_without_drivers().block_on(task),
+            Err(ManagedRunError::ControlRevisionOverflow)
+        );
+        assert_eq!(
+            runtime_without_drivers().block_on(receipt),
+            Err(ManagedCommandError::ControlRevisionOverflow)
+        );
+        assert_eq!(
+            *handle.status(),
+            ManagedStatus::Failed {
+                error: ManagedRunError::ControlRevisionOverflow
+            }
+        );
+        assert_eq!(handle.barrier().err(), Some(ManagedCommandError::Stopping));
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Started));
+        assert_eq!(
+            events.try_recv(),
+            Ok(ManagedEvent::Failed {
+                error: ManagedRunError::ControlRevisionOverflow
+            })
+        );
+        assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
+        assert_eq!(
+            recorded_statuses(&observed_statuses),
+            vec![ManagedStatus::Failed {
+                error: ManagedRunError::ControlRevisionOverflow
+            }]
+        );
+    }
+
+    #[test]
+    fn existing_events_drain_after_terminal_sender_drop() {
+        let (mut task, handle, mut events) = ManagedClient::start_async().unwrap();
+        let observed_statuses = record_terminal_statuses(&mut task);
+        handle.stop();
+        let outcome = runtime_without_drivers().block_on(task).unwrap();
+
+        assert_eq!(events.try_recv(), Ok(ManagedEvent::Stopping));
+        assert_eq!(
+            events.try_recv(),
+            Ok(ManagedEvent::Completed(outcome.clone()))
+        );
+        assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
+        assert_eq!(
+            recorded_statuses(&observed_statuses),
+            vec![
+                ManagedStatus::Stopping {
+                    control_revision: 0
+                },
+                ManagedStatus::Completed(outcome)
+            ]
+        );
     }
 
     #[test]
@@ -883,7 +1253,8 @@ mod tests {
 
     #[test]
     fn worker_panic_maps_to_failure_not_abandonment() {
-        let (mut task, handle, _events) = ManagedClient::start_async().unwrap();
+        let (mut task, handle, mut events) = ManagedClient::start_async().unwrap();
+        let observed_statuses = record_terminal_statuses(&mut task);
         task.panic_on_poll = true;
         let owner = ManagedClient::spawn_task(task, handle.clone()).unwrap();
 
@@ -893,6 +1264,19 @@ mod tests {
             ManagedStatus::Failed {
                 error: ManagedRunError::WorkerPanicked
             }
+        );
+        assert_eq!(
+            events.try_recv(),
+            Ok(ManagedEvent::Failed {
+                error: ManagedRunError::WorkerPanicked
+            })
+        );
+        assert_eq!(events.try_recv(), Err(TryRecvError::Closed));
+        assert_eq!(
+            recorded_statuses(&observed_statuses),
+            vec![ManagedStatus::Failed {
+                error: ManagedRunError::WorkerPanicked
+            }]
         );
     }
 }
