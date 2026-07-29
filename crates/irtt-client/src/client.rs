@@ -168,6 +168,7 @@ impl Client {
         self.recv_once_inner()
     }
 
+    #[cfg(not(feature = "tokio"))]
     pub(crate) fn recv_once_until(
         &mut self,
         deadline: Option<Instant>,
@@ -260,14 +261,17 @@ impl Client {
         self.runtime.is_peer_closed()
     }
 
+    #[cfg(not(feature = "tokio"))]
     pub(crate) fn has_timed_out_metadata(&self) -> bool {
         self.runtime.has_timed_out_metadata()
     }
 
+    #[cfg(not(feature = "tokio"))]
     pub(crate) fn packets_sent(&self) -> u64 {
         self.runtime.packets_sent()
     }
 
+    #[cfg(not(feature = "tokio"))]
     pub(crate) fn send_managed_probe(
         &mut self,
         scheduled_at: Instant,
@@ -293,6 +297,7 @@ impl Client {
         })
     }
 
+    #[cfg(any(test, not(feature = "tokio")))]
     fn send_managed_probe_inner(
         &mut self,
         scheduled_at: Instant,
@@ -329,6 +334,7 @@ impl Client {
     }
 }
 
+#[cfg(any(test, not(feature = "tokio")))]
 fn bounded_receive_timeout(
     deadline: Option<Instant>,
     configured_timeout: Option<Duration>,

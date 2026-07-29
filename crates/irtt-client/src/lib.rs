@@ -15,32 +15,35 @@
 //! events through a subscription:
 //!
 //! ```no_run
-//! use std::time::Duration;
-//!
-//! use irtt_client::{ClientConfig, ClientEvent, ManagedClient, SubscriberConfig};
-//!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = ClientConfig {
-//!     server_addr: "127.0.0.1:2112".to_owned(),
-//!     duration: Some(Duration::from_secs(10)),
-//!     interval: Duration::from_secs(1),
-//!     ..ClientConfig::default()
-//! };
+//! # #[cfg(not(feature = "tokio"))]
+//! # {
+//!     use std::time::Duration;
 //!
-//! let (session, events) =
-//!     ManagedClient::start_with_subscription(config, SubscriberConfig::default())?;
+//!     use irtt_client::{ClientConfig, ClientEvent, ManagedClient, SubscriberConfig};
 //!
-//! while let Ok(event) = events.recv() {
-//!     match event {
-//!         ClientEvent::EchoReply { seq, rtt, .. } => {
-//!             println!("seq={seq} effective_rtt_us={}", rtt.effective.as_micros());
+//!     let config = ClientConfig {
+//!         server_addr: "127.0.0.1:2112".to_owned(),
+//!         duration: Some(Duration::from_secs(10)),
+//!         interval: Duration::from_secs(1),
+//!         ..ClientConfig::default()
+//!     };
+//!
+//!     let (session, events) =
+//!         ManagedClient::start_with_subscription(config, SubscriberConfig::default())?;
+//!
+//!     while let Ok(event) = events.recv() {
+//!         match event {
+//!             ClientEvent::EchoReply { seq, rtt, .. } => {
+//!                 println!("seq={seq} effective_rtt_us={}", rtt.effective.as_micros());
+//!             }
+//!             ClientEvent::SessionClosed { .. } => break,
+//!             _ => {}
 //!         }
-//!         ClientEvent::SessionClosed { .. } => break,
-//!         _ => {}
 //!     }
-//! }
 //!
-//! let _outcome = session.join()?;
+//!     let _outcome = session.join()?;
+//! }
 //! # Ok(())
 //! # }
 //! ```
@@ -77,12 +80,19 @@ pub use event::{
 };
 pub use managed::{
     CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientGroup,
-    ManagedClientGroupConfig, ManagedClientGroupSession, ManagedClientSession,
-    ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, ManagedGroupOutcome,
-    ManagedGroupPacing, ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure,
-    ManagedTargetFailureKind, ManagedTargetOutcome, SessionEndReason, SessionOutcome,
-    SubscriberConfig, SubscriberOverflow, TargetEvent, TargetEventSubscription, TargetId,
-    MANAGED_GROUP_OUTCOME_HISTORY_LIMIT,
+    ManagedClientGroupConfig, ManagedClientGroupSession, ManagedGroupCompletionPolicy,
+    ManagedGroupEndReason, ManagedGroupEvent, ManagedGroupOutcome, ManagedGroupPacing,
+    ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure, ManagedTargetFailureKind,
+    ManagedTargetOutcome, SubscriberConfig, SubscriberOverflow, TargetEvent,
+    TargetEventSubscription, TargetId, MANAGED_GROUP_OUTCOME_HISTORY_LIMIT,
 };
+#[cfg(feature = "tokio")]
+pub use managed::{
+    ManagedClientHandle, ManagedClientTask, ManagedCommandAck, ManagedCommandError,
+    ManagedCommandReceipt, ManagedEvent, ManagedEventSubscription, ManagedOutcome, ManagedRunError,
+    ManagedStartError, ManagedStatus, ManagedSubscribeError, ManagedTaskResult,
+};
+#[cfg(not(feature = "tokio"))]
+pub use managed::{ManagedClientSession, SessionEndReason, SessionOutcome};
 pub use session::{NegotiatedParams, NegotiationRestriction};
 pub use timing::ClientTimestamp;
