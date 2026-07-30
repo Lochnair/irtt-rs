@@ -7,6 +7,7 @@ use irtt_proto::{
 };
 
 use crate::{
+    client::schedule::ProbeSchedule,
     config::{
         ClientConfig, RunMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_UDP_PAYLOAD_LENGTH,
     },
@@ -56,13 +57,9 @@ struct ActiveSession {
     next_wire_seq: u32,
     highest_received_seq: Option<u32>,
     packets_sent: u64,
-    start_mono: Instant,
-    end_mono: Option<Instant>,
-    next_send_at: Instant,
     pending: PendingMap,
     timed_out: TimedOutMap,
     completed: CompletedSet,
-    sending_done: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -159,33 +156,25 @@ impl SessionMachine {
         }
     }
 
-    pub(crate) fn next_send_deadline(&self) -> Option<Instant> {
-        let MachineState::Open(session) = &self.state else {
-            return None;
-        };
-        if session.sending_done {
-            return None;
-        }
-        Some(session.next_send_at)
-    }
-
     pub(crate) fn probe_timeout(&self) -> Duration {
         self.config.probe_timeout
     }
 
     pub(crate) fn send_probe_with<F>(
         &mut self,
+        schedule: &mut ProbeSchedule,
         override_ts: Option<ClientTimestamp>,
         send: F,
     ) -> Result<Vec<ClientEvent>, ClientError>
     where
         F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
     {
-        self.send_probe_inner(override_ts, None, false, send)
+        self.send_probe_inner(schedule, override_ts, None, false, send)
     }
 
     pub(crate) fn send_probe_for_deadline<F>(
         &mut self,
+        schedule: &mut ProbeSchedule,
         override_ts: Option<ClientTimestamp>,
         scheduled_at: Instant,
         send: F,
@@ -193,11 +182,12 @@ impl SessionMachine {
     where
         F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
     {
-        self.send_probe_inner(override_ts, Some(scheduled_at), true, send)
+        self.send_probe_inner(schedule, override_ts, Some(scheduled_at), true, send)
     }
 
     fn send_probe_inner<F>(
         &mut self,
+        schedule: &mut ProbeSchedule,
         override_ts: Option<ClientTimestamp>,
         scheduled_at_override: Option<Instant>,
         skip_missed_slots: bool,
@@ -206,6 +196,11 @@ impl SessionMachine {
     where
         F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
     {
+        let now = override_ts.unwrap_or_else(ClientTimestamp::now);
+        if !schedule.permit_probe_at(now.mono) {
+            return Ok(vec![]);
+        }
+
         let (config, state) = (&self.config, &mut self.state);
         let probe_timeout = config.probe_timeout;
         let hmac_key = config.hmac_key.as_deref();
@@ -216,23 +211,9 @@ impl SessionMachine {
             MachineState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         };
 
-        if session.sending_done {
-            return Ok(vec![]);
-        }
-
-        let now = override_ts.unwrap_or_else(ClientTimestamp::now);
-
-        if let Some(end) = session.end_mono {
-            if now.mono >= end {
-                session.sending_done = true;
-                return Ok(vec![]);
-            }
-        }
-
         session.pending.check_capacity()?;
 
         let wire_seq = session.next_wire_seq;
-        let scheduled_at = scheduled_at_override.unwrap_or(session.next_send_at);
 
         let request = EchoRequest {
             token: session.token,
@@ -263,27 +244,17 @@ impl SessionMachine {
                     counter: "packets_sent",
                 })?;
 
-        let interval_ns = u64::try_from(session.negotiated.params.interval_ns)
-            .expect("validated positive negotiated interval");
-        let interval = Duration::from_nanos(interval_ns);
-        let (scheduled_at, next_send_at) = if skip_missed_slots {
-            let (scheduled_at, next_send_at, _) =
-                advance_cadence(scheduled_at, interval, send_result.sent_at.mono)?;
-            (scheduled_at, next_send_at)
+        let schedule_commit = if skip_missed_slots {
+            schedule.preflight_managed_commit(
+                scheduled_at_override.expect("managed sends include a scheduled deadline"),
+                send_result.sent_at.mono,
+            )?
         } else {
-            (
-                scheduled_at,
-                next_probe_deadline(session.start_mono, interval_ns, session.packets_sent)?,
-            )
+            schedule.preflight_caller_commit(send_result.sent_at.mono, session.packets_sent)?
         };
-        let timer_error = instant_abs_diff(send_result.sent_at.mono, scheduled_at);
-        session.next_send_at = next_send_at;
-
-        if let Some(end) = session.end_mono {
-            if session.next_send_at >= end {
-                session.sending_done = true;
-            }
-        }
+        let scheduled_at = schedule_commit.scheduled_at;
+        let timer_error = schedule_commit.timer_error;
+        schedule.commit(schedule_commit);
 
         Ok(vec![ClientEvent::EchoSent {
             seq: wire_seq,
@@ -358,12 +329,19 @@ impl SessionMachine {
         }])
     }
 
-    pub(crate) fn is_run_complete(&self) -> bool {
+    pub(crate) fn pending_is_empty(&self) -> bool {
         match &self.state {
-            MachineState::Open(session) => session.sending_done && session.pending.len() == 0,
+            MachineState::Open(session) => session.pending.len() == 0,
             MachineState::NoTestCompleted | MachineState::Closed { .. } => true,
             MachineState::Connected => false,
         }
+    }
+
+    pub(crate) fn is_terminal(&self) -> bool {
+        matches!(
+            self.state,
+            MachineState::NoTestCompleted | MachineState::Closed { .. }
+        )
     }
 
     pub(crate) fn is_peer_closed(&self) -> bool {
@@ -395,6 +373,10 @@ impl SessionMachine {
         matches!(self.state, MachineState::Open(_))
     }
 
+    pub(crate) fn ensure_open(&self) -> Result<(), ClientError> {
+        self.open_session().map(|_| ())
+    }
+
     fn accept_normal_open<F>(
         &mut self,
         reply: OpenReply,
@@ -412,28 +394,15 @@ impl SessionMachine {
         )?;
         before_normal_open(&negotiated)?;
 
-        let end_mono = if negotiated.params.duration_ns > 0 {
-            Some(negotiated_end_mono(
-                now.mono,
-                negotiated.params.duration_ns,
-            )?)
-        } else {
-            None
-        };
-
         self.state = MachineState::Open(ActiveSession {
             token,
             negotiated: negotiated.clone(),
             next_wire_seq: 0,
             highest_received_seq: None,
             packets_sent: 0,
-            start_mono: now.mono,
-            end_mono,
-            next_send_at: now.mono,
             pending: PendingMap::new(self.config.max_pending_probes),
             timed_out: TimedOutMap::new(self.config.max_pending_probes),
             completed: CompletedSet::new(self.config.max_pending_probes),
-            sending_done: false,
         });
 
         let event = ClientEvent::SessionStarted {
@@ -704,79 +673,12 @@ pub(crate) fn update_highest_received(highest_received_seq: &mut Option<u32>, wi
     }));
 }
 
-fn next_probe_deadline(
-    start: Instant,
-    interval_ns: u64,
-    packets_sent: u64,
-) -> Result<Instant, ClientError> {
-    let offset_ns = interval_ns
-        .checked_mul(packets_sent)
-        .ok_or(ClientError::DurationOverflow)?;
-    start
-        .checked_add(Duration::from_nanos(offset_ns))
-        .ok_or(ClientError::DurationOverflow)
-}
-
-pub(crate) fn advance_cadence(
-    deadline: Instant,
-    interval: Duration,
-    now: Instant,
-) -> Result<(Instant, Instant, u128), ClientError> {
-    if interval.is_zero() {
-        return Err(ClientError::InvalidConfig {
-            reason: "probe interval must be greater than zero".to_owned(),
-        });
-    }
-
-    let elapsed_slots = now
-        .checked_duration_since(deadline)
-        .map_or(0, |elapsed| elapsed.as_nanos() / interval.as_nanos());
-    let scheduled_offset = duration_from_nanos(
-        interval
-            .as_nanos()
-            .checked_mul(elapsed_slots)
-            .ok_or(ClientError::DurationOverflow)?,
-    )?;
-    let next_offset = duration_from_nanos(
-        interval
-            .as_nanos()
-            .checked_mul(
-                elapsed_slots
-                    .checked_add(1)
-                    .ok_or(ClientError::DurationOverflow)?,
-            )
-            .ok_or(ClientError::DurationOverflow)?,
-    )?;
-    let scheduled_at = deadline
-        .checked_add(scheduled_offset)
-        .ok_or(ClientError::DurationOverflow)?;
-    let next_at = deadline
-        .checked_add(next_offset)
-        .ok_or(ClientError::DurationOverflow)?;
-    Ok((scheduled_at, next_at, elapsed_slots))
-}
-
-fn duration_from_nanos(nanos: u128) -> Result<Duration, ClientError> {
-    const NANOS_PER_SECOND: u128 = 1_000_000_000;
-    let seconds =
-        u64::try_from(nanos / NANOS_PER_SECOND).map_err(|_| ClientError::DurationOverflow)?;
-    let subsec_nanos = u32::try_from(nanos % NANOS_PER_SECOND)
-        .expect("nanosecond remainder is always less than one second");
-    Ok(Duration::new(seconds, subsec_nanos))
-}
-
 pub(crate) fn sequence_is_after(candidate: u32, current: u32) -> bool {
     candidate != current && candidate.wrapping_sub(current) < (1 << 31)
 }
 
 pub(crate) fn sequence_is_before(candidate: u32, current: u32) -> bool {
     current != candidate && current.wrapping_sub(candidate) < (1 << 31)
-}
-
-fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
-    left.checked_duration_since(right)
-        .or_else(|| right.checked_duration_since(left))
-        .unwrap_or(Duration::ZERO)
 }
 
 pub(crate) fn compute_rtt(
@@ -928,14 +830,4 @@ fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientE
     i64::try_from(duration.as_nanos()).map_err(|_| ClientError::InvalidConfig {
         reason: format!("{field} is too large to encode as nanoseconds"),
     })
-}
-
-fn negotiated_end_mono(start: Instant, duration_ns: i64) -> Result<Instant, ClientError> {
-    debug_assert!(duration_ns > 0);
-    let duration_ns = u64::try_from(duration_ns).expect("validated positive negotiated duration");
-    start
-        .checked_add(Duration::from_nanos(duration_ns))
-        .ok_or_else(|| ClientError::NegotiationRejected {
-            reason: "duration is too large to schedule".to_owned(),
-        })
 }

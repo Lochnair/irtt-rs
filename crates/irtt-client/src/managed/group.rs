@@ -12,12 +12,13 @@ use std::{
 };
 
 use crate::{
+    client::schedule::{advance_cadence, ProbeSchedule},
     config::{ClientAuthConfig, ClientConfig},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
     metadata::ReceiveMeta,
     receive::recv_datagram_from,
-    session::machine::{advance_cadence, params_from_config, SendProbeResult, SessionMachine},
+    session::machine::{params_from_config, SendProbeResult, SessionMachine},
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
@@ -626,6 +627,7 @@ struct TargetState {
     remote: SocketAddr,
     configured_auth: Option<ClientAuthConfig>,
     runtime: SessionMachine,
+    schedule: Option<ProbeSchedule>,
     status: TargetStatus,
     open_packet: Vec<u8>,
     counters: TargetCounters,
@@ -716,6 +718,7 @@ impl TargetState {
             remote: target.remote,
             configured_auth: target.auth,
             runtime,
+            schedule: None,
             status: TargetStatus::Opening {
                 attempt: 0,
                 next_send_at: now,
@@ -747,6 +750,14 @@ impl TargetState {
         }
         self.status = TargetStatus::Finished;
         self.final_reason = Some(reason);
+    }
+
+    fn is_run_complete(&self) -> bool {
+        self.runtime.is_terminal()
+            || self
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.is_finished() && self.runtime.pending_is_empty())
     }
 
     fn outcome(&self, reason: ManagedTargetEndReason) -> ManagedTargetOutcome {
@@ -872,16 +883,21 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
             let mut target = target.lock().expect("target mutex poisoned");
             match target.status {
                 TargetStatus::Opening { .. } => {
+                    let opened_at = datagram.received_at;
+                    let mut schedule = None;
                     let result = target.runtime.decode_open_reply(packet).and_then(|reply| {
-                        target.runtime.accept_open_reply(
-                            reply,
-                            datagram.received_at,
-                            |negotiated| validate_group_negotiation(&shared, negotiated),
-                        )
+                        target
+                            .runtime
+                            .accept_open_reply(reply, opened_at, |negotiated| {
+                                validate_group_negotiation(&shared, negotiated)?;
+                                schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
+                                Ok(())
+                            })
                     });
 
                     match result {
                         Ok(outcome) => {
+                            target.schedule = schedule;
                             publish_open_outcome(&shared.hub, &mut target, outcome);
                             wake_scheduler = true;
                         }
@@ -1251,7 +1267,7 @@ fn finish_completed_targets(socket: &UdpSocket, shared: &GroupShared, now: Insta
     for target in all_targets(shared) {
         let mut target = target.lock().expect("target mutex poisoned");
         match target.status {
-            TargetStatus::Active if target.runtime.is_run_complete() => {
+            TargetStatus::Active if target.is_run_complete() => {
                 if target.runtime.is_peer_closed() {
                     target.mark_finished(ManagedTargetEndReason::PeerClosed);
                 } else if target.runtime.has_timed_out_metadata() {
@@ -1295,19 +1311,27 @@ fn send_echo_to_target(
         return;
     }
     let remote = target.remote;
-    let result = target
+    target
         .runtime
-        .send_probe_for_deadline(None, scheduled_at, |packet| {
-            let sent_at = ClientTimestamp::now();
-            let send_call_start = Instant::now();
-            let bytes = socket.send_to(packet, remote)?;
-            let send_call = send_call_start.elapsed();
-            Ok(SendProbeResult {
-                sent_at,
-                bytes,
-                send_call,
-            })
-        });
+        .ensure_open()
+        .expect("active targets are open");
+    let TargetState {
+        runtime, schedule, ..
+    } = &mut *target;
+    let schedule = schedule
+        .as_mut()
+        .expect("active targets always have a probe schedule");
+    let result = runtime.send_probe_for_deadline(schedule, None, scheduled_at, |packet| {
+        let sent_at = ClientTimestamp::now();
+        let send_call_start = Instant::now();
+        let bytes = socket.send_to(packet, remote)?;
+        let send_call = send_call_start.elapsed();
+        Ok(SendProbeResult {
+            sent_at,
+            bytes,
+            send_call,
+        })
+    });
 
     match result {
         Ok(events) => {
@@ -1619,7 +1643,7 @@ fn target_is_due_for_slot(target: &Arc<Mutex<TargetState>>, scheduled_at: Instan
 fn target_next_send_deadline(target: &Arc<Mutex<TargetState>>) -> Option<Instant> {
     let target = target.lock().expect("target mutex poisoned");
     if matches!(target.status, TargetStatus::Active) {
-        target.runtime.next_send_deadline()
+        target.schedule.as_ref()?.next_send_deadline()
     } else {
         None
     }
@@ -1810,24 +1834,38 @@ mod tests {
 
         let open_packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params);
         let open_reply = target.runtime.decode_open_reply(&open_packet).unwrap();
+        let opened_at = ClientTimestamp::now();
+        let mut opened_schedule = None;
         let open_outcome = target
             .runtime
-            .accept_open_reply(open_reply, ClientTimestamp::now(), |_| Ok(()))
+            .accept_open_reply(open_reply, opened_at, |negotiated| {
+                opened_schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
+                Ok(())
+            })
             .unwrap();
+        target.schedule = opened_schedule;
         publish_open_outcome(&hub, &mut target, open_outcome);
 
         let scheduled_at = Instant::now();
         let sent_at = ClientTimestamp::now();
-        let sent_events = target
-            .runtime
-            .send_probe_for_deadline(Some(sent_at), scheduled_at, |packet| {
-                Ok(SendProbeResult {
-                    sent_at,
-                    bytes: packet.len(),
-                    send_call: Duration::ZERO,
-                })
-            })
-            .unwrap();
+        let sent_events = {
+            let TargetState {
+                runtime, schedule, ..
+            } = &mut target;
+            runtime.send_probe_for_deadline(
+                schedule.as_mut().unwrap(),
+                Some(sent_at),
+                scheduled_at,
+                |packet| {
+                    Ok(SendProbeResult {
+                        sent_at,
+                        bytes: packet.len(),
+                        send_call: Duration::ZERO,
+                    })
+                },
+            )
+        }
+        .unwrap();
         publish_events(&hub, &mut target, sent_events);
 
         ActiveTargetFixture {
