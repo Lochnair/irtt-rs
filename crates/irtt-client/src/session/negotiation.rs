@@ -1,11 +1,10 @@
-use std::{fmt, time::Instant};
+use std::fmt;
 
 use irtt_proto::{Clock, Params, ReceivedStats, StampAt, PROTOCOL_VERSION};
 
 use crate::{
     config::{NegotiationPolicy, MAX_DSCP_CODEPOINT},
     error::ClientError,
-    probe::{CompletedSet, PendingMap, TimedOutMap},
 };
 
 /// Protocol parameters accepted for a session.
@@ -154,34 +153,6 @@ impl fmt::Display for NegotiationRestriction {
             Self::ServerFillChanged => write!(f, "server changed payload fill behavior"),
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ClientPhase {
-    Connected,
-    Open { token: u64 },
-    NoTestCompleted,
-    Closed { source: CloseSource },
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CloseSource {
-    Local,
-    Peer,
-}
-
-#[derive(Debug)]
-pub(crate) struct ActiveSession {
-    pub next_wire_seq: u32,
-    pub highest_received_seq: Option<u32>,
-    pub packets_sent: u64,
-    pub start_mono: Instant,
-    pub end_mono: Option<Instant>,
-    pub next_send_at: Instant,
-    pub pending: PendingMap,
-    pub timed_out: TimedOutMap,
-    pub completed: CompletedSet,
-    pub sending_done: bool,
 }
 
 pub(crate) fn negotiate_params(

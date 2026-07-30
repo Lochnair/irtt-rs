@@ -12,7 +12,7 @@ use crate::{
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
     receive::recv_datagram,
-    runtime::{recv_buffer_size, SendProbeResult, SessionRuntime, MAX_OPEN_PACKET_SIZE},
+    session::machine::{recv_buffer_size, SendProbeResult, SessionMachine, MAX_OPEN_PACKET_SIZE},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
@@ -20,7 +20,7 @@ use crate::{
 
 #[cfg(test)]
 use crate::{
-    runtime::{
+    session::machine::{
         compute_one_way, compute_rtt, params_from_config, sequence_is_after, sequence_is_before,
         unix_epoch_ns_i64, update_highest_received,
     },
@@ -36,7 +36,7 @@ use crate::{
 /// instead.
 #[derive(Debug)]
 pub struct Client {
-    runtime: SessionRuntime,
+    runtime: SessionMachine,
     socket: UdpSocket,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
@@ -51,7 +51,7 @@ impl Client {
     pub fn connect(config: ClientConfig) -> Result<Self, ClientError> {
         validate_open_timeouts(&config.open_timeouts)?;
         let remote = resolve_remote(&config)?;
-        let runtime = SessionRuntime::new(config.clone(), remote)?;
+        let runtime = SessionMachine::new(config.clone(), remote)?;
         let socket = connect_udp_socket(&config.socket_config, remote)?;
 
         Ok(Self {

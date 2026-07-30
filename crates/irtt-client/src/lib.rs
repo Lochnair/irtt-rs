@@ -62,7 +62,6 @@ mod managed;
 mod metadata;
 mod probe;
 mod receive;
-mod runtime;
 mod session;
 mod socket;
 mod socket_options;
