@@ -1336,7 +1336,7 @@ fn send_echo_to_locked_target(
     scheduled_at: Instant,
 ) -> Result<Vec<ClientEvent>, ClientError> {
     target.runtime.ensure_open()?;
-    let permission_now = Instant::now();
+    let sent_at = ClientTimestamp::now();
     let remote = target.remote;
     let TargetState {
         runtime, schedule, ..
@@ -1344,14 +1344,13 @@ fn send_echo_to_locked_target(
     let schedule = schedule
         .as_mut()
         .expect("active targets always have a probe schedule");
-    if !schedule.permit_probe_at(permission_now) {
+    if !schedule.permit_probe_at(sent_at.mono) {
         return Ok(Vec::new());
     }
 
     let Some(prepared) = runtime.prepare_probe()? else {
         return Ok(Vec::new());
     };
-    let sent_at = ClientTimestamp::now();
     let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at)?;
     let schedule_commit = schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?;
     let mut events = Vec::new();

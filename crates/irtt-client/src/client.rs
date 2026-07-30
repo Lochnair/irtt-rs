@@ -331,20 +331,19 @@ impl Client {
         mode: ProbeScheduleMode,
     ) -> Result<Vec<ClientEvent>, ClientError> {
         self.runtime.ensure_open()?;
-        let permission_now = override_ts.map_or_else(Instant::now, |timestamp| timestamp.mono);
+        let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
         let remote = self.remote;
         let (runtime, schedule, socket) = (&mut self.runtime, &mut self.schedule, &self.socket);
         let schedule = schedule
             .as_mut()
             .expect("open sessions always have a probe schedule");
-        if !schedule.permit_probe_at(permission_now) {
+        if !schedule.permit_probe_at(sent_at.mono) {
             return Ok(Vec::new());
         }
 
         let Some(prepared) = runtime.prepare_probe()? else {
             return Ok(Vec::new());
         };
-        let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
         let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at)?;
         let schedule_commit = match mode {
             ProbeScheduleMode::CallerPaced => {

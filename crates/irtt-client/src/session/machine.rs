@@ -201,10 +201,12 @@ impl SessionMachine {
     ) -> Result<ProbeCommit, ClientError> {
         let probe_timeout = self.config.probe_timeout;
         let session = self.open_session_mut()?;
-        debug_assert_eq!(
-            prepared.seq, session.next_wire_seq,
-            "prepared probes are committed before preparing another probe"
-        );
+        if prepared.seq != session.next_wire_seq {
+            return Err(ClientError::StalePreparedProbe {
+                prepared_seq: prepared.seq,
+                next_wire_seq: session.next_wire_seq,
+            });
+        }
         session.pending.preflight_insert(prepared.seq)?;
         let next_packets_sent =
             session
@@ -903,6 +905,31 @@ mod tests {
         assert_eq!(session.next_wire_seq, 0);
         assert_eq!(session.packets_sent, 0);
         assert_eq!(session.pending.len(), 0);
+    }
+
+    #[test]
+    fn stale_prepared_probe_is_rejected_without_changing_state() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let stale = machine.prepare_probe().unwrap().unwrap();
+        let accepted = machine.prepare_probe().unwrap().unwrap();
+        let sent_at = timestamp(Instant::now());
+        let commit = machine.preflight_probe_commit(&accepted, sent_at).unwrap();
+        machine.commit_probe_sent(commit, metadata(accepted.bytes.len()));
+
+        let capacity = active(&machine).pending.capacity();
+        assert!(matches!(
+            machine.preflight_probe_commit(&stale, sent_at),
+            Err(ClientError::StalePreparedProbe {
+                prepared_seq: 0,
+                next_wire_seq: 1,
+            })
+        ));
+
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 1);
+        assert_eq!(session.packets_sent, 1);
+        assert_eq!(session.pending.len(), 1);
+        assert_eq!(session.pending.capacity(), capacity);
     }
 
     #[test]
