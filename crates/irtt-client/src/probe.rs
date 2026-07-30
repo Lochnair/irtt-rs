@@ -82,7 +82,7 @@ impl PendingMap {
     }
 
     #[cfg(test)]
-    fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.map.capacity()
     }
 }

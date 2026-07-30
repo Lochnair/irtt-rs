@@ -981,6 +981,25 @@ mod tests {
     }
 
     #[test]
+    fn commit_uses_reserved_capacity_and_prevalidated_counter() {
+        let mut machine = open_machine(2, Duration::from_secs(1));
+        active_mut(&mut machine).packets_sent = u64::MAX - 1;
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let commit = machine
+            .preflight_probe_commit(&prepared, timestamp(Instant::now()))
+            .unwrap();
+        let reserved_capacity = active(&machine).pending.capacity();
+
+        machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+
+        let session = active(&machine);
+        assert_eq!(session.pending.capacity(), reserved_capacity);
+        assert_eq!(session.pending.len(), 1);
+        assert_eq!(session.packets_sent, u64::MAX);
+        assert_eq!(session.next_wire_seq, 1);
+    }
+
+    #[test]
     fn pending_capacity_exhaustion_is_detected_before_commit() {
         let mut machine = open_machine(1, Duration::from_secs(1));
         let first = machine.prepare_probe().unwrap().unwrap();
