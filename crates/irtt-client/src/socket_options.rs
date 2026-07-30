@@ -75,22 +75,6 @@ pub(crate) fn apply_ttl_to_socket(
     })
 }
 
-#[cfg(all(feature = "tokio", not(unix)))]
-pub(crate) fn apply_ttl_to_tokio_socket(
-    socket: &tokio::net::UdpSocket,
-    remote: SocketAddr,
-    ttl: u32,
-) -> Result<(), ClientError> {
-    validate_ttl(ttl)?;
-    set_socket_ttl_ref(SockRef::from(socket), remote, ttl).map_err(|source| {
-        ClientError::SocketOption {
-            operation: "set TTL/hop limit",
-            remote,
-            source,
-        }
-    })
-}
-
 #[cfg(test)]
 pub(crate) fn socket_traffic_class(
     socket: &UdpSocket,

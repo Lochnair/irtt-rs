@@ -12,9 +12,6 @@ use crate::{
     socket_options::apply_ttl_to_socket,
 };
 
-#[cfg(all(feature = "tokio", not(unix)))]
-use crate::socket_options::apply_ttl_to_tokio_socket;
-
 pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), ClientError> {
     if timeouts.is_empty() {
         return Err(ClientError::NoOpenTimeouts);
@@ -117,16 +114,7 @@ fn create_connected_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
 ) -> Result<UdpSocket, ClientError> {
-    let domain = if remote.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
-
-    if config.ipv6_only && remote.is_ipv6() {
-        socket.set_only_v6(true)?;
-    }
+    let socket = create_prebind_udp_socket(config, remote)?;
     let bind_addr = config.bind_addr.unwrap_or_else(|| {
         if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
@@ -149,7 +137,24 @@ fn create_connected_udp_socket(
     Ok(socket)
 }
 
-#[cfg(all(feature = "tokio", unix))]
+fn create_prebind_udp_socket(
+    config: &SocketConfig,
+    remote: SocketAddr,
+) -> Result<Socket, ClientError> {
+    let domain = if remote.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+    if config.ipv6_only && remote.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    Ok(socket)
+}
+
+#[cfg(feature = "tokio")]
 pub(crate) async fn connect_tokio_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
@@ -157,26 +162,6 @@ pub(crate) async fn connect_tokio_udp_socket(
     let socket = create_connected_udp_socket(config, remote)?;
     socket.set_nonblocking(true)?;
     Ok(tokio::net::UdpSocket::from_std(socket)?)
-}
-
-#[cfg(all(feature = "tokio", not(unix)))]
-pub(crate) async fn connect_tokio_udp_socket(
-    config: &SocketConfig,
-    remote: SocketAddr,
-) -> Result<tokio::net::UdpSocket, ClientError> {
-    let bind_addr = config.bind_addr.unwrap_or_else(|| {
-        if remote.is_ipv4() {
-            SocketAddr::from(([0, 0, 0, 0], 0))
-        } else {
-            SocketAddr::from(([0_u16; 8], 0))
-        }
-    });
-    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
-    socket.connect(remote).await?;
-    if let Some(ttl) = config.ttl {
-        apply_ttl_to_tokio_socket(&socket, remote, ttl)?;
-    }
-    Ok(socket)
 }
 
 pub(crate) fn bind_unconnected_udp_socket(
@@ -230,5 +215,103 @@ mod tests {
         assert_eq!(normalize_server_addr("::1"), "[::1]:2112");
         assert_eq!(normalize_server_addr("[::1]"), "[::1]:2112");
         assert_eq!(normalize_server_addr("[::1]:1234"), "[::1]:1234");
+    }
+
+    #[test]
+    fn address_family_filtering_remains_unchanged() {
+        let ipv4 = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT));
+        let ipv6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], DEFAULT_PORT));
+        let mut config = ClientConfig::default();
+
+        assert!(address_family_allowed(&config, ipv4));
+        assert!(address_family_allowed(&config, ipv6));
+
+        config.socket_config.ipv4_only = true;
+        assert!(address_family_allowed(&config, ipv4));
+        assert!(!address_family_allowed(&config, ipv6));
+
+        config.socket_config.ipv4_only = false;
+        config.socket_config.ipv6_only = true;
+        assert!(!address_family_allowed(&config, ipv4));
+        assert!(address_family_allowed(&config, ipv6));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_ipv6_only_is_applied_before_bind() {
+        let config = SocketConfig {
+            ipv6_only: true,
+            ..SocketConfig::default()
+        };
+        let remote = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], DEFAULT_PORT));
+
+        let socket = create_prebind_udp_socket(&config, remote).unwrap();
+
+        assert!(socket.only_v6().unwrap());
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_ipv6_socket_preserves_v6only_and_explicit_bind() {
+        let bind_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0));
+        let peer = match UdpSocket::bind(bind_addr) {
+            Ok(peer) => peer,
+            Err(error) if ipv6_loopback_unavailable(&error) => {
+                eprintln!("skipping IPv6 Tokio socket test: IPv6 loopback unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        let remote = peer.local_addr().unwrap();
+        let config = SocketConfig {
+            bind_addr: Some(bind_addr),
+            ipv6_only: true,
+            ..SocketConfig::default()
+        };
+
+        tokio_runtime().block_on(async {
+            let socket = connect_tokio_udp_socket(&config, remote).await.unwrap();
+
+            assert!(socket2::SockRef::from(&socket).only_v6().unwrap());
+            assert!(socket.local_addr().unwrap().is_ipv6());
+            assert_eq!(socket.local_addr().unwrap().ip(), bind_addr.ip());
+            assert_eq!(socket.peer_addr().unwrap(), remote);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_ipv4_socket_preserves_family_and_explicit_bind() {
+        let peer = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let remote = peer.local_addr().unwrap();
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let config = SocketConfig {
+            bind_addr: Some(bind_addr),
+            ..SocketConfig::default()
+        };
+
+        tokio_runtime().block_on(async {
+            let socket = connect_tokio_udp_socket(&config, remote).await.unwrap();
+
+            assert!(socket.local_addr().unwrap().is_ipv4());
+            assert_eq!(socket.local_addr().unwrap().ip(), bind_addr.ip());
+            assert_eq!(socket.peer_addr().unwrap(), remote);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    fn tokio_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(feature = "tokio")]
+    fn ipv6_loopback_unavailable(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+        )
     }
 }
