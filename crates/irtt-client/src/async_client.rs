@@ -788,6 +788,67 @@ mod tests {
         })
     }
 
+    fn start_no_test_server() -> TestServer {
+        start_server(move |socket, tx| {
+            let (open_packet, peer) = recv_packet(&socket, &tx);
+            let request = decode_open_request(&open_packet, None).unwrap();
+            assert!(request.close);
+            send_open_reply(
+                &socket,
+                peer,
+                request.params,
+                None,
+                flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
+                0,
+            );
+        })
+    }
+
+    fn start_timeout_server() -> TestServer {
+        start_server(move |socket, tx| {
+            let (open_packet, peer) = recv_packet(&socket, &tx);
+            let request = decode_open_request(&open_packet, None).unwrap();
+            send_open_reply(
+                &socket,
+                peer,
+                request.params,
+                None,
+                flags::FLAG_OPEN | flags::FLAG_REPLY,
+                TOKEN,
+            );
+            let _ = recv_packet(&socket, &tx);
+        })
+    }
+
+    fn start_peer_close_server() -> TestServer {
+        start_server(move |socket, tx| {
+            let (open_packet, peer) = recv_packet(&socket, &tx);
+            let request = decode_open_request(&open_packet, None).unwrap();
+            send_open_reply(
+                &socket,
+                peer,
+                request.params.clone(),
+                None,
+                flags::FLAG_OPEN | flags::FLAG_REPLY,
+                TOKEN,
+            );
+            let (probe_packet, _) = recv_packet(&socket, &tx);
+            let probe = decode_echo_request(&probe_packet, &request.params, None).unwrap();
+            socket
+                .send_to(
+                    &echo_reply(
+                        &request.params,
+                        probe.sequence,
+                        TOKEN,
+                        flags::FLAG_REPLY | flags::FLAG_CLOSE,
+                        None,
+                    ),
+                    peer,
+                )
+                .unwrap();
+        })
+    }
+
     #[test]
     fn connect_requires_current_runtime_when_polled() {
         let mut future = Box::pin(AsyncClient::connect(ClientConfig::default()));
@@ -803,7 +864,7 @@ mod tests {
     fn current_thread_hmac_lifecycle_matches_blocking_client() {
         let key = b"async-transaction-key".to_vec();
         let blocking_server = start_echo_close_server(Some(key.clone()));
-        let blocking_config = config(blocking_server.addr, Some(key.clone()), 0);
+        let blocking_config = config(blocking_server.addr, Some(key.clone()), 46);
         let mut blocking = Client::connect(blocking_config).unwrap();
         let blocking_open = blocking.open().unwrap();
         let blocking_sent = blocking.send_probe().unwrap();
@@ -812,10 +873,14 @@ mod tests {
         blocking_server.join();
 
         let async_server = start_echo_close_server(Some(key.clone()));
-        let async_config = config(async_server.addr, Some(key), 0);
+        let async_config = config(async_server.addr, Some(key), 46);
         let (async_open, async_sent, async_reply, async_close) = runtime().block_on(async {
             let mut client = AsyncClient::connect(async_config).await.unwrap();
             let opened = client.open().await.unwrap();
+            assert_eq!(
+                tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
+                46 << 2
+            );
             client.test_hooks.receive_would_block.set(1);
             let sent = client.send_probe().await.unwrap();
             let reply = client.recv().await.unwrap();
@@ -828,6 +893,7 @@ mod tests {
             open_negotiated(&blocking_open),
             open_negotiated(&async_open)
         );
+        assert_eq!(open_negotiated(&async_open).params.dscp, 46);
         assert_matching_event_shape(&blocking_sent[0], &async_sent[0]);
         assert_matching_event_shape(&blocking_reply[0], &async_reply[0]);
         assert_matching_event_shape(&blocking_close[0], &async_close[0]);
@@ -1457,62 +1523,101 @@ mod tests {
     }
 
     #[test]
-    fn no_test_and_timeout_paths_match_blocking_semantics() {
-        let no_test_server = start_server(move |socket, tx| {
-            let (open_packet, peer) = recv_packet(&socket, &tx);
-            let request = decode_open_request(&open_packet, None).unwrap();
-            assert!(request.close);
-            send_open_reply(
-                &socket,
-                peer,
-                request.params,
-                None,
-                flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
-                0,
-            );
-        });
-        runtime().block_on(async {
-            let mut config = config(no_test_server.addr, None, 0);
-            config.run_mode = crate::RunMode::NoTest;
-            let mut client = AsyncClient::connect(config).await.unwrap();
-            assert!(matches!(
-                client.open().await.unwrap(),
-                OpenOutcome::NoTestCompleted { .. }
-            ));
+    fn no_test_timeout_and_peer_close_match_blocking_client() {
+        let blocking_no_test_server = start_no_test_server();
+        let mut blocking_no_test_config = config(blocking_no_test_server.addr, None, 0);
+        blocking_no_test_config.run_mode = crate::RunMode::NoTest;
+        let mut blocking_no_test = Client::connect(blocking_no_test_config).unwrap();
+        let blocking_no_test_open = blocking_no_test.open().unwrap();
+        assert!(blocking_no_test.is_run_complete());
+        blocking_no_test_server.join();
+
+        let async_no_test_server = start_no_test_server();
+        let mut async_no_test_config = config(async_no_test_server.addr, None, 0);
+        async_no_test_config.run_mode = crate::RunMode::NoTest;
+        let async_no_test_open = runtime().block_on(async {
+            let mut client = AsyncClient::connect(async_no_test_config).await.unwrap();
+            let opened = client.open().await.unwrap();
             assert!(client.is_run_complete());
             assert!(matches!(
                 client.close().await,
                 Err(ClientError::AlreadyCompleted)
             ));
+            opened
         });
-        no_test_server.join();
+        async_no_test_server.join();
 
-        let timeout_server = start_server(move |socket, tx| {
-            let (open_packet, peer) = recv_packet(&socket, &tx);
-            let request = decode_open_request(&open_packet, None).unwrap();
-            send_open_reply(
-                &socket,
-                peer,
-                request.params,
-                None,
-                flags::FLAG_OPEN | flags::FLAG_REPLY,
-                TOKEN,
-            );
-            let _ = recv_packet(&socket, &tx);
-        });
-        runtime().block_on(async {
-            let mut config = config(timeout_server.addr, None, 0);
-            config.probe_timeout = Duration::from_millis(5);
-            let mut client = AsyncClient::connect(config).await.unwrap();
+        assert!(matches!(
+            blocking_no_test_open,
+            OpenOutcome::NoTestCompleted { .. }
+        ));
+        assert!(matches!(
+            async_no_test_open,
+            OpenOutcome::NoTestCompleted { .. }
+        ));
+        assert_eq!(
+            open_negotiated(&blocking_no_test_open),
+            open_negotiated(&async_no_test_open)
+        );
+
+        let blocking_timeout_server = start_timeout_server();
+        let mut blocking_timeout_config = config(blocking_timeout_server.addr, None, 0);
+        blocking_timeout_config.probe_timeout = Duration::from_millis(5);
+        let mut blocking_timeout = Client::connect(blocking_timeout_config).unwrap();
+        blocking_timeout.open().unwrap();
+        blocking_timeout.send_probe().unwrap();
+        thread::sleep(Duration::from_millis(10));
+        let blocking_loss = blocking_timeout.poll_timeouts().unwrap();
+        blocking_timeout_server.join();
+
+        let async_timeout_server = start_timeout_server();
+        let mut async_timeout_config = config(async_timeout_server.addr, None, 0);
+        async_timeout_config.probe_timeout = Duration::from_millis(5);
+        let async_loss = runtime().block_on(async {
+            let mut client = AsyncClient::connect(async_timeout_config).await.unwrap();
             client.open().await.unwrap();
             client.send_probe().await.unwrap();
             time::sleep(Duration::from_millis(10)).await;
-            assert!(matches!(
-                client.poll_timeouts().unwrap().as_slice(),
-                [ClientEvent::EchoLoss { seq: 0, .. }]
-            ));
+            client.poll_timeouts().unwrap()
         });
-        timeout_server.join();
+        async_timeout_server.join();
+
+        assert_eq!(blocking_loss.len(), 1);
+        assert_eq!(async_loss.len(), 1);
+        assert_matching_event_shape(&blocking_loss[0], &async_loss[0]);
+
+        let blocking_peer_close_server = start_peer_close_server();
+        let mut blocking_peer_close =
+            Client::connect(config(blocking_peer_close_server.addr, None, 0)).unwrap();
+        blocking_peer_close.open().unwrap();
+        blocking_peer_close.send_probe().unwrap();
+        let blocking_peer_close_events = blocking_peer_close.recv_once().unwrap();
+        assert!(blocking_peer_close.is_peer_closed());
+        blocking_peer_close_server.join();
+
+        let async_peer_close_server = start_peer_close_server();
+        let async_peer_close_events = runtime().block_on(async {
+            let mut client = AsyncClient::connect(config(async_peer_close_server.addr, None, 0))
+                .await
+                .unwrap();
+            client.open().await.unwrap();
+            client.send_probe().await.unwrap();
+            let events = client.recv().await.unwrap();
+            assert!(client.is_peer_closed());
+            events
+        });
+        async_peer_close_server.join();
+
+        assert_eq!(
+            blocking_peer_close_events.len(),
+            async_peer_close_events.len()
+        );
+        for (blocking, asynchronous) in blocking_peer_close_events
+            .iter()
+            .zip(&async_peer_close_events)
+        {
+            assert_matching_event_shape(blocking, asynchronous);
+        }
     }
 
     fn open_negotiated(outcome: &OpenOutcome) -> &crate::NegotiatedParams {
@@ -1562,6 +1667,10 @@ mod tests {
                     token: right_token, ..
                 },
             ) => assert_eq!(left_token, right_token),
+            (
+                ClientEvent::EchoLoss { seq: left_seq, .. },
+                ClientEvent::EchoLoss { seq: right_seq, .. },
+            ) => assert_eq!(left_seq, right_seq),
             pair => panic!("event shapes differ: {pair:?}"),
         }
     }
