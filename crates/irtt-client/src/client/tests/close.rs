@@ -39,6 +39,62 @@ fn close_sends_one_close_packet_with_negotiated_token() {
 }
 
 #[test]
+fn close_send_failure_leaves_machine_and_schedule_open() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+        let _ = recv_request(&socket, &tx);
+    });
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+    client.test_hooks.fail_close_send.set(true);
+
+    assert!(matches!(client.close(), Err(ClientError::Socket(_))));
+    assert!(client.runtime.is_open());
+    assert!(client.schedule.is_some());
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
+fn short_successful_close_commits_before_length_mismatch() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+        let _ = recv_request(&socket, &tx);
+    });
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+    let expected = client.runtime.prepare_close().unwrap().bytes.len();
+    client.test_hooks.close_reported_len.set(Some(expected - 1));
+
+    assert!(matches!(
+        client.close(),
+        Err(ClientError::DatagramLengthMismatch {
+            expected: error_expected,
+            actual,
+        }) if error_expected == expected && actual + 1 == expected
+    ));
+    assert!(!client.runtime.is_open());
+    assert!(client.schedule.is_none());
+    assert!(matches!(client.close(), Err(ClientError::AlreadyClosed)));
+    server.join();
+}
+
+#[test]
 fn send_probe_fails_after_close() {
     let params = default_params();
     let server = start_fake_server(move |socket, tx| {
@@ -118,6 +174,8 @@ fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
     ));
     assert_eq!(events.len(), 2);
     assert!(client.next_send_deadline().is_none());
+    assert!(client.schedule.is_none());
+    assert_eq!(client.applied_dscp, None);
     assert!(matches!(
         client.send_probe(),
         Err(ClientError::AlreadyClosed)

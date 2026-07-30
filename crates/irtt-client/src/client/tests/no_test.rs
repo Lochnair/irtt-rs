@@ -10,6 +10,8 @@ fn no_test_success_validates_params() {
     let mut client = Client::connect(config).unwrap();
     let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
+    assert!(client.schedule.is_none());
+    assert_eq!(client.applied_dscp, None);
     server.join();
 }
 

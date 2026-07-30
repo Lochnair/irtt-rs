@@ -62,10 +62,6 @@ pub fn decode_open_reply(packet: &[u8], hmac_key: Option<&[u8]>) -> Result<OpenR
     }
     let token = u64::from_le_bytes(packet[pos..pos + TOKEN_SIZE].try_into().unwrap());
     pos += TOKEN_SIZE;
-    if token == 0 && !has(flags, FLAG_CLOSE) {
-        return Err(ProtoError::ZeroToken);
-    }
-
     Ok(OpenReply {
         flags,
         token,
@@ -159,6 +155,16 @@ mod tests {
         let reply = decode_open_reply(&packet, None).unwrap();
         assert_eq!(reply.token, 0x7896_b6ab_8771_5213);
         assert_eq!(reply.params, default_params());
+    }
+
+    #[test]
+    fn open_reply_preserves_zero_token_for_authenticated_session_validation() {
+        let mut packet = vec![0x14, 0xa7, 0x5b, FLAG_OPEN | FLAG_REPLY];
+        packet.extend_from_slice(&0_u64.to_le_bytes());
+        packet.extend_from_slice(&default_params().encode());
+
+        let reply = decode_open_reply(&packet, None).unwrap();
+        assert_eq!(reply.token, 0);
     }
 
     #[test]

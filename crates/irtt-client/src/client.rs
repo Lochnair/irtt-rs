@@ -5,6 +5,9 @@ use std::{
 };
 
 #[cfg(test)]
+use std::cell::Cell;
+
+#[cfg(test)]
 use irtt_proto::{flags, Params, TimestampFields, PROTOCOL_VERSION};
 
 use crate::{
@@ -13,7 +16,8 @@ use crate::{
     event::{ClientEvent, OpenOutcome},
     receive::recv_datagram,
     session::machine::{
-        recv_buffer_size, ProbeSent, SendMetadata, SessionMachine, MAX_OPEN_PACKET_SIZE,
+        recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, ProbeSent, SendMetadata,
+        SessionMachine, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
@@ -31,6 +35,36 @@ enum ProbeScheduleMode {
     Managed {
         scheduled_at: Instant,
     },
+}
+
+#[derive(Debug)]
+struct PreparedClientOpen {
+    machine: PreparedOpenAcceptance,
+    schedule: Option<ProbeSchedule>,
+    recv_buffer_len: Option<usize>,
+    negotiated_dscp: Option<u8>,
+    previous_dscp: Option<u8>,
+    post_open_recv_timeout: Option<Duration>,
+}
+
+#[derive(Debug)]
+struct PreparedClientOpenFailure {
+    primary: ClientError,
+    machine: PreparedOpenAcceptance,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct ClientTestHooks {
+    fail_open_dscp: Cell<bool>,
+    fail_open_timeout_restore: Cell<bool>,
+    fail_close_send: Cell<bool>,
+    close_reported_len: Cell<Option<usize>>,
+    fail_cleanup_send: Cell<bool>,
+    recv_buffer_len_override: Cell<Option<usize>>,
+    fail_dscp_restore: Cell<bool>,
+    last_restored_read_timeout: Cell<Option<Duration>>,
+    prepared_active_session_before_dscp: Cell<bool>,
 }
 
 #[cfg(test)]
@@ -56,6 +90,9 @@ pub struct Client {
     socket: UdpSocket,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
+    applied_dscp: Option<u8>,
+    #[cfg(test)]
+    test_hooks: ClientTestHooks,
 }
 
 impl Client {
@@ -76,6 +113,9 @@ impl Client {
             socket,
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
+            applied_dscp: None,
+            #[cfg(test)]
+            test_hooks: ClientTestHooks::default(),
         })
     }
 
@@ -83,81 +123,58 @@ impl Client {
     ///
     /// On success, returns the negotiated open outcome and transitions the
     /// client into either an open probe session or completed no-test state.
-    /// Open attempts use [`ClientConfig::open_timeouts`].
+    /// Open attempts use [`ClientConfig::open_timeouts`]. Malformed, unrelated,
+    /// or unauthenticated datagrams are ignored until the current attempt's
+    /// absolute deadline, so one attempt may consume several datagrams without
+    /// retransmitting. Silence or ignored traffic eventually produces
+    /// [`ClientError::OpenTimeout`], while authenticated incompatibility remains
+    /// terminal.
+    ///
+    /// When a trusted reply allocates a token but later negotiation or socket
+    /// preparation fails, the client sends a best-effort cleanup close and
+    /// preserves the original failure. Failed opening never leaves the session
+    /// machine open.
     pub fn open(&mut self) -> Result<OpenOutcome, ClientError> {
-        let outcome = (|| -> Result<OpenOutcome, ClientError> {
-            let packet = self.runtime.open_packet()?;
-            let mut buf = [0_u8; MAX_OPEN_PACKET_SIZE];
-
-            for timeout in &self.runtime.config().open_timeouts {
-                self.socket.set_read_timeout(Some(*timeout))?;
-                self.socket.send(&packet)?;
-
-                match self.socket.recv(&mut buf) {
-                    Ok(size) => {
-                        let reply = self.runtime.decode_open_reply(&buf[..size])?;
-                        let opened_at = ClientTimestamp::now();
-                        let remote = self.remote;
-                        let has_hmac = self.runtime.has_hmac();
-                        let socket = &self.socket;
-                        let recv_buffer = &mut self.recv_buffer;
-                        let mut schedule = None;
-
-                        let outcome =
-                            self.runtime
-                                .accept_open_reply(reply, opened_at, |negotiated| {
-                                    let size = recv_buffer_size(has_hmac, Some(negotiated))?;
-                                    let negotiated_dscp = u8::try_from(negotiated.params.dscp)
-                                        .map_err(|_| ClientError::InvalidConfig {
-                                            reason: "negotiated dscp must be in range 0..=63"
-                                                .to_owned(),
-                                        })?;
-                                    apply_dscp_to_socket(socket, remote, negotiated_dscp)?;
-                                    recv_buffer.resize(size, 0);
-                                    schedule =
-                                        Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
-                                    Ok(())
-                                })?;
-                        self.schedule = schedule;
-                        return Ok(outcome);
-                    }
-                    Err(err)
-                        if matches!(
-                            err.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                        ) => {}
-                    Err(err) => return Err(ClientError::Socket(err)),
-                }
-            }
-
-            Err(ClientError::OpenTimeout)
-        })();
-
-        let restore = self
-            .socket
-            .set_read_timeout(self.runtime.config().socket_config.recv_timeout);
-
-        match (outcome, restore) {
-            (Ok(outcome), Ok(())) => Ok(outcome),
-            (Ok(_), Err(source)) => Err(ClientError::ReadTimeoutRestore { source }),
-            (Err(err), Ok(())) => Err(err),
-            (Err(err), Err(_)) => Err(err),
+        let result = self.open_transaction();
+        if result.is_err() {
+            let _ =
+                self.restore_open_read_timeout(self.runtime.config().socket_config.recv_timeout);
         }
+        result
     }
 
     /// Send a close request and emit a [`ClientEvent::SessionClosed`] event.
     ///
     /// The close event means the client has sent its close packet and stopped
-    /// tracking the session locally; it is not a server acknowledgement.
+    /// tracking the session locally; it is not a server acknowledgement. If the
+    /// send fails, the negotiated DSCP is restored best-effort and the session
+    /// and probe schedule remain open.
     pub fn close(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
-        let socket = &self.socket;
-        let remote = self.remote;
-        let events = self.runtime.close_with(|packet| {
-            clear_dscp_on_socket(socket, remote)?;
-            socket.send(packet)?;
-            Ok(())
-        })?;
+        let prepared = self.runtime.prepare_close()?;
+        let mut events = Vec::new();
+        events
+            .try_reserve(1)
+            .map_err(|source| ClientError::AllocationFailed {
+                operation: "close event result",
+                source,
+            })?;
+        let previous_dscp = self.applied_dscp;
+        let expected_bytes = prepared.bytes.len();
+
+        clear_dscp_on_socket(&self.socket, self.remote)?;
+        let bytes = match self.send_close_datagram(prepared.bytes) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.restore_dscp_best_effort(previous_dscp);
+                return Err(ClientError::Socket(err));
+            }
+        };
+        let event = self.runtime.commit_local_close(prepared.commit);
         self.schedule = None;
+        self.applied_dscp = None;
+
+        validate_datagram_length(expected_bytes, bytes)?;
+        events.push(event);
         Ok(events)
     }
 
@@ -226,11 +243,18 @@ impl Client {
             Err(err) => return Err(ClientError::Socket(err)),
         };
 
-        self.runtime.process_received_echo_packet(
+        let events = self.runtime.process_received_echo_packet(
             &self.recv_buffer[..datagram.len],
             datagram.received_at,
             datagram.meta,
-        )
+        )?;
+        if self.runtime.is_peer_closed() {
+            self.schedule = None;
+            if clear_dscp_on_socket(&self.socket, self.remote).is_ok() {
+                self.applied_dscp = None;
+            }
+        }
+        Ok(events)
     }
 
     /// Receive and classify datagrams until a receive produces no events or the
@@ -375,6 +399,244 @@ impl Client {
 
         events.push(echo_sent_event(remote, sent, scheduled_at, timer_error));
         Ok(events)
+    }
+
+    fn open_transaction(&mut self) -> Result<OpenOutcome, ClientError> {
+        let request = self.runtime.prepare_open_request()?;
+        let mut buf = [0_u8; MAX_OPEN_PACKET_SIZE];
+        let attempt_count = self.runtime.config().open_timeouts.len();
+
+        for attempt in 0..attempt_count {
+            let timeout = self.runtime.config().open_timeouts[attempt];
+            let deadline = Instant::now()
+                .checked_add(timeout)
+                .ok_or(ClientError::DurationOverflow)?;
+            self.socket.set_read_timeout(Some(timeout))?;
+            self.socket.send(&request.bytes)?;
+
+            loop {
+                let now = Instant::now();
+                let Some(remaining) = deadline.checked_duration_since(now) else {
+                    break;
+                };
+                if remaining.is_zero() {
+                    break;
+                }
+                self.socket.set_read_timeout(Some(remaining))?;
+
+                let datagram = match recv_datagram(&self.socket, &mut buf) {
+                    Ok(datagram) => datagram,
+                    Err(err)
+                        if matches!(
+                            err.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) =>
+                    {
+                        if Instant::now() >= deadline {
+                            break;
+                        }
+                        continue;
+                    }
+                    Err(err) => return Err(ClientError::Socket(err)),
+                };
+                if datagram.received_at.mono > deadline {
+                    break;
+                }
+
+                let reply = match self.runtime.inspect_open_datagram(&buf[..datagram.len])? {
+                    OpenDatagramDisposition::Ignore => continue,
+                    OpenDatagramDisposition::Trusted(reply) => reply,
+                };
+                let machine = match self
+                    .runtime
+                    .prepare_open_acceptance(reply, datagram.received_at)
+                {
+                    Ok(machine) => machine,
+                    Err(failure) => {
+                        self.send_cleanup_close_best_effort(failure.cleanup_close.as_deref());
+                        return Err(failure.primary);
+                    }
+                };
+                let prepared = match self.prepare_client_open(machine, datagram.received_at) {
+                    Ok(prepared) => prepared,
+                    Err(failure) => {
+                        self.send_cleanup_close_best_effort(failure.machine.cleanup_close_packet());
+                        return Err(failure.primary);
+                    }
+                };
+                return self.apply_prepared_open(prepared);
+            }
+        }
+
+        Err(ClientError::OpenTimeout)
+    }
+
+    fn prepare_client_open(
+        &self,
+        machine: PreparedOpenAcceptance,
+        opened_at: ClientTimestamp,
+    ) -> Result<PreparedClientOpen, Box<PreparedClientOpenFailure>> {
+        let Some(negotiated) = machine.normal_negotiated() else {
+            return Ok(PreparedClientOpen {
+                machine,
+                schedule: None,
+                recv_buffer_len: None,
+                negotiated_dscp: None,
+                previous_dscp: self.applied_dscp,
+                post_open_recv_timeout: self.runtime.config().socket_config.recv_timeout,
+            });
+        };
+        let schedule = match ProbeSchedule::new(opened_at.mono, negotiated) {
+            Ok(schedule) => schedule,
+            Err(primary) => return Err(Box::new(PreparedClientOpenFailure { primary, machine })),
+        };
+        let recv_buffer_len = match recv_buffer_size(self.runtime.has_hmac(), Some(negotiated)) {
+            Ok(size) => size,
+            Err(primary) => return Err(Box::new(PreparedClientOpenFailure { primary, machine })),
+        };
+        #[cfg(test)]
+        let recv_buffer_len = self
+            .test_hooks
+            .recv_buffer_len_override
+            .get()
+            .unwrap_or(recv_buffer_len);
+        let negotiated_dscp = match u8::try_from(negotiated.params.dscp) {
+            Ok(dscp) => dscp,
+            Err(_) => {
+                return Err(Box::new(PreparedClientOpenFailure {
+                    primary: ClientError::InvalidConfig {
+                        reason: "negotiated dscp must be in range 0..=63".to_owned(),
+                    },
+                    machine,
+                }));
+            }
+        };
+
+        Ok(PreparedClientOpen {
+            machine,
+            schedule: Some(schedule),
+            recv_buffer_len: Some(recv_buffer_len),
+            negotiated_dscp: Some(negotiated_dscp),
+            previous_dscp: self.applied_dscp,
+            post_open_recv_timeout: self.runtime.config().socket_config.recv_timeout,
+        })
+    }
+
+    fn apply_prepared_open(
+        &mut self,
+        prepared: PreparedClientOpen,
+    ) -> Result<OpenOutcome, ClientError> {
+        let PreparedClientOpen {
+            machine,
+            schedule,
+            recv_buffer_len,
+            negotiated_dscp,
+            previous_dscp,
+            post_open_recv_timeout,
+        } = prepared;
+
+        if let (Some(recv_buffer_len), Some(negotiated_dscp)) = (recv_buffer_len, negotiated_dscp) {
+            let previous_len = self.recv_buffer.len();
+            let additional = recv_buffer_len.saturating_sub(previous_len);
+            if let Err(source) = self.recv_buffer.try_reserve(additional) {
+                self.send_cleanup_close_best_effort(machine.cleanup_close_packet());
+                return Err(ClientError::AllocationFailed {
+                    operation: "negotiated receive buffer",
+                    source,
+                });
+            }
+            self.recv_buffer.resize(recv_buffer_len, 0);
+
+            #[cfg(test)]
+            self.test_hooks
+                .prepared_active_session_before_dscp
+                .set(machine.has_prepared_active_session());
+            if let Err(primary) = self.apply_open_dscp(negotiated_dscp) {
+                self.recv_buffer.truncate(previous_len);
+                self.restore_dscp_best_effort(previous_dscp);
+                self.send_cleanup_close_best_effort(machine.cleanup_close_packet());
+                return Err(primary);
+            }
+            if let Err(source) = self.restore_open_read_timeout(post_open_recv_timeout) {
+                let primary = ClientError::ReadTimeoutRestore { source };
+                self.recv_buffer.truncate(previous_len);
+                self.restore_dscp_best_effort(previous_dscp);
+                self.send_cleanup_close_best_effort(machine.cleanup_close_packet());
+                return Err(primary);
+            }
+
+            let outcome = self.runtime.commit_open(machine);
+            self.schedule = schedule;
+            self.applied_dscp = Some(negotiated_dscp);
+            Ok(outcome)
+        } else {
+            debug_assert!(schedule.is_none());
+            if let Err(source) = self.restore_open_read_timeout(post_open_recv_timeout) {
+                return Err(ClientError::ReadTimeoutRestore { source });
+            }
+            let outcome = self.runtime.commit_open(machine);
+            self.schedule = None;
+            self.applied_dscp = None;
+            Ok(outcome)
+        }
+    }
+
+    fn restore_dscp_best_effort(&self, previous_dscp: Option<u8>) {
+        #[cfg(test)]
+        if self.test_hooks.fail_dscp_restore.replace(false) {
+            return;
+        }
+        let _ = match previous_dscp {
+            Some(dscp) => apply_dscp_to_socket(&self.socket, self.remote, dscp),
+            None => clear_dscp_on_socket(&self.socket, self.remote),
+        };
+    }
+
+    fn send_cleanup_close_best_effort(&self, packet: Option<&[u8]>) {
+        if let Some(packet) = packet {
+            #[cfg(test)]
+            if self.test_hooks.fail_cleanup_send.replace(false) {
+                return;
+            }
+            let _ = self.socket.send(packet);
+        }
+    }
+
+    fn apply_open_dscp(&self, dscp: u8) -> Result<(), ClientError> {
+        #[cfg(test)]
+        if self.test_hooks.fail_open_dscp.replace(false) {
+            return Err(ClientError::SocketOption {
+                operation: "set negotiated DSCP",
+                remote: self.remote,
+                source: io::Error::other("injected negotiated DSCP failure"),
+            });
+        }
+        apply_dscp_to_socket(&self.socket, self.remote, dscp)
+    }
+
+    fn restore_open_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {
+        #[cfg(test)]
+        self.test_hooks.last_restored_read_timeout.set(timeout);
+        #[cfg(test)]
+        if self.test_hooks.fail_open_timeout_restore.replace(false) {
+            return Err(io::Error::other(
+                "injected configured read timeout restoration failure",
+            ));
+        }
+        self.socket.set_read_timeout(timeout)
+    }
+
+    fn send_close_datagram(&self, packet: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        if self.test_hooks.fail_close_send.replace(false) {
+            return Err(io::Error::other("injected close send failure"));
+        }
+        let bytes = self.socket.send(packet)?;
+        #[cfg(test)]
+        if let Some(reported) = self.test_hooks.close_reported_len.take() {
+            return Ok(reported);
+        }
+        Ok(bytes)
     }
 }
 

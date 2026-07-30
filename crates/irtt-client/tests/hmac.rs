@@ -5,7 +5,7 @@ use std::time::Duration;
 use irtt_client::{
     Client, ClientConfig, ClientError, ClientEvent, OpenOutcome, SocketConfig, WarningKind,
 };
-use irtt_proto::{ProtoError, TimestampFields};
+use irtt_proto::TimestampFields;
 
 use support::{
     config_for_params, default_params, params_for_modes, run_one_probe_with_config,
@@ -192,7 +192,7 @@ fn bad_hmac_echo_reply_is_rejected_without_echo_reply_event() {
 }
 
 #[test]
-fn hmac_open_reply_with_bad_hmac_fails_with_protocol_error() {
+fn hmac_open_reply_with_bad_hmac_is_ignored_until_timeout() {
     let key = b"compat-secret".to_vec();
     let wrong_key = b"wrong-secret".to_vec();
     let params = default_params();
@@ -201,10 +201,7 @@ fn hmac_open_reply_with_bad_hmac_fails_with_protocol_error() {
     config.hmac_key = Some(key);
 
     let mut client = Client::connect(config).unwrap();
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::Protocol(ProtoError::BadHmac))
-    ));
+    assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
     server.join();
 }
 
