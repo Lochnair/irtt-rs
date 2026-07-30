@@ -34,6 +34,8 @@ pub enum ProtoError {
     NegativePacketLength { length: i64 },
     #[error("parameter {tag} length is too large: {length} bytes")]
     ParameterLengthTooLarge { tag: u64, length: u64 },
+    #[error("open reply has zero token without close flag")]
+    ZeroToken,
     #[error("trailing or malformed parameter payload")]
     MalformedParams,
     #[error("payload is too large: {provided} bytes provided, {available} bytes available")]

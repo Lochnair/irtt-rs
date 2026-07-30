@@ -302,10 +302,13 @@ impl SessionMachine {
         let request = EchoRequest {
             token: session.token,
             sequence: session.next_wire_seq,
-            params: session.negotiated.params.clone(),
             payload: vec![],
         };
-        let bytes = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
+        let bytes = encode_echo_request(
+            &request,
+            &session.negotiated.params,
+            self.config.hmac_key.as_deref(),
+        )?;
         Ok(Some(PreparedProbe {
             bytes: bytes.into_boxed_slice(),
             seq: session.next_wire_seq,
