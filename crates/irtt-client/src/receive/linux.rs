@@ -2,7 +2,7 @@
 use std::{
     io, mem,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
-    os::fd::AsRawFd,
+    os::fd::{AsRawFd, RawFd},
     ptr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -50,6 +50,22 @@ pub(crate) fn recv_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> Result<ReceivedDatagram, io::Error> {
+    recv_datagram_fd(socket.as_raw_fd(), buf, 0)
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) fn try_recv_tokio_datagram(
+    socket: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagram, io::Error> {
+    recv_datagram_fd(socket.as_raw_fd(), buf, libc::MSG_DONTWAIT)
+}
+
+fn recv_datagram_fd(
+    socket_fd: RawFd,
+    buf: &mut [u8],
+    flags: libc::c_int,
+) -> Result<ReceivedDatagram, io::Error> {
     let mut control = ControlBuffer::new();
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr().cast(),
@@ -64,8 +80,8 @@ pub(crate) fn recv_datagram(
     let len = unsafe {
         // SAFETY: `msg` points to one writable iovec backed by `buf`, and the
         // control buffer is writable and lives until `recvmsg` returns. The
-        // socket file descriptor is borrowed from a valid `UdpSocket`.
-        libc::recvmsg(socket.as_raw_fd(), &mut msg, 0)
+        // socket file descriptor is borrowed from a valid UDP socket.
+        libc::recvmsg(socket_fd, &mut msg, flags)
     };
     if len < 0 {
         return Err(io::Error::last_os_error());

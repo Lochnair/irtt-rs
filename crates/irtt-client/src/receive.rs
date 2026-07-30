@@ -62,6 +62,32 @@ pub(crate) fn recv_datagram(
     linux::recv_datagram(socket, buf)
 }
 
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_os = "linux", feature = "ancillary"))
+))]
+pub(crate) fn try_recv_tokio_datagram(
+    socket: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagram, io::Error> {
+    let len = socket.try_recv(buf)?;
+    let received_at = ClientTimestamp::now();
+
+    Ok(ReceivedDatagram {
+        len,
+        received_at,
+        meta: ReceiveMeta::default(),
+    })
+}
+
+#[cfg(all(feature = "tokio", target_os = "linux", feature = "ancillary"))]
+pub(crate) fn try_recv_tokio_datagram(
+    socket: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagram, io::Error> {
+    linux::try_recv_tokio_datagram(socket, buf)
+}
+
 #[cfg(all(target_os = "linux", feature = "ancillary"))]
 pub(crate) fn recv_datagram_from(
     socket: &UdpSocket,

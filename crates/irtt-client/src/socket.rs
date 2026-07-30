@@ -12,6 +12,9 @@ use crate::{
     socket_options::apply_ttl_to_socket,
 };
 
+#[cfg(all(feature = "tokio", not(unix)))]
+use crate::socket_options::apply_ttl_to_tokio_socket;
+
 pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), ClientError> {
     if timeouts.is_empty() {
         return Err(ClientError::NoOpenTimeouts);
@@ -66,6 +69,15 @@ pub(crate) fn connect_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
 ) -> Result<UdpSocket, ClientError> {
+    let socket = create_connected_udp_socket(config, remote)?;
+    socket.set_read_timeout(config.recv_timeout)?;
+    Ok(socket)
+}
+
+fn create_connected_udp_socket(
+    config: &SocketConfig,
+    remote: SocketAddr,
+) -> Result<UdpSocket, ClientError> {
     let domain = if remote.is_ipv4() {
         Domain::IPV4
     } else {
@@ -95,7 +107,36 @@ pub(crate) fn connect_udp_socket(
     if let Some(ttl) = config.ttl {
         apply_ttl_to_socket(&socket, remote, ttl)?;
     }
-    socket.set_read_timeout(config.recv_timeout)?;
+    Ok(socket)
+}
+
+#[cfg(all(feature = "tokio", unix))]
+pub(crate) async fn connect_tokio_udp_socket(
+    config: &SocketConfig,
+    remote: SocketAddr,
+) -> Result<tokio::net::UdpSocket, ClientError> {
+    let socket = create_connected_udp_socket(config, remote)?;
+    socket.set_nonblocking(true)?;
+    Ok(tokio::net::UdpSocket::from_std(socket)?)
+}
+
+#[cfg(all(feature = "tokio", not(unix)))]
+pub(crate) async fn connect_tokio_udp_socket(
+    config: &SocketConfig,
+    remote: SocketAddr,
+) -> Result<tokio::net::UdpSocket, ClientError> {
+    let bind_addr = config.bind_addr.unwrap_or_else(|| {
+        if remote.is_ipv4() {
+            SocketAddr::from(([0, 0, 0, 0], 0))
+        } else {
+            SocketAddr::from(([0_u16; 8], 0))
+        }
+    });
+    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+    socket.connect(remote).await?;
+    if let Some(ttl) = config.ttl {
+        apply_ttl_to_tokio_socket(&socket, remote, ttl)?;
+    }
     Ok(socket)
 }
 

@@ -12,6 +12,10 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientError {
+    /// A Tokio-backed client operation was polled without a current runtime.
+    #[cfg(feature = "tokio")]
+    #[error("Tokio AsyncClient requires a current Tokio runtime")]
+    NoTokioRuntime,
     /// The configured server address could not be resolved to a socket address.
     ///
     /// Check the host, port, address-family restrictions, and name service

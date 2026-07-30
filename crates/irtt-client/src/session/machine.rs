@@ -747,7 +747,7 @@ impl SessionMachine {
         }
     }
 
-    fn ensure_connected(&self) -> Result<(), ClientError> {
+    pub(crate) fn ensure_connected(&self) -> Result<(), ClientError> {
         match self.state {
             MachineState::Connected => Ok(()),
             MachineState::Open(_) => Err(ClientError::AlreadyOpen),
