@@ -31,16 +31,55 @@ pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), Client
 }
 
 pub(crate) fn resolve_remote(config: &ClientConfig) -> Result<SocketAddr, ClientError> {
+    #[cfg(all(test, feature = "tokio"))]
+    SYNC_RESOLVER_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let addr = normalize_server_addr(&config.server_addr);
     let mut addrs = addr
         .to_socket_addrs()
         .map_err(|_| ClientError::Resolve { addr: addr.clone() })?;
     addrs
-        .find(|addr| {
-            (!config.socket_config.ipv4_only || addr.is_ipv4())
-                && (!config.socket_config.ipv6_only || addr.is_ipv6())
-        })
+        .find(|addr| address_family_allowed(config, *addr))
         .ok_or(ClientError::Resolve { addr })
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) async fn resolve_remote_tokio(config: &ClientConfig) -> Result<SocketAddr, ClientError> {
+    let addr = normalize_server_addr(&config.server_addr);
+    if let Ok(remote) = addr.parse::<SocketAddr>() {
+        return address_family_allowed(config, remote)
+            .then_some(remote)
+            .ok_or(ClientError::Resolve { addr });
+    }
+
+    #[cfg(all(test, feature = "tokio"))]
+    TOKIO_DNS_LOOKUPS.with(|calls| calls.set(calls.get() + 1));
+
+    let mut addrs = tokio::net::lookup_host(&addr)
+        .await
+        .map_err(|_| ClientError::Resolve { addr: addr.clone() })?;
+    addrs
+        .find(|remote| address_family_allowed(config, *remote))
+        .ok_or_else(|| ClientError::Resolve { addr: addr.clone() })
+}
+
+fn address_family_allowed(config: &ClientConfig, remote: SocketAddr) -> bool {
+    (!config.socket_config.ipv4_only || remote.is_ipv4())
+        && (!config.socket_config.ipv6_only || remote.is_ipv6())
+}
+
+#[cfg(all(test, feature = "tokio"))]
+std::thread_local! {
+    static SYNC_RESOLVER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOKIO_DNS_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) fn resolution_call_counts() -> (usize, usize) {
+    (
+        SYNC_RESOLVER_CALLS.with(std::cell::Cell::get),
+        TOKIO_DNS_LOOKUPS.with(std::cell::Cell::get),
+    )
 }
 
 pub(crate) fn normalize_server_addr(addr: &str) -> String {
