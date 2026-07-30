@@ -17,7 +17,7 @@ use crate::{
     event::{ClientEvent, OpenOutcome},
     metadata::ReceiveMeta,
     receive::recv_datagram_from,
-    runtime::{advance_cadence, params_from_config, SendProbeResult, SessionRuntime},
+    session::machine::{advance_cadence, params_from_config, SendProbeResult, SessionMachine},
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
@@ -625,7 +625,7 @@ struct TargetState {
     id: TargetId,
     remote: SocketAddr,
     configured_auth: Option<ClientAuthConfig>,
-    runtime: SessionRuntime,
+    runtime: SessionMachine,
     status: TargetStatus,
     open_packet: Vec<u8>,
     counters: TargetCounters,
@@ -709,7 +709,7 @@ impl TargetState {
         if let Some(auth) = &target.auth {
             config.hmac_key = auth.hmac_key.clone();
         }
-        let runtime = SessionRuntime::new(config, target.remote)?;
+        let runtime = SessionMachine::new(config, target.remote)?;
         let open_packet = runtime.open_packet()?;
         Ok(Self {
             id: target.id,

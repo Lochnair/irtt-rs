@@ -17,7 +17,7 @@ use crate::{
     },
     metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
-    session::{negotiate_params, ActiveSession, ClientPhase, CloseSource, NegotiatedParams},
+    session::{negotiate_params, NegotiatedParams},
     timing::ClientTimestamp,
 };
 
@@ -25,7 +25,7 @@ pub(crate) const MAX_OPEN_PACKET_SIZE: usize = 512;
 const MIN_RECV_BUFFER_SIZE: usize = 2048;
 
 #[derive(Debug)]
-pub(crate) struct SessionRuntime {
+pub(crate) struct SessionMachine {
     config: ClientConfig,
     remote: std::net::SocketAddr,
     requested: Params,
@@ -35,6 +35,34 @@ pub(crate) struct SessionRuntime {
     final_packets_sent: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClientPhase {
+    Connected,
+    Open { token: u64 },
+    NoTestCompleted,
+    Closed { source: CloseSource },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseSource {
+    Local,
+    Peer,
+}
+
+#[derive(Debug)]
+struct ActiveSession {
+    next_wire_seq: u32,
+    highest_received_seq: Option<u32>,
+    packets_sent: u64,
+    start_mono: Instant,
+    end_mono: Option<Instant>,
+    next_send_at: Instant,
+    pending: PendingMap,
+    timed_out: TimedOutMap,
+    completed: CompletedSet,
+    sending_done: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SendProbeResult {
     pub(crate) sent_at: ClientTimestamp,
@@ -42,7 +70,7 @@ pub(crate) struct SendProbeResult {
     pub(crate) send_call: Duration,
 }
 
-impl SessionRuntime {
+impl SessionMachine {
     pub(crate) fn new(
         config: ClientConfig,
         remote: std::net::SocketAddr,
