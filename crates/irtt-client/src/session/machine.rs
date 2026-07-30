@@ -7,7 +7,6 @@ use irtt_proto::{
 };
 
 use crate::{
-    client::schedule::ProbeSchedule,
     config::{
         ClientConfig, RunMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_UDP_PAYLOAD_LENGTH,
     },
@@ -253,61 +252,6 @@ impl SessionMachine {
             bytes: metadata.bytes,
             send_call: metadata.send_call,
         }
-    }
-
-    pub(crate) fn send_probe_for_deadline<F>(
-        &mut self,
-        schedule: &mut ProbeSchedule,
-        override_ts: Option<ClientTimestamp>,
-        scheduled_at: Instant,
-        send: F,
-    ) -> Result<Vec<ClientEvent>, ClientError>
-    where
-        F: FnOnce(&[u8]) -> Result<SendMetadata, ClientError>,
-    {
-        self.ensure_open()?;
-        let permission_now = override_ts.map_or_else(Instant::now, |timestamp| timestamp.mono);
-        if !schedule.permit_probe_at(permission_now) {
-            return Ok(Vec::new());
-        }
-        let Some(prepared) = self.prepare_probe()? else {
-            return Ok(Vec::new());
-        };
-        let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
-        let machine_commit = self.preflight_probe_commit(&prepared, sent_at)?;
-        let schedule_commit = schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?;
-        let mut events = Vec::new();
-        events
-            .try_reserve(1)
-            .map_err(|source| ClientError::AllocationFailed {
-                operation: "probe event result",
-                source,
-            })?;
-
-        let expected_bytes = prepared.bytes.len();
-        let event_scheduled_at = schedule_commit.scheduled_at;
-        let timer_error = schedule_commit.timer_error;
-        let metadata = send(&prepared.bytes)?;
-        let sent = self.commit_probe_sent(machine_commit, metadata);
-        schedule.commit(schedule_commit);
-
-        if metadata.bytes != expected_bytes {
-            return Err(ClientError::DatagramLengthMismatch {
-                expected: expected_bytes,
-                actual: metadata.bytes,
-            });
-        }
-
-        events.push(ClientEvent::EchoSent {
-            seq: sent.seq,
-            remote: self.remote,
-            scheduled_at: event_scheduled_at,
-            sent_at: sent.sent_at,
-            bytes: sent.bytes,
-            send_call: sent.send_call,
-            timer_error,
-        });
-        Ok(events)
     }
 
     pub(crate) fn process_received_echo_packet(
@@ -878,8 +822,7 @@ fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::schedule::ProbeSchedule;
-    use std::io;
+    use crate::client::{schedule::ProbeSchedule, validate_datagram_length};
 
     fn open_machine(max_pending_probes: usize, probe_timeout: Duration) -> SessionMachine {
         let config = ClientConfig {
@@ -986,41 +929,22 @@ mod tests {
     }
 
     #[test]
-    fn compatibility_send_error_leaves_machine_and_schedule_unchanged() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let start = Instant::now();
-        let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
-
-        let result =
-            machine.send_probe_for_deadline(&mut schedule, Some(timestamp(start)), start, |_| {
-                Err(ClientError::Socket(io::Error::from(
-                    io::ErrorKind::WouldBlock,
-                )))
-            });
-
-        assert!(matches!(
-            result,
-            Err(ClientError::Socket(err)) if err.kind() == io::ErrorKind::WouldBlock
-        ));
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 0);
-        assert_eq!(session.packets_sent, 0);
-        assert_eq!(session.pending.len(), 0);
-        assert_eq!(schedule.next_send_deadline(), Some(start));
-    }
-
-    #[test]
     fn short_success_commits_before_reporting_transport_invariant() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let start = Instant::now();
         let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
+        assert!(schedule.permit_probe_at(start));
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let machine_commit = machine
+            .preflight_probe_commit(&prepared, timestamp(start))
+            .unwrap();
+        let schedule_commit = schedule.preflight_managed_commit(start, start).unwrap();
+        let expected = prepared.bytes.len();
+        let actual = expected - 1;
 
-        let result = machine.send_probe_for_deadline(
-            &mut schedule,
-            Some(timestamp(start)),
-            start,
-            |packet| Ok(metadata(packet.len() - 1)),
-        );
+        machine.commit_probe_sent(machine_commit, metadata(actual));
+        schedule.commit(schedule_commit);
+        let result = validate_datagram_length(expected, actual);
 
         assert!(matches!(
             result,

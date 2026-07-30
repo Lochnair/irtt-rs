@@ -12,7 +12,11 @@ use std::{
 };
 
 use crate::{
-    client::schedule::{advance_cadence, ProbeSchedule},
+    client::{
+        echo_sent_event,
+        schedule::{advance_cadence, ProbeSchedule},
+        validate_datagram_length,
+    },
     config::{ClientAuthConfig, ClientConfig},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
@@ -1310,23 +1314,7 @@ fn send_echo_to_target(
     if !matches!(target.status, TargetStatus::Active) {
         return;
     }
-    let remote = target.remote;
-    target
-        .runtime
-        .ensure_open()
-        .expect("active targets are open");
-    let TargetState {
-        runtime, schedule, ..
-    } = &mut *target;
-    let schedule = schedule
-        .as_mut()
-        .expect("active targets always have a probe schedule");
-    let result = runtime.send_probe_for_deadline(schedule, None, scheduled_at, |packet| {
-        let send_call_start = Instant::now();
-        let bytes = socket.send_to(packet, remote)?;
-        let send_call = send_call_start.elapsed();
-        Ok(SendMetadata { bytes, send_call })
-    });
+    let result = send_echo_to_locked_target(socket, &mut target, scheduled_at);
 
     match result {
         Ok(events) => {
@@ -1340,6 +1328,57 @@ fn send_echo_to_target(
             ManagedTargetFailure::runtime(&err),
         )),
     }
+}
+
+fn send_echo_to_locked_target(
+    socket: &UdpSocket,
+    target: &mut TargetState,
+    scheduled_at: Instant,
+) -> Result<Vec<ClientEvent>, ClientError> {
+    target.runtime.ensure_open()?;
+    let permission_now = Instant::now();
+    let remote = target.remote;
+    let TargetState {
+        runtime, schedule, ..
+    } = target;
+    let schedule = schedule
+        .as_mut()
+        .expect("active targets always have a probe schedule");
+    if !schedule.permit_probe_at(permission_now) {
+        return Ok(Vec::new());
+    }
+
+    let Some(prepared) = runtime.prepare_probe()? else {
+        return Ok(Vec::new());
+    };
+    let sent_at = ClientTimestamp::now();
+    let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at)?;
+    let schedule_commit = schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?;
+    let mut events = Vec::new();
+    events
+        .try_reserve(1)
+        .map_err(|source| ClientError::AllocationFailed {
+            operation: "managed probe event result",
+            source,
+        })?;
+
+    let expected_bytes = prepared.bytes.len();
+    let event_scheduled_at = schedule_commit.scheduled_at;
+    let timer_error = schedule_commit.timer_error;
+    let send_call_start = Instant::now();
+    let bytes = socket.send_to(&prepared.bytes, remote)?;
+    let send_call = send_call_start.elapsed();
+    let sent = runtime.commit_probe_sent(machine_commit, SendMetadata { bytes, send_call });
+    schedule.commit(schedule_commit);
+
+    validate_datagram_length(expected_bytes, bytes)?;
+    events.push(echo_sent_event(
+        remote,
+        sent,
+        event_scheduled_at,
+        timer_error,
+    ));
+    Ok(events)
 }
 
 fn collect_finished_targets(shared: &GroupShared, records: &mut TargetOutcomeHistory) {
@@ -1844,22 +1883,34 @@ mod tests {
         let scheduled_at = Instant::now();
         let sent_at = ClientTimestamp::now();
         let sent_events = {
+            let remote = target.remote;
             let TargetState {
                 runtime, schedule, ..
             } = &mut target;
-            runtime.send_probe_for_deadline(
-                schedule.as_mut().unwrap(),
-                Some(sent_at),
-                scheduled_at,
-                |packet| {
-                    Ok(SendMetadata {
-                        bytes: packet.len(),
-                        send_call: Duration::ZERO,
-                    })
+            let schedule = schedule.as_mut().unwrap();
+            assert!(schedule.permit_probe_at(sent_at.mono));
+            let prepared = runtime.prepare_probe().unwrap().unwrap();
+            let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at).unwrap();
+            let schedule_commit = schedule
+                .preflight_managed_commit(scheduled_at, sent_at.mono)
+                .unwrap();
+            let event_scheduled_at = schedule_commit.scheduled_at;
+            let timer_error = schedule_commit.timer_error;
+            let sent = runtime.commit_probe_sent(
+                machine_commit,
+                SendMetadata {
+                    bytes: prepared.bytes.len(),
+                    send_call: Duration::ZERO,
                 },
-            )
-        }
-        .unwrap();
+            );
+            schedule.commit(schedule_commit);
+            vec![echo_sent_event(
+                remote,
+                sent,
+                event_scheduled_at,
+                timer_error,
+            )]
+        };
         publish_events(&hub, &mut target, sent_events);
 
         ActiveTargetFixture {

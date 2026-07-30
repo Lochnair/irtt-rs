@@ -372,12 +372,7 @@ impl Client {
         let sent = runtime.commit_probe_sent(machine_commit, SendMetadata { bytes, send_call });
         schedule.commit(schedule_commit);
 
-        if bytes != expected_bytes {
-            return Err(ClientError::DatagramLengthMismatch {
-                expected: expected_bytes,
-                actual: bytes,
-            });
-        }
+        validate_datagram_length(expected_bytes, bytes)?;
 
         events.push(echo_sent_event(remote, sent, scheduled_at, timer_error));
         Ok(events)
@@ -398,6 +393,14 @@ pub(crate) fn echo_sent_event(
         bytes: sent.bytes,
         send_call: sent.send_call,
         timer_error,
+    }
+}
+
+pub(crate) fn validate_datagram_length(expected: usize, actual: usize) -> Result<(), ClientError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ClientError::DatagramLengthMismatch { expected, actual })
     }
 }
 
