@@ -158,17 +158,10 @@ pub(crate) struct ProbeCommit {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SendMetadata {
-    pub(crate) bytes: usize,
-    pub(crate) send_call: Duration,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub(crate) struct ProbeSent {
     pub(crate) seq: u32,
     pub(crate) sent_at: ClientTimestamp,
     pub(crate) bytes: usize,
-    pub(crate) send_call: Duration,
 }
 
 impl SessionMachine {
@@ -352,11 +345,7 @@ impl SessionMachine {
         })
     }
 
-    pub(crate) fn commit_probe_sent(
-        &mut self,
-        commit: ProbeCommit,
-        metadata: SendMetadata,
-    ) -> ProbeSent {
+    pub(crate) fn commit_probe_sent(&mut self, commit: ProbeCommit, bytes: usize) -> ProbeSent {
         let session = match &mut self.state {
             MachineState::Open(session) => session,
             _ => unreachable!("probe commits are only created for an open session"),
@@ -372,8 +361,7 @@ impl SessionMachine {
         ProbeSent {
             seq,
             sent_at,
-            bytes: metadata.bytes,
-            send_call: metadata.send_call,
+            bytes,
         }
     }
 
@@ -1024,13 +1012,6 @@ mod tests {
         }
     }
 
-    fn metadata(bytes: usize) -> SendMetadata {
-        SendMetadata {
-            bytes,
-            send_call: Duration::ZERO,
-        }
-    }
-
     fn connected_machine(config: ClientConfig) -> SessionMachine {
         SessionMachine::new(config, "127.0.0.1:2112".parse().unwrap()).unwrap()
     }
@@ -1220,7 +1201,7 @@ mod tests {
         let accepted = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(Instant::now());
         let commit = machine.preflight_probe_commit(&accepted, sent_at).unwrap();
-        machine.commit_probe_sent(commit, metadata(accepted.bytes.len()));
+        machine.commit_probe_sent(commit, accepted.bytes.len());
 
         let capacity = active(&machine).pending.capacity();
         assert!(matches!(
@@ -1275,7 +1256,7 @@ mod tests {
         let expected = prepared.bytes.len();
         let actual = expected - 1;
 
-        machine.commit_probe_sent(machine_commit, metadata(actual));
+        machine.commit_probe_sent(machine_commit, actual);
         schedule.commit(schedule_commit);
         let result = validate_datagram_length(expected, actual);
 
@@ -1304,13 +1285,27 @@ mod tests {
             let _would_block_commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
         }
         let commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
-        let sent = machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+        let sent = machine.commit_probe_sent(commit, prepared.bytes.len());
 
         assert_eq!(sent.seq, 0);
         let session = active(&machine);
         assert_eq!(session.next_wire_seq, 1);
         assert_eq!(session.packets_sent, 1);
         assert_eq!(session.pending.len(), 1);
+    }
+
+    #[test]
+    fn probe_commit_does_not_require_presentation_timing() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let sent_at = timestamp(Instant::now());
+        let commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+
+        let sent = machine.commit_probe_sent(commit, prepared.bytes.len());
+
+        assert_eq!(sent.seq, prepared.seq);
+        assert_eq!(sent.sent_at, sent_at);
+        assert_eq!(sent.bytes, prepared.bytes.len());
     }
 
     #[test]
@@ -1323,7 +1318,7 @@ mod tests {
             .unwrap();
         let reserved_capacity = active(&machine).pending.capacity();
 
-        machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+        machine.commit_probe_sent(commit, prepared.bytes.len());
 
         let session = active(&machine);
         assert_eq!(session.pending.capacity(), reserved_capacity);
@@ -1338,7 +1333,7 @@ mod tests {
         let first = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(Instant::now());
         let commit = machine.preflight_probe_commit(&first, sent_at).unwrap();
-        machine.commit_probe_sent(commit, metadata(first.bytes.len()));
+        machine.commit_probe_sent(commit, first.bytes.len());
 
         let second = machine.prepare_probe().unwrap().unwrap();
         assert!(matches!(
@@ -1354,7 +1349,7 @@ mod tests {
         let first = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(Instant::now());
         let commit = machine.preflight_probe_commit(&first, sent_at).unwrap();
-        machine.commit_probe_sent(commit, metadata(first.bytes.len()));
+        machine.commit_probe_sent(commit, first.bytes.len());
         active_mut(&mut machine).next_wire_seq = 0;
 
         let reused = machine.prepare_probe().unwrap().unwrap();
@@ -1400,7 +1395,7 @@ mod tests {
         let commit = machine
             .preflight_probe_commit(&prepared, timestamp(Instant::now()))
             .unwrap();
-        machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+        machine.commit_probe_sent(commit, prepared.bytes.len());
 
         assert_eq!(active(&machine).next_wire_seq, 0);
         assert_eq!(machine.prepare_probe().unwrap().unwrap().seq, 0);
@@ -1427,7 +1422,7 @@ mod tests {
         assert!(active(&machine).timed_out.contains(0));
         assert!(active(&machine).completed.contains(0));
 
-        machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+        machine.commit_probe_sent(commit, prepared.bytes.len());
         let session = active(&machine);
         assert!(!session.timed_out.contains(0));
         assert!(!session.completed.contains(0));

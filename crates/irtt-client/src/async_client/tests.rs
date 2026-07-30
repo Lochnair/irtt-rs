@@ -571,6 +571,7 @@ fn probe_would_block_error_and_cancellation_preserve_transaction() {
                 .is_err()
         );
         let retained = client.prepared_probe.as_ref().unwrap().bytes.clone();
+        let retained_ptr = client.prepared_probe.as_ref().unwrap().bytes.as_ptr();
         let deadline = client.next_send_deadline();
         client
             .test_hooks
@@ -582,6 +583,10 @@ fn probe_would_block_error_and_cancellation_preserve_transaction() {
             Err(ClientError::Socket(_))
         ));
         assert_eq!(client.prepared_probe.as_ref().unwrap().bytes, retained);
+        assert_eq!(
+            client.prepared_probe.as_ref().unwrap().bytes.as_ptr(),
+            retained_ptr
+        );
         assert_eq!(client.machine.packets_sent(), 1);
         assert_eq!(client.next_send_deadline(), deadline);
 
@@ -721,7 +726,7 @@ fn timed_out_probe_reply_is_classified_late() {
 }
 
 #[test]
-fn short_probe_and_close_commit_before_length_error() {
+fn short_probe_clears_retained_and_commits_before_length_error() {
     let server = start_server(move |socket, tx| {
         let (open_packet, peer) = recv_packet(&socket, &tx);
         let request = decode_open_request(&open_packet, None).unwrap();
@@ -747,6 +752,7 @@ fn short_probe_and_close_commit_before_length_error() {
                 .is_err()
         );
         let probe_len = client.prepared_probe.as_ref().unwrap().bytes.len();
+        let probe_deadline = client.next_send_deadline().unwrap();
         client
             .test_hooks
             .sends
@@ -758,6 +764,10 @@ fn short_probe_and_close_commit_before_length_error() {
         ));
         assert_eq!(client.machine.packets_sent(), 1);
         assert!(client.prepared_probe.is_none());
+        assert_eq!(
+            client.next_send_deadline(),
+            Some(probe_deadline + client.machine.config().interval)
+        );
 
         let close_len = client.machine.prepare_close().unwrap().bytes.len();
         client

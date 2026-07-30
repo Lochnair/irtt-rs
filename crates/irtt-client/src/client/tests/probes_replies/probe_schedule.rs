@@ -51,6 +51,34 @@ fn send_probe_sends_valid_echo_request() {
 }
 
 #[test]
+fn blocking_short_probe_commits_before_presentation_length_error() {
+    let params = default_params();
+    let server = silent_open_server(params.clone());
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let expected = echo_packet_len(false, &params);
+    let initial_deadline = client.next_send_deadline().unwrap();
+    client.test_hooks.probe_reported_len.set(Some(expected - 1));
+
+    assert!(matches!(
+        client.send_probe(),
+        Err(ClientError::DatagramLengthMismatch {
+            expected: error_expected,
+            actual,
+        }) if error_expected == expected && actual + 1 == expected
+    ));
+    assert_eq!(client.runtime.packets_sent(), 1);
+    assert_eq!(
+        client.next_send_deadline(),
+        Some(initial_deadline + client.runtime.config().interval)
+    );
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
 fn send_probe_respects_finite_duration_exclusive_end() {
     let params = Params {
         protocol_version: 1,

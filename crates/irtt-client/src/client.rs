@@ -16,7 +16,7 @@ use crate::{
     event::{ClientEvent, OpenOutcome},
     receive::recv_datagram,
     session::machine::{
-        recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, ProbeSent, SendMetadata,
+        recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, ProbeSent,
         SessionMachine, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
@@ -65,6 +65,7 @@ struct ClientTestHooks {
     fail_dscp_restore: Cell<bool>,
     last_restored_read_timeout: Cell<Option<Duration>>,
     prepared_active_session_before_dscp: Cell<bool>,
+    probe_reported_len: Cell<Option<usize>>,
 }
 
 #[cfg(test)]
@@ -389,15 +390,25 @@ impl Client {
         let expected_bytes = prepared.bytes.len();
         let scheduled_at = schedule_commit.scheduled_at;
         let timer_error = schedule_commit.timer_error;
+        #[cfg(test)]
+        let reported_bytes = self.test_hooks.probe_reported_len.take();
         let send_call_start = Instant::now();
         let bytes = socket.send(&prepared.bytes)?;
-        let send_call = send_call_start.elapsed();
-        let sent = runtime.commit_probe_sent(machine_commit, SendMetadata { bytes, send_call });
+        let sent = runtime.commit_probe_sent(machine_commit, bytes);
         schedule.commit(schedule_commit);
 
+        let send_call = send_call_start.elapsed();
+        #[cfg(test)]
+        let bytes = reported_bytes.unwrap_or(bytes);
         validate_datagram_length(expected_bytes, bytes)?;
 
-        events.push(echo_sent_event(remote, sent, scheduled_at, timer_error));
+        events.push(echo_sent_event(
+            remote,
+            sent,
+            send_call,
+            scheduled_at,
+            timer_error,
+        ));
         Ok(events)
     }
 
@@ -643,6 +654,7 @@ impl Client {
 pub(crate) fn echo_sent_event(
     remote: SocketAddr,
     sent: ProbeSent,
+    send_call: Duration,
     scheduled_at: Instant,
     timer_error: Duration,
 ) -> ClientEvent {
@@ -652,7 +664,7 @@ pub(crate) fn echo_sent_event(
         scheduled_at,
         sent_at: sent.sent_at,
         bytes: sent.bytes,
-        send_call: sent.send_call,
+        send_call,
         timer_error,
     }
 }

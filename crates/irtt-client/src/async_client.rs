@@ -21,7 +21,7 @@ use crate::{
     receive::try_recv_tokio_datagram,
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
-        PreparedProbe, SendMetadata, SessionMachine, MAX_OPEN_PACKET_SIZE,
+        PreparedProbe, SessionMachine, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_tokio_udp_socket, resolve_remote_tokio, validate_open_timeouts},
     socket_options::{apply_dscp_to_tokio_socket, clear_dscp_on_tokio_socket},
@@ -243,24 +243,25 @@ impl AsyncClient {
             let send_result = self.test_hooks.try_send(&self.socket, &prepared.bytes);
             #[cfg(not(test))]
             let send_result = self.socket.try_send(&prepared.bytes);
-            let bytes = match send_result {
-                Ok(bytes) => bytes,
+            let (bytes, sent) = match send_result {
+                Ok(bytes) => {
+                    let sent = self.machine.commit_probe_sent(machine_commit, bytes);
+                    schedule.commit(schedule_commit);
+                    self.prepared_probe = None;
+                    (bytes, sent)
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     continue;
                 }
                 Err(error) => return Err(ClientError::Socket(error)),
             };
-            let send_call = send_call_start.elapsed();
-            let sent = self
-                .machine
-                .commit_probe_sent(machine_commit, SendMetadata { bytes, send_call });
-            schedule.commit(schedule_commit);
-            self.prepared_probe = None;
 
+            let send_call = send_call_start.elapsed();
             validate_datagram_length(expected_bytes, bytes)?;
             events.push(echo_sent_event(
                 self.remote,
                 sent,
+                send_call,
                 scheduled_at,
                 timer_error,
             ));

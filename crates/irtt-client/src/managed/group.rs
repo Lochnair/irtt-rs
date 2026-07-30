@@ -24,7 +24,7 @@ use crate::{
     receive::recv_datagram_from,
     session::machine::{
         params_from_config, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
-        SendMetadata, SessionMachine,
+        SessionMachine,
     },
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
@@ -700,6 +700,8 @@ struct TargetState {
     counters: TargetCounters,
     order: u64,
     final_reason: Option<ManagedTargetEndReason>,
+    #[cfg(test)]
+    probe_reported_len: Option<usize>,
 }
 
 type ScheduledTarget = (Arc<Mutex<TargetState>>, Instant);
@@ -822,6 +824,8 @@ impl TargetState {
             counters: TargetCounters::default(),
             order,
             final_reason: None,
+            #[cfg(test)]
+            probe_reported_len: None,
         })
     }
 
@@ -1526,6 +1530,8 @@ fn send_echo_to_locked_target_at(
 ) -> Result<Vec<ClientEvent>, ClientError> {
     target.runtime.ensure_open()?;
     let remote = target.remote;
+    #[cfg(test)]
+    let reported_bytes = target.probe_reported_len.take();
     let TargetState {
         runtime, schedule, ..
     } = target;
@@ -1554,14 +1560,17 @@ fn send_echo_to_locked_target_at(
     let timer_error = schedule_commit.timer_error;
     let send_call_start = Instant::now();
     let bytes = socket.send_to(&prepared.bytes, remote)?;
-    let send_call = send_call_start.elapsed();
-    let sent = runtime.commit_probe_sent(machine_commit, SendMetadata { bytes, send_call });
+    let sent = runtime.commit_probe_sent(machine_commit, bytes);
     schedule.commit(schedule_commit);
 
+    let send_call = send_call_start.elapsed();
+    #[cfg(test)]
+    let bytes = reported_bytes.unwrap_or(bytes);
     validate_datagram_length(expected_bytes, bytes)?;
     events.push(echo_sent_event(
         remote,
         sent,
+        send_call,
         event_scheduled_at,
         timer_error,
     ));
@@ -2119,17 +2128,12 @@ mod tests {
                 .unwrap();
             let event_scheduled_at = schedule_commit.scheduled_at;
             let timer_error = schedule_commit.timer_error;
-            let sent = runtime.commit_probe_sent(
-                machine_commit,
-                SendMetadata {
-                    bytes: prepared.bytes.len(),
-                    send_call: Duration::ZERO,
-                },
-            );
+            let sent = runtime.commit_probe_sent(machine_commit, prepared.bytes.len());
             schedule.commit(schedule_commit);
             vec![echo_sent_event(
                 remote,
                 sent,
+                Duration::ZERO,
                 event_scheduled_at,
                 timer_error,
             )]
@@ -3473,6 +3477,65 @@ mod tests {
             Some(opened_mono + Duration::from_millis(600))
         );
         assert_eq!(target.runtime.packets_sent(), 1);
+    }
+
+    #[test]
+    fn group_short_probe_commits_before_presentation_length_error() {
+        let duration = Duration::from_secs(1);
+        let interval = Duration::from_millis(100);
+        let params = test_params(Some(duration), interval);
+        let config = group_config(Some(duration), interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let mut target =
+            TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap();
+        let opened_mono = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test host monotonic clock has at least two seconds of history");
+        let opened_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono,
+        };
+        let reply = match target
+            .runtime
+            .inspect_open_datagram(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params))
+            .unwrap()
+        {
+            OpenDatagramDisposition::Trusted(reply) => reply,
+            OpenDatagramDisposition::Ignore => panic!("test open reply must be trusted"),
+        };
+        let prepared = target
+            .runtime
+            .prepare_open_acceptance(reply, opened_at)
+            .unwrap();
+        target.schedule =
+            Some(ProbeSchedule::new(opened_mono, prepared.normal_negotiated().unwrap()).unwrap());
+        let _ = target.runtime.commit_open(prepared);
+        target.status = TargetStatus::Active;
+
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono + Duration::from_millis(500),
+        };
+        let expected = echo_packet_len(false, &params).unwrap();
+        target.probe_reported_len = Some(expected - 1);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        assert!(matches!(
+            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at),
+            Err(ClientError::DatagramLengthMismatch {
+                expected: error_expected,
+                actual,
+            }) if error_expected == expected && actual + 1 == expected
+        ));
+        assert_eq!(target.runtime.packets_sent(), 1);
+        assert_eq!(
+            target
+                .schedule
+                .as_ref()
+                .and_then(ProbeSchedule::next_send_deadline),
+            Some(opened_mono + Duration::from_millis(600))
+        );
     }
 
     #[test]
