@@ -58,7 +58,9 @@ pub(crate) fn try_recv_tokio_datagram(
     socket: &tokio::net::UdpSocket,
     buf: &mut [u8],
 ) -> Result<ReceivedDatagram, io::Error> {
-    recv_datagram_fd(socket.as_raw_fd(), buf, libc::MSG_DONTWAIT)
+    socket.try_io(tokio::io::Interest::READABLE, || {
+        recv_datagram_fd(socket.as_raw_fd(), buf, libc::MSG_DONTWAIT)
+    })
 }
 
 fn recv_datagram_fd(
@@ -380,6 +382,52 @@ mod tests {
         assert_eq!(&buf[..datagram.len], b"hello");
         assert!(datagram.received_at.mono >= before.mono);
         assert!(datagram.received_at.mono <= after.mono);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_recvmsg_would_block_clears_readiness() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (sender, receiver) = connected_ipv4_loopback_pair();
+            configure_receive_metadata(&receiver, sender.local_addr().unwrap()).unwrap();
+            receiver.set_nonblocking(true).unwrap();
+            let receiver = tokio::net::UdpSocket::from_std(receiver).unwrap();
+            let mut buf = [0_u8; 16];
+
+            sender.send(b"first").unwrap();
+            tokio::time::timeout(Duration::from_secs(1), receiver.readable())
+                .await
+                .expect("initial readability timed out")
+                .unwrap();
+
+            let first = super::try_recv_tokio_datagram(&receiver, &mut buf).unwrap();
+            assert_eq!(&buf[..first.len], b"first");
+
+            let error = super::try_recv_tokio_datagram(&receiver, &mut buf).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+
+            assert!(
+                tokio::time::timeout(Duration::from_millis(20), receiver.readable())
+                    .await
+                    .is_err(),
+                "readable completed from stale readiness after recvmsg WouldBlock"
+            );
+
+            sender.send(b"second").unwrap();
+            tokio::time::timeout(Duration::from_secs(1), receiver.readable())
+                .await
+                .expect("second readability timed out")
+                .unwrap();
+
+            let second = super::try_recv_tokio_datagram(&receiver, &mut buf).unwrap();
+            assert_eq!(&buf[..second.len], b"second");
+        });
     }
 
     #[test]
