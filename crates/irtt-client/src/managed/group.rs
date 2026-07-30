@@ -18,7 +18,7 @@ use crate::{
     event::{ClientEvent, OpenOutcome},
     metadata::ReceiveMeta,
     receive::recv_datagram_from,
-    session::machine::{params_from_config, SendProbeResult, SessionMachine},
+    session::machine::{params_from_config, SendMetadata, SessionMachine},
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
@@ -1322,15 +1322,10 @@ fn send_echo_to_target(
         .as_mut()
         .expect("active targets always have a probe schedule");
     let result = runtime.send_probe_for_deadline(schedule, None, scheduled_at, |packet| {
-        let sent_at = ClientTimestamp::now();
         let send_call_start = Instant::now();
         let bytes = socket.send_to(packet, remote)?;
         let send_call = send_call_start.elapsed();
-        Ok(SendProbeResult {
-            sent_at,
-            bytes,
-            send_call,
-        })
+        Ok(SendMetadata { bytes, send_call })
     });
 
     match result {
@@ -1857,8 +1852,7 @@ mod tests {
                 Some(sent_at),
                 scheduled_at,
                 |packet| {
-                    Ok(SendProbeResult {
-                        sent_at,
+                    Ok(SendMetadata {
                         bytes: packet.len(),
                         send_call: Duration::ZERO,
                     })

@@ -77,13 +77,13 @@ impl PendingMap {
     }
 
     #[cfg(test)]
-    fn capacity(&self) -> usize {
-        self.map.capacity()
+    pub fn contains(&self, wire_seq: u32) -> bool {
+        self.map.contains_key(&wire_seq)
     }
 
     #[cfg(test)]
-    fn contains(&self, wire_seq: u32) -> bool {
-        self.map.contains_key(&wire_seq)
+    fn capacity(&self) -> usize {
+        self.map.capacity()
     }
 }
 
@@ -138,6 +138,11 @@ impl TimedOutMap {
     }
 
     #[cfg(test)]
+    pub fn contains(&self, wire_seq: u32) -> bool {
+        self.map.contains_key(&wire_seq)
+    }
+
+    #[cfg(test)]
     fn insertion_order_len(&self) -> usize {
         self.insertion_order.len()
     }
@@ -182,6 +187,14 @@ impl CompletedSet {
 
     pub fn contains(&self, seq: u32) -> bool {
         self.set.contains(&seq)
+    }
+
+    pub fn remove(&mut self, seq: u32) -> bool {
+        let removed = self.set.remove(&seq);
+        if removed {
+            self.insertion_order.retain(|entry| *entry != seq);
+        }
+        removed
     }
 
     fn evict_oldest(&mut self) {

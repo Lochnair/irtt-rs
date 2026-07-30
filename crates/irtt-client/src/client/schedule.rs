@@ -178,3 +178,60 @@ fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
         .or_else(|| right.checked_duration_since(left))
         .unwrap_or(Duration::ZERO)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use irtt_proto::Params;
+
+    fn negotiated(interval_ns: i64, duration_ns: i64) -> NegotiatedParams {
+        NegotiatedParams {
+            params: Params {
+                interval_ns,
+                duration_ns,
+                ..Params::default()
+            },
+            restrictions: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn caller_preflight_keeps_absolute_cadence_without_mutation() {
+        let start = Instant::now();
+        let schedule = ProbeSchedule::new(start, &negotiated(10_000_000, 0)).unwrap();
+        let sent_at = start + Duration::from_millis(4);
+
+        let commit = schedule.preflight_caller_commit(sent_at, 3).unwrap();
+
+        assert_eq!(commit.scheduled_at, start);
+        assert_eq!(commit.next_send_at, Some(start + Duration::from_millis(30)));
+        assert_eq!(commit.timer_error, Duration::from_millis(4));
+        assert_eq!(schedule.next_send_deadline(), Some(start));
+    }
+
+    #[test]
+    fn managed_preflight_skips_missed_slots_without_mutation() {
+        let start = Instant::now();
+        let schedule = ProbeSchedule::new(start, &negotiated(10_000_000, 0)).unwrap();
+        let sent_at = start + Duration::from_millis(45);
+
+        let commit = schedule.preflight_managed_commit(start, sent_at).unwrap();
+
+        assert_eq!(commit.scheduled_at, start + Duration::from_millis(40));
+        assert_eq!(commit.next_send_at, Some(start + Duration::from_millis(50)));
+        assert_eq!(commit.timer_error, Duration::from_millis(5));
+        assert_eq!(schedule.next_send_deadline(), Some(start));
+    }
+
+    #[test]
+    fn deadline_arithmetic_overflow_is_detected_before_commit() {
+        let start = Instant::now();
+        let schedule = ProbeSchedule::new(start, &negotiated(2, 0)).unwrap();
+
+        assert!(matches!(
+            schedule.preflight_caller_commit(start, u64::MAX),
+            Err(ClientError::DurationOverflow)
+        ));
+        assert_eq!(schedule.next_send_deadline(), Some(start));
+    }
+}

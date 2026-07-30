@@ -36,7 +36,7 @@ pub(crate) struct SessionMachine {
 #[derive(Debug)]
 enum MachineState {
     Connected,
-    Open(ActiveSession),
+    Open(Box<ActiveSession>),
     NoTestCompleted,
     Closed {
         source: CloseSource,
@@ -62,8 +62,28 @@ struct ActiveSession {
     completed: CompletedSet,
 }
 
+#[derive(Debug)]
+pub(crate) struct PreparedProbe {
+    pub(crate) bytes: Box<[u8]>,
+    pub(crate) seq: u32,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProbeCommit {
+    pending: PendingProbe,
+    next_wire_seq: u32,
+    pub(crate) next_packets_sent: u64,
+}
+
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct SendProbeResult {
+pub(crate) struct SendMetadata {
+    pub(crate) bytes: usize,
+    pub(crate) send_call: Duration,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProbeSent {
+    pub(crate) seq: u32,
     pub(crate) sent_at: ClientTimestamp,
     pub(crate) bytes: usize,
     pub(crate) send_call: Duration,
@@ -160,16 +180,79 @@ impl SessionMachine {
         self.config.probe_timeout
     }
 
-    pub(crate) fn send_probe_with<F>(
+    pub(crate) fn prepare_probe(&self) -> Result<Option<PreparedProbe>, ClientError> {
+        let session = self.open_session()?;
+        let request = EchoRequest {
+            token: session.token,
+            sequence: session.next_wire_seq,
+            params: session.negotiated.params.clone(),
+            payload: vec![],
+        };
+        let bytes = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
+        Ok(Some(PreparedProbe {
+            bytes: bytes.into_boxed_slice(),
+            seq: session.next_wire_seq,
+        }))
+    }
+
+    pub(crate) fn preflight_probe_commit(
         &mut self,
-        schedule: &mut ProbeSchedule,
-        override_ts: Option<ClientTimestamp>,
-        send: F,
-    ) -> Result<Vec<ClientEvent>, ClientError>
-    where
-        F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
-    {
-        self.send_probe_inner(schedule, override_ts, None, false, send)
+        prepared: &PreparedProbe,
+        sent_at: ClientTimestamp,
+    ) -> Result<ProbeCommit, ClientError> {
+        let probe_timeout = self.config.probe_timeout;
+        let session = self.open_session_mut()?;
+        debug_assert_eq!(
+            prepared.seq, session.next_wire_seq,
+            "prepared probes are committed before preparing another probe"
+        );
+        session.pending.preflight_insert(prepared.seq)?;
+        let next_packets_sent =
+            session
+                .packets_sent
+                .checked_add(1)
+                .ok_or(ClientError::CounterOverflow {
+                    counter: "packets_sent",
+                })?;
+        let timeout_at = sent_at
+            .mono
+            .checked_add(probe_timeout)
+            .ok_or(ClientError::DurationOverflow)?;
+
+        Ok(ProbeCommit {
+            pending: PendingProbe {
+                wire_seq: prepared.seq,
+                sent_at,
+                timeout_at,
+            },
+            next_wire_seq: prepared.seq.wrapping_add(1),
+            next_packets_sent,
+        })
+    }
+
+    pub(crate) fn commit_probe_sent(
+        &mut self,
+        commit: ProbeCommit,
+        metadata: SendMetadata,
+    ) -> ProbeSent {
+        let session = match &mut self.state {
+            MachineState::Open(session) => session,
+            _ => unreachable!("probe commits are only created for an open session"),
+        };
+        let seq = commit.pending.wire_seq;
+        let sent_at = commit.pending.sent_at;
+        session.timed_out.remove(seq);
+        session.completed.remove(seq);
+        session.pending.commit_insert(commit.pending);
+        session.next_wire_seq = commit.next_wire_seq;
+        session.packets_sent = commit.next_packets_sent;
+
+        ProbeSent {
+            seq,
+            sent_at,
+            bytes: metadata.bytes,
+            send_call: metadata.send_call,
+        }
     }
 
     pub(crate) fn send_probe_for_deadline<F>(
@@ -180,91 +263,51 @@ impl SessionMachine {
         send: F,
     ) -> Result<Vec<ClientEvent>, ClientError>
     where
-        F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
+        F: FnOnce(&[u8]) -> Result<SendMetadata, ClientError>,
     {
-        self.send_probe_inner(schedule, override_ts, Some(scheduled_at), true, send)
-    }
-
-    fn send_probe_inner<F>(
-        &mut self,
-        schedule: &mut ProbeSchedule,
-        override_ts: Option<ClientTimestamp>,
-        scheduled_at_override: Option<Instant>,
-        skip_missed_slots: bool,
-        send: F,
-    ) -> Result<Vec<ClientEvent>, ClientError>
-    where
-        F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
-    {
-        let now = override_ts.unwrap_or_else(ClientTimestamp::now);
-        if !schedule.permit_probe_at(now.mono) {
-            return Ok(vec![]);
+        self.ensure_open()?;
+        let permission_now = override_ts.map_or_else(Instant::now, |timestamp| timestamp.mono);
+        if !schedule.permit_probe_at(permission_now) {
+            return Ok(Vec::new());
         }
-
-        let (config, state) = (&self.config, &mut self.state);
-        let probe_timeout = config.probe_timeout;
-        let hmac_key = config.hmac_key.as_deref();
-        let session = match state {
-            MachineState::Open(session) => session,
-            MachineState::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            MachineState::Connected => return Err(ClientError::NotOpen),
-            MachineState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        let Some(prepared) = self.prepare_probe()? else {
+            return Ok(Vec::new());
         };
+        let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
+        let machine_commit = self.preflight_probe_commit(&prepared, sent_at)?;
+        let schedule_commit = schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?;
+        let mut events = Vec::new();
+        events
+            .try_reserve(1)
+            .map_err(|source| ClientError::AllocationFailed {
+                operation: "probe event result",
+                source,
+            })?;
 
-        session.pending.preflight_insert(session.next_wire_seq)?;
-
-        let wire_seq = session.next_wire_seq;
-
-        let request = EchoRequest {
-            token: session.token,
-            sequence: wire_seq,
-            params: session.negotiated.params.clone(),
-            payload: vec![],
-        };
-        let packet = encode_echo_request(&request, hmac_key)?;
-        let send_result = send(&packet)?;
-
-        let pending = PendingProbe {
-            wire_seq,
-            sent_at: send_result.sent_at,
-            timeout_at: send_result
-                .sent_at
-                .mono
-                .checked_add(probe_timeout)
-                .ok_or(ClientError::DurationOverflow)?,
-        };
-        session.pending.commit_insert(pending);
-
-        session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
-        session.packets_sent =
-            session
-                .packets_sent
-                .checked_add(1)
-                .ok_or(ClientError::CounterOverflow {
-                    counter: "packets_sent",
-                })?;
-
-        let schedule_commit = if skip_missed_slots {
-            schedule.preflight_managed_commit(
-                scheduled_at_override.expect("managed sends include a scheduled deadline"),
-                send_result.sent_at.mono,
-            )?
-        } else {
-            schedule.preflight_caller_commit(send_result.sent_at.mono, session.packets_sent)?
-        };
-        let scheduled_at = schedule_commit.scheduled_at;
+        let expected_bytes = prepared.bytes.len();
+        let event_scheduled_at = schedule_commit.scheduled_at;
         let timer_error = schedule_commit.timer_error;
+        let metadata = send(&prepared.bytes)?;
+        let sent = self.commit_probe_sent(machine_commit, metadata);
         schedule.commit(schedule_commit);
 
-        Ok(vec![ClientEvent::EchoSent {
-            seq: wire_seq,
+        if metadata.bytes != expected_bytes {
+            return Err(ClientError::DatagramLengthMismatch {
+                expected: expected_bytes,
+                actual: metadata.bytes,
+            });
+        }
+
+        events.push(ClientEvent::EchoSent {
+            seq: sent.seq,
             remote: self.remote,
-            scheduled_at,
-            sent_at: send_result.sent_at,
-            bytes: send_result.bytes,
-            send_call: send_result.send_call,
+            scheduled_at: event_scheduled_at,
+            sent_at: sent.sent_at,
+            bytes: sent.bytes,
+            send_call: sent.send_call,
             timer_error,
-        }])
+        });
+        Ok(events)
     }
 
     pub(crate) fn process_received_echo_packet(
@@ -394,7 +437,7 @@ impl SessionMachine {
         )?;
         before_normal_open(&negotiated)?;
 
-        self.state = MachineState::Open(ActiveSession {
+        self.state = MachineState::Open(Box::new(ActiveSession {
             token,
             negotiated: negotiated.clone(),
             next_wire_seq: 0,
@@ -403,7 +446,7 @@ impl SessionMachine {
             pending: PendingMap::new(self.config.max_pending_probes),
             timed_out: TimedOutMap::new(self.config.max_pending_probes),
             completed: CompletedSet::new(self.config.max_pending_probes),
-        });
+        }));
 
         let event = ClientEvent::SessionStarted {
             remote: self.remote,
@@ -830,4 +873,290 @@ fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientE
     i64::try_from(duration.as_nanos()).map_err(|_| ClientError::InvalidConfig {
         reason: format!("{field} is too large to encode as nanoseconds"),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::client::schedule::ProbeSchedule;
+    use std::io;
+
+    fn open_machine(max_pending_probes: usize, probe_timeout: Duration) -> SessionMachine {
+        let config = ClientConfig {
+            max_pending_probes,
+            probe_timeout,
+            ..ClientConfig::default()
+        };
+        let remote = "127.0.0.1:2112".parse().unwrap();
+        let mut machine = SessionMachine::new(config, remote).unwrap();
+        let negotiated = NegotiatedParams {
+            params: machine.requested.clone(),
+            restrictions: Vec::new(),
+        };
+        machine.state = MachineState::Open(Box::new(ActiveSession {
+            token: 0x0102_0304_0506_0708,
+            negotiated,
+            next_wire_seq: 0,
+            highest_received_seq: None,
+            packets_sent: 0,
+            pending: PendingMap::new(max_pending_probes),
+            timed_out: TimedOutMap::new(max_pending_probes),
+            completed: CompletedSet::new(max_pending_probes),
+        }));
+        machine
+    }
+
+    fn active(machine: &SessionMachine) -> &ActiveSession {
+        match &machine.state {
+            MachineState::Open(session) => session,
+            _ => panic!("test machine must be open"),
+        }
+    }
+
+    fn active_mut(machine: &mut SessionMachine) -> &mut ActiveSession {
+        match &mut machine.state {
+            MachineState::Open(session) => session,
+            _ => panic!("test machine must be open"),
+        }
+    }
+
+    fn timestamp(mono: Instant) -> ClientTimestamp {
+        ClientTimestamp {
+            mono,
+            wall: SystemTime::now(),
+        }
+    }
+
+    fn metadata(bytes: usize) -> SendMetadata {
+        SendMetadata {
+            bytes,
+            send_call: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn dropping_prepared_probe_changes_nothing() {
+        let machine = open_machine(4, Duration::from_secs(1));
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        assert_eq!(prepared.seq, 0);
+        drop(prepared);
+
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 0);
+        assert_eq!(session.packets_sent, 0);
+        assert_eq!(session.pending.len(), 0);
+    }
+
+    #[test]
+    fn repeated_uncommitted_preflight_changes_no_logical_state() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let sent_at = timestamp(Instant::now());
+
+        let _first_preflight = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        let _second_preflight = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 0);
+        assert_eq!(session.packets_sent, 0);
+        assert_eq!(session.pending.len(), 0);
+    }
+
+    #[test]
+    fn simulated_send_error_leaves_machine_and_schedule_unchanged() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let start = Instant::now();
+        let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
+        assert!(schedule.permit_probe_at(start));
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let sent_at = timestamp(start);
+        let machine_commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        let schedule_commit = schedule
+            .preflight_caller_commit(sent_at.mono, machine_commit.next_packets_sent)
+            .unwrap();
+
+        let _uncommitted_machine = machine_commit;
+        let _uncommitted_schedule = schedule_commit;
+
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 0);
+        assert_eq!(session.packets_sent, 0);
+        assert_eq!(session.pending.len(), 0);
+        assert_eq!(schedule.next_send_deadline(), Some(start));
+    }
+
+    #[test]
+    fn compatibility_send_error_leaves_machine_and_schedule_unchanged() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let start = Instant::now();
+        let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
+
+        let result =
+            machine.send_probe_for_deadline(&mut schedule, Some(timestamp(start)), start, |_| {
+                Err(ClientError::Socket(io::Error::from(
+                    io::ErrorKind::WouldBlock,
+                )))
+            });
+
+        assert!(matches!(
+            result,
+            Err(ClientError::Socket(err)) if err.kind() == io::ErrorKind::WouldBlock
+        ));
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 0);
+        assert_eq!(session.packets_sent, 0);
+        assert_eq!(session.pending.len(), 0);
+        assert_eq!(schedule.next_send_deadline(), Some(start));
+    }
+
+    #[test]
+    fn short_success_commits_before_reporting_transport_invariant() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let start = Instant::now();
+        let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
+
+        let result = machine.send_probe_for_deadline(
+            &mut schedule,
+            Some(timestamp(start)),
+            start,
+            |packet| Ok(metadata(packet.len() - 1)),
+        );
+
+        assert!(matches!(
+            result,
+            Err(ClientError::DatagramLengthMismatch { expected, actual })
+                if actual + 1 == expected
+        ));
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 1);
+        assert_eq!(session.packets_sent, 1);
+        assert_eq!(session.pending.len(), 1);
+        assert_eq!(
+            schedule.next_send_deadline(),
+            Some(start + machine.config.interval)
+        );
+    }
+
+    #[test]
+    fn repeated_would_block_style_preflight_commits_once() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let sent_at = timestamp(Instant::now());
+
+        for _ in 0..3 {
+            let _would_block_commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        }
+        let commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        let sent = machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+
+        assert_eq!(sent.seq, 0);
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 1);
+        assert_eq!(session.packets_sent, 1);
+        assert_eq!(session.pending.len(), 1);
+    }
+
+    #[test]
+    fn pending_capacity_exhaustion_is_detected_before_commit() {
+        let mut machine = open_machine(1, Duration::from_secs(1));
+        let first = machine.prepare_probe().unwrap().unwrap();
+        let sent_at = timestamp(Instant::now());
+        let commit = machine.preflight_probe_commit(&first, sent_at).unwrap();
+        machine.commit_probe_sent(commit, metadata(first.bytes.len()));
+
+        let second = machine.prepare_probe().unwrap().unwrap();
+        assert!(matches!(
+            machine.preflight_probe_commit(&second, sent_at),
+            Err(ClientError::PendingLimitExceeded { limit: 1 })
+        ));
+        assert_eq!(active(&machine).packets_sent, 1);
+    }
+
+    #[test]
+    fn pending_sequence_collision_is_detected_before_commit() {
+        let mut machine = open_machine(2, Duration::from_secs(1));
+        let first = machine.prepare_probe().unwrap().unwrap();
+        let sent_at = timestamp(Instant::now());
+        let commit = machine.preflight_probe_commit(&first, sent_at).unwrap();
+        machine.commit_probe_sent(commit, metadata(first.bytes.len()));
+        active_mut(&mut machine).next_wire_seq = 0;
+
+        let reused = machine.prepare_probe().unwrap().unwrap();
+        assert!(matches!(
+            machine.preflight_probe_commit(&reused, sent_at),
+            Err(ClientError::PendingSequenceCollision { seq: 0 })
+        ));
+        assert_eq!(active(&machine).packets_sent, 1);
+    }
+
+    #[test]
+    fn counter_overflow_is_detected_before_commit() {
+        let mut machine = open_machine(2, Duration::from_secs(1));
+        active_mut(&mut machine).packets_sent = u64::MAX;
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+
+        assert!(matches!(
+            machine.preflight_probe_commit(&prepared, timestamp(Instant::now())),
+            Err(ClientError::CounterOverflow {
+                counter: "packets_sent"
+            })
+        ));
+        assert_eq!(active(&machine).pending.len(), 0);
+    }
+
+    #[test]
+    fn timeout_overflow_is_detected_before_commit() {
+        let mut machine = open_machine(2, Duration::MAX);
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+
+        assert!(matches!(
+            machine.preflight_probe_commit(&prepared, timestamp(Instant::now())),
+            Err(ClientError::DurationOverflow)
+        ));
+        assert_eq!(active(&machine).pending.len(), 0);
+    }
+
+    #[test]
+    fn wrapping_sequence_from_max_to_zero_remains_valid() {
+        let mut machine = open_machine(2, Duration::from_secs(1));
+        active_mut(&mut machine).next_wire_seq = u32::MAX;
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let commit = machine
+            .preflight_probe_commit(&prepared, timestamp(Instant::now()))
+            .unwrap();
+        machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+
+        assert_eq!(active(&machine).next_wire_seq, 0);
+        assert_eq!(machine.prepare_probe().unwrap().unwrap().seq, 0);
+    }
+
+    #[test]
+    fn successful_wrapped_reuse_purges_obsolete_history_only_on_commit() {
+        let mut machine = open_machine(3, Duration::from_secs(1));
+        let now = Instant::now();
+        let obsolete = PendingProbe {
+            wire_seq: 0,
+            sent_at: timestamp(now - Duration::from_secs(1)),
+            timeout_at: now,
+        };
+        let session = active_mut(&mut machine);
+        session.next_wire_seq = 0;
+        session.timed_out.insert(obsolete);
+        session.completed.insert(0);
+
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let commit = machine
+            .preflight_probe_commit(&prepared, timestamp(now))
+            .unwrap();
+        assert!(active(&machine).timed_out.contains(0));
+        assert!(active(&machine).completed.contains(0));
+
+        machine.commit_probe_sent(commit, metadata(prepared.bytes.len()));
+        let session = active(&machine);
+        assert!(!session.timed_out.contains(0));
+        assert!(!session.completed.contains(0));
+        assert!(session.pending.contains(0));
+        assert_eq!(session.next_wire_seq, 1);
+        assert_eq!(session.packets_sent, 1);
+    }
 }

@@ -160,6 +160,13 @@ pub enum ClientError {
         #[source]
         source: TryReserveError,
     },
+    /// UDP reported successful acceptance of a datagram with an unexpected
+    /// byte count.
+    ///
+    /// The send is committed locally before this transport invariant failure
+    /// is returned because the kernel reported success.
+    #[error("UDP accepted {actual} bytes for a {expected}-byte datagram")]
+    DatagramLengthMismatch { expected: usize, actual: usize },
     /// Client configuration failed validation before the requested operation.
     ///
     /// The reported reason names a value that must be changed before retrying.
