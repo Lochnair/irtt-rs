@@ -1,7 +1,8 @@
 use irtt_proto::{
-    decode_echo_reply, decode_open_reply, encode_close_request, encode_echo_request,
-    encode_open_request, verify_hmac, Clock, CloseRequest, EchoRequest, OpenRequest, Params,
-    ReceivedStats, StampAt,
+    decode_close_request, decode_echo_reply, decode_echo_request, decode_open_reply,
+    decode_open_request, encode_close_request, encode_echo_reply, encode_echo_request,
+    encode_open_reply, encode_open_request, verify_hmac, Clock, CloseRequest, EchoRequest,
+    OpenRequest, Params, ProtoError, ReceivedStats, StampAt, FLAG_REPLY,
 };
 
 fn hex(input: &str) -> Vec<u8> {
@@ -50,6 +51,13 @@ fn vector_1_open_request_no_hmac() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_open_request(&expected, None),
+        Ok(OpenRequest {
+            params: default_params_3s(),
+            close: false,
+        })
+    );
 }
 
 #[test]
@@ -59,6 +67,7 @@ fn vector_2_open_reply_no_hmac() {
     let reply = decode_open_reply(&packet, None).unwrap();
     assert_eq!(reply.token, 0x7896_b6ab_8771_5213);
     assert_eq!(reply.params, default_params_3s());
+    assert_eq!(encode_open_reply(&reply, None).unwrap(), packet);
 }
 
 #[test]
@@ -71,13 +80,21 @@ fn vector_3_echo_request_no_hmac() {
         &EchoRequest {
             token: 0x7896_b6ab_8771_5213,
             sequence: 0,
-            params: default_params_3s(),
             payload: Vec::new(),
         },
+        &default_params_3s(),
         None,
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_echo_request(&expected, &default_params_3s(), None),
+        Ok(EchoRequest {
+            token: 0x7896_b6ab_8771_5213,
+            sequence: 0,
+            payload: Vec::new(),
+        })
+    );
 }
 
 #[test]
@@ -90,6 +107,10 @@ fn vector_4_echo_reply_no_hmac() {
     assert_eq!(reply.sequence, 2);
     assert_eq!(reply.recv_count, Some(3));
     assert_eq!(reply.recv_window, Some(7));
+    assert_eq!(
+        encode_echo_reply(&reply, &default_params_3s(), None).unwrap(),
+        packet
+    );
 }
 
 #[test]
@@ -103,6 +124,12 @@ fn vector_5_close_request_no_hmac() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_close_request(&expected, None),
+        Ok(CloseRequest {
+            token: 0x7896_b6ab_8771_5213,
+        })
+    );
 }
 
 #[test]
@@ -120,6 +147,13 @@ fn vector_6_hmac_open_request() {
     .unwrap();
     assert_eq!(packet, expected);
     verify_hmac(b"testkey", &packet, 4).unwrap();
+    assert_eq!(
+        decode_open_request(&expected, Some(b"testkey")),
+        Ok(OpenRequest {
+            params: hmac_params_2s(),
+            close: false,
+        })
+    );
 }
 
 #[test]
@@ -133,13 +167,21 @@ fn vector_7_hmac_echo_request() {
         &EchoRequest {
             token: 0x4387_e9eb_5d3f_ca59,
             sequence: 0,
-            params: default_params_3s(),
             payload: Vec::new(),
         },
+        &default_params_3s(),
         Some(b"testkey"),
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_echo_request(&expected, &default_params_3s(), Some(b"testkey")),
+        Ok(EchoRequest {
+            token: 0x4387_e9eb_5d3f_ca59,
+            sequence: 0,
+            payload: Vec::new(),
+        })
+    );
 }
 
 #[test]
@@ -154,6 +196,12 @@ fn vector_8_hmac_close_request() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_close_request(&expected, Some(b"testkey")),
+        Ok(CloseRequest {
+            token: 0x4387_e9eb_5d3f_ca59,
+        })
+    );
 }
 
 #[test]
@@ -169,6 +217,13 @@ fn vector_9_no_test_open_close_request() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_open_request(&expected, None),
+        Ok(OpenRequest {
+            params: default_params_60s(),
+            close: true,
+        })
+    );
 }
 
 #[test]
@@ -179,6 +234,7 @@ fn vector_10_no_test_open_close_reply() {
     let reply = decode_open_reply(&packet, None).unwrap();
     assert_eq!(reply.token, 0);
     assert_eq!(reply.params, default_params_60s());
+    assert_eq!(encode_open_reply(&reply, None).unwrap(), packet);
 }
 
 #[test]
@@ -188,13 +244,21 @@ fn vector_11_minimal_echo_packet() {
         &EchoRequest {
             token: 0xa031_6fa2_5c61_154e,
             sequence: 0,
-            params: Params::default(),
             payload: Vec::new(),
         },
+        &Params::default(),
         None,
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_echo_request(&expected, &Params::default(), None),
+        Ok(EchoRequest {
+            token: 0xa031_6fa2_5c61_154e,
+            sequence: 0,
+            payload: Vec::new(),
+        })
+    );
 }
 
 #[test]
@@ -214,6 +278,7 @@ fn vector_12_midpoint_reply() {
     assert!(reply.timestamps.midpoint_wall.is_some());
     assert!(reply.timestamps.recv_wall.is_none());
     assert!(reply.timestamps.send_wall.is_none());
+    assert_eq!(encode_echo_reply(&reply, &params, None).unwrap(), packet);
 }
 
 #[test]
@@ -235,27 +300,51 @@ fn spec_18_1_hmac_echo_request_fixture() {
         &EchoRequest {
             token: 0x886b_c9a7_22b3_3eea,
             sequence: 0x6fe2_a1bb,
-            params,
             payload: [0xff, 0xfe, 0xfd, 0xfc].repeat(4),
         },
+        &params,
         Some(&[0x3c, 0x68, 0x1d, 0x39, 0x41, 0x1d, 0x72, 0x43]),
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_echo_request(
+            &expected,
+            &Params {
+                length: 92,
+                received_stats: ReceivedStats::Both,
+                stamp_at: StampAt::Both,
+                clock: Clock::Both,
+                ..Params::default()
+            },
+            Some(&[0x3c, 0x68, 0x1d, 0x39, 0x41, 0x1d, 0x72, 0x43]),
+        )
+        .unwrap()
+        .payload,
+        [0xff, 0xfe, 0xfd, 0xfc].repeat(4)
+    );
 }
 
 #[test]
-fn spec_18_2_hmac_echo_reply_fixture() {
+fn spec_18_2_ambiguous_hmac_fixture_omits_reply_flag() {
     let packet = hex("14 a7 5b 08 d2 98 a3 4a 6a 13 41 02 68 b2 67 a8
          d6 7e 28 25 c3 cb 6f 76 b6 ce 66 e6 06 07 3b 1d
          19 9f bc a3 9b 3b f8 86 e5 39 e9 d7 a1 75 2a ee
          3d f1 5a 52 9a c6 4a 3e 22 62 55 2d 69 3f 29 46
          d4 05 97 58 66 50 2c dd 2f f1 1d 46 ff fe fd fc
          ff fe fd fc ff fe fd fc ff fe fd fc");
-    verify_hmac(
-        &[0xda, 0xb3, 0xe9, 0x04, 0xa6, 0x87, 0x92, 0x49],
-        &packet,
-        4,
-    )
-    .unwrap();
+    let key = [0xda, 0xb3, 0xe9, 0x04, 0xa6, 0x87, 0x92, 0x49];
+    verify_hmac(&key, &packet, 4).unwrap();
+
+    let params = Params {
+        length: 92,
+        received_stats: ReceivedStats::Both,
+        stamp_at: StampAt::Both,
+        clock: Clock::Both,
+        ..Params::default()
+    };
+    assert_eq!(
+        decode_echo_reply(&packet, &params, Some(&key)),
+        Err(ProtoError::MissingFlag(FLAG_REPLY))
+    );
 }
