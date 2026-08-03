@@ -12,13 +12,17 @@ use std::{
 };
 
 use crate::{
-    client::schedule::{advance_cadence, ProbeSchedule},
+    client::{
+        echo_sent_event,
+        schedule::{advance_cadence, ProbeSchedule},
+        validate_datagram_length,
+    },
     config::{ClientAuthConfig, ClientConfig},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
     metadata::ReceiveMeta,
     receive::recv_datagram_from,
-    session::machine::{params_from_config, SendProbeResult, SessionMachine},
+    session::machine::{params_from_config, SessionMachine},
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
@@ -633,6 +637,10 @@ struct TargetState {
     counters: TargetCounters,
     order: u64,
     final_reason: Option<ManagedTargetEndReason>,
+    #[cfg(test)]
+    probe_reported_len: Option<usize>,
+    #[cfg(test)]
+    probe_send_error: bool,
 }
 
 type ScheduledTarget = (Arc<Mutex<TargetState>>, Instant);
@@ -727,6 +735,10 @@ impl TargetState {
             counters: TargetCounters::default(),
             order,
             final_reason: None,
+            #[cfg(test)]
+            probe_reported_len: None,
+            #[cfg(test)]
+            probe_send_error: false,
         })
     }
 
@@ -1311,28 +1323,7 @@ fn send_echo_to_target(
     if !matches!(target.status, TargetStatus::Active) {
         return;
     }
-    let remote = target.remote;
-    target
-        .runtime
-        .ensure_open()
-        .expect("active targets are open");
-    let TargetState {
-        runtime, schedule, ..
-    } = &mut *target;
-    let schedule = schedule
-        .as_mut()
-        .expect("active targets always have a probe schedule");
-    let result = runtime.send_probe_for_deadline(schedule, None, scheduled_at, |packet| {
-        let sent_at = ClientTimestamp::now();
-        let send_call_start = Instant::now();
-        let bytes = socket.send_to(packet, remote)?;
-        let send_call = send_call_start.elapsed();
-        Ok(SendProbeResult {
-            sent_at,
-            bytes,
-            send_call,
-        })
-    });
+    let result = send_echo_to_locked_target(socket, &mut target, scheduled_at);
 
     match result {
         Ok(events) => {
@@ -1346,6 +1337,77 @@ fn send_echo_to_target(
             ManagedTargetFailure::runtime(&err),
         )),
     }
+}
+
+fn send_echo_to_locked_target(
+    socket: &UdpSocket,
+    target: &mut TargetState,
+    scheduled_at: Instant,
+) -> Result<Vec<ClientEvent>, ClientError> {
+    send_echo_to_locked_target_at(socket, target, scheduled_at, ClientTimestamp::now())
+}
+
+fn send_echo_to_locked_target_at(
+    socket: &UdpSocket,
+    target: &mut TargetState,
+    scheduled_at: Instant,
+    sent_at: ClientTimestamp,
+) -> Result<Vec<ClientEvent>, ClientError> {
+    target.runtime.ensure_open()?;
+    let remote = target.remote;
+    #[cfg(test)]
+    let reported_bytes = target.probe_reported_len.take();
+    #[cfg(test)]
+    let fail_send = std::mem::take(&mut target.probe_send_error);
+    let TargetState {
+        runtime, schedule, ..
+    } = target;
+    let schedule = schedule
+        .as_mut()
+        .expect("active targets always have a probe schedule");
+    if !schedule.permit_probe_at(sent_at.mono) {
+        return Ok(Vec::new());
+    }
+
+    let Some(prepared) = runtime.prepare_probe()? else {
+        return Ok(Vec::new());
+    };
+    let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at)?;
+    let schedule_commit = schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?;
+    let mut events = Vec::new();
+    events
+        .try_reserve(1)
+        .map_err(|source| ClientError::AllocationFailed {
+            operation: "managed probe event result",
+            source,
+        })?;
+
+    let expected_bytes = prepared.bytes.len();
+    let event_scheduled_at = schedule_commit.scheduled_at;
+    let timer_error = schedule_commit.timer_error;
+    #[cfg(test)]
+    if fail_send {
+        return Err(ClientError::Socket(std::io::Error::other(
+            "injected managed probe send failure",
+        )));
+    }
+    let send_call_start = Instant::now();
+    let bytes = socket.send_to(&prepared.bytes, remote)?;
+    let sent = runtime.commit_probe_sent(machine_commit, bytes);
+    schedule.commit(schedule_commit);
+
+    let send_call = send_call_start.elapsed();
+    #[cfg(test)]
+    let bytes = reported_bytes.unwrap_or(bytes);
+    validate_datagram_length(expected_bytes, bytes)?;
+    events.push(echo_sent_event(
+        remote,
+        sent,
+        send_call,
+        event_scheduled_at,
+        timer_error,
+    ));
+    Ok(events)
 }
 
 fn collect_finished_targets(shared: &GroupShared, records: &mut TargetOutcomeHistory) {
@@ -1853,23 +1915,29 @@ mod tests {
         let scheduled_at = Instant::now();
         let sent_at = ClientTimestamp::now();
         let sent_events = {
+            let remote = target.remote;
             let TargetState {
                 runtime, schedule, ..
             } = &mut target;
-            runtime.send_probe_for_deadline(
-                schedule.as_mut().unwrap(),
-                Some(sent_at),
-                scheduled_at,
-                |packet| {
-                    Ok(SendProbeResult {
-                        sent_at,
-                        bytes: packet.len(),
-                        send_call: Duration::ZERO,
-                    })
-                },
-            )
-        }
-        .unwrap();
+            let schedule = schedule.as_mut().unwrap();
+            assert!(schedule.permit_probe_at(sent_at.mono));
+            let prepared = runtime.prepare_probe().unwrap().unwrap();
+            let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at).unwrap();
+            let schedule_commit = schedule
+                .preflight_managed_commit(scheduled_at, sent_at.mono)
+                .unwrap();
+            let event_scheduled_at = schedule_commit.scheduled_at;
+            let timer_error = schedule_commit.timer_error;
+            let sent = runtime.commit_probe_sent(machine_commit, prepared.bytes.len());
+            schedule.commit(schedule_commit);
+            vec![echo_sent_event(
+                remote,
+                sent,
+                Duration::ZERO,
+                event_scheduled_at,
+                timer_error,
+            )]
+        };
         publish_events(&hub, &mut target, sent_events);
 
         ActiveTargetFixture {
@@ -1932,6 +2000,29 @@ mod tests {
             remote,
             auth: None,
         }
+    }
+
+    fn active_probe_target(
+        config: &ClientConfig,
+        params: &Params,
+        remote: SocketAddr,
+        opened_at: ClientTimestamp,
+    ) -> TargetState {
+        let mut target =
+            TargetState::new(config, target("peer", remote), 0, opened_at.mono).unwrap();
+        let packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, params);
+        let reply = target.runtime.decode_open_reply(&packet).unwrap();
+        let mut schedule = None;
+        target
+            .runtime
+            .accept_open_reply(reply, opened_at, |negotiated| {
+                schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
+                Ok(())
+            })
+            .unwrap();
+        target.schedule = schedule;
+        target.status = TargetStatus::Active;
+        target
     }
 
     fn target_outcome(
@@ -2881,6 +2972,137 @@ mod tests {
             .targets
             .iter()
             .all(|target| target.end_reason.failure().is_some()));
+    }
+
+    #[test]
+    fn group_probe_uses_one_timestamp_for_permission_and_schedule_commit() {
+        let duration = Duration::from_secs(1);
+        let interval = Duration::from_millis(100);
+        let params = test_params(Some(duration), interval);
+        let config = group_config(Some(duration), interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let opened_mono = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test host monotonic clock has at least two seconds of history");
+        let opened_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono,
+        };
+        let mut target = active_probe_target(&config, &params, remote, opened_at);
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono + Duration::from_millis(500),
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let events =
+            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at).unwrap();
+
+        assert!(matches!(
+            events.as_slice(),
+            [ClientEvent::EchoSent {
+                scheduled_at,
+                sent_at: event_sent_at,
+                timer_error,
+                ..
+            }] if *scheduled_at == sent_at.mono
+                && *event_sent_at == sent_at
+                && *timer_error == Duration::ZERO
+        ));
+        assert_eq!(
+            target
+                .schedule
+                .as_ref()
+                .and_then(ProbeSchedule::next_send_deadline),
+            Some(opened_mono + Duration::from_millis(600))
+        );
+        assert_eq!(target.runtime.packets_sent(), 1);
+    }
+
+    #[test]
+    fn group_failed_probe_send_preserves_machine_and_schedule() {
+        let duration = Duration::from_secs(1);
+        let interval = Duration::from_millis(100);
+        let params = test_params(Some(duration), interval);
+        let config = group_config(Some(duration), interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let opened_mono = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test host monotonic clock has at least two seconds of history");
+        let opened_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono,
+        };
+        let mut target = active_probe_target(&config, &params, remote, opened_at);
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono + Duration::from_millis(500),
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        target.probe_send_error = true;
+
+        assert!(matches!(
+            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at),
+            Err(ClientError::Socket(_))
+        ));
+        assert_eq!(target.runtime.packets_sent(), 0);
+        assert_eq!(
+            target
+                .schedule
+                .as_ref()
+                .and_then(ProbeSchedule::next_send_deadline),
+            Some(opened_mono)
+        );
+
+        assert!(matches!(
+            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at)
+                .unwrap()
+                .as_slice(),
+            [ClientEvent::EchoSent { seq: 0, .. }]
+        ));
+    }
+
+    #[test]
+    fn group_short_probe_commits_before_presentation_length_error() {
+        let duration = Duration::from_secs(1);
+        let interval = Duration::from_millis(100);
+        let params = test_params(Some(duration), interval);
+        let config = group_config(Some(duration), interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let opened_mono = Instant::now()
+            .checked_sub(Duration::from_secs(2))
+            .expect("test host monotonic clock has at least two seconds of history");
+        let opened_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono,
+        };
+        let mut target = active_probe_target(&config, &params, remote, opened_at);
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::now(),
+            mono: opened_mono + Duration::from_millis(500),
+        };
+        let expected = echo_packet_len(false, &params).unwrap();
+        target.probe_reported_len = Some(expected - 1);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        assert!(matches!(
+            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at),
+            Err(ClientError::DatagramLengthMismatch {
+                expected: error_expected,
+                actual,
+            }) if error_expected == expected && actual + 1 == expected
+        ));
+        assert_eq!(target.runtime.packets_sent(), 1);
+        assert_eq!(
+            target
+                .schedule
+                .as_ref()
+                .and_then(ProbeSchedule::next_send_deadline),
+            Some(opened_mono + Duration::from_millis(600))
+        );
     }
 
     #[test]

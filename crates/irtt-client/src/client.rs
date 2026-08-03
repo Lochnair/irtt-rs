@@ -12,7 +12,7 @@ use crate::{
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
     receive::recv_datagram,
-    session::machine::{recv_buffer_size, SendProbeResult, SessionMachine, MAX_OPEN_PACKET_SIZE},
+    session::machine::{recv_buffer_size, ProbeSent, SessionMachine, MAX_OPEN_PACKET_SIZE},
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
     socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
@@ -21,6 +21,12 @@ use crate::{
 pub(crate) mod schedule;
 
 use schedule::ProbeSchedule;
+
+#[derive(Debug, Clone, Copy)]
+enum ProbeScheduleMode {
+    CallerPaced,
+    Managed { scheduled_at: Instant },
+}
 
 #[cfg(test)]
 use crate::{
@@ -45,6 +51,10 @@ pub struct Client {
     socket: UdpSocket,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
+    #[cfg(test)]
+    probe_reported_len: Option<usize>,
+    #[cfg(test)]
+    probe_send_error: bool,
 }
 
 impl Client {
@@ -65,6 +75,10 @@ impl Client {
             socket,
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
+            #[cfg(test)]
+            probe_reported_len: None,
+            #[cfg(test)]
+            probe_send_error: false,
         })
     }
 
@@ -302,24 +316,7 @@ impl Client {
         &mut self,
         override_ts: Option<ClientTimestamp>,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        let socket = &self.socket;
-        self.runtime.ensure_open()?;
-        let schedule = self
-            .schedule
-            .as_mut()
-            .expect("open sessions always have a probe schedule");
-        self.runtime
-            .send_probe_with(schedule, override_ts, |packet| {
-                let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
-                let send_call_start = Instant::now();
-                let bytes = socket.send(packet)?;
-                let send_call = send_call_start.elapsed();
-                Ok(SendProbeResult {
-                    sent_at,
-                    bytes,
-                    send_call,
-                })
-            })
+        self.send_probe_transaction(override_ts, ProbeScheduleMode::CallerPaced)
     }
 
     fn send_managed_probe_inner(
@@ -327,24 +324,102 @@ impl Client {
         scheduled_at: Instant,
         override_ts: Option<ClientTimestamp>,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        let socket = &self.socket;
+        self.send_probe_transaction(override_ts, ProbeScheduleMode::Managed { scheduled_at })
+    }
+
+    fn send_probe_transaction(
+        &mut self,
+        override_ts: Option<ClientTimestamp>,
+        mode: ProbeScheduleMode,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
         self.runtime.ensure_open()?;
-        let schedule = self
-            .schedule
+        let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
+        #[cfg(test)]
+        let fail_send = std::mem::take(&mut self.probe_send_error);
+        let remote = self.remote;
+        let (runtime, schedule, socket) = (&mut self.runtime, &mut self.schedule, &self.socket);
+        let schedule = schedule
             .as_mut()
             .expect("open sessions always have a probe schedule");
-        self.runtime
-            .send_probe_for_deadline(schedule, override_ts, scheduled_at, |packet| {
-                let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
-                let send_call_start = Instant::now();
-                let bytes = socket.send(packet)?;
-                let send_call = send_call_start.elapsed();
-                Ok(SendProbeResult {
-                    sent_at,
-                    bytes,
-                    send_call,
-                })
-            })
+        if !schedule.permit_probe_at(sent_at.mono) {
+            return Ok(Vec::new());
+        }
+
+        let Some(prepared) = runtime.prepare_probe()? else {
+            return Ok(Vec::new());
+        };
+        let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at)?;
+        let schedule_commit = match mode {
+            ProbeScheduleMode::CallerPaced => {
+                schedule.preflight_caller_commit(sent_at.mono, machine_commit.next_packets_sent)?
+            }
+            ProbeScheduleMode::Managed { scheduled_at } => {
+                schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?
+            }
+        };
+        let mut events = Vec::new();
+        events
+            .try_reserve(1)
+            .map_err(|source| ClientError::AllocationFailed {
+                operation: "probe event result",
+                source,
+            })?;
+
+        let expected_bytes = prepared.bytes.len();
+        let scheduled_at = schedule_commit.scheduled_at;
+        let timer_error = schedule_commit.timer_error;
+        #[cfg(test)]
+        let reported_bytes = self.probe_reported_len.take();
+        #[cfg(test)]
+        if fail_send {
+            return Err(ClientError::Socket(io::Error::other(
+                "injected probe send failure",
+            )));
+        }
+        let send_call_start = Instant::now();
+        let bytes = socket.send(&prepared.bytes)?;
+        let sent = runtime.commit_probe_sent(machine_commit, bytes);
+        schedule.commit(schedule_commit);
+
+        let send_call = send_call_start.elapsed();
+        #[cfg(test)]
+        let bytes = reported_bytes.unwrap_or(bytes);
+        validate_datagram_length(expected_bytes, bytes)?;
+
+        events.push(echo_sent_event(
+            remote,
+            sent,
+            send_call,
+            scheduled_at,
+            timer_error,
+        ));
+        Ok(events)
+    }
+}
+
+pub(crate) fn echo_sent_event(
+    remote: SocketAddr,
+    sent: ProbeSent,
+    send_call: Duration,
+    scheduled_at: Instant,
+    timer_error: Duration,
+) -> ClientEvent {
+    ClientEvent::EchoSent {
+        seq: sent.seq,
+        remote,
+        scheduled_at,
+        sent_at: sent.sent_at,
+        bytes: sent.bytes,
+        send_call,
+        timer_error,
+    }
+}
+
+pub(crate) fn validate_datagram_length(expected: usize, actual: usize) -> Result<(), ClientError> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(ClientError::DatagramLengthMismatch { expected, actual })
     }
 }
 
