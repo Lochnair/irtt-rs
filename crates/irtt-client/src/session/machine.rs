@@ -211,7 +211,7 @@ impl SessionMachine {
             MachineState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         };
 
-        session.pending.check_capacity()?;
+        session.pending.preflight_insert(session.next_wire_seq)?;
 
         let wire_seq = session.next_wire_seq;
 
@@ -232,7 +232,7 @@ impl SessionMachine {
                 .checked_add(probe_timeout)
                 .ok_or(ClientError::DurationOverflow)?,
         };
-        session.pending.insert(pending)?;
+        session.pending.commit_insert(pending);
 
         session.next_wire_seq = session.next_wire_seq.wrapping_add(1);
         session.packets_sent =

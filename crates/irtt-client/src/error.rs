@@ -1,4 +1,4 @@
-use std::{io, time::Duration};
+use std::{collections::TryReserveError, io, time::Duration};
 
 use thiserror::Error;
 
@@ -146,6 +146,20 @@ pub enum ClientError {
     /// sending again.
     #[error("pending probe limit exceeded ({limit})")]
     PendingLimitExceeded { limit: usize },
+    /// A wrapping wire sequence is still represented by an in-flight probe.
+    ///
+    /// The existing probe must be replied to or timed out before that sequence
+    /// can be reused.
+    #[error("wire sequence {seq} is still pending")]
+    PendingSequenceCollision { seq: u32 },
+    /// Reserving memory required by an operation failed before any datagram was
+    /// sent or logical protocol state was changed.
+    #[error("failed to reserve memory for {operation}: {source}")]
+    AllocationFailed {
+        operation: &'static str,
+        #[source]
+        source: TryReserveError,
+    },
     /// Client configuration failed validation before the requested operation.
     ///
     /// The reported reason names a value that must be changed before retrying.
