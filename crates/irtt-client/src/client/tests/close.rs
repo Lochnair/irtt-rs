@@ -118,6 +118,7 @@ fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
     ));
     assert_eq!(events.len(), 2);
     assert!(client.next_send_deadline().is_none());
+    assert!(client.schedule.is_none());
     assert!(matches!(
         client.send_probe(),
         Err(ClientError::AlreadyClosed)

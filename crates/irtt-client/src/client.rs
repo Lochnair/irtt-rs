@@ -18,6 +18,10 @@ use crate::{
     timing::ClientTimestamp,
 };
 
+pub(crate) mod schedule;
+
+use schedule::ProbeSchedule;
+
 #[cfg(test)]
 use crate::{
     session::machine::{
@@ -37,6 +41,7 @@ use crate::{
 #[derive(Debug)]
 pub struct Client {
     runtime: SessionMachine,
+    schedule: Option<ProbeSchedule>,
     socket: UdpSocket,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
@@ -56,6 +61,7 @@ impl Client {
 
         Ok(Self {
             runtime,
+            schedule: None,
             socket,
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
@@ -79,26 +85,30 @@ impl Client {
                 match self.socket.recv(&mut buf) {
                     Ok(size) => {
                         let reply = self.runtime.decode_open_reply(&buf[..size])?;
+                        let opened_at = ClientTimestamp::now();
                         let remote = self.remote;
                         let has_hmac = self.runtime.has_hmac();
                         let socket = &self.socket;
                         let recv_buffer = &mut self.recv_buffer;
+                        let mut schedule = None;
 
-                        return self.runtime.accept_open_reply(
-                            reply,
-                            ClientTimestamp::now(),
-                            |negotiated| {
-                                let size = recv_buffer_size(has_hmac, Some(negotiated))?;
-                                let negotiated_dscp = u8::try_from(negotiated.params.dscp)
-                                    .map_err(|_| ClientError::InvalidConfig {
-                                        reason: "negotiated dscp must be in range 0..=63"
-                                            .to_owned(),
-                                    })?;
-                                apply_dscp_to_socket(socket, remote, negotiated_dscp)?;
-                                recv_buffer.resize(size, 0);
-                                Ok(())
-                            },
-                        );
+                        let outcome =
+                            self.runtime
+                                .accept_open_reply(reply, opened_at, |negotiated| {
+                                    let size = recv_buffer_size(has_hmac, Some(negotiated))?;
+                                    let negotiated_dscp = u8::try_from(negotiated.params.dscp)
+                                        .map_err(|_| ClientError::InvalidConfig {
+                                            reason: "negotiated dscp must be in range 0..=63"
+                                                .to_owned(),
+                                        })?;
+                                    apply_dscp_to_socket(socket, remote, negotiated_dscp)?;
+                                    recv_buffer.resize(size, 0);
+                                    schedule =
+                                        Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
+                                    Ok(())
+                                })?;
+                        self.schedule = schedule;
+                        return Ok(outcome);
                     }
                     Err(err)
                         if matches!(
@@ -131,17 +141,22 @@ impl Client {
     pub fn close(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         let socket = &self.socket;
         let remote = self.remote;
-        self.runtime.close_with(|packet| {
+        let events = self.runtime.close_with(|packet| {
             clear_dscp_on_socket(socket, remote)?;
             socket.send(packet)?;
             Ok(())
-        })
+        })?;
+        self.schedule = None;
+        Ok(events)
     }
 
     /// Return the monotonic deadline for the next probe send, if another probe
     /// is scheduled.
     pub fn next_send_deadline(&self) -> Option<Instant> {
-        self.runtime.next_send_deadline()
+        if !self.runtime.is_open() {
+            return None;
+        }
+        self.schedule.as_ref()?.next_send_deadline()
     }
 
     /// Return the local timeout used to classify pending probes as lost.
@@ -199,11 +214,15 @@ impl Client {
             Err(err) => return Err(ClientError::Socket(err)),
         };
 
-        self.runtime.process_received_echo_packet(
+        let events = self.runtime.process_received_echo_packet(
             &self.recv_buffer[..datagram.len],
             datagram.received_at,
             datagram.meta,
-        )
+        )?;
+        if self.runtime.is_terminal() {
+            self.schedule = None;
+        }
+        Ok(events)
     }
 
     /// Receive and classify datagrams until a receive produces no events or the
@@ -247,7 +266,11 @@ impl Client {
     /// pending probes have either replied or timed out. No-test and closed
     /// sessions are also considered complete.
     pub fn is_run_complete(&self) -> bool {
-        self.runtime.is_run_complete()
+        self.runtime.is_terminal()
+            || self
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.is_finished() && self.runtime.pending_is_empty())
     }
 
     /// Return whether the session was closed by a peer close-flagged reply.
@@ -280,17 +303,23 @@ impl Client {
         override_ts: Option<ClientTimestamp>,
     ) -> Result<Vec<ClientEvent>, ClientError> {
         let socket = &self.socket;
-        self.runtime.send_probe_with(override_ts, |packet| {
-            let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
-            let send_call_start = Instant::now();
-            let bytes = socket.send(packet)?;
-            let send_call = send_call_start.elapsed();
-            Ok(SendProbeResult {
-                sent_at,
-                bytes,
-                send_call,
+        self.runtime.ensure_open()?;
+        let schedule = self
+            .schedule
+            .as_mut()
+            .expect("open sessions always have a probe schedule");
+        self.runtime
+            .send_probe_with(schedule, override_ts, |packet| {
+                let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
+                let send_call_start = Instant::now();
+                let bytes = socket.send(packet)?;
+                let send_call = send_call_start.elapsed();
+                Ok(SendProbeResult {
+                    sent_at,
+                    bytes,
+                    send_call,
+                })
             })
-        })
     }
 
     fn send_managed_probe_inner(
@@ -299,8 +328,13 @@ impl Client {
         override_ts: Option<ClientTimestamp>,
     ) -> Result<Vec<ClientEvent>, ClientError> {
         let socket = &self.socket;
+        self.runtime.ensure_open()?;
+        let schedule = self
+            .schedule
+            .as_mut()
+            .expect("open sessions always have a probe schedule");
         self.runtime
-            .send_probe_for_deadline(override_ts, scheduled_at, |packet| {
+            .send_probe_for_deadline(schedule, override_ts, scheduled_at, |packet| {
                 let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
                 let send_call_start = Instant::now();
                 let bytes = socket.send(packet)?;

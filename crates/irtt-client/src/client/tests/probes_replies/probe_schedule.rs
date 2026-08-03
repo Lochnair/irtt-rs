@@ -20,6 +20,7 @@ fn send_probe_sends_valid_echo_request() {
         ..default_test_config(server.addr)
     };
     let mut client = Client::connect(config).unwrap();
+    assert!(client.next_send_deadline().is_none());
     assert_open_started(client.open().unwrap());
     let events = client.send_probe().unwrap();
     assert_eq!(events.len(), 1);

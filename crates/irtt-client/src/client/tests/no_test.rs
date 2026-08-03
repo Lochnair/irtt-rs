@@ -8,8 +8,11 @@ fn no_test_success_validates_params() {
     let server = no_test_server(params.clone(), 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
+    assert!(client.next_send_deadline().is_none());
     let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
+    assert!(client.next_send_deadline().is_none());
+    assert!(client.schedule.is_none());
     server.join();
 }
 
