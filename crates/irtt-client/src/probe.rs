@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashMap, HashSet, TryReserveError, VecDeque},
     time::Instant,
 };
 
@@ -26,19 +26,24 @@ impl PendingMap {
         }
     }
 
-    pub fn check_capacity(&self) -> Result<(), ClientError> {
+    pub fn preflight_insert(&mut self, wire_seq: u32) -> Result<(), ClientError> {
+        if self.map.contains_key(&wire_seq) {
+            return Err(ClientError::PendingSequenceCollision { seq: wire_seq });
+        }
         if self.map.len() >= self.max_capacity {
             return Err(ClientError::PendingLimitExceeded {
                 limit: self.max_capacity,
             });
         }
+        if self.map.len() == self.map.capacity() {
+            self.map.try_reserve(1).map_err(pending_allocation_failed)?;
+        }
         Ok(())
     }
 
-    pub fn insert(&mut self, probe: PendingProbe) -> Result<(), ClientError> {
-        self.check_capacity()?;
-        self.map.insert(probe.wire_seq, probe);
-        Ok(())
+    pub fn commit_insert(&mut self, probe: PendingProbe) {
+        let replaced = self.map.insert(probe.wire_seq, probe);
+        debug_assert!(replaced.is_none(), "preflight rejected pending collision");
     }
 
     pub fn remove(&mut self, wire_seq: u32) -> Option<PendingProbe> {
@@ -64,6 +69,23 @@ impl PendingMap {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    #[cfg(test)]
+    pub fn contains(&self, wire_seq: u32) -> bool {
+        self.map.contains_key(&wire_seq)
+    }
+
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.map.capacity()
+    }
+}
+
+fn pending_allocation_failed(source: TryReserveError) -> ClientError {
+    ClientError::AllocationFailed {
+        operation: "pending probe storage",
+        source,
     }
 }
 
@@ -118,6 +140,11 @@ impl TimedOutMap {
     }
 
     #[cfg(test)]
+    pub fn contains(&self, wire_seq: u32) -> bool {
+        self.map.contains_key(&wire_seq)
+    }
+
+    #[cfg(test)]
     fn insertion_order_len(&self) -> usize {
         self.insertion_order.len()
     }
@@ -164,6 +191,14 @@ impl CompletedSet {
         self.set.contains(&seq)
     }
 
+    pub fn remove(&mut self, seq: u32) -> bool {
+        let removed = self.set.remove(&seq);
+        if removed {
+            self.insertion_order.retain(|entry| *entry != seq);
+        }
+        removed
+    }
+
     fn evict_oldest(&mut self) {
         while let Some(oldest_seq) = self.insertion_order.pop_front() {
             if self.set.remove(&oldest_seq) {
@@ -197,13 +232,58 @@ mod tests {
     fn pending_map_rejects_over_capacity() {
         let mut map = PendingMap::new(2);
         let now = Instant::now();
-        map.insert(pending(0, now + Duration::from_secs(4)))
-            .unwrap();
-        map.insert(pending(1, now + Duration::from_secs(4)))
-            .unwrap();
+        map.preflight_insert(0).unwrap();
+        map.commit_insert(pending(0, now + Duration::from_secs(4)));
+        map.preflight_insert(1).unwrap();
+        map.commit_insert(pending(1, now + Duration::from_secs(4)));
         assert!(matches!(
-            map.insert(pending(2, now + Duration::from_secs(4))),
+            map.preflight_insert(2),
             Err(ClientError::PendingLimitExceeded { limit: 2 })
+        ));
+    }
+
+    #[test]
+    fn pending_map_preflight_reserves_without_changing_contents() {
+        let mut map = PendingMap::new(2);
+        let initial_capacity = map.capacity();
+
+        map.preflight_insert(7).unwrap();
+        let reserved_capacity = map.capacity();
+        assert!(reserved_capacity >= initial_capacity);
+        assert_eq!(map.len(), 0);
+        assert!(!map.contains(7));
+
+        map.preflight_insert(7).unwrap();
+        assert_eq!(map.capacity(), reserved_capacity);
+        assert_eq!(map.len(), 0);
+        assert!(!map.contains(7));
+    }
+
+    #[test]
+    fn pending_map_preflight_rejects_sequence_collision() {
+        let mut map = PendingMap::new(2);
+        let now = Instant::now();
+        map.preflight_insert(9).unwrap();
+        map.commit_insert(pending(9, now));
+
+        assert!(matches!(
+            map.preflight_insert(9),
+            Err(ClientError::PendingSequenceCollision { seq: 9 })
+        ));
+        assert_eq!(map.len(), 1);
+    }
+
+    #[test]
+    fn pending_map_allocation_failure_maps_to_dedicated_error() {
+        let mut map = HashMap::<u32, PendingProbe>::new();
+        let source = map.try_reserve(usize::MAX).unwrap_err();
+
+        assert!(matches!(
+            pending_allocation_failed(source),
+            ClientError::AllocationFailed {
+                operation: "pending probe storage",
+                ..
+            }
         ));
     }
 

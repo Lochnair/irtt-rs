@@ -52,6 +52,113 @@ fn send_probe_sends_valid_echo_request() {
 }
 
 #[test]
+fn blocking_short_probe_commits_before_presentation_length_error() {
+    let params = default_params();
+    let server = silent_open_server(params.clone());
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let expected = echo_packet_len(false, &params);
+    let initial_deadline = client.next_send_deadline().unwrap();
+    client.probe_reported_len = Some(expected - 1);
+
+    assert!(matches!(
+        client.send_probe(),
+        Err(ClientError::DatagramLengthMismatch {
+            expected: error_expected,
+            actual,
+        }) if error_expected == expected && actual + 1 == expected
+    ));
+    assert_eq!(client.runtime.packets_sent(), 1);
+    assert_eq!(
+        client.next_send_deadline(),
+        Some(initial_deadline + client.runtime.config().interval)
+    );
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
+fn blocking_failed_probe_send_preserves_machine_and_schedule() {
+    let params = default_params();
+    let server = silent_open_server(params);
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let initial_deadline = client.next_send_deadline().unwrap();
+    client.probe_send_error = true;
+
+    assert!(matches!(client.send_probe(), Err(ClientError::Socket(_))));
+    assert_eq!(client.runtime.packets_sent(), 0);
+    assert_eq!(client.next_send_deadline(), Some(initial_deadline));
+
+    assert!(matches!(
+        client.send_probe().unwrap().as_slice(),
+        [ClientEvent::EchoSent { seq: 0, .. }]
+    ));
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
+fn blocking_probe_uses_one_timestamp_for_permission_and_schedule_commit() {
+    let duration = Duration::from_secs(1);
+    let interval = Duration::from_millis(100);
+    let params = Params {
+        duration_ns: 1_000_000_000,
+        interval_ns: 100_000_000,
+        ..default_params()
+    };
+    let server = silent_open_server(params.clone());
+    let config = ClientConfig {
+        duration: Some(duration),
+        interval,
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let opened_mono = Instant::now()
+        .checked_sub(Duration::from_secs(2))
+        .expect("test host monotonic clock has at least two seconds of history");
+    client.schedule = Some(
+        ProbeSchedule::new(
+            opened_mono,
+            &NegotiatedParams {
+                params,
+                restrictions: Vec::new(),
+            },
+        )
+        .unwrap(),
+    );
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::now(),
+        mono: opened_mono + Duration::from_millis(500),
+    };
+
+    let events = client.send_probe_at(sent_at).unwrap();
+
+    assert!(matches!(
+        events.as_slice(),
+        [ClientEvent::EchoSent {
+            scheduled_at,
+            sent_at: event_sent_at,
+            timer_error,
+            ..
+        }] if *scheduled_at == opened_mono
+            && *event_sent_at == sent_at
+            && *timer_error == Duration::from_millis(500)
+    ));
+    assert_eq!(client.next_send_deadline(), Some(opened_mono + interval));
+    assert_eq!(client.runtime.packets_sent(), 1);
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
 fn send_probe_respects_finite_duration_exclusive_end() {
     let params = Params {
         protocol_version: 1,
