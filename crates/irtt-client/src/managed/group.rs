@@ -2342,29 +2342,6 @@ mod tests {
         outcome
     }
 
-    fn sent_events_after_start(events: &[TargetEvent]) -> Vec<(&TargetId, Instant)> {
-        let both_started_at = events
-            .iter()
-            .filter_map(|event| match &event.event {
-                ClientEvent::SessionStarted { at, .. } => Some(at.mono),
-                _ => None,
-            })
-            .max()
-            .expect("expected at least one SessionStarted event");
-
-        let mut sent: Vec<_> = events
-            .iter()
-            .filter_map(|event| match &event.event {
-                ClientEvent::EchoSent { sent_at, .. } if sent_at.mono >= both_started_at => {
-                    Some((&event.target, sent_at.mono))
-                }
-                _ => None,
-            })
-            .collect();
-        sent.sort_by_key(|(_, at)| *at);
-        sent
-    }
-
     #[test]
     fn target_event_hub_uses_generic_overflow_behavior() {
         let hub = EventHub::<TargetEvent>::new();
@@ -3156,73 +3133,42 @@ mod tests {
     }
 
     #[test]
-    fn staggered_pacing_does_not_burst_active_targets() {
-        let duration = Duration::from_millis(170);
+    fn staggered_pacing_assigns_distinct_target_slots() {
         let interval = Duration::from_millis(80);
-        let params = test_params(Some(duration), interval);
-        let a = start_echo_server(params.clone(), Duration::ZERO);
-        let b = start_echo_server(params, Duration::ZERO);
+        let first_slot = Instant::now();
 
-        let (session, sub) = ManagedClientGroup::start_with_subscription(
-            group_config(Some(duration), interval, ManagedGroupPacing::Staggered),
-            vec![target("a", a.addr), target("b", b.addr)],
-            SubscriberConfig {
-                capacity: 256,
-                overflow: SubscriberOverflow::DropNewest,
-            },
-        )
-        .unwrap();
+        let (first_scheduled_at, second_slot, first_target) =
+            advance_staggered_slot(first_slot, interval, 2, 0, first_slot).unwrap();
+        let (second_scheduled_at, third_slot, second_target) =
+            advance_staggered_slot(second_slot, interval, 2, 1, second_slot).unwrap();
 
-        let _ = session.join().unwrap();
-        let events = drain_after_join(&sub);
-        a.join();
-        b.join();
-
-        let sent = sent_events_after_start(&events);
-        let pair = sent
-            .windows(2)
-            .find(|window| window[0].0 != window[1].0)
-            .expect("expected sends for two targets");
-        let delta = pair[1].1.duration_since(pair[0].1);
-        assert!(
-            delta >= Duration::from_millis(20),
-            "staggered sends were too close: {delta:?}"
-        );
+        assert_eq!(first_scheduled_at, first_slot);
+        assert_eq!(second_slot, first_slot + Duration::from_millis(40));
+        assert_eq!(first_target, 0);
+        assert_eq!(second_scheduled_at, second_slot);
+        assert_eq!(third_slot, first_slot + interval);
+        assert_eq!(second_target, 1);
+        assert_ne!(first_scheduled_at, second_scheduled_at);
     }
 
     #[test]
-    fn burst_pacing_sends_active_targets_back_to_back() {
-        let duration = Duration::from_millis(190);
+    fn burst_pacing_uses_one_shared_target_deadline() {
         let interval = Duration::from_millis(80);
-        let params = test_params(Some(duration), interval);
-        let a = start_echo_server(params.clone(), Duration::ZERO);
-        let b = start_echo_server(params, Duration::ZERO);
+        let first_burst = Instant::now();
+        let mut pacing = PacingRuntime::new(ManagedGroupPacing::Burst);
+        pacing.next_burst_at = Some(first_burst);
 
-        let (session, sub) = ManagedClientGroup::start_with_subscription(
-            group_config(Some(duration), interval, ManagedGroupPacing::Burst),
-            vec![target("a", a.addr), target("b", b.addr)],
-            SubscriberConfig {
-                capacity: 256,
-                overflow: SubscriberOverflow::DropNewest,
-            },
-        )
-        .unwrap();
+        let shared_deadline = pacing.next_burst(interval, first_burst).unwrap().unwrap();
 
-        let _ = session.join().unwrap();
-        let events = drain_after_join(&sub);
-        a.join();
-        b.join();
+        assert_eq!(shared_deadline, first_burst);
+        assert_eq!(pacing.next_wakeup(), Some(first_burst + interval));
 
-        let sent = sent_events_after_start(&events);
-        let pair = sent
-            .windows(2)
-            .find(|window| window[0].0 != window[1].0)
-            .expect("expected sends for two targets");
-        let delta = pair[1].1.duration_since(pair[0].1);
-        assert!(
-            delta <= Duration::from_millis(20),
-            "burst sends were too far apart: {delta:?}"
-        );
+        let next_deadline = pacing
+            .next_burst(interval, first_burst + interval)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next_deadline, first_burst + interval);
+        assert_eq!(pacing.next_wakeup(), Some(first_burst + interval * 2));
     }
 
     #[test]
