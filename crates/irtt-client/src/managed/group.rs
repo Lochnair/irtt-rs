@@ -12,12 +12,13 @@ use std::{
 };
 
 use crate::{
+    client::schedule::{advance_cadence, ProbeSchedule},
     config::{ClientAuthConfig, ClientConfig},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
     metadata::ReceiveMeta,
     receive::recv_datagram_from,
-    session::machine::{advance_cadence, params_from_config, SendProbeResult, SessionMachine},
+    session::machine::{params_from_config, SendProbeResult, SessionMachine},
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
@@ -626,6 +627,7 @@ struct TargetState {
     remote: SocketAddr,
     configured_auth: Option<ClientAuthConfig>,
     runtime: SessionMachine,
+    schedule: Option<ProbeSchedule>,
     status: TargetStatus,
     open_packet: Vec<u8>,
     counters: TargetCounters,
@@ -716,6 +718,7 @@ impl TargetState {
             remote: target.remote,
             configured_auth: target.auth,
             runtime,
+            schedule: None,
             status: TargetStatus::Opening {
                 attempt: 0,
                 next_send_at: now,
@@ -747,6 +750,14 @@ impl TargetState {
         }
         self.status = TargetStatus::Finished;
         self.final_reason = Some(reason);
+    }
+
+    fn is_run_complete(&self) -> bool {
+        self.runtime.is_terminal()
+            || self
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.is_finished() && self.runtime.pending_is_empty())
     }
 
     fn outcome(&self, reason: ManagedTargetEndReason) -> ManagedTargetOutcome {
@@ -872,16 +883,21 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
             let mut target = target.lock().expect("target mutex poisoned");
             match target.status {
                 TargetStatus::Opening { .. } => {
+                    let opened_at = datagram.received_at;
+                    let mut schedule = None;
                     let result = target.runtime.decode_open_reply(packet).and_then(|reply| {
-                        target.runtime.accept_open_reply(
-                            reply,
-                            datagram.received_at,
-                            |negotiated| validate_group_negotiation(&shared, negotiated),
-                        )
+                        target
+                            .runtime
+                            .accept_open_reply(reply, opened_at, |negotiated| {
+                                validate_group_negotiation(&shared, negotiated)?;
+                                schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
+                                Ok(())
+                            })
                     });
 
                     match result {
                         Ok(outcome) => {
+                            target.schedule = schedule;
                             publish_open_outcome(&shared.hub, &mut target, outcome);
                             wake_scheduler = true;
                         }
@@ -985,6 +1001,7 @@ fn process_active_target_packet(
         Ok(events) => {
             publish_events(hub, target, events);
             if target.runtime.is_peer_closed() {
+                target.schedule = None;
                 target.mark_finished(ManagedTargetEndReason::PeerClosed);
                 true
             } else {
@@ -1251,7 +1268,7 @@ fn finish_completed_targets(socket: &UdpSocket, shared: &GroupShared, now: Insta
     for target in all_targets(shared) {
         let mut target = target.lock().expect("target mutex poisoned");
         match target.status {
-            TargetStatus::Active if target.runtime.is_run_complete() => {
+            TargetStatus::Active if target.is_run_complete() => {
                 if target.runtime.is_peer_closed() {
                     target.mark_finished(ManagedTargetEndReason::PeerClosed);
                 } else if target.runtime.has_timed_out_metadata() {
@@ -1295,19 +1312,27 @@ fn send_echo_to_target(
         return;
     }
     let remote = target.remote;
-    let result = target
+    target
         .runtime
-        .send_probe_for_deadline(None, scheduled_at, |packet| {
-            let sent_at = ClientTimestamp::now();
-            let send_call_start = Instant::now();
-            let bytes = socket.send_to(packet, remote)?;
-            let send_call = send_call_start.elapsed();
-            Ok(SendProbeResult {
-                sent_at,
-                bytes,
-                send_call,
-            })
-        });
+        .ensure_open()
+        .expect("active targets are open");
+    let TargetState {
+        runtime, schedule, ..
+    } = &mut *target;
+    let schedule = schedule
+        .as_mut()
+        .expect("active targets always have a probe schedule");
+    let result = runtime.send_probe_for_deadline(schedule, None, scheduled_at, |packet| {
+        let sent_at = ClientTimestamp::now();
+        let send_call_start = Instant::now();
+        let bytes = socket.send_to(packet, remote)?;
+        let send_call = send_call_start.elapsed();
+        Ok(SendProbeResult {
+            sent_at,
+            bytes,
+            send_call,
+        })
+    });
 
     match result {
         Ok(events) => {
@@ -1437,7 +1462,10 @@ fn close_locked_target(
             socket.send_to(packet, remote)?;
             Ok(())
         }) {
-            Ok(events) => publish_events(hub, target, events),
+            Ok(events) => {
+                publish_events(hub, target, events);
+                target.schedule = None;
+            }
             Err(err) => {
                 target.mark_finished(ManagedTargetEndReason::Failed(
                     ManagedTargetFailure::runtime(&err),
@@ -1619,7 +1647,7 @@ fn target_is_due_for_slot(target: &Arc<Mutex<TargetState>>, scheduled_at: Instan
 fn target_next_send_deadline(target: &Arc<Mutex<TargetState>>) -> Option<Instant> {
     let target = target.lock().expect("target mutex poisoned");
     if matches!(target.status, TargetStatus::Active) {
-        target.runtime.next_send_deadline()
+        target.schedule.as_ref()?.next_send_deadline()
     } else {
         None
     }
@@ -1810,24 +1838,38 @@ mod tests {
 
         let open_packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params);
         let open_reply = target.runtime.decode_open_reply(&open_packet).unwrap();
+        let opened_at = ClientTimestamp::now();
+        let mut opened_schedule = None;
         let open_outcome = target
             .runtime
-            .accept_open_reply(open_reply, ClientTimestamp::now(), |_| Ok(()))
+            .accept_open_reply(open_reply, opened_at, |negotiated| {
+                opened_schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
+                Ok(())
+            })
             .unwrap();
+        target.schedule = opened_schedule;
         publish_open_outcome(&hub, &mut target, open_outcome);
 
         let scheduled_at = Instant::now();
         let sent_at = ClientTimestamp::now();
-        let sent_events = target
-            .runtime
-            .send_probe_for_deadline(Some(sent_at), scheduled_at, |packet| {
-                Ok(SendProbeResult {
-                    sent_at,
-                    bytes: packet.len(),
-                    send_call: Duration::ZERO,
-                })
-            })
-            .unwrap();
+        let sent_events = {
+            let TargetState {
+                runtime, schedule, ..
+            } = &mut target;
+            runtime.send_probe_for_deadline(
+                schedule.as_mut().unwrap(),
+                Some(sent_at),
+                scheduled_at,
+                |packet| {
+                    Ok(SendProbeResult {
+                        sent_at,
+                        bytes: packet.len(),
+                        send_call: Duration::ZERO,
+                    })
+                },
+            )
+        }
+        .unwrap();
         publish_events(&hub, &mut target, sent_events);
 
         ActiveTargetFixture {
@@ -2298,29 +2340,6 @@ mod tests {
             .unwrap();
         joiner.join().unwrap();
         outcome
-    }
-
-    fn sent_events_after_start(events: &[TargetEvent]) -> Vec<(&TargetId, Instant)> {
-        let both_started_at = events
-            .iter()
-            .filter_map(|event| match &event.event {
-                ClientEvent::SessionStarted { at, .. } => Some(at.mono),
-                _ => None,
-            })
-            .max()
-            .expect("expected at least one SessionStarted event");
-
-        let mut sent: Vec<_> = events
-            .iter()
-            .filter_map(|event| match &event.event {
-                ClientEvent::EchoSent { sent_at, .. } if sent_at.mono >= both_started_at => {
-                    Some((&event.target, sent_at.mono))
-                }
-                _ => None,
-            })
-            .collect();
-        sent.sort_by_key(|(_, at)| *at);
-        sent
     }
 
     #[test]
@@ -3114,73 +3133,42 @@ mod tests {
     }
 
     #[test]
-    fn staggered_pacing_does_not_burst_active_targets() {
-        let duration = Duration::from_millis(170);
+    fn staggered_pacing_assigns_distinct_target_slots() {
         let interval = Duration::from_millis(80);
-        let params = test_params(Some(duration), interval);
-        let a = start_echo_server(params.clone(), Duration::ZERO);
-        let b = start_echo_server(params, Duration::ZERO);
+        let first_slot = Instant::now();
 
-        let (session, sub) = ManagedClientGroup::start_with_subscription(
-            group_config(Some(duration), interval, ManagedGroupPacing::Staggered),
-            vec![target("a", a.addr), target("b", b.addr)],
-            SubscriberConfig {
-                capacity: 256,
-                overflow: SubscriberOverflow::DropNewest,
-            },
-        )
-        .unwrap();
+        let (first_scheduled_at, second_slot, first_target) =
+            advance_staggered_slot(first_slot, interval, 2, 0, first_slot).unwrap();
+        let (second_scheduled_at, third_slot, second_target) =
+            advance_staggered_slot(second_slot, interval, 2, 1, second_slot).unwrap();
 
-        let _ = session.join().unwrap();
-        let events = drain_after_join(&sub);
-        a.join();
-        b.join();
-
-        let sent = sent_events_after_start(&events);
-        let pair = sent
-            .windows(2)
-            .find(|window| window[0].0 != window[1].0)
-            .expect("expected sends for two targets");
-        let delta = pair[1].1.duration_since(pair[0].1);
-        assert!(
-            delta >= Duration::from_millis(20),
-            "staggered sends were too close: {delta:?}"
-        );
+        assert_eq!(first_scheduled_at, first_slot);
+        assert_eq!(second_slot, first_slot + Duration::from_millis(40));
+        assert_eq!(first_target, 0);
+        assert_eq!(second_scheduled_at, second_slot);
+        assert_eq!(third_slot, first_slot + interval);
+        assert_eq!(second_target, 1);
+        assert_ne!(first_scheduled_at, second_scheduled_at);
     }
 
     #[test]
-    fn burst_pacing_sends_active_targets_back_to_back() {
-        let duration = Duration::from_millis(190);
+    fn burst_pacing_uses_one_shared_target_deadline() {
         let interval = Duration::from_millis(80);
-        let params = test_params(Some(duration), interval);
-        let a = start_echo_server(params.clone(), Duration::ZERO);
-        let b = start_echo_server(params, Duration::ZERO);
+        let first_burst = Instant::now();
+        let mut pacing = PacingRuntime::new(ManagedGroupPacing::Burst);
+        pacing.next_burst_at = Some(first_burst);
 
-        let (session, sub) = ManagedClientGroup::start_with_subscription(
-            group_config(Some(duration), interval, ManagedGroupPacing::Burst),
-            vec![target("a", a.addr), target("b", b.addr)],
-            SubscriberConfig {
-                capacity: 256,
-                overflow: SubscriberOverflow::DropNewest,
-            },
-        )
-        .unwrap();
+        let shared_deadline = pacing.next_burst(interval, first_burst).unwrap().unwrap();
 
-        let _ = session.join().unwrap();
-        let events = drain_after_join(&sub);
-        a.join();
-        b.join();
+        assert_eq!(shared_deadline, first_burst);
+        assert_eq!(pacing.next_wakeup(), Some(first_burst + interval));
 
-        let sent = sent_events_after_start(&events);
-        let pair = sent
-            .windows(2)
-            .find(|window| window[0].0 != window[1].0)
-            .expect("expected sends for two targets");
-        let delta = pair[1].1.duration_since(pair[0].1);
-        assert!(
-            delta <= Duration::from_millis(20),
-            "burst sends were too far apart: {delta:?}"
-        );
+        let next_deadline = pacing
+            .next_burst(interval, first_burst + interval)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next_deadline, first_burst + interval);
+        assert_eq!(pacing.next_wakeup(), Some(first_burst + interval * 2));
     }
 
     #[test]
