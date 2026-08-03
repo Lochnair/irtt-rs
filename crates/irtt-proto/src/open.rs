@@ -35,6 +35,37 @@ pub fn encode_open_request(request: &OpenRequest, hmac_key: Option<&[u8]>) -> Re
     envelope::finish(out, hmac_key)
 }
 
+pub fn decode_open_request(packet: &[u8], hmac_key: Option<&[u8]>) -> Result<OpenRequest> {
+    let envelope = envelope::decode(
+        packet,
+        hmac_key,
+        &[FlagRule::Require(FLAG_OPEN), FlagRule::Reject(FLAG_REPLY)],
+    )?;
+    envelope::verify(packet, hmac_key)?;
+
+    Ok(OpenRequest {
+        params: Params::decode(&packet[envelope.body_offset..])?,
+        close: has(envelope.flags, FLAG_CLOSE),
+    })
+}
+
+pub fn encode_open_reply(reply: &OpenReply, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
+    let params = reply.params.encode();
+    let mut out = envelope::begin(
+        reply.flags,
+        hmac_key,
+        &[FlagRule::Require(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
+        PacketLayout::open_reply(hmac_key.is_some()).header_len() + params.len(),
+    )?;
+    if reply.token == 0 && !has(reply.flags, FLAG_CLOSE) {
+        return Err(ProtoError::ZeroToken);
+    }
+
+    out.extend_from_slice(&reply.token.to_le_bytes());
+    out.extend_from_slice(&params);
+    envelope::finish(out, hmac_key)
+}
+
 pub fn decode_open_reply(packet: &[u8], hmac_key: Option<&[u8]>) -> Result<OpenReply> {
     let envelope = envelope::decode(
         packet,

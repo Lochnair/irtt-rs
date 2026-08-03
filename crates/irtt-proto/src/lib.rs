@@ -31,13 +31,16 @@ pub mod open;
 pub mod params;
 pub mod varint;
 
-pub use close::{encode_close_request, CloseRequest};
+pub use close::{decode_close_request, encode_close_request, CloseRequest};
 pub use echo::{decode_echo_reply, encode_echo_request, EchoReply, EchoRequest, TimestampFields};
 pub use error::{ProtoError, Result};
 pub use flags::*;
 pub use hmac::{compute_hmac, compute_hmac_in_place, verify_hmac};
 pub use layout::{echo_header_len, echo_packet_len, PacketLayout};
-pub use open::{decode_open_reply, encode_open_request, OpenReply, OpenRequest};
+pub use open::{
+    decode_open_reply, decode_open_request, encode_open_reply, encode_open_request, OpenReply,
+    OpenRequest,
+};
 pub use params::{Clock, Params, ReceivedStats, ServerFill, StampAt, MAX_SERVER_FILL_BYTES};
 
 pub const MAGIC: [u8; 3] = [0x14, 0xA7, 0x5B];

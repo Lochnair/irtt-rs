@@ -1,7 +1,7 @@
 use irtt_proto::{
-    decode_echo_reply, decode_open_reply, encode_close_request, encode_echo_request,
-    encode_open_request, verify_hmac, Clock, CloseRequest, EchoRequest, OpenRequest, Params,
-    ReceivedStats, StampAt,
+    decode_close_request, decode_echo_reply, decode_open_reply, decode_open_request,
+    encode_close_request, encode_echo_request, encode_open_reply, encode_open_request, verify_hmac,
+    Clock, CloseRequest, EchoRequest, OpenRequest, Params, ReceivedStats, StampAt,
 };
 
 fn hex(input: &str) -> Vec<u8> {
@@ -50,6 +50,13 @@ fn vector_1_open_request_no_hmac() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_open_request(&expected, None),
+        Ok(OpenRequest {
+            params: default_params_3s(),
+            close: false,
+        })
+    );
 }
 
 #[test]
@@ -59,6 +66,7 @@ fn vector_2_open_reply_no_hmac() {
     let reply = decode_open_reply(&packet, None).unwrap();
     assert_eq!(reply.token, 0x7896_b6ab_8771_5213);
     assert_eq!(reply.params, default_params_3s());
+    assert_eq!(encode_open_reply(&reply, None).unwrap(), packet);
 }
 
 #[test]
@@ -103,6 +111,12 @@ fn vector_5_close_request_no_hmac() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_close_request(&expected, None),
+        Ok(CloseRequest {
+            token: 0x7896_b6ab_8771_5213,
+        })
+    );
 }
 
 #[test]
@@ -120,6 +134,13 @@ fn vector_6_hmac_open_request() {
     .unwrap();
     assert_eq!(packet, expected);
     verify_hmac(b"testkey", &packet, 4).unwrap();
+    assert_eq!(
+        decode_open_request(&expected, Some(b"testkey")),
+        Ok(OpenRequest {
+            params: hmac_params_2s(),
+            close: false,
+        })
+    );
 }
 
 #[test]
@@ -154,6 +175,12 @@ fn vector_8_hmac_close_request() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_close_request(&expected, Some(b"testkey")),
+        Ok(CloseRequest {
+            token: 0x4387_e9eb_5d3f_ca59,
+        })
+    );
 }
 
 #[test]
@@ -169,6 +196,13 @@ fn vector_9_no_test_open_close_request() {
     )
     .unwrap();
     assert_eq!(packet, expected);
+    assert_eq!(
+        decode_open_request(&expected, None),
+        Ok(OpenRequest {
+            params: default_params_60s(),
+            close: true,
+        })
+    );
 }
 
 #[test]
@@ -179,6 +213,7 @@ fn vector_10_no_test_open_close_reply() {
     let reply = decode_open_reply(&packet, None).unwrap();
     assert_eq!(reply.token, 0);
     assert_eq!(reply.params, default_params_60s());
+    assert_eq!(encode_open_reply(&reply, None).unwrap(), packet);
 }
 
 #[test]

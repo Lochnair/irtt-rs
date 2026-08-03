@@ -1,8 +1,8 @@
 use crate::{
     envelope::{self, FlagRule},
-    flags::{FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
+    flags::{has, FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
     layout::PacketLayout,
-    Result,
+    ProtoError, Result, TOKEN_SIZE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,35 @@ pub fn encode_close_request(request: &CloseRequest, hmac_key: Option<&[u8]>) -> 
     )?;
     out.extend_from_slice(&request.token.to_le_bytes());
     envelope::finish(out, hmac_key)
+}
+
+pub fn decode_close_request(packet: &[u8], hmac_key: Option<&[u8]>) -> Result<CloseRequest> {
+    let envelope = envelope::decode(
+        packet,
+        hmac_key,
+        &[
+            FlagRule::Require(FLAG_CLOSE),
+            FlagRule::Reject(FLAG_OPEN),
+            FlagRule::Reject(FLAG_REPLY),
+        ],
+    )?;
+    let expected_len =
+        PacketLayout::close_request(has(envelope.flags, crate::FLAG_HMAC)).header_len();
+    if packet.len() != expected_len {
+        return Err(ProtoError::PacketLengthMismatch {
+            expected: expected_len,
+            actual: packet.len(),
+        });
+    }
+    envelope::verify(packet, hmac_key)?;
+
+    Ok(CloseRequest {
+        token: u64::from_le_bytes(
+            packet[envelope.body_offset..envelope.body_offset + TOKEN_SIZE]
+                .try_into()
+                .unwrap(),
+        ),
+    })
 }
 
 #[cfg(test)]
