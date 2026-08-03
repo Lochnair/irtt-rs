@@ -17,7 +17,7 @@ use crate::{
     },
     metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
-    session::{negotiate_params, ActiveSession, ClientPhase, CloseSource, NegotiatedParams},
+    session::{negotiate_params, NegotiatedParams},
     timing::ClientTimestamp,
 };
 
@@ -25,14 +25,44 @@ pub(crate) const MAX_OPEN_PACKET_SIZE: usize = 512;
 const MIN_RECV_BUFFER_SIZE: usize = 2048;
 
 #[derive(Debug)]
-pub(crate) struct SessionRuntime {
+pub(crate) struct SessionMachine {
     config: ClientConfig,
     remote: std::net::SocketAddr,
     requested: Params,
-    negotiated: Option<NegotiatedParams>,
-    phase: ClientPhase,
-    session: Option<ActiveSession>,
-    final_packets_sent: u64,
+    state: MachineState,
+}
+
+#[derive(Debug)]
+enum MachineState {
+    Connected,
+    Open(Box<ActiveSession>),
+    NoTestCompleted,
+    Closed {
+        source: CloseSource,
+        packets_sent: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CloseSource {
+    Local,
+    Peer,
+}
+
+#[derive(Debug)]
+struct ActiveSession {
+    token: u64,
+    negotiated: NegotiatedParams,
+    next_wire_seq: u32,
+    highest_received_seq: Option<u32>,
+    packets_sent: u64,
+    start_mono: Instant,
+    end_mono: Option<Instant>,
+    next_send_at: Instant,
+    pending: PendingMap,
+    timed_out: TimedOutMap,
+    completed: CompletedSet,
+    sending_done: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -42,7 +72,7 @@ pub(crate) struct SendProbeResult {
     pub(crate) send_call: Duration,
 }
 
-impl SessionRuntime {
+impl SessionMachine {
     pub(crate) fn new(
         config: ClientConfig,
         remote: std::net::SocketAddr,
@@ -63,10 +93,7 @@ impl SessionRuntime {
             config,
             remote,
             requested,
-            negotiated: None,
-            phase: ClientPhase::Connected,
-            session: None,
-            final_packets_sent: 0,
+            state: MachineState::Connected,
         })
     }
 
@@ -79,11 +106,11 @@ impl SessionRuntime {
     }
 
     pub(crate) fn open_packet(&self) -> Result<Vec<u8>, ClientError> {
-        match self.phase {
-            ClientPhase::Connected => {}
-            ClientPhase::Open { .. } => return Err(ClientError::AlreadyOpen),
-            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        match self.state {
+            MachineState::Connected => {}
+            MachineState::Open(_) => return Err(ClientError::AlreadyOpen),
+            MachineState::Closed { .. } => return Err(ClientError::AlreadyClosed),
+            MachineState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         }
 
         let request = OpenRequest {
@@ -133,7 +160,9 @@ impl SessionRuntime {
     }
 
     pub(crate) fn next_send_deadline(&self) -> Option<Instant> {
-        let session = self.session.as_ref()?;
+        let MachineState::Open(session) = &self.state else {
+            return None;
+        };
         if session.sending_done {
             return None;
         }
@@ -177,17 +206,15 @@ impl SessionRuntime {
     where
         F: FnOnce(&[u8]) -> Result<SendProbeResult, ClientError>,
     {
-        let token = match self.phase {
-            ClientPhase::Open { token } => token,
-            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            ClientPhase::Connected => return Err(ClientError::NotOpen),
-            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
+        let (config, state) = (&self.config, &mut self.state);
+        let probe_timeout = config.probe_timeout;
+        let hmac_key = config.hmac_key.as_deref();
+        let session = match state {
+            MachineState::Open(session) => session,
+            MachineState::Closed { .. } => return Err(ClientError::AlreadyClosed),
+            MachineState::Connected => return Err(ClientError::NotOpen),
+            MachineState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
         };
-
-        let session = self
-            .session
-            .as_mut()
-            .expect("session must exist when phase is Open");
 
         if session.sending_done {
             return Ok(vec![]);
@@ -204,27 +231,17 @@ impl SessionRuntime {
 
         session.pending.check_capacity()?;
 
-        let negotiated = self
-            .negotiated
-            .as_ref()
-            .expect("negotiated must exist when Open");
-
         let wire_seq = session.next_wire_seq;
         let scheduled_at = scheduled_at_override.unwrap_or(session.next_send_at);
 
         let request = EchoRequest {
-            token,
+            token: session.token,
             sequence: wire_seq,
-            params: negotiated.params.clone(),
+            params: session.negotiated.params.clone(),
             payload: vec![],
         };
-        let packet = encode_echo_request(&request, self.config.hmac_key.as_deref())?;
+        let packet = encode_echo_request(&request, hmac_key)?;
         let send_result = send(&packet)?;
-
-        let session = self
-            .session
-            .as_mut()
-            .expect("session must exist when phase is Open");
 
         let pending = PendingProbe {
             wire_seq,
@@ -232,7 +249,7 @@ impl SessionRuntime {
             timeout_at: send_result
                 .sent_at
                 .mono
-                .checked_add(self.config.probe_timeout)
+                .checked_add(probe_timeout)
                 .ok_or(ClientError::DurationOverflow)?,
         };
         session.pending.insert(pending)?;
@@ -246,11 +263,7 @@ impl SessionRuntime {
                     counter: "packets_sent",
                 })?;
 
-        let negotiated = self
-            .negotiated
-            .as_ref()
-            .expect("negotiated must exist when Open");
-        let interval_ns = u64::try_from(negotiated.params.interval_ns)
+        let interval_ns = u64::try_from(session.negotiated.params.interval_ns)
             .expect("validated positive negotiated interval");
         let interval = Duration::from_nanos(interval_ns);
         let (scheduled_at, next_send_at) = if skip_missed_slots {
@@ -264,10 +277,6 @@ impl SessionRuntime {
             )
         };
         let timer_error = instant_abs_diff(send_result.sent_at.mono, scheduled_at);
-        let session = self
-            .session
-            .as_mut()
-            .expect("session must exist when phase is Open");
         session.next_send_at = next_send_at;
 
         if let Some(end) = session.end_mono {
@@ -293,12 +302,7 @@ impl SessionRuntime {
         now: ClientTimestamp,
         meta: ReceiveMeta,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        match self.phase {
-            ClientPhase::Open { .. } => {}
-            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            ClientPhase::Connected => return Err(ClientError::NotOpen),
-            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
-        }
+        self.open_session()?;
 
         let Some(reply) = self.decode_received_packet(packet) else {
             return Ok(vec![ClientEvent::Warning {
@@ -314,17 +318,7 @@ impl SessionRuntime {
         &mut self,
         now: Instant,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        match self.phase {
-            ClientPhase::Open { .. } => {}
-            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            ClientPhase::Connected => return Err(ClientError::NotOpen),
-            ClientPhase::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
-        }
-
-        let session = self
-            .session
-            .as_mut()
-            .expect("session must exist when phase is Open");
+        let session = self.open_session_mut()?;
 
         let expired = session.pending.drain_expired(now);
         let mut events = Vec::with_capacity(expired.len());
@@ -344,10 +338,10 @@ impl SessionRuntime {
     where
         F: FnOnce(&[u8]) -> Result<(), ClientError>,
     {
-        let token = match self.phase {
-            ClientPhase::Open { token } => token,
-            ClientPhase::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            ClientPhase::Connected | ClientPhase::NoTestCompleted => {
+        let token = match &self.state {
+            MachineState::Open(session) => session.token,
+            MachineState::Closed { .. } => return Err(ClientError::AlreadyClosed),
+            MachineState::Connected | MachineState::NoTestCompleted => {
                 return Err(ClientError::NotOpen)
             }
         };
@@ -365,38 +359,40 @@ impl SessionRuntime {
     }
 
     pub(crate) fn is_run_complete(&self) -> bool {
-        let Some(session) = self.session.as_ref() else {
-            return matches!(
-                self.phase,
-                ClientPhase::Closed { .. } | ClientPhase::NoTestCompleted
-            );
-        };
-        session.sending_done && session.pending.len() == 0
+        match &self.state {
+            MachineState::Open(session) => session.sending_done && session.pending.len() == 0,
+            MachineState::NoTestCompleted | MachineState::Closed { .. } => true,
+            MachineState::Connected => false,
+        }
     }
 
     pub(crate) fn is_peer_closed(&self) -> bool {
         matches!(
-            self.phase,
-            ClientPhase::Closed {
-                source: CloseSource::Peer
+            self.state,
+            MachineState::Closed {
+                source: CloseSource::Peer,
+                ..
             }
         )
     }
 
     pub(crate) fn has_timed_out_metadata(&self) -> bool {
-        self.session
-            .as_ref()
-            .is_some_and(|session| session.timed_out.len() > 0)
+        matches!(
+            &self.state,
+            MachineState::Open(session) if session.timed_out.len() > 0
+        )
     }
 
     pub(crate) fn packets_sent(&self) -> u64 {
-        self.session
-            .as_ref()
-            .map_or(self.final_packets_sent, |session| session.packets_sent)
+        match &self.state {
+            MachineState::Open(session) => session.packets_sent,
+            MachineState::Closed { packets_sent, .. } => *packets_sent,
+            MachineState::Connected | MachineState::NoTestCompleted => 0,
+        }
     }
 
     pub(crate) fn is_open(&self) -> bool {
-        matches!(self.phase, ClientPhase::Open { .. })
+        matches!(self.state, MachineState::Open(_))
     }
 
     fn accept_normal_open<F>(
@@ -415,8 +411,6 @@ impl SessionRuntime {
             self.config.negotiation_policy,
         )?;
         before_normal_open(&negotiated)?;
-        self.negotiated = Some(negotiated.clone());
-        self.phase = ClientPhase::Open { token };
 
         let end_mono = if negotiated.params.duration_ns > 0 {
             Some(negotiated_end_mono(
@@ -427,7 +421,9 @@ impl SessionRuntime {
             None
         };
 
-        self.session = Some(ActiveSession {
+        self.state = MachineState::Open(Box::new(ActiveSession {
+            token,
+            negotiated: negotiated.clone(),
             next_wire_seq: 0,
             highest_received_seq: None,
             packets_sent: 0,
@@ -438,7 +434,7 @@ impl SessionRuntime {
             timed_out: TimedOutMap::new(self.config.max_pending_probes),
             completed: CompletedSet::new(self.config.max_pending_probes),
             sending_done: false,
-        });
+        }));
 
         let event = ClientEvent::SessionStarted {
             remote: self.remote,
@@ -465,8 +461,7 @@ impl SessionRuntime {
             reply.params,
             self.config.negotiation_policy,
         )?;
-        self.negotiated = Some(negotiated.clone());
-        self.phase = ClientPhase::NoTestCompleted;
+        self.state = MachineState::NoTestCompleted;
         let event = ClientEvent::NoTestCompleted {
             remote: self.remote,
             negotiated: negotiated.clone(),
@@ -480,12 +475,16 @@ impl SessionRuntime {
     }
 
     fn decode_received_packet(&self, packet: &[u8]) -> Option<EchoReply> {
-        let negotiated = self
-            .negotiated
-            .as_ref()
-            .expect("negotiated must exist when Open");
+        let session = self
+            .open_session()
+            .expect("decode_received_packet is only called for an open session");
 
-        decode_echo_reply(packet, &negotiated.params, self.config.hmac_key.as_deref()).ok()
+        decode_echo_reply(
+            packet,
+            &session.negotiated.params,
+            self.config.hmac_key.as_deref(),
+        )
+        .ok()
     }
 
     fn process_echo_reply(
@@ -495,10 +494,10 @@ impl SessionRuntime {
         now: ClientTimestamp,
         meta: ReceiveMeta,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        let token = match self.phase {
-            ClientPhase::Open { token } => token,
-            _ => unreachable!(),
-        };
+        let token = self
+            .open_session()
+            .expect("process_echo_reply is only called for an open session")
+            .token;
         if reply.token != token {
             return Ok(vec![ClientEvent::Warning {
                 kind: WarningKind::WrongToken,
@@ -513,7 +512,9 @@ impl SessionRuntime {
         let wire_seq = reply.sequence;
         let should_close = flags::has(reply.flags, flags::FLAG_CLOSE);
         let mut events = {
-            let session = self.session.as_mut().expect("session must exist when Open");
+            let session = self
+                .open_session_mut()
+                .expect("process_echo_reply is only called for an open session");
 
             if let Some(pending) = session.pending.remove(wire_seq) {
                 let rtt = compute_rtt(&pending.sent_at, &now, &reply.timestamps);
@@ -630,11 +631,36 @@ impl SessionRuntime {
     }
 
     fn transition_to_closed(&mut self, source: CloseSource) {
-        if let Some(mut session) = self.session.take() {
-            session.timed_out.clear();
-            self.final_packets_sent = session.packets_sent;
+        let packets_sent = match &mut self.state {
+            MachineState::Open(session) => {
+                session.timed_out.clear();
+                session.packets_sent
+            }
+            MachineState::Closed { packets_sent, .. } => *packets_sent,
+            MachineState::Connected | MachineState::NoTestCompleted => 0,
+        };
+        self.state = MachineState::Closed {
+            source,
+            packets_sent,
+        };
+    }
+
+    fn open_session(&self) -> Result<&ActiveSession, ClientError> {
+        match &self.state {
+            MachineState::Open(session) => Ok(session),
+            MachineState::Closed { .. } => Err(ClientError::AlreadyClosed),
+            MachineState::Connected => Err(ClientError::NotOpen),
+            MachineState::NoTestCompleted => Err(ClientError::AlreadyCompleted),
         }
-        self.phase = ClientPhase::Closed { source };
+    }
+
+    fn open_session_mut(&mut self) -> Result<&mut ActiveSession, ClientError> {
+        match &mut self.state {
+            MachineState::Open(session) => Ok(session),
+            MachineState::Closed { .. } => Err(ClientError::AlreadyClosed),
+            MachineState::Connected => Err(ClientError::NotOpen),
+            MachineState::NoTestCompleted => Err(ClientError::AlreadyCompleted),
+        }
     }
 }
 
