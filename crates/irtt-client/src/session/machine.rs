@@ -205,7 +205,7 @@ impl SessionMachine {
         self.ensure_connected()?;
         match irtt_proto::decode_open_reply(packet, self.config.hmac_key.as_deref()) {
             Ok(reply) => Ok(OpenDatagramDisposition::Trusted(reply)),
-            Err(irtt_proto::ProtoError::ZeroToken) => Err(ClientError::ZeroToken),
+            Err(error @ irtt_proto::ProtoError::ZeroToken) => Err(ClientError::Protocol(error)),
             Err(
                 error @ (irtt_proto::ProtoError::TruncatedVarint
                 | irtt_proto::ProtoError::VarintOverflow
@@ -280,37 +280,6 @@ impl SessionMachine {
         );
         self.state = prepared.next_state;
         prepared.outcome
-    }
-
-    // Temporary private bridges keep this first commit independently compiling.
-    // The blocking and managed migrations remove them before the PR is complete.
-    pub(crate) fn open_packet(&self) -> Result<Vec<u8>, ClientError> {
-        Ok(self.prepare_open_request()?.bytes.into_vec())
-    }
-
-    pub(crate) fn decode_open_reply(&self, packet: &[u8]) -> Result<OpenReply, ClientError> {
-        Ok(irtt_proto::decode_open_reply(
-            packet,
-            self.config.hmac_key.as_deref(),
-        )?)
-    }
-
-    pub(crate) fn accept_open_reply<F>(
-        &mut self,
-        reply: OpenReply,
-        now: ClientTimestamp,
-        before_normal_open: F,
-    ) -> Result<OpenOutcome, ClientError>
-    where
-        F: FnOnce(&NegotiatedParams) -> Result<(), ClientError>,
-    {
-        let prepared = self
-            .prepare_open_acceptance(reply, now)
-            .map_err(|failure| failure.primary)?;
-        if let Some(negotiated) = prepared.normal_negotiated() {
-            before_normal_open(negotiated)?;
-        }
-        Ok(self.commit_open(prepared))
     }
 
     pub(crate) fn probe_timeout(&self) -> Duration {
@@ -1151,7 +1120,7 @@ mod tests {
 
         assert!(matches!(
             machine.inspect_open_datagram(&packet),
-            Err(ClientError::ZeroToken)
+            Err(ClientError::Protocol(irtt_proto::ProtoError::ZeroToken))
         ));
         assert!(matches!(machine.state, MachineState::Connected));
     }

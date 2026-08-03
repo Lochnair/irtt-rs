@@ -225,7 +225,10 @@ fn trusted_zero_token_normal_reply_is_terminal() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
 
-    assert!(matches!(client.open(), Err(ClientError::ZeroToken)));
+    assert!(matches!(
+        client.open(),
+        Err(ClientError::Protocol(irtt_proto::ProtoError::ZeroToken))
+    ));
     assert_eq!(server.rx.iter().take(1).count(), 1);
     assert!(client.runtime.prepare_open_request().is_ok());
     assert!(client.schedule.is_none());
