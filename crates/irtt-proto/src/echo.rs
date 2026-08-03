@@ -1,18 +1,15 @@
 use crate::{
-    flags::{has, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY},
-    hmac,
+    envelope::{self, FlagRule},
+    flags::{FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
     layout::{echo_packet_len, PacketLayout},
-    open::{check_hmac_presence, reject},
     params::Params,
-    validate_header, write_header, ProtoError, Result, HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE,
-    RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE, TOKEN_SIZE,
+    ProtoError, Result, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE, TOKEN_SIZE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchoRequest {
     pub token: u64,
     pub sequence: u32,
-    pub params: Params,
     pub payload: Vec<u8>,
 }
 
@@ -37,13 +34,13 @@ pub struct TimestampFields {
     pub send_mono: Option<i64>,
 }
 
-pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut flags = 0;
-    if hmac_key.is_some() {
-        flags |= FLAG_HMAC;
-    }
-    let layout = PacketLayout::echo(hmac_key.is_some(), &request.params);
-    let len = echo_packet_len(hmac_key.is_some(), &request.params)?;
+pub fn encode_echo_request(
+    request: &EchoRequest,
+    params: &Params,
+    hmac_key: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let layout = PacketLayout::echo(hmac_key.is_some(), params);
+    let len = echo_packet_len(hmac_key.is_some(), params)?;
     let payload_offset = layout.header_len();
     let available_payload_len = len.saturating_sub(payload_offset);
     if request.payload.len() > available_payload_len {
@@ -52,21 +49,83 @@ pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Re
             provided: request.payload.len(),
         });
     }
-    let mut out = Vec::with_capacity(len);
-    write_header(&mut out, flags);
-    if hmac_key.is_some() {
-        out.extend_from_slice(&[0; HMAC_SIZE]);
-    }
+    let mut out = envelope::begin(
+        0,
+        hmac_key,
+        &[
+            FlagRule::Reject(FLAG_OPEN),
+            FlagRule::Reject(FLAG_REPLY),
+            FlagRule::Reject(FLAG_CLOSE),
+        ],
+        len,
+    )?;
     out.extend_from_slice(&request.token.to_le_bytes());
     out.extend_from_slice(&request.sequence.to_le_bytes());
     push_zeroed_layout_tail(layout, &mut out);
     out.resize(len, 0);
     out[payload_offset..payload_offset + request.payload.len()].copy_from_slice(&request.payload);
 
-    if let Some(key) = hmac_key {
-        hmac::compute_hmac_in_place(key, &mut out, hmac::hmac_offset())?;
+    envelope::finish(out, hmac_key)
+}
+
+pub fn decode_echo_request(
+    packet: &[u8],
+    params: &Params,
+    hmac_key: Option<&[u8]>,
+) -> Result<EchoRequest> {
+    let envelope = envelope::decode(
+        packet,
+        hmac_key,
+        &[
+            FlagRule::Reject(FLAG_OPEN),
+            FlagRule::Reject(FLAG_REPLY),
+            FlagRule::Reject(FLAG_CLOSE),
+        ],
+    )?;
+    let layout = PacketLayout::echo(hmac_key.is_some(), params);
+    validate_echo_length(packet, params, layout)?;
+    envelope::verify(packet, hmac_key)?;
+
+    let mut pos = envelope.body_offset;
+    let token = read_u64(packet, &mut pos);
+    let sequence = read_u32(packet, &mut pos);
+
+    Ok(EchoRequest {
+        token,
+        sequence,
+        payload: packet[layout.header_len()..].to_vec(),
+    })
+}
+
+pub fn encode_echo_reply(
+    reply: &EchoReply,
+    params: &Params,
+    hmac_key: Option<&[u8]>,
+) -> Result<Vec<u8>> {
+    let layout = PacketLayout::echo(hmac_key.is_some(), params);
+    let len = echo_packet_len(hmac_key.is_some(), params)?;
+    let payload_offset = layout.header_len();
+    let available_payload_len = len.saturating_sub(payload_offset);
+    if reply.payload.len() > available_payload_len {
+        return Err(ProtoError::PayloadTooLarge {
+            available: available_payload_len,
+            provided: reply.payload.len(),
+        });
     }
-    Ok(out)
+
+    let mut out = envelope::begin(
+        reply.flags,
+        hmac_key,
+        &[FlagRule::Reject(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
+        len,
+    )?;
+    out.extend_from_slice(&reply.token.to_le_bytes());
+    out.extend_from_slice(&reply.sequence.to_le_bytes());
+    push_echo_reply_tail(reply, layout, &mut out)?;
+    out.resize(len, 0);
+    out[payload_offset..payload_offset + reply.payload.len()].copy_from_slice(&reply.payload);
+
+    envelope::finish(out, hmac_key)
 }
 
 pub fn decode_echo_reply(
@@ -74,35 +133,17 @@ pub fn decode_echo_reply(
     params: &Params,
     hmac_key: Option<&[u8]>,
 ) -> Result<EchoReply> {
-    let flags = validate_header(packet)?;
-    reject(flags, FLAG_OPEN)?;
-    crate::open::require(flags, FLAG_REPLY)?;
-    check_hmac_presence(flags, hmac_key)?;
+    let envelope = envelope::decode(
+        packet,
+        hmac_key,
+        &[FlagRule::Reject(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
+    )?;
+    let layout = PacketLayout::echo(hmac_key.is_some(), params);
+    validate_echo_length(packet, params, layout)?;
+    envelope::verify(packet, hmac_key)?;
 
-    let layout = PacketLayout::echo(has(flags, FLAG_HMAC), params);
     let header_len = layout.header_len();
-    if packet.len() < header_len {
-        return Err(ProtoError::PacketTooShort {
-            needed: header_len,
-            actual: packet.len(),
-        });
-    }
-    let expected_len = echo_packet_len(has(flags, FLAG_HMAC), params)?;
-    if packet.len() != expected_len {
-        return Err(ProtoError::PacketLengthMismatch {
-            expected: expected_len,
-            actual: packet.len(),
-        });
-    }
-
-    if let Some(key) = hmac_key {
-        hmac::verify_hmac(key, packet, hmac::hmac_offset())?;
-    }
-
-    let mut pos = HEADER_SIZE;
-    if layout.hmac {
-        pos += HMAC_SIZE;
-    }
+    let mut pos = envelope.body_offset;
     let token = read_u64(packet, &mut pos);
     let sequence = read_u32(packet, &mut pos);
     let recv_count = layout.recv_count.then(|| read_u32(packet, &mut pos));
@@ -117,7 +158,7 @@ pub fn decode_echo_reply(
     };
 
     Ok(EchoReply {
-        flags,
+        flags: envelope.flags,
         token,
         sequence,
         recv_count,
@@ -125,6 +166,24 @@ pub fn decode_echo_reply(
         timestamps,
         payload: packet[header_len..].to_vec(),
     })
+}
+
+fn validate_echo_length(packet: &[u8], params: &Params, layout: PacketLayout) -> Result<()> {
+    let header_len = layout.header_len();
+    if packet.len() < header_len {
+        return Err(ProtoError::PacketTooShort {
+            needed: header_len,
+            actual: packet.len(),
+        });
+    }
+    let expected_len = echo_packet_len(layout.hmac, params)?;
+    if packet.len() != expected_len {
+        return Err(ProtoError::PacketLengthMismatch {
+            expected: expected_len,
+            actual: packet.len(),
+        });
+    }
+    Ok(())
 }
 
 fn push_zeroed_layout_tail(layout: PacketLayout, out: &mut Vec<u8>) {
@@ -136,6 +195,47 @@ fn push_zeroed_layout_tail(layout: PacketLayout, out: &mut Vec<u8>) {
     }
     for _ in 0..layout.timestamp_count() {
         out.extend_from_slice(&[0; TIMESTAMP_SIZE]);
+    }
+}
+
+fn push_echo_reply_tail(reply: &EchoReply, layout: PacketLayout, out: &mut Vec<u8>) -> Result<()> {
+    if let Some(value) = field_value(layout.recv_count, reply.recv_count, "recv_count")? {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    if let Some(value) = field_value(layout.recv_window, reply.recv_window, "recv_window")? {
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+
+    let timestamps = &reply.timestamps;
+    for (present, value, name) in [
+        (layout.recv_wall, timestamps.recv_wall, "recv_wall"),
+        (layout.recv_mono, timestamps.recv_mono, "recv_mono"),
+        (
+            layout.midpoint_wall,
+            timestamps.midpoint_wall,
+            "midpoint_wall",
+        ),
+        (
+            layout.midpoint_mono,
+            timestamps.midpoint_mono,
+            "midpoint_mono",
+        ),
+        (layout.send_wall, timestamps.send_wall, "send_wall"),
+        (layout.send_mono, timestamps.send_mono, "send_mono"),
+    ] {
+        if let Some(value) = field_value(present, value, name)? {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+    }
+    Ok(())
+}
+
+fn field_value<T: Copy>(present: bool, value: Option<T>, name: &'static str) -> Result<Option<T>> {
+    match (present, value) {
+        (true, Some(value)) => Ok(Some(value)),
+        (true, None) => Err(ProtoError::MissingField(name)),
+        (false, Some(_)) => Err(ProtoError::UnexpectedField(name)),
+        (false, None) => Ok(None),
     }
 }
 
@@ -160,7 +260,11 @@ fn read_i64(packet: &[u8], pos: &mut usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{Clock, ReceivedStats, StampAt};
+    use crate::{
+        hmac,
+        params::{Clock, ReceivedStats, StampAt},
+        write_header, FLAG_HMAC, HMAC_SIZE,
+    };
 
     fn default_params() -> Params {
         Params {
@@ -179,24 +283,24 @@ mod tests {
         }
     }
 
-    fn echo_request_with_payload(payload_space: usize, payload: Vec<u8>) -> EchoRequest {
+    fn echo_request_with_payload(payload: Vec<u8>) -> EchoRequest {
         EchoRequest {
             token: 0x7896_b6ab_8771_5213,
             sequence: 9,
-            params: params_with_payload_space(payload_space),
             payload,
         }
     }
 
     #[test]
     fn echo_request_encodes_default_placeholders() {
+        let params = default_params();
         let packet = encode_echo_request(
             &EchoRequest {
                 token: 0x7896_b6ab_8771_5213,
                 sequence: 0,
-                params: default_params(),
                 payload: Vec::new(),
             },
+            &params,
             None,
         )
         .unwrap();
@@ -208,29 +312,32 @@ mod tests {
 
     #[test]
     fn echo_request_encodes_exact_fit_payload() {
-        let request = echo_request_with_payload(4, vec![1, 2, 3, 4]);
-        let packet = encode_echo_request(&request, None).unwrap();
-        let payload_offset = PacketLayout::echo(false, &request.params).header_len();
+        let params = params_with_payload_space(4);
+        let request = echo_request_with_payload(vec![1, 2, 3, 4]);
+        let packet = encode_echo_request(&request, &params, None).unwrap();
+        let payload_offset = PacketLayout::echo(false, &params).header_len();
 
         assert_eq!(&packet[payload_offset..], &[1, 2, 3, 4]);
     }
 
     #[test]
     fn echo_request_encodes_shorter_payload_and_zero_fills_remainder() {
-        let request = echo_request_with_payload(4, vec![1, 2]);
-        let packet = encode_echo_request(&request, None).unwrap();
-        let payload_offset = PacketLayout::echo(false, &request.params).header_len();
+        let params = params_with_payload_space(4);
+        let request = echo_request_with_payload(vec![1, 2]);
+        let packet = encode_echo_request(&request, &params, None).unwrap();
+        let payload_offset = PacketLayout::echo(false, &params).header_len();
 
         assert_eq!(&packet[payload_offset..], &[1, 2, 0, 0]);
     }
 
     #[test]
     fn echo_request_rejects_oversized_payload() {
-        let request = echo_request_with_payload(4, vec![1, 2, 3, 4, 5]);
+        let params = params_with_payload_space(4);
+        let request = echo_request_with_payload(vec![1, 2, 3, 4, 5]);
         let original = request.clone();
 
         assert_eq!(
-            encode_echo_request(&request, None),
+            encode_echo_request(&request, &params, None),
             Err(ProtoError::PayloadTooLarge {
                 available: 4,
                 provided: 5,
@@ -241,24 +348,28 @@ mod tests {
 
     #[test]
     fn echo_request_rejects_negative_requested_length() {
-        let mut request = echo_request_with_payload(0, Vec::new());
-        request.params.length = -1;
+        let request = echo_request_with_payload(Vec::new());
+        let params = Params {
+            length: -1,
+            ..Params::default()
+        };
 
         assert_eq!(
-            encode_echo_request(&request, None),
+            encode_echo_request(&request, &params, None),
             Err(ProtoError::NegativePacketLength { length: -1 })
         );
     }
 
     #[test]
     fn hmac_echo_request_places_token_and_sequence_after_hmac() {
+        let params = default_params();
         let packet = encode_echo_request(
             &EchoRequest {
                 token: 0x7896_b6ab_8771_5213,
                 sequence: 9,
-                params: default_params(),
                 payload: Vec::new(),
             },
+            &params,
             Some(b"testkey"),
         )
         .unwrap();

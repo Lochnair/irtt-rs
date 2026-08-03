@@ -218,10 +218,9 @@ impl SessionMachine {
         let request = EchoRequest {
             token: session.token,
             sequence: wire_seq,
-            params: session.negotiated.params.clone(),
             payload: vec![],
         };
-        let packet = encode_echo_request(&request, hmac_key)?;
+        let packet = encode_echo_request(&request, &session.negotiated.params, hmac_key)?;
         let send_result = send(&packet)?;
 
         let pending = PendingProbe {

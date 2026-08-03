@@ -15,11 +15,14 @@
 //! The crate also provides packet layout calculation, open/echo/close packet
 //! encoding and decoding, and optional HMAC placement, computation, and
 //! verification helpers.
+//! Encoder `hmac_key` arguments are authoritative: `Some(key)` adds
+//! `FLAG_HMAC`, while `None` removes it from caller-supplied reply flags.
 //!
 #![forbid(unsafe_code)]
 
 pub mod close;
 pub mod echo;
+mod envelope;
 pub mod error;
 pub mod flags;
 pub mod hmac;
@@ -28,13 +31,19 @@ pub mod open;
 pub mod params;
 pub mod varint;
 
-pub use close::{encode_close_request, CloseRequest};
-pub use echo::{decode_echo_reply, encode_echo_request, EchoReply, EchoRequest, TimestampFields};
+pub use close::{decode_close_request, encode_close_request, CloseRequest};
+pub use echo::{
+    decode_echo_reply, decode_echo_request, encode_echo_reply, encode_echo_request, EchoReply,
+    EchoRequest, TimestampFields,
+};
 pub use error::{ProtoError, Result};
 pub use flags::*;
 pub use hmac::{compute_hmac, compute_hmac_in_place, verify_hmac};
 pub use layout::{echo_header_len, echo_packet_len, PacketLayout};
-pub use open::{decode_open_reply, encode_open_request, OpenReply, OpenRequest};
+pub use open::{
+    decode_open_reply, decode_open_request, encode_open_reply, encode_open_request, OpenReply,
+    OpenRequest,
+};
 pub use params::{Clock, Params, ReceivedStats, ServerFill, StampAt, MAX_SERVER_FILL_BYTES};
 
 pub const MAGIC: [u8; 3] = [0x14, 0xA7, 0x5B];
