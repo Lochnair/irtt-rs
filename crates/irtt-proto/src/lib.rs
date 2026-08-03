@@ -32,7 +32,10 @@ pub mod params;
 pub mod varint;
 
 pub use close::{decode_close_request, encode_close_request, CloseRequest};
-pub use echo::{decode_echo_reply, encode_echo_request, EchoReply, EchoRequest, TimestampFields};
+pub use echo::{
+    decode_echo_reply, decode_echo_request, encode_echo_reply, encode_echo_request, EchoReply,
+    EchoRequest, TimestampFields,
+};
 pub use error::{ProtoError, Result};
 pub use flags::*;
 pub use hmac::{compute_hmac, compute_hmac_in_place, verify_hmac};

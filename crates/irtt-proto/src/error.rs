@@ -40,4 +40,8 @@ pub enum ProtoError {
     MalformedParams,
     #[error("payload is too large: {provided} bytes provided, {available} bytes available")]
     PayloadTooLarge { available: usize, provided: usize },
+    #[error("required packet field {0} is missing")]
+    MissingField(&'static str),
+    #[error("packet field {0} is not present in the negotiated layout")]
+    UnexpectedField(&'static str),
 }
