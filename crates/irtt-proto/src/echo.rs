@@ -1,11 +1,9 @@
 use crate::{
-    flags::{has, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY},
-    hmac,
+    envelope::{self, FlagRule},
+    flags::{FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
     layout::{echo_packet_len, PacketLayout},
-    open::{check_hmac_presence, reject},
     params::Params,
-    validate_header, write_header, ProtoError, Result, HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE,
-    RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE, TOKEN_SIZE,
+    ProtoError, Result, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE, TOKEN_SIZE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -38,10 +36,6 @@ pub struct TimestampFields {
 }
 
 pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut flags = 0;
-    if hmac_key.is_some() {
-        flags |= FLAG_HMAC;
-    }
     let layout = PacketLayout::echo(hmac_key.is_some(), &request.params);
     let len = echo_packet_len(hmac_key.is_some(), &request.params)?;
     let payload_offset = layout.header_len();
@@ -52,21 +46,23 @@ pub fn encode_echo_request(request: &EchoRequest, hmac_key: Option<&[u8]>) -> Re
             provided: request.payload.len(),
         });
     }
-    let mut out = Vec::with_capacity(len);
-    write_header(&mut out, flags);
-    if hmac_key.is_some() {
-        out.extend_from_slice(&[0; HMAC_SIZE]);
-    }
+    let mut out = envelope::begin(
+        0,
+        hmac_key,
+        &[
+            FlagRule::Reject(FLAG_OPEN),
+            FlagRule::Reject(FLAG_REPLY),
+            FlagRule::Reject(FLAG_CLOSE),
+        ],
+        len,
+    )?;
     out.extend_from_slice(&request.token.to_le_bytes());
     out.extend_from_slice(&request.sequence.to_le_bytes());
     push_zeroed_layout_tail(layout, &mut out);
     out.resize(len, 0);
     out[payload_offset..payload_offset + request.payload.len()].copy_from_slice(&request.payload);
 
-    if let Some(key) = hmac_key {
-        hmac::compute_hmac_in_place(key, &mut out, hmac::hmac_offset())?;
-    }
-    Ok(out)
+    envelope::finish(out, hmac_key)
 }
 
 pub fn decode_echo_reply(
@@ -74,35 +70,17 @@ pub fn decode_echo_reply(
     params: &Params,
     hmac_key: Option<&[u8]>,
 ) -> Result<EchoReply> {
-    let flags = validate_header(packet)?;
-    reject(flags, FLAG_OPEN)?;
-    crate::open::require(flags, FLAG_REPLY)?;
-    check_hmac_presence(flags, hmac_key)?;
+    let envelope = envelope::decode(
+        packet,
+        hmac_key,
+        &[FlagRule::Reject(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
+    )?;
+    let layout = PacketLayout::echo(hmac_key.is_some(), params);
+    validate_echo_length(packet, params, layout)?;
+    envelope::verify(packet, hmac_key)?;
 
-    let layout = PacketLayout::echo(has(flags, FLAG_HMAC), params);
     let header_len = layout.header_len();
-    if packet.len() < header_len {
-        return Err(ProtoError::PacketTooShort {
-            needed: header_len,
-            actual: packet.len(),
-        });
-    }
-    let expected_len = echo_packet_len(has(flags, FLAG_HMAC), params)?;
-    if packet.len() != expected_len {
-        return Err(ProtoError::PacketLengthMismatch {
-            expected: expected_len,
-            actual: packet.len(),
-        });
-    }
-
-    if let Some(key) = hmac_key {
-        hmac::verify_hmac(key, packet, hmac::hmac_offset())?;
-    }
-
-    let mut pos = HEADER_SIZE;
-    if layout.hmac {
-        pos += HMAC_SIZE;
-    }
+    let mut pos = envelope.body_offset;
     let token = read_u64(packet, &mut pos);
     let sequence = read_u32(packet, &mut pos);
     let recv_count = layout.recv_count.then(|| read_u32(packet, &mut pos));
@@ -117,7 +95,7 @@ pub fn decode_echo_reply(
     };
 
     Ok(EchoReply {
-        flags,
+        flags: envelope.flags,
         token,
         sequence,
         recv_count,
@@ -125,6 +103,24 @@ pub fn decode_echo_reply(
         timestamps,
         payload: packet[header_len..].to_vec(),
     })
+}
+
+fn validate_echo_length(packet: &[u8], params: &Params, layout: PacketLayout) -> Result<()> {
+    let header_len = layout.header_len();
+    if packet.len() < header_len {
+        return Err(ProtoError::PacketTooShort {
+            needed: header_len,
+            actual: packet.len(),
+        });
+    }
+    let expected_len = echo_packet_len(layout.hmac, params)?;
+    if packet.len() != expected_len {
+        return Err(ProtoError::PacketLengthMismatch {
+            expected: expected_len,
+            actual: packet.len(),
+        });
+    }
+    Ok(())
 }
 
 fn push_zeroed_layout_tail(layout: PacketLayout, out: &mut Vec<u8>) {
@@ -160,7 +156,11 @@ fn read_i64(packet: &[u8], pos: &mut usize) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{Clock, ReceivedStats, StampAt};
+    use crate::{
+        hmac,
+        params::{Clock, ReceivedStats, StampAt},
+        write_header, FLAG_HMAC, HMAC_SIZE,
+    };
 
     fn default_params() -> Params {
         Params {

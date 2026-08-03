@@ -15,11 +15,14 @@
 //! The crate also provides packet layout calculation, open/echo/close packet
 //! encoding and decoding, and optional HMAC placement, computation, and
 //! verification helpers.
+//! Encoder `hmac_key` arguments are authoritative: `Some(key)` adds
+//! `FLAG_HMAC`, while `None` removes it from caller-supplied reply flags.
 //!
 #![forbid(unsafe_code)]
 
 pub mod close;
 pub mod echo;
+mod envelope;
 pub mod error;
 pub mod flags;
 pub mod hmac;

@@ -1,8 +1,9 @@
 use crate::{
-    flags::{has, FLAG_CLOSE, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY},
-    hmac,
+    envelope::{self, FlagRule},
+    flags::{has, FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
+    layout::PacketLayout,
     params::Params,
-    validate_header, write_header, ProtoError, Result, HEADER_SIZE, HMAC_SIZE, TOKEN_SIZE,
+    ProtoError, Result, TOKEN_SIZE,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,36 +24,26 @@ pub fn encode_open_request(request: &OpenRequest, hmac_key: Option<&[u8]>) -> Re
     if request.close {
         flags |= FLAG_CLOSE;
     }
-    if hmac_key.is_some() {
-        flags |= FLAG_HMAC;
-    }
-
-    let mut out = Vec::new();
-    write_header(&mut out, flags);
-    if hmac_key.is_some() {
-        out.extend_from_slice(&[0; HMAC_SIZE]);
-    }
-    out.extend_from_slice(&request.params.encode());
-
-    if let Some(key) = hmac_key {
-        hmac::compute_hmac_in_place(key, &mut out, hmac::hmac_offset())?;
-    }
-    Ok(out)
+    let params = request.params.encode();
+    let mut out = envelope::begin(
+        flags,
+        hmac_key,
+        &[FlagRule::Require(FLAG_OPEN), FlagRule::Reject(FLAG_REPLY)],
+        PacketLayout::open_request(hmac_key.is_some()).header_len() + params.len(),
+    )?;
+    out.extend_from_slice(&params);
+    envelope::finish(out, hmac_key)
 }
 
 pub fn decode_open_reply(packet: &[u8], hmac_key: Option<&[u8]>) -> Result<OpenReply> {
-    let flags = validate_header(packet)?;
-    require(flags, FLAG_OPEN)?;
-    require(flags, FLAG_REPLY)?;
-    check_hmac_presence(flags, hmac_key)?;
-    if let Some(key) = hmac_key {
-        hmac::verify_hmac(key, packet, hmac::hmac_offset())?;
-    }
+    let envelope = envelope::decode(
+        packet,
+        hmac_key,
+        &[FlagRule::Require(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
+    )?;
+    envelope::verify(packet, hmac_key)?;
 
-    let mut pos = HEADER_SIZE;
-    if has(flags, FLAG_HMAC) {
-        pos += HMAC_SIZE;
-    }
+    let mut pos = envelope.body_offset;
     let needed = pos + TOKEN_SIZE;
     if packet.len() < needed {
         return Err(ProtoError::PacketTooShort {
@@ -62,45 +53,25 @@ pub fn decode_open_reply(packet: &[u8], hmac_key: Option<&[u8]>) -> Result<OpenR
     }
     let token = u64::from_le_bytes(packet[pos..pos + TOKEN_SIZE].try_into().unwrap());
     pos += TOKEN_SIZE;
-    if token == 0 && !has(flags, FLAG_CLOSE) {
+    if token == 0 && !has(envelope.flags, FLAG_CLOSE) {
         return Err(ProtoError::ZeroToken);
     }
 
     Ok(OpenReply {
-        flags,
+        flags: envelope.flags,
         token,
         params: Params::decode(&packet[pos..])?,
     })
 }
 
-pub(crate) fn require(flags: u8, flag: u8) -> Result<()> {
-    if has(flags, flag) {
-        Ok(())
-    } else {
-        Err(ProtoError::MissingFlag(flag))
-    }
-}
-
-pub(crate) fn reject(flags: u8, flag: u8) -> Result<()> {
-    if has(flags, flag) {
-        Err(ProtoError::UnexpectedFlag(flag))
-    } else {
-        Ok(())
-    }
-}
-
-pub(crate) fn check_hmac_presence(flags: u8, hmac_key: Option<&[u8]>) -> Result<()> {
-    if has(flags, FLAG_HMAC) == hmac_key.is_some() {
-        Ok(())
-    } else {
-        Err(ProtoError::HmacPresenceMismatch)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::params::{Clock, ReceivedStats, StampAt};
+    use crate::{
+        hmac,
+        params::{Clock, ReceivedStats, StampAt},
+        FLAG_HMAC, HMAC_SIZE,
+    };
 
     fn default_params() -> Params {
         Params {
