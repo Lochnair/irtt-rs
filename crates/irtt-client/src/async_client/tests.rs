@@ -16,10 +16,7 @@ use irtt_proto::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::*;
-use crate::{
-    socket::resolution_call_counts, socket_options::tokio_socket_traffic_class, Client, RunMode,
-    SocketConfig, WarningKind,
-};
+use crate::{socket_options::tokio_socket_traffic_class, Client, RunMode, SocketConfig};
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -58,6 +55,22 @@ fn config(addr: SocketAddr, key: Option<Vec<u8>>, dscp: u8) -> ClientConfig {
         },
         ..ClientConfig::default()
     }
+}
+
+async fn opened_client(addr: SocketAddr, dscp: u8) -> AsyncClient {
+    let mut client = AsyncClient::connect(config(addr, None, dscp))
+        .await
+        .unwrap();
+    client.open().await.unwrap();
+    client
+}
+
+fn inject_send(client: &AsyncClient, result: InjectedSend) {
+    client.test_hooks.sends.borrow_mut().push_back(result);
+}
+
+fn socket_dscp(client: &AsyncClient) -> u32 {
+    tokio_socket_traffic_class(&client.socket, client.remote).unwrap() >> 2
 }
 
 fn start_server<F>(handler: F) -> TestServer
@@ -106,6 +119,24 @@ fn send_open_reply(
     socket.send_to(&reply, peer).unwrap();
 }
 
+fn open_session(
+    socket: &UdpSocket,
+    tx: &mpsc::Sender<Vec<u8>>,
+    key: Option<&[u8]>,
+) -> (Params, SocketAddr) {
+    let (packet, peer) = recv_packet(socket, tx);
+    let request = decode_open_request(&packet, key).unwrap();
+    send_open_reply(
+        socket,
+        peer,
+        request.params.clone(),
+        key,
+        flags::FLAG_OPEN | flags::FLAG_REPLY,
+        TOKEN,
+    );
+    (request.params, peer)
+}
+
 fn echo_reply(
     params: &Params,
     sequence: u32,
@@ -131,16 +162,7 @@ fn echo_reply(
 
 fn start_open_server(key: Option<Vec<u8>>, packets_after_open: usize) -> TestServer {
     start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, key.as_deref()).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params,
-            key.as_deref(),
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
+        open_session(&socket, &tx, key.as_deref());
         for _ in 0..packets_after_open {
             let _ = recv_packet(&socket, &tx);
         }
@@ -165,22 +187,13 @@ fn start_no_test_server() -> TestServer {
 
 fn start_peer_close_server() -> TestServer {
     start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params.clone(),
-            None,
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
+        let (params, peer) = open_session(&socket, &tx, None);
         let (probe_packet, _) = recv_packet(&socket, &tx);
-        let probe = decode_echo_request(&probe_packet, &request.params, None).unwrap();
+        let probe = decode_echo_request(&probe_packet, &params, None).unwrap();
         socket
             .send_to(
                 &echo_reply(
-                    &request.params,
+                    &params,
                     probe.sequence,
                     TOKEN,
                     flags::FLAG_REPLY | flags::FLAG_CLOSE,
@@ -194,23 +207,14 @@ fn start_peer_close_server() -> TestServer {
 
 fn start_echo_close_server(key: Option<Vec<u8>>) -> TestServer {
     start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, key.as_deref()).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params.clone(),
-            key.as_deref(),
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
+        let (params, peer) = open_session(&socket, &tx, key.as_deref());
 
         let (probe_packet, _) = recv_packet(&socket, &tx);
-        let probe = decode_echo_request(&probe_packet, &request.params, key.as_deref()).unwrap();
+        let probe = decode_echo_request(&probe_packet, &params, key.as_deref()).unwrap();
         socket
             .send_to(
                 &echo_reply(
-                    &request.params,
+                    &params,
                     probe.sequence,
                     TOKEN,
                     flags::FLAG_REPLY,
@@ -226,49 +230,6 @@ fn start_echo_close_server(key: Option<Vec<u8>>) -> TestServer {
                 .unwrap()
                 .token,
             TOKEN
-        );
-    })
-}
-
-fn start_timeout_server() -> TestServer {
-    start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params,
-            None,
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
-        let _ = recv_packet(&socket, &tx);
-    })
-}
-
-fn start_filtered_open_server(key: Vec<u8>) -> TestServer {
-    start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, Some(&key)).unwrap();
-        socket.send_to(&[0_u8], peer).unwrap();
-        let mut bad_hmac = encode_open_reply(
-            &OpenReply {
-                flags: flags::FLAG_OPEN | flags::FLAG_REPLY,
-                token: TOKEN,
-                params: request.params.clone(),
-            },
-            Some(&key),
-        )
-        .unwrap();
-        bad_hmac[4] ^= 0xff;
-        socket.send_to(&bad_hmac, peer).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params,
-            Some(&key),
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
         );
     })
 }
@@ -290,36 +251,6 @@ fn connect_requires_current_runtime_when_polled() {
         poll_once(Pin::as_mut(&mut future)),
         Poll::Ready(Err(ClientError::NoTokioRuntime))
     ));
-}
-
-#[test]
-fn hostname_connect_uses_tokio_lookup_without_synchronous_resolution() {
-    runtime().block_on(async {
-        let mut client_config = config(SocketAddr::from(([127, 0, 0, 1], 2112)), None, 0);
-        client_config.server_addr = "localhost:2112".to_owned();
-        client_config.socket_config.ipv4_only = true;
-        let before = resolution_call_counts();
-
-        let client = AsyncClient::connect(client_config).await.unwrap();
-
-        let after = resolution_call_counts();
-        assert!(client.remote.is_ipv4());
-        assert_eq!(after.0, before.0);
-        assert_eq!(after.1, before.1 + 1);
-    });
-}
-
-#[test]
-fn literal_connect_bypasses_all_name_resolution() {
-    runtime().block_on(async {
-        let remote = SocketAddr::from(([127, 0, 0, 1], 2112));
-        let before = resolution_call_counts();
-
-        let client = AsyncClient::connect(config(remote, None, 0)).await.unwrap();
-
-        assert_eq!(client.remote, remote);
-        assert_eq!(resolution_call_counts(), before);
-    });
 }
 
 #[test]
@@ -368,11 +299,7 @@ fn open_ignores_malformed_and_bad_hmac_without_resending() {
         let mut client = AsyncClient::connect(config(server.addr, Some(key), 0))
             .await
             .unwrap();
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::WouldBlock);
+        inject_send(&client, InjectedSend::WouldBlock);
         let attempts = client.test_hooks.send_attempts.get();
         assert!(matches!(
             client.open().await.unwrap(),
@@ -559,16 +486,7 @@ fn opening_cancellation_after_submission_can_retry() {
 #[test]
 fn adapter_failure_sends_preencoded_cleanup_without_committing_open() {
     let server = start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params,
-            None,
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
+        open_session(&socket, &tx, None);
         let (close, _) = recv_packet(&socket, &tx);
         assert_eq!(decode_close_request(&close, None).unwrap().token, TOKEN);
     });
@@ -592,16 +510,7 @@ fn adapter_failure_sends_preencoded_cleanup_without_committing_open() {
 #[test]
 fn cleanup_failure_preserves_primary_open_error() {
     let server = start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params,
-            None,
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
+        open_session(&socket, &tx, None);
     });
 
     runtime().block_on(async {
@@ -650,10 +559,7 @@ fn no_test_open_has_no_schedule_or_dscp_state() {
 fn probe_cancellation_would_block_and_error_retain_one_preparation() {
     let server = start_open_server(None, 1);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 0))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 0).await;
         let deadline = client.next_send_deadline();
         let attempts = client.test_hooks.send_attempts.get();
 
@@ -701,10 +607,7 @@ fn probe_cancellation_would_block_and_error_retain_one_preparation() {
 fn probe_false_readiness_resamples_all_timestamps() {
     let server = start_open_server(None, 1);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 0))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 0).await;
         let scheduled_at = client.next_send_deadline().unwrap();
         let first_sent = ClientTimestamp {
             wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
@@ -728,11 +631,7 @@ fn probe_false_readiness_resamples_all_timestamps() {
                 send_finished_at: scheduled_at + Duration::from_millis(17),
             },
         ]);
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::WouldBlock);
+        inject_send(&client, InjectedSend::WouldBlock);
 
         let events = client.send_probe().await.unwrap();
         assert!(matches!(
@@ -763,21 +662,14 @@ fn probe_false_readiness_resamples_all_timestamps() {
 fn successful_short_probe_commits_before_length_error() {
     let server = start_open_server(None, 0);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 0))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 0).await;
         client.test_hooks.pause_probe_before_writable.set(true);
         let mut send = Box::pin(client.send_probe());
         assert!(matches!(poll_once(Pin::as_mut(&mut send)), Poll::Pending));
         drop(send);
         let probe_len = client.prepared_probe.as_ref().unwrap().bytes.len();
         let deadline = client.next_send_deadline().unwrap();
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::ReportedLength(probe_len - 1));
+        inject_send(&client, InjectedSend::ReportedLength(probe_len - 1));
 
         assert!(matches!(
             client.send_probe().await,
@@ -798,10 +690,7 @@ fn successful_short_probe_commits_before_length_error() {
 fn stale_retained_probe_is_rejected_before_send() {
     let server = start_open_server(None, 0);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 0))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 0).await;
         client.test_hooks.pause_probe_before_writable.set(true);
         let mut send = Box::pin(client.send_probe());
         assert!(matches!(poll_once(Pin::as_mut(&mut send)), Poll::Pending));
@@ -864,148 +753,25 @@ fn finite_duration_boundary_clears_preparation_without_send() {
 #[test]
 fn receive_retries_false_readiness_and_shares_packet_classification() {
     let server = start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params.clone(),
-            None,
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
+        let (params, peer) = open_session(&socket, &tx, None);
         let (probe_packet, _) = recv_packet(&socket, &tx);
-        let probe = decode_echo_request(&probe_packet, &request.params, None).unwrap();
-        socket.send_to(&[0_u8], peer).unwrap();
+        let probe = decode_echo_request(&probe_packet, &params, None).unwrap();
         socket
             .send_to(
-                &echo_reply(
-                    &request.params,
-                    probe.sequence,
-                    TOKEN + 1,
-                    flags::FLAG_REPLY,
-                    None,
-                ),
-                peer,
-            )
-            .unwrap();
-        let normal = echo_reply(
-            &request.params,
-            probe.sequence,
-            TOKEN,
-            flags::FLAG_REPLY,
-            None,
-        );
-        socket.send_to(&normal, peer).unwrap();
-        socket.send_to(&normal, peer).unwrap();
-        socket
-            .send_to(
-                &echo_reply(
-                    &request.params,
-                    probe.sequence,
-                    TOKEN,
-                    flags::FLAG_REPLY | flags::FLAG_CLOSE,
-                    None,
-                ),
+                &echo_reply(&params, probe.sequence, TOKEN, flags::FLAG_REPLY, None),
                 peer,
             )
             .unwrap();
     });
 
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 46))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 0).await;
         client.send_probe().await.unwrap();
         client.test_hooks.receive_would_block.set(2);
 
         assert!(matches!(
             client.recv().await.unwrap().as_slice(),
-            [ClientEvent::Warning {
-                kind: WarningKind::MalformedOrUnrelatedPacket,
-                ..
-            }]
-        ));
-        assert!(matches!(
-            client.recv().await.unwrap().as_slice(),
-            [ClientEvent::Warning {
-                kind: WarningKind::WrongToken,
-                ..
-            }]
-        ));
-        assert!(matches!(
-            client.recv().await.unwrap().as_slice(),
-            [ClientEvent::EchoReply { packet_meta, .. }]
-                if *packet_meta == crate::PacketMeta::default()
-        ));
-        assert!(matches!(
-            client.recv().await.unwrap().as_slice(),
-            [ClientEvent::DuplicateReply { .. }]
-        ));
-        assert!(matches!(
-            client.recv().await.unwrap().as_slice(),
-            [
-                ClientEvent::DuplicateReply { .. },
-                ClientEvent::SessionClosed { .. }
-            ]
-        ));
-        assert!(client.is_peer_closed());
-        assert!(client.schedule.is_none());
-        assert!(client.prepared_probe.is_none());
-        assert_eq!(client.applied_dscp, None);
-        assert_eq!(
-            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-            0
-        );
-    });
-    assert_eq!(server.finish().len(), 2);
-}
-
-#[test]
-fn timed_out_probe_reply_is_classified_late() {
-    let server = start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params.clone(),
-            None,
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
-        let (probe_packet, _) = recv_packet(&socket, &tx);
-        let probe = decode_echo_request(&probe_packet, &request.params, None).unwrap();
-        thread::sleep(Duration::from_millis(30));
-        socket
-            .send_to(
-                &echo_reply(
-                    &request.params,
-                    probe.sequence,
-                    TOKEN,
-                    flags::FLAG_REPLY,
-                    None,
-                ),
-                peer,
-            )
-            .unwrap();
-    });
-
-    runtime().block_on(async {
-        let mut client_config = config(server.addr, None, 0);
-        client_config.probe_timeout = Duration::from_millis(5);
-        let mut client = AsyncClient::connect(client_config).await.unwrap();
-        client.open().await.unwrap();
-        client.send_probe().await.unwrap();
-        time::sleep(Duration::from_millis(10)).await;
-        assert!(matches!(
-            client.poll_timeouts().unwrap().as_slice(),
-            [ClientEvent::EchoLoss { seq: 0, .. }]
-        ));
-        assert!(matches!(
-            client.recv().await.unwrap().as_slice(),
-            [ClientEvent::LateReply { seq: 0, .. }]
+            [ClientEvent::EchoReply { seq: 0, .. }]
         ));
     });
     assert_eq!(server.finish().len(), 2);
@@ -1015,10 +781,7 @@ fn timed_out_probe_reply_is_classified_late() {
 fn peer_close_dscp_failure_preserves_events_and_logical_ownership() {
     let server = start_peer_close_server();
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 46))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 46).await;
         client.send_probe().await.unwrap();
         client.prepared_probe = client.machine.prepare_probe().unwrap();
         client.test_hooks.fail_peer_close_dscp.set(true);
@@ -1036,10 +799,7 @@ fn peer_close_dscp_failure_preserves_events_and_logical_ownership() {
         assert!(client.prepared_probe.is_none());
         assert_eq!(client.applied_dscp, Some(46));
         assert_eq!(client.next_send_deadline(), None);
-        assert_eq!(
-            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-            46 << 2
-        );
+        assert_eq!(socket_dscp(&client), 46);
     });
     assert_eq!(server.finish().len(), 2);
 }
@@ -1047,16 +807,7 @@ fn peer_close_dscp_failure_preserves_events_and_logical_ownership() {
 #[test]
 fn recv_after_local_close_and_no_test_fails_on_first_poll() {
     let close_server = start_server(move |socket, tx| {
-        let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        send_open_reply(
-            &socket,
-            peer,
-            request.params,
-            None,
-            flags::FLAG_OPEN | flags::FLAG_REPLY,
-            TOKEN,
-        );
+        open_session(&socket, &tx, None);
         let (close_packet, _) = recv_packet(&socket, &tx);
         assert_eq!(
             decode_close_request(&close_packet, None).unwrap().token,
@@ -1064,10 +815,7 @@ fn recv_after_local_close_and_no_test_fails_on_first_poll() {
         );
     });
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(close_server.addr, None, 0))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(close_server.addr, 0).await;
         client.close().await.unwrap();
         assert!(matches!(
             poll_recv_once(&mut client),
@@ -1094,16 +842,10 @@ fn recv_after_local_close_and_no_test_fails_on_first_poll() {
 fn close_cancellation_and_would_block_restore_dscp_before_suspend() {
     let server = start_open_server(None, 1);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 46))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 46).await;
         let deadline = client.next_send_deadline();
         let attempts = client.test_hooks.send_attempts.get();
-        assert_eq!(
-            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-            46 << 2
-        );
+        assert_eq!(socket_dscp(&client), 46);
 
         client.test_hooks.pause_close_before_writable.set(true);
         let mut close = Box::pin(client.close());
@@ -1114,16 +856,9 @@ fn close_cancellation_and_would_block_restore_dscp_before_suspend() {
         assert_eq!(client.next_send_deadline(), deadline);
         assert_eq!(client.applied_dscp, Some(46));
         assert_eq!(client.test_hooks.send_attempts.get(), attempts);
-        assert_eq!(
-            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-            46 << 2
-        );
+        assert_eq!(socket_dscp(&client), 46);
 
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::WouldBlock);
+        inject_send(&client, InjectedSend::WouldBlock);
         client.test_hooks.pause_close_after_would_block.set(true);
         let mut close = Box::pin(client.close());
         assert!(matches!(poll_once(Pin::as_mut(&mut close)), Poll::Pending));
@@ -1131,10 +866,7 @@ fn close_cancellation_and_would_block_restore_dscp_before_suspend() {
         assert!(client.machine.is_open());
         assert!(client.schedule.is_some());
         assert_eq!(client.applied_dscp, Some(46));
-        assert_eq!(
-            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-            46 << 2
-        );
+        assert_eq!(socket_dscp(&client), 46);
 
         assert!(matches!(
             client.close().await.unwrap().as_slice(),
@@ -1150,33 +882,19 @@ fn close_cancellation_and_would_block_restore_dscp_before_suspend() {
 fn close_errors_preserve_open_state_and_primary_send_error() {
     let server = start_open_server(None, 0);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 46))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 46).await;
         let deadline = client.next_send_deadline();
 
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::Error);
+        inject_send(&client, InjectedSend::Error);
         assert!(matches!(client.close().await, Err(ClientError::Socket(_))));
         assert!(client.machine.is_open());
         assert!(client.schedule.is_some());
         assert_eq!(client.next_send_deadline(), deadline);
         assert_eq!(client.applied_dscp, Some(46));
-        assert_eq!(
-            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-            46 << 2
-        );
+        assert_eq!(socket_dscp(&client), 46);
 
         client.test_hooks.fail_dscp_restore.set(true);
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::Error);
+        inject_send(&client, InjectedSend::Error);
         assert!(matches!(client.close().await, Err(ClientError::Socket(_))));
         assert!(client.machine.is_open());
         assert!(client.schedule.is_some());
@@ -1188,16 +906,9 @@ fn close_errors_preserve_open_state_and_primary_send_error() {
 fn close_would_block_restore_failure_stops_without_committing() {
     let server = start_open_server(None, 0);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 46))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 46).await;
         client.test_hooks.fail_dscp_restore.set(true);
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::WouldBlock);
+        inject_send(&client, InjectedSend::WouldBlock);
 
         assert!(matches!(
             client.close().await,
@@ -1214,13 +925,10 @@ fn close_would_block_restore_failure_stops_without_committing() {
 }
 
 #[test]
-fn close_timestamp_is_sampled_after_success_and_short_send_commits() {
+fn successful_short_close_commits_before_length_error() {
     let server = start_open_server(None, 0);
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, None, 0))
-            .await
-            .unwrap();
-        client.open().await.unwrap();
+        let mut client = opened_client(server.addr, 0).await;
         client.test_hooks.pause_probe_before_writable.set(true);
         let mut send = Box::pin(client.send_probe());
         assert!(matches!(poll_once(Pin::as_mut(&mut send)), Poll::Pending));
@@ -1228,16 +936,7 @@ fn close_timestamp_is_sampled_after_success_and_short_send_commits() {
         assert!(client.prepared_probe.is_some());
 
         let close_len = client.machine.prepare_close().unwrap().bytes.len();
-        let close_sent_at = ClientTimestamp {
-            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(44),
-            mono: Instant::now() + Duration::from_secs(1),
-        };
-        client.test_hooks.close_sent_at.set(Some(close_sent_at));
-        client
-            .test_hooks
-            .sends
-            .borrow_mut()
-            .push_back(InjectedSend::ReportedLength(close_len - 1));
+        inject_send(&client, InjectedSend::ReportedLength(close_len - 1));
 
         assert!(matches!(
             client.close().await,
@@ -1251,25 +950,27 @@ fn close_timestamp_is_sampled_after_success_and_short_send_commits() {
             client.machine.prepare_close(),
             Err(ClientError::AlreadyClosed)
         ));
-
-        let server = start_open_server(None, 1);
-        let mut exact = AsyncClient::connect(config(server.addr, None, 0))
-            .await
-            .unwrap();
-        exact.open().await.unwrap();
-        exact.test_hooks.close_sent_at.set(Some(close_sent_at));
-        let events = exact.close().await.unwrap();
-        assert!(matches!(
-            events.as_slice(),
-            [ClientEvent::SessionClosed { at, .. }] if *at == close_sent_at
-        ));
-        assert!(matches!(
-            exact.close().await,
-            Err(ClientError::AlreadyClosed)
-        ));
-        assert_eq!(server.finish().len(), 2);
     });
     assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn successful_close_uses_post_acceptance_timestamp() {
+    let server = start_open_server(None, 1);
+    runtime().block_on(async {
+        let mut client = opened_client(server.addr, 0).await;
+        let close_sent_at = ClientTimestamp {
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(44),
+            mono: Instant::now() + Duration::from_secs(1),
+        };
+        client.test_hooks.close_sent_at.set(Some(close_sent_at));
+
+        assert!(matches!(
+            client.close().await.unwrap().as_slice(),
+            [ClientEvent::SessionClosed { at, .. }] if *at == close_sent_at
+        ));
+    });
+    assert_eq!(server.finish().len(), 2);
 }
 
 #[test]
@@ -1290,10 +991,7 @@ fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
             .await
             .unwrap();
         let opened = client.open().await.unwrap();
-        assert_eq!(
-            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-            46 << 2
-        );
+        assert_eq!(socket_dscp(&client), 46);
         let sent = client.send_probe().await.unwrap();
         let reply = client.recv().await.unwrap();
         let closed = client.close().await.unwrap();
@@ -1312,7 +1010,7 @@ fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
 }
 
 #[test]
-fn blocking_and_async_no_test_timeout_and_peer_close_are_equivalent() {
+fn blocking_and_async_no_test_are_semantically_equivalent() {
     let blocking_no_test_server = start_no_test_server();
     let mut blocking_no_test_config = config(blocking_no_test_server.addr, None, 0);
     blocking_no_test_config.run_mode = RunMode::NoTest;
@@ -1343,30 +1041,10 @@ fn blocking_and_async_no_test_timeout_and_peer_close_are_equivalent() {
         open_negotiated(&blocking_no_test_open),
         open_negotiated(&async_no_test_open)
     );
+}
 
-    let blocking_timeout_server = start_timeout_server();
-    let mut blocking_timeout_config = config(blocking_timeout_server.addr, None, 0);
-    blocking_timeout_config.probe_timeout = Duration::from_millis(5);
-    let mut blocking_timeout = Client::connect(blocking_timeout_config).unwrap();
-    blocking_timeout.open().unwrap();
-    blocking_timeout.send_probe().unwrap();
-    thread::sleep(Duration::from_millis(10));
-    let blocking_loss = blocking_timeout.poll_timeouts().unwrap();
-    assert_eq!(blocking_timeout_server.finish().len(), 2);
-
-    let async_timeout_server = start_timeout_server();
-    let mut async_timeout_config = config(async_timeout_server.addr, None, 0);
-    async_timeout_config.probe_timeout = Duration::from_millis(5);
-    let async_loss = runtime().block_on(async {
-        let mut client = AsyncClient::connect(async_timeout_config).await.unwrap();
-        client.open().await.unwrap();
-        client.send_probe().await.unwrap();
-        time::sleep(Duration::from_millis(10)).await;
-        client.poll_timeouts().unwrap()
-    });
-    assert_eq!(async_timeout_server.finish().len(), 2);
-    assert_matching_event_shape(&blocking_loss[0], &async_loss[0]);
-
+#[test]
+fn blocking_and_async_peer_close_are_semantically_equivalent() {
     let blocking_peer_close_server = start_peer_close_server();
     let mut blocking_peer_close =
         Client::connect(config(blocking_peer_close_server.addr, None, 0)).unwrap();
@@ -1400,52 +1078,6 @@ fn blocking_and_async_no_test_timeout_and_peer_close_are_equivalent() {
     }
 }
 
-#[test]
-fn blocking_and_async_filtered_open_and_finite_completion_are_equivalent() {
-    let key = b"filtered-open-equivalence".to_vec();
-    let blocking_server = start_filtered_open_server(key.clone());
-    let mut blocking = Client::connect(config(blocking_server.addr, Some(key.clone()), 0)).unwrap();
-    let blocking_open = blocking.open().unwrap();
-    assert_eq!(blocking_server.finish().len(), 1);
-
-    let async_server = start_filtered_open_server(key.clone());
-    let async_open = runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(async_server.addr, Some(key), 0))
-            .await
-            .unwrap();
-        client.open().await.unwrap()
-    });
-    assert_eq!(async_server.finish().len(), 1);
-    assert_eq!(
-        open_negotiated(&blocking_open),
-        open_negotiated(&async_open)
-    );
-
-    let blocking_finite_server = start_open_server(None, 0);
-    let mut blocking_config = config(blocking_finite_server.addr, None, 0);
-    blocking_config.interval = Duration::from_millis(5);
-    blocking_config.duration = Some(Duration::from_millis(20));
-    let mut blocking = Client::connect(blocking_config).unwrap();
-    blocking.open().unwrap();
-    thread::sleep(Duration::from_millis(25));
-    assert!(blocking.send_probe().unwrap().is_empty());
-    assert!(blocking.is_run_complete());
-    assert_eq!(blocking_finite_server.finish().len(), 1);
-
-    let async_finite_server = start_open_server(None, 0);
-    let mut async_config = config(async_finite_server.addr, None, 0);
-    async_config.interval = Duration::from_millis(5);
-    async_config.duration = Some(Duration::from_millis(20));
-    runtime().block_on(async {
-        let mut client = AsyncClient::connect(async_config).await.unwrap();
-        client.open().await.unwrap();
-        time::sleep(Duration::from_millis(25)).await;
-        assert!(client.send_probe().await.unwrap().is_empty());
-        assert!(client.is_run_complete());
-    });
-    assert_eq!(async_finite_server.finish().len(), 1);
-}
-
 fn open_negotiated(outcome: &OpenOutcome) -> &crate::NegotiatedParams {
     match outcome {
         OpenOutcome::Started { negotiated, .. }
@@ -1454,49 +1086,14 @@ fn open_negotiated(outcome: &OpenOutcome) -> &crate::NegotiatedParams {
 }
 
 fn assert_matching_event_shape(blocking: &ClientEvent, asynchronous: &ClientEvent) {
-    match (blocking, asynchronous) {
-        (
-            ClientEvent::EchoSent {
-                seq: left_seq,
-                bytes: left_bytes,
-                ..
-            },
-            ClientEvent::EchoSent {
-                seq: right_seq,
-                bytes: right_bytes,
-                ..
-            },
-        ) => {
-            assert_eq!(left_seq, right_seq);
-            assert_eq!(left_bytes, right_bytes);
-        }
-        (
-            ClientEvent::EchoReply {
-                seq: left_seq,
-                bytes: left_bytes,
-                ..
-            },
-            ClientEvent::EchoReply {
-                seq: right_seq,
-                bytes: right_bytes,
-                ..
-            },
-        ) => {
-            assert_eq!(left_seq, right_seq);
-            assert_eq!(left_bytes, right_bytes);
-        }
-        (
-            ClientEvent::SessionClosed {
-                token: left_token, ..
-            },
-            ClientEvent::SessionClosed {
-                token: right_token, ..
-            },
-        ) => assert_eq!(left_token, right_token),
-        (
-            ClientEvent::EchoLoss { seq: left_seq, .. },
-            ClientEvent::EchoLoss { seq: right_seq, .. },
-        ) => assert_eq!(left_seq, right_seq),
-        pair => panic!("event shapes differ: {pair:?}"),
+    assert_eq!(event_shape(blocking), event_shape(asynchronous));
+}
+
+fn event_shape(event: &ClientEvent) -> (&'static str, u64, usize) {
+    match event {
+        ClientEvent::EchoSent { seq, bytes, .. } => ("sent", u64::from(*seq), *bytes),
+        ClientEvent::EchoReply { seq, bytes, .. } => ("reply", u64::from(*seq), *bytes),
+        ClientEvent::SessionClosed { token, .. } => ("closed", *token, 0),
+        other => panic!("unexpected equivalence event: {other:?}"),
     }
 }

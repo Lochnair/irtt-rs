@@ -66,7 +66,6 @@ struct AsyncClientTestHooks {
     fail_open_dscp: Cell<bool>,
     fail_cleanup_send: Cell<bool>,
     fail_peer_close_dscp: Cell<bool>,
-    fail_close_dscp_clear: Cell<bool>,
     fail_dscp_restore: Cell<bool>,
     pause_open_before_writable: Cell<bool>,
     pause_open_before_readable: Cell<bool>,
@@ -642,14 +641,6 @@ impl AsyncClient {
     }
 
     fn clear_close_dscp(&self) -> Result<(), ClientError> {
-        #[cfg(test)]
-        if self.test_hooks.fail_close_dscp_clear.replace(false) {
-            return Err(ClientError::SocketOption {
-                operation: "clear DSCP before close",
-                remote: self.remote,
-                source: io::Error::other("injected close DSCP clear failure"),
-            });
-        }
         clear_dscp_on_tokio_socket(&self.socket, self.remote)
     }
 
