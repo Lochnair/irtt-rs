@@ -388,6 +388,7 @@ fn classify_target_failure(error: &ClientError, opening: bool) -> ManagedTargetF
         ClientError::InvalidConfig { .. }
         | ClientError::OpenTimeoutTooSmall { .. }
         | ClientError::NoOpenTimeouts => ManagedTargetFailureKind::InvalidConfiguration,
+        ClientError::DurationOverflow if opening => ManagedTargetFailureKind::InvalidConfiguration,
         ClientError::WorkerPanicked => ManagedTargetFailureKind::InternalWorker,
         _ if opening => ManagedTargetFailureKind::OpeningProtocol,
         _ => ManagedTargetFailureKind::RuntimeProtocol,
@@ -4102,6 +4103,18 @@ mod tests {
     }
 
     #[test]
+    fn opening_duration_overflow_is_invalid_configuration_only_while_opening() {
+        assert_eq!(
+            classify_target_failure(&ClientError::DurationOverflow, true),
+            ManagedTargetFailureKind::InvalidConfiguration
+        );
+        assert_eq!(
+            classify_target_failure(&ClientError::DurationOverflow, false),
+            ManagedTargetFailureKind::RuntimeProtocol
+        );
+    }
+
+    #[test]
     fn group_open_deadline_overflow_fails_before_send() {
         let silent_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
         let remote = silent_peer.local_addr().unwrap();
@@ -4112,14 +4125,41 @@ mod tests {
         );
         config.client.open_timeouts = vec![Duration::MAX];
 
-        let outcome = ManagedClientGroup::start(config, vec![target("peer", remote)])
-            .unwrap()
-            .join()
-            .unwrap();
+        let (session, sub) = ManagedClientGroup::start_with_subscription(
+            config,
+            vec![target("peer", remote)],
+            SubscriberConfig {
+                capacity: 8,
+                overflow: SubscriberOverflow::DropNewest,
+            },
+        )
+        .unwrap();
+        let events = collect_group_events_until_disconnected(&sub);
+        let outcome = session.join().unwrap();
 
+        assert_eq!(outcome.total_target_outcomes, 1);
         assert_eq!(outcome.failed_target_outcomes, 1);
+        assert_eq!(outcome.targets.len(), 1);
+        assert!(matches!(
+            outcome.targets[0].end_reason,
+            ManagedTargetEndReason::OpenFailed(ManagedTargetFailure {
+                kind: ManagedTargetFailureKind::InvalidConfiguration,
+                ..
+            })
+        ));
         let failure = outcome.targets[0].end_reason.failure().unwrap();
+        assert_eq!(failure.kind, ManagedTargetFailureKind::InvalidConfiguration);
+        assert_ne!(failure.kind, ManagedTargetFailureKind::OpeningProtocol);
         assert!(failure.message.contains("duration"));
+        let finished: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ManagedGroupEvent::TargetFinished(outcome) => Some(outcome),
+                ManagedGroupEvent::Client(_) => None,
+            })
+            .collect();
+        assert_eq!(finished.len(), 1);
+        assert_eq!(finished[0], &outcome.targets[0]);
         silent_peer.set_nonblocking(true).unwrap();
         let mut packet = [0_u8; 512];
         assert!(matches!(
