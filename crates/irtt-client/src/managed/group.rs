@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt,
-    hash::{Hash, Hasher},
     net::{SocketAddr, UdpSocket},
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -37,6 +36,7 @@ use crate::client::ProbeSendTimestamps;
 use super::{
     cancellation::CancellationToken,
     hub::{EventHub, EventSubscription, SubscriberConfig},
+    TargetId,
 };
 
 const GROUP_RECV_TIMEOUT: Duration = Duration::from_millis(20);
@@ -48,59 +48,6 @@ const GROUP_RECEIVER_DRAIN_LIMIT: Duration = Duration::from_millis(60);
 const RECV_BUFFER_SIZE: usize = 65_536;
 /// Maximum number of recent target outcomes retained in [`ManagedGroupOutcome`].
 pub const MANAGED_GROUP_OUTCOME_HISTORY_LIMIT: usize = 256;
-
-/// Caller-owned target identity for managed multi-target probing.
-#[derive(Clone, Eq)]
-pub struct TargetId(Arc<str>);
-
-impl TargetId {
-    /// Borrow the identifier as a string slice.
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Debug for TargetId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_tuple("TargetId").field(&self.0).finish()
-    }
-}
-
-impl fmt::Display for TargetId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl PartialEq for TargetId {
-    fn eq(&self, other: &Self) -> bool {
-        self.0 == other.0
-    }
-}
-
-impl Hash for TargetId {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        self.0.hash(state);
-    }
-}
-
-impl From<&str> for TargetId {
-    fn from(value: &str) -> Self {
-        Self(Arc::from(value))
-    }
-}
-
-impl From<String> for TargetId {
-    fn from(value: String) -> Self {
-        Self(Arc::from(value))
-    }
-}
-
-impl AsRef<str> for TargetId {
-    fn as_ref(&self) -> &str {
-        self.as_str()
-    }
-}
 
 /// Per-target configuration for [`ManagedClientGroup`].
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2283,7 +2230,7 @@ fn divide_duration(duration: Duration, divisor: usize) -> Duration {
 mod tests {
     use super::*;
     use crate::{
-        config::NegotiationPolicy, managed::SubscriberOverflow, EventSubscriptionError, WarningKind,
+        config::NegotiationPolicy, EventSubscriptionError, SubscriberOverflow, WarningKind,
     };
     use irtt_proto::{
         compute_hmac_in_place, echo_packet_len,

@@ -682,6 +682,41 @@ impl AsyncClient {
         self.machine.is_peer_closed()
     }
 
+    pub(crate) fn remote_addr(&self) -> SocketAddr {
+        self.remote
+    }
+
+    pub(crate) fn packets_sent(&self) -> u64 {
+        self.machine.packets_sent()
+    }
+
+    pub(crate) fn next_probe_timeout_deadline(&self) -> Option<Instant> {
+        self.machine.next_probe_timeout_deadline()
+    }
+
+    pub(crate) fn latest_probe_timeout_deadline(&self) -> Option<Instant> {
+        self.machine.latest_probe_timeout_deadline()
+    }
+
+    pub(crate) fn discard_prepared_probe(&mut self) {
+        self.prepared_probe = None;
+    }
+
+    pub(crate) fn skip_missed_probe_slots_at(&mut self, now: Instant) -> Result<(), ClientError> {
+        let Some(schedule) = self.schedule.as_mut() else {
+            return Ok(());
+        };
+        let Some(deadline) = schedule.next_send_deadline() else {
+            return Ok(());
+        };
+        if deadline > now {
+            return Ok(());
+        }
+        let commit = schedule.preflight_managed_commit(deadline, now)?;
+        schedule.commit(commit);
+        Ok(())
+    }
+
     fn prepare_async_open(
         &mut self,
         machine: PreparedOpenAcceptance,

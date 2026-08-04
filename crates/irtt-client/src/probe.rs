@@ -71,6 +71,16 @@ impl PendingMap {
         self.map.len()
     }
 
+    #[cfg(feature = "tokio")]
+    pub fn next_timeout_deadline(&self) -> Option<Instant> {
+        self.map.values().map(|probe| probe.timeout_at).min()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub fn latest_timeout_deadline(&self) -> Option<Instant> {
+        self.map.values().map(|probe| probe.timeout_at).max()
+    }
+
     #[cfg(test)]
     pub fn contains(&self, wire_seq: u32) -> bool {
         self.map.contains_key(&wire_seq)
@@ -137,6 +147,11 @@ impl TimedOutMap {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    #[cfg(feature = "tokio")]
+    pub fn latest_timeout_deadline(&self) -> Option<Instant> {
+        self.map.values().map(|probe| probe.timeout_at).max()
     }
 
     #[cfg(test)]
