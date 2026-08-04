@@ -42,6 +42,9 @@ use super::{
 const GROUP_RECV_TIMEOUT: Duration = Duration::from_millis(20);
 const GROUP_FINAL_DRAIN: Duration = Duration::from_millis(100);
 const MAX_SLEEP: Duration = Duration::from_millis(20);
+// One receive may already be in progress, then the receiver gets one full
+// receive interval after observing the request, plus one scheduler interval.
+const GROUP_RECEIVER_DRAIN_LIMIT: Duration = Duration::from_millis(60);
 const RECV_BUFFER_SIZE: usize = 65_536;
 /// Maximum number of recent target outcomes retained in [`ManagedGroupOutcome`].
 pub const MANAGED_GROUP_OUTCOME_HISTORY_LIMIT: usize = 256;
@@ -620,59 +623,99 @@ struct GroupShared {
     family_remote: SocketAddr,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Copy, Default)]
 struct ReceiverDrainState {
     requested: u64,
     completed: u64,
+    deadline: Option<Instant>,
 }
 
 impl ReceiverDrainState {
-    fn request_or_join(&mut self) -> Result<u64, ClientError> {
-        if self.requested == self.completed {
-            self.requested = self
-                .requested
-                .checked_add(1)
-                .ok_or(ClientError::CounterOverflow {
-                    counter: "receiver_drain_generation",
-                })?;
+    fn request_or_join(&mut self, now: Instant) -> Result<u64, ClientError> {
+        self.assert_invariants();
+        if self.is_outstanding() {
+            return Ok(self.requested);
         }
-        Ok(self.requested)
+
+        let generation = self
+            .requested
+            .checked_add(1)
+            .ok_or(ClientError::CounterOverflow {
+                counter: "receiver_drain_generation",
+            })?;
+        let deadline = now
+            .checked_add(GROUP_RECEIVER_DRAIN_LIMIT)
+            .ok_or(ClientError::DurationOverflow)?;
+
+        self.requested = generation;
+        self.deadline = Some(deadline);
+        self.assert_invariants();
+        Ok(generation)
     }
 
     fn complete_observed(&mut self, observed_generation: u64) -> bool {
+        self.assert_invariants();
         let observed_generation = observed_generation.min(self.requested);
         if observed_generation > self.completed {
             self.completed = observed_generation;
+            if self.completed == self.requested {
+                self.deadline = None;
+            }
+            self.assert_invariants();
             true
         } else {
             false
         }
     }
+
+    fn complete_if_expired(&mut self, now: Instant) -> bool {
+        self.assert_invariants();
+        if !self.deadline.is_some_and(|deadline| deadline <= now) {
+            return false;
+        }
+
+        self.completed = self.requested;
+        self.deadline = None;
+        self.assert_invariants();
+        true
+    }
+
+    fn is_outstanding(&self) -> bool {
+        self.requested > self.completed
+    }
+
+    fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn assert_invariants(&self) {
+        debug_assert!(self.completed <= self.requested);
+        debug_assert_eq!(self.is_outstanding(), self.deadline.is_some());
+    }
 }
 
 #[cfg(test)]
-fn request_receiver_drain(shared: &GroupShared) -> Result<u64, ClientError> {
+fn request_receiver_drain(shared: &GroupShared, now: Instant) -> Result<u64, ClientError> {
     shared
         .receiver_drain
         .lock()
         .expect("receiver drain mutex poisoned")
-        .request_or_join()
+        .request_or_join(now)
+}
+
+fn receiver_drain_snapshot(shared: &GroupShared) -> ReceiverDrainState {
+    *shared
+        .receiver_drain
+        .lock()
+        .expect("receiver drain mutex poisoned")
 }
 
 fn requested_receiver_drain(shared: &GroupShared) -> u64 {
-    shared
-        .receiver_drain
-        .lock()
-        .expect("receiver drain mutex poisoned")
-        .requested
+    receiver_drain_snapshot(shared).requested
 }
 
 fn completed_receiver_drain(shared: &GroupShared) -> u64 {
-    shared
-        .receiver_drain
-        .lock()
-        .expect("receiver drain mutex poisoned")
-        .completed
+    receiver_drain_snapshot(shared).completed
 }
 
 fn complete_receiver_drain(shared: &GroupShared, observed_generation: u64) {
@@ -686,6 +729,14 @@ fn complete_receiver_drain(shared: &GroupShared, observed_generation: u64) {
     if advanced {
         let _ = shared.control_tx.send(ControlMessage::Wake);
     }
+}
+
+fn complete_expired_receiver_drain(shared: &GroupShared, now: Instant) -> bool {
+    shared
+        .receiver_drain
+        .lock()
+        .expect("receiver drain mutex poisoned")
+        .complete_if_expired(now)
 }
 
 struct GroupSchedulerCleanup {
@@ -934,6 +985,7 @@ fn run_group_scheduler(
         }
 
         let now = Instant::now();
+        complete_expired_receiver_drain(&shared, now);
         drive_open_attempts(&config.client, &socket, &shared, now);
         poll_active_timeouts(&shared, now);
         finish_completed_targets(&socket, &shared, now);
@@ -945,23 +997,16 @@ fn run_group_scheduler(
 
         let active = active_targets(&shared);
         pacing.reconcile(&active, now);
-        if pacing.send_due(&active, now) {
-            match config.pacing {
-                ManagedGroupPacing::Staggered => {
-                    if let Some((target, scheduled_at)) =
-                        pacing.next_staggered(&active, config.client.interval, now)?
-                    {
-                        send_echo_to_target(&socket, &shared, target, scheduled_at);
-                    }
-                }
-                ManagedGroupPacing::Burst => {
-                    if let Some(scheduled_at) = pacing.next_burst(config.client.interval, now)? {
-                        for target in active {
-                            send_echo_to_target(&socket, &shared, target, scheduled_at);
-                        }
-                    }
-                }
-            }
+        let receiver_drain_outstanding = receiver_drain_snapshot(&shared).is_outstanding();
+        if send_due_active_probes(
+            &config,
+            &socket,
+            &shared,
+            &mut pacing,
+            &active,
+            now,
+            receiver_drain_outstanding,
+        )? {
             continue;
         }
 
@@ -1009,9 +1054,6 @@ fn process_group_datagram(
     datagram: ReceivedDatagramFrom,
     packet: &[u8],
 ) {
-    // The single receiver thread cannot advance completion while processing
-    // this datagram, so one snapshot consistently classifies its target.
-    let completed_drain_generation = completed_receiver_drain(shared);
     let target = {
         let registry = shared
             .registry
@@ -1026,85 +1068,106 @@ fn process_group_datagram(
         return;
     };
 
-    let mut wake_scheduler = false;
-    {
-        let mut target = target.lock().expect("target mutex poisoned");
-        match target.status {
-            TargetStatus::Opening {
-                attempt,
-                awaiting_receiver_generation,
-                ..
-            } => {
-                if attempt == 0
-                    || awaiting_receiver_generation
-                        .is_some_and(|generation| completed_drain_generation >= generation)
-                {
-                    return;
-                }
-                let opened_at = datagram.received_at;
-                let reply = match target.runtime.inspect_open_datagram(packet) {
-                    Ok(OpenDatagramDisposition::Ignore) => return,
-                    Ok(OpenDatagramDisposition::Trusted(reply)) => reply,
-                    Err(err) => {
-                        target.mark_finished(ManagedTargetEndReason::OpenFailed(
-                            ManagedTargetFailure::opening(&err),
-                        ));
-                        let _ = shared.control_tx.send(ControlMessage::Wake);
-                        return;
-                    }
-                };
-                let machine = match target.runtime.prepare_open_acceptance(reply, opened_at) {
-                    Ok(machine) => machine,
-                    Err(failure) => {
-                        send_group_cleanup_close_best_effort(
-                            socket,
-                            target.remote,
-                            failure.cleanup_close.as_deref(),
-                        );
-                        target.mark_finished(ManagedTargetEndReason::OpenFailed(
-                            ManagedTargetFailure::opening(&failure.primary),
-                        ));
-                        let _ = shared.control_tx.send(ControlMessage::Wake);
-                        return;
-                    }
-                };
-
-                match prepare_group_open(shared, machine, opened_at) {
-                    Ok(prepared) => {
-                        let outcome = target.runtime.commit_open(prepared.machine);
-                        target.schedule = prepared.schedule;
-                        publish_open_outcome(&shared.hub, &mut target, outcome);
-                        wake_scheduler = true;
-                    }
-                    Err(failure) => {
-                        send_group_cleanup_close_best_effort(
-                            socket,
-                            target.remote,
-                            failure.machine.cleanup_close_packet(),
-                        );
-                        target.mark_finished(ManagedTargetEndReason::OpenFailed(
-                            ManagedTargetFailure::opening(&failure.primary),
-                        ));
-                        wake_scheduler = true;
-                    }
-                }
-            }
-            TargetStatus::Active | TargetStatus::Draining { .. } => {
-                wake_scheduler = process_active_target_packet(
-                    &shared.hub,
-                    &mut target,
-                    packet,
-                    datagram.received_at,
-                    datagram.meta,
-                );
-            }
-            TargetStatus::Finished => {}
+    let is_opening = matches!(
+        target.lock().expect("target mutex poisoned").status,
+        TargetStatus::Opening { .. }
+    );
+    if is_opening {
+        if process_opening_target_packet(socket, shared, &target, datagram.received_at, packet) {
+            let _ = shared.control_tx.send(ControlMessage::Wake);
         }
+        return;
     }
 
+    let mut target = target.lock().expect("target mutex poisoned");
+    let wake_scheduler = match target.status {
+        TargetStatus::Active | TargetStatus::Draining { .. } => process_active_target_packet(
+            &shared.hub,
+            &mut target,
+            packet,
+            datagram.received_at,
+            datagram.meta,
+        ),
+        TargetStatus::Opening { .. } | TargetStatus::Finished => false,
+    };
     if wake_scheduler {
         let _ = shared.control_tx.send(ControlMessage::Wake);
     }
+}
+
+fn process_opening_target_packet(
+    socket: &UdpSocket,
+    shared: &GroupShared,
+    target: &Arc<Mutex<TargetState>>,
+    opened_at: ClientTimestamp,
+    packet: &[u8],
+) -> bool {
+    // Serialize opening-packet eligibility with natural and forced drain
+    // completion. The shared drain lock always precedes the target lock.
+    let drain = shared
+        .receiver_drain
+        .lock()
+        .expect("receiver drain mutex poisoned");
+    let mut target = target.lock().expect("target mutex poisoned");
+    let TargetStatus::Opening {
+        attempt,
+        awaiting_receiver_generation,
+        ..
+    } = target.status
+    else {
+        return false;
+    };
+    if attempt == 0
+        || awaiting_receiver_generation.is_some_and(|generation| drain.completed >= generation)
+    {
+        return false;
+    }
+
+    let reply = match target.runtime.inspect_open_datagram(packet) {
+        Ok(OpenDatagramDisposition::Ignore) => return false,
+        Ok(OpenDatagramDisposition::Trusted(reply)) => reply,
+        Err(err) => {
+            target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                ManagedTargetFailure::opening(&err),
+            ));
+            return true;
+        }
+    };
+    let machine = match target.runtime.prepare_open_acceptance(reply, opened_at) {
+        Ok(machine) => machine,
+        Err(failure) => {
+            send_group_cleanup_close_best_effort(
+                socket,
+                target.remote,
+                failure.cleanup_close.as_deref(),
+            );
+            target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                ManagedTargetFailure::opening(&failure.primary),
+            ));
+            return true;
+        }
+    };
+
+    match prepare_group_open(shared, machine, opened_at) {
+        Ok(prepared) => {
+            let outcome = target.runtime.commit_open(prepared.machine);
+            target.schedule = prepared.schedule;
+            publish_open_outcome(&shared.hub, &mut target, outcome);
+        }
+        Err(failure) => {
+            send_group_cleanup_close_best_effort(
+                socket,
+                target.remote,
+                failure.machine.cleanup_close_packet(),
+            );
+            target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                ManagedTargetFailure::opening(&failure.primary),
+            ));
+        }
+    }
+    drop(target);
+    drop(drain);
+    true
 }
 
 fn validate_group_negotiation(
@@ -1498,7 +1561,7 @@ fn register_due_open_drains(
         if attempt == 0 || next_send_at > now {
             continue;
         }
-        match drain.request_or_join() {
+        match drain.request_or_join(now) {
             Ok(generation) => {
                 target.status = TargetStatus::Opening {
                     attempt,
@@ -1570,6 +1633,38 @@ fn finish_completed_targets(socket: &UdpSocket, shared: &GroupShared, now: Insta
             _ => {}
         }
     }
+}
+
+fn send_due_active_probes(
+    config: &ManagedClientGroupConfig,
+    socket: &UdpSocket,
+    shared: &GroupShared,
+    pacing: &mut PacingRuntime,
+    active: &[Arc<Mutex<TargetState>>],
+    now: Instant,
+    receiver_drain_outstanding: bool,
+) -> Result<bool, ClientError> {
+    if receiver_drain_outstanding || !pacing.send_due(active, now) {
+        return Ok(false);
+    }
+
+    match config.pacing {
+        ManagedGroupPacing::Staggered => {
+            if let Some((target, scheduled_at)) =
+                pacing.next_staggered(active, config.client.interval, now)?
+            {
+                send_echo_to_target(socket, shared, target, scheduled_at);
+            }
+        }
+        ManagedGroupPacing::Burst => {
+            if let Some(scheduled_at) = pacing.next_burst(config.client.interval, now)? {
+                for target in active {
+                    send_echo_to_target(socket, shared, target.clone(), scheduled_at);
+                }
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn send_echo_to_target(
@@ -2083,13 +2178,36 @@ fn wait_for_next_scheduler_wakeup(
 ) -> Option<ControlMessage> {
     let open_deadline = next_open_deadline(shared);
     let pacing_deadline = (!active.is_empty()).then(|| pacing.next_wakeup()).flatten();
-    let drain_deadline = next_drain_deadline(shared);
-    let deadline = [open_deadline, pacing_deadline, drain_deadline]
-        .into_iter()
-        .flatten()
-        .min();
+    let target_drain_deadline = next_target_drain_deadline(shared);
+    let receiver_drain = receiver_drain_snapshot(shared);
+    let deadline = next_scheduler_deadline(
+        open_deadline,
+        pacing_deadline,
+        target_drain_deadline,
+        receiver_drain,
+    );
 
     wait_for_scheduler_control(control_rx, &shared.cancellation, deadline)
+}
+
+fn next_scheduler_deadline(
+    open_deadline: Option<Instant>,
+    pacing_deadline: Option<Instant>,
+    target_drain_deadline: Option<Instant>,
+    receiver_drain: ReceiverDrainState,
+) -> Option<Instant> {
+    let pacing_deadline = (!receiver_drain.is_outstanding())
+        .then_some(pacing_deadline)
+        .flatten();
+    [
+        open_deadline,
+        pacing_deadline,
+        target_drain_deadline,
+        receiver_drain.deadline(),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
 }
 
 fn wait_for_scheduler_control(
@@ -2139,7 +2257,7 @@ fn next_open_deadline(shared: &GroupShared) -> Option<Instant> {
         .min()
 }
 
-fn next_drain_deadline(shared: &GroupShared) -> Option<Instant> {
+fn next_target_drain_deadline(shared: &GroupShared) -> Option<Instant> {
     all_targets(shared)
         .into_iter()
         .filter_map(|target| {
@@ -4022,7 +4140,7 @@ mod tests {
         ));
         let (shared, control_rx) = shared_with_targets(&config, EventHub::new(), vec![target]);
         let shared = Arc::new(shared);
-        let generation = request_receiver_drain(&shared).unwrap();
+        let generation = request_receiver_drain(&shared, now).unwrap();
         let waiter_shared = shared.clone();
         let waiter = thread::spawn(move || {
             wait_for_scheduler_control(&control_rx, &waiter_shared.cancellation, None)
@@ -4035,6 +4153,95 @@ mod tests {
         complete_receiver_drain(&shared, 0);
         complete_receiver_drain(&shared, generation);
         assert_eq!(completed_receiver_drain(&shared), generation);
+    }
+
+    #[test]
+    fn receiver_drain_request_join_and_natural_completion_share_one_deadline() {
+        let requested_at = Instant::now();
+        let mut drain = ReceiverDrainState::default();
+
+        let generation = drain.request_or_join(requested_at).unwrap();
+        let deadline = drain.deadline().expect("new drain needs a deadline");
+        assert_eq!(generation, 1);
+        assert_eq!(deadline, requested_at + GROUP_RECEIVER_DRAIN_LIMIT);
+        assert!(drain.is_outstanding());
+
+        assert_eq!(
+            drain
+                .request_or_join(requested_at + Duration::from_millis(10))
+                .unwrap(),
+            generation
+        );
+        assert_eq!(drain.deadline(), Some(deadline));
+        assert!(drain.complete_observed(generation));
+        assert_eq!(drain.completed, generation);
+        assert_eq!(drain.deadline(), None);
+        assert!(!drain.is_outstanding());
+    }
+
+    #[test]
+    fn receiver_drain_forced_completion_is_bounded_and_idempotent() {
+        let requested_at = Instant::now();
+        let mut drain = ReceiverDrainState::default();
+        let generation = drain.request_or_join(requested_at).unwrap();
+        let deadline = drain.deadline().unwrap();
+
+        assert!(!drain.complete_if_expired(deadline - Duration::from_nanos(1)));
+        assert_eq!(drain.completed, 0);
+        assert_eq!(drain.deadline(), Some(deadline));
+
+        assert!(drain.complete_if_expired(deadline));
+        assert_eq!(drain.completed, generation);
+        assert_eq!(drain.deadline(), None);
+        assert!(!drain.complete_if_expired(deadline));
+        assert!(!drain.complete_observed(generation));
+
+        let later_request = deadline + Duration::from_millis(10);
+        let next_generation = drain.request_or_join(later_request).unwrap();
+        let next_deadline = drain.deadline().unwrap();
+        assert_eq!(next_generation, generation + 1);
+        assert_eq!(next_deadline, later_request + GROUP_RECEIVER_DRAIN_LIMIT);
+        assert!(drain.complete_if_expired(next_deadline + Duration::from_nanos(1)));
+        assert_eq!(drain.completed, next_generation);
+    }
+
+    #[test]
+    fn stale_receiver_completion_cannot_clear_a_newer_generation_deadline() {
+        let requested_at = Instant::now();
+        let mut drain = ReceiverDrainState::default();
+        let first = drain.request_or_join(requested_at).unwrap();
+        assert!(drain.complete_if_expired(requested_at + GROUP_RECEIVER_DRAIN_LIMIT));
+
+        let second_requested_at = requested_at + GROUP_RECEIVER_DRAIN_LIMIT;
+        let second = drain.request_or_join(second_requested_at).unwrap();
+        let second_deadline = drain.deadline().unwrap();
+        assert_eq!(second, first + 1);
+
+        assert!(!drain.complete_observed(first));
+        assert_eq!(drain.completed, first);
+        assert_eq!(drain.requested, second);
+        assert_eq!(drain.deadline(), Some(second_deadline));
+        assert!(drain.is_outstanding());
+    }
+
+    #[test]
+    fn receiver_drain_generation_overflow_does_not_mutate_state() {
+        let mut drain = ReceiverDrainState {
+            requested: u64::MAX,
+            completed: u64::MAX,
+            deadline: None,
+        };
+        let before = drain;
+
+        assert!(matches!(
+            drain.request_or_join(Instant::now()),
+            Err(ClientError::CounterOverflow {
+                counter: "receiver_drain_generation"
+            })
+        ));
+        assert_eq!(drain.requested, before.requested);
+        assert_eq!(drain.completed, before.completed);
+        assert_eq!(drain.deadline(), before.deadline());
     }
 
     #[test]
@@ -4078,8 +4285,22 @@ mod tests {
         };
         assert!(recv_request_timeout(&peer).is_none());
 
-        complete_receiver_drain(&shared, generation);
-        drive_open_attempts(&config, &socket, &shared, deadline);
+        let drain_deadline = receiver_drain_snapshot(&shared).deadline().unwrap();
+        assert!(!complete_expired_receiver_drain(
+            &shared,
+            drain_deadline - Duration::from_nanos(1)
+        ));
+        drive_open_attempts(
+            &config,
+            &socket,
+            &shared,
+            drain_deadline - Duration::from_nanos(1),
+        );
+        assert!(target.lock().unwrap().final_reason.is_none());
+
+        assert!(complete_expired_receiver_drain(&shared, drain_deadline));
+        assert_eq!(completed_receiver_drain(&shared), generation);
+        drive_open_attempts(&config, &socket, &shared, drain_deadline);
         assert!(matches!(
             target.lock().expect("target mutex poisoned").status,
             TargetStatus::Opening {
@@ -4089,6 +4310,181 @@ mod tests {
             }
         ));
         assert!(recv_request_timeout(&peer).is_some());
+    }
+
+    #[test]
+    fn continuous_traffic_receiver_drain_forces_progress_and_resumes_pacing() {
+        let interval = Duration::from_millis(10);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.client.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+        let params = test_params(None, interval);
+        let active_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let opening_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for peer in [&active_peer, &opening_peer] {
+            peer.set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+        }
+        let started_at = Instant::now();
+        let active = Arc::new(Mutex::new(active_probe_target(
+            &config.client,
+            &params,
+            active_peer.local_addr().unwrap(),
+            ClientTimestamp {
+                wall: std::time::SystemTime::now(),
+                mono: started_at,
+            },
+        )));
+        let opening = Arc::new(Mutex::new(
+            TargetState::new(
+                &config.client,
+                target("opening", opening_peer.local_addr().unwrap()),
+                1,
+                started_at,
+            )
+            .unwrap(),
+        ));
+        let (shared, _control_rx) = shared_with_targets(
+            &config.client,
+            EventHub::new(),
+            vec![active.clone(), opening.clone()],
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config.client, &socket, &shared, started_at);
+        assert!(recv_request_timeout(&opening_peer).is_some());
+        let opening_deadline = match opening.lock().unwrap().status {
+            TargetStatus::Opening { next_send_at, .. } => next_send_at,
+            ref status => panic!("unexpected opening status: {status:?}"),
+        };
+
+        drive_open_attempts(&config.client, &socket, &shared, opening_deadline);
+        let drain = receiver_drain_snapshot(&shared);
+        let drain_deadline = drain.deadline().expect("expired attempt needs a drain");
+        assert!(drain.is_outstanding());
+
+        let active_targets = active_targets(&shared);
+        let mut pacing = PacingRuntime::new(config.pacing);
+        pacing.reconcile(&active_targets, opening_deadline);
+        assert!(!send_due_active_probes(
+            &config,
+            &socket,
+            &shared,
+            &mut pacing,
+            &active_targets,
+            opening_deadline,
+            true,
+        )
+        .unwrap());
+        assert!(recv_request_timeout(&active_peer).is_none());
+
+        let unrelated = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for _ in 0..3 {
+            unrelated
+                .send_to(&[0_u8], socket.local_addr().unwrap())
+                .unwrap();
+            let (datagram, packet) = recv_group_datagram(&socket);
+            process_group_datagram(&socket, &shared, datagram, &packet);
+            assert_eq!(completed_receiver_drain(&shared), drain.completed);
+        }
+
+        assert!(!complete_expired_receiver_drain(
+            &shared,
+            drain_deadline - Duration::from_nanos(1)
+        ));
+        drive_open_attempts(
+            &config.client,
+            &socket,
+            &shared,
+            drain_deadline - Duration::from_nanos(1),
+        );
+        assert!(recv_request_timeout(&opening_peer).is_none());
+
+        assert!(complete_expired_receiver_drain(&shared, drain_deadline));
+        drive_open_attempts(&config.client, &socket, &shared, drain_deadline);
+        assert!(recv_request_timeout(&opening_peer).is_some());
+        drive_open_attempts(&config.client, &socket, &shared, drain_deadline);
+        assert!(recv_request_timeout(&opening_peer).is_none());
+
+        assert!(send_due_active_probes(
+            &config,
+            &socket,
+            &shared,
+            &mut pacing,
+            &active_targets,
+            drain_deadline,
+            receiver_drain_snapshot(&shared).is_outstanding(),
+        )
+        .unwrap());
+        assert!(recv_request_timeout(&active_peer).is_some());
+        assert!(!send_due_active_probes(
+            &config,
+            &socket,
+            &shared,
+            &mut pacing,
+            &active_targets,
+            drain_deadline,
+            false,
+        )
+        .unwrap());
+        assert!(recv_request_timeout(&active_peer).is_none());
+        assert_eq!(active.lock().unwrap().runtime.packets_sent(), 1);
+        assert!(pacing
+            .next_wakeup()
+            .is_some_and(|deadline| deadline > drain_deadline));
+    }
+
+    #[test]
+    fn active_reply_and_timeout_processing_continue_during_receiver_drain() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fixture = active_target_fixture_at(peer.local_addr().unwrap());
+        let shared = shared_with_target(
+            &fixture.client_config,
+            fixture.hub.clone(),
+            fixture.target.clone(),
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        request_receiver_drain(&shared, Instant::now()).unwrap();
+
+        peer.send_to(&fixture.close_reply, socket.local_addr().unwrap())
+            .unwrap();
+        let (datagram, packet) = recv_group_datagram(&socket);
+        process_group_datagram(&socket, &shared, datagram, &packet);
+
+        assert!(receiver_drain_snapshot(&shared).is_outstanding());
+        assert_eq!(
+            fixture.target.lock().unwrap().final_reason,
+            Some(ManagedTargetEndReason::PeerClosed)
+        );
+        assert!(drain_available_group_events(&fixture.subscription)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::EchoReply { seq: 0, .. },
+                    ..
+                })
+            )));
+
+        let fixture = active_target_fixture();
+        let shared =
+            shared_with_target(&fixture.client_config, fixture.hub.clone(), fixture.target);
+        let now = Instant::now();
+        request_receiver_drain(&shared, now).unwrap();
+        poll_active_timeouts(
+            &shared,
+            now + fixture.client_config.probe_timeout + Duration::from_millis(10),
+        );
+
+        assert!(receiver_drain_snapshot(&shared).is_outstanding());
+        assert!(drain_available_group_events(&fixture.subscription)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::EchoLoss { seq: 0, .. },
+                    ..
+                })
+            )));
     }
 
     #[test]
@@ -4162,7 +4558,7 @@ mod tests {
         let shared = shared_with_target(&config, EventHub::new(), target);
 
         let observed_before_request = requested_receiver_drain(&shared);
-        let generation = request_receiver_drain(&shared).unwrap();
+        let generation = request_receiver_drain(&shared, Instant::now()).unwrap();
         complete_receiver_drain(&shared, observed_before_request);
         assert!(completed_receiver_drain(&shared) < generation);
 
@@ -4257,7 +4653,7 @@ mod tests {
     }
 
     #[test]
-    fn post_drain_reply_cannot_open_expired_attempt() {
+    fn force_completed_drain_rejects_packet_dequeued_before_completion() {
         let interval = Duration::from_millis(10);
         let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
         config.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
@@ -4287,14 +4683,15 @@ mod tests {
             } => generation,
             ref status => panic!("unexpected waiting status: {status:?}"),
         };
-        complete_receiver_drain(&shared, generation);
-
         peer.send_to(
             &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params),
             client_addr,
         )
         .unwrap();
         let (datagram, packet) = recv_group_datagram(&socket);
+        let drain_deadline = receiver_drain_snapshot(&shared).deadline().unwrap();
+        assert!(complete_expired_receiver_drain(&shared, drain_deadline));
+        assert_eq!(completed_receiver_drain(&shared), generation);
         process_group_datagram(&socket, &shared, datagram, &packet);
         {
             let target = target.lock().expect("target mutex poisoned");
@@ -4309,7 +4706,7 @@ mod tests {
             assert!(target.runtime.prepare_open_request().is_ok());
         }
 
-        drive_open_attempts(&config, &socket, &shared, deadline);
+        drive_open_attempts(&config, &socket, &shared, drain_deadline);
         assert!(matches!(
             target.lock().expect("target mutex poisoned").status,
             TargetStatus::Opening {
@@ -4379,9 +4776,17 @@ mod tests {
             ref status => panic!("unexpected waiting status: {status:?}"),
         });
         assert_eq!(generations[0], generations[1]);
+        let shared_drain = receiver_drain_snapshot(&shared);
+        assert_eq!(
+            shared_drain.deadline(),
+            Some(deadline + GROUP_RECEIVER_DRAIN_LIMIT)
+        );
 
-        complete_receiver_drain(&shared, generations[0]);
-        drive_open_attempts(&config, &socket, &shared, deadline);
+        assert!(complete_expired_receiver_drain(
+            &shared,
+            shared_drain.deadline().unwrap()
+        ));
+        drive_open_attempts(&config, &socket, &shared, shared_drain.deadline().unwrap());
         for target in [&first, &second] {
             assert!(matches!(
                 target.lock().unwrap().status,
@@ -4516,8 +4921,22 @@ mod tests {
             generation
         };
 
-        complete_receiver_drain(&shared, generation);
-        drive_open_attempts(&config, &socket, &shared, deadline);
+        let drain_deadline = receiver_drain_snapshot(&shared).deadline().unwrap();
+        assert!(!complete_expired_receiver_drain(
+            &shared,
+            drain_deadline - Duration::from_nanos(1)
+        ));
+        drive_open_attempts(
+            &config,
+            &socket,
+            &shared,
+            drain_deadline - Duration::from_nanos(1),
+        );
+        assert!(target.lock().unwrap().final_reason.is_none());
+
+        assert!(complete_expired_receiver_drain(&shared, drain_deadline));
+        assert_eq!(completed_receiver_drain(&shared), generation);
+        drive_open_attempts(&config, &socket, &shared, drain_deadline);
         let reason = {
             let target = target.lock().expect("target mutex poisoned");
             assert!(matches!(target.status, TargetStatus::Finished));
@@ -4531,7 +4950,7 @@ mod tests {
             target.final_reason.clone()
         };
 
-        drive_open_attempts(&config, &socket, &shared, deadline);
+        drive_open_attempts(&config, &socket, &shared, drain_deadline);
         assert_eq!(
             target.lock().expect("target mutex poisoned").final_reason,
             reason
@@ -4953,6 +5372,37 @@ mod tests {
         .is_none());
         assert!(started_at.elapsed() >= Duration::from_millis(5));
         assert!(!cancellation.is_cancelled());
+    }
+
+    #[test]
+    fn scheduler_wakeup_uses_receiver_drain_deadline_and_suppresses_due_pacing() {
+        let now = Instant::now();
+        let mut drain = ReceiverDrainState::default();
+        drain.request_or_join(now).unwrap();
+        let drain_deadline = drain.deadline().unwrap();
+
+        assert_eq!(
+            next_scheduler_deadline(None, Some(now), None, drain),
+            Some(drain_deadline)
+        );
+
+        let open_deadline = now + Duration::from_millis(10);
+        let target_drain_deadline = now + Duration::from_millis(20);
+        assert_eq!(
+            next_scheduler_deadline(
+                Some(open_deadline),
+                Some(now),
+                Some(target_drain_deadline),
+                drain,
+            ),
+            Some(open_deadline)
+        );
+
+        drain.complete_if_expired(drain_deadline);
+        assert_eq!(
+            next_scheduler_deadline(None, Some(now), None, drain),
+            Some(now)
+        );
     }
 
     #[test]
