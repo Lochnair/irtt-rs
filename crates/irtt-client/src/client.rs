@@ -55,6 +55,12 @@ struct PreparedClientOpenFailure {
 struct ClientTestHooks {
     fail_open_dscp: Cell<bool>,
     fail_open_timeout_restore: Cell<bool>,
+    fail_close_event_reserve: Cell<bool>,
+    fail_close_dscp_clear: Cell<bool>,
+    fail_close_send: Cell<bool>,
+    close_reported_len: Cell<Option<usize>>,
+    close_send_attempts: Cell<usize>,
+    close_sent_at: Cell<Option<ClientTimestamp>>,
     fail_cleanup_send: Cell<bool>,
     recv_buffer_len_override: Cell<Option<usize>>,
     fail_dscp_restore: Cell<bool>,
@@ -162,16 +168,52 @@ impl Client {
     /// Send a close request and emit a [`ClientEvent::SessionClosed`] event.
     ///
     /// The close event means the client has sent its close packet and stopped
-    /// tracking the session locally; it is not a server acknowledgement.
+    /// tracking the session locally; it is not a server acknowledgement. If the
+    /// send fails, the negotiated DSCP is restored best-effort and the session
+    /// and probe schedule remain open.
     pub fn close(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
-        let socket = &self.socket;
-        let remote = self.remote;
-        let events = self.runtime.close_with(|packet| {
-            clear_dscp_on_socket(socket, remote)?;
-            socket.send(packet)?;
-            Ok(())
-        })?;
+        let prepared = self.runtime.prepare_close()?;
+        let mut events = Vec::new();
+        #[cfg(test)]
+        if self.test_hooks.fail_close_event_reserve.replace(false) {
+            events
+                .try_reserve(usize::MAX)
+                .map_err(|source| ClientError::AllocationFailed {
+                    operation: "close event result",
+                    source,
+                })?;
+        }
+        events
+            .try_reserve(1)
+            .map_err(|source| ClientError::AllocationFailed {
+                operation: "close event result",
+                source,
+            })?;
+        let previous_dscp = self.applied_dscp;
+        let expected_bytes = prepared.bytes.len();
+
+        self.clear_close_dscp()?;
+        let bytes = match self.send_close_datagram(prepared.bytes) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                self.restore_dscp_best_effort(previous_dscp);
+                return Err(ClientError::Socket(err));
+            }
+        };
+        #[cfg(not(test))]
+        let sent_at = ClientTimestamp::now();
+        #[cfg(test)]
+        let sent_at = self
+            .test_hooks
+            .close_sent_at
+            .take()
+            .unwrap_or_else(ClientTimestamp::now);
+        let event = self.runtime.commit_local_close(prepared.commit, sent_at);
         self.schedule = None;
+        self.applied_dscp = None;
+
+        validate_datagram_length(expected_bytes, bytes)?;
+        events.push(event);
         Ok(events)
     }
 
@@ -244,8 +286,11 @@ impl Client {
             datagram.received_at,
             datagram.meta,
         )?;
-        if self.runtime.is_terminal() {
+        if self.runtime.is_peer_closed() {
             self.schedule = None;
+            if self.clear_close_dscp().is_ok() {
+                self.applied_dscp = None;
+            }
         }
         Ok(events)
     }
@@ -607,6 +652,18 @@ impl Client {
         };
     }
 
+    fn clear_close_dscp(&self) -> Result<(), ClientError> {
+        #[cfg(test)]
+        if self.test_hooks.fail_close_dscp_clear.replace(false) {
+            return Err(ClientError::SocketOption {
+                operation: "clear negotiated DSCP",
+                remote: self.remote,
+                source: io::Error::other("injected negotiated DSCP clear failure"),
+            });
+        }
+        clear_dscp_on_socket(&self.socket, self.remote)
+    }
+
     fn send_cleanup_close_best_effort(&self, packet: Option<&[u8]>) {
         if let Some(packet) = packet {
             #[cfg(test)]
@@ -639,6 +696,24 @@ impl Client {
             ));
         }
         self.socket.set_read_timeout(timeout)
+    }
+
+    fn send_close_datagram(&self, packet: &[u8]) -> io::Result<usize> {
+        #[cfg(test)]
+        {
+            self.test_hooks
+                .close_send_attempts
+                .set(self.test_hooks.close_send_attempts.get() + 1);
+            if self.test_hooks.fail_close_send.replace(false) {
+                return Err(io::Error::other("injected close send failure"));
+            }
+        }
+        let bytes = self.socket.send(packet)?;
+        #[cfg(test)]
+        if let Some(reported) = self.test_hooks.close_reported_len.take() {
+            return Ok(reported);
+        }
+        Ok(bytes)
     }
 }
 

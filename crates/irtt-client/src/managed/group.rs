@@ -725,6 +725,16 @@ struct TargetState {
     probe_send_error: bool,
     #[cfg(test)]
     probe_send_timestamps: Option<ProbeSendTimestamps>,
+    #[cfg(test)]
+    close_reported_len: Option<usize>,
+    #[cfg(test)]
+    close_send_error: bool,
+    #[cfg(test)]
+    close_send_attempts: usize,
+    #[cfg(test)]
+    close_event_reserve_error: bool,
+    #[cfg(test)]
+    close_sent_at: Option<ClientTimestamp>,
 }
 
 type ScheduledTarget = (Arc<Mutex<TargetState>>, Instant);
@@ -839,6 +849,16 @@ impl TargetState {
             probe_send_error: false,
             #[cfg(test)]
             probe_send_timestamps: None,
+            #[cfg(test)]
+            close_reported_len: None,
+            #[cfg(test)]
+            close_send_error: false,
+            #[cfg(test)]
+            close_send_attempts: 0,
+            #[cfg(test)]
+            close_event_reserve_error: false,
+            #[cfg(test)]
+            close_sent_at: None,
         })
     }
 
@@ -1795,21 +1815,86 @@ fn close_locked_target(
 ) {
     if target.runtime.is_open() && !target.runtime.is_peer_closed() {
         let remote = target.remote;
-        match target.runtime.close_with(|packet| {
-            socket.send_to(packet, remote)?;
-            Ok(())
-        }) {
-            Ok(events) => {
-                publish_events(hub, target, events);
-                target.schedule = None;
-            }
+        let prepared = match target.runtime.prepare_close() {
+            Ok(prepared) => prepared,
             Err(err) => {
                 target.mark_finished(ManagedTargetEndReason::Failed(
                     ManagedTargetFailure::runtime(&err),
                 ));
                 return;
             }
+        };
+        let mut events = Vec::new();
+        #[cfg(test)]
+        if std::mem::take(&mut target.close_event_reserve_error) {
+            if let Err(source) = events.try_reserve(usize::MAX) {
+                let err = ClientError::AllocationFailed {
+                    operation: "managed close event result",
+                    source,
+                };
+                target.mark_finished(ManagedTargetEndReason::Failed(
+                    ManagedTargetFailure::runtime(&err),
+                ));
+                return;
+            }
         }
+        if let Err(source) = events.try_reserve(1) {
+            let err = ClientError::AllocationFailed {
+                operation: "managed close event result",
+                source,
+            };
+            target.mark_finished(ManagedTargetEndReason::Failed(
+                ManagedTargetFailure::runtime(&err),
+            ));
+            return;
+        }
+        let expected_bytes = prepared.bytes.len();
+        #[cfg(test)]
+        let reported_bytes = target.close_reported_len.take();
+        #[cfg(test)]
+        let fail_send = std::mem::take(&mut target.close_send_error);
+        #[cfg(test)]
+        {
+            target.close_send_attempts += 1;
+            if fail_send {
+                let err = ClientError::Socket(std::io::Error::other(
+                    "injected managed close send failure",
+                ));
+                target.mark_finished(ManagedTargetEndReason::Failed(
+                    ManagedTargetFailure::runtime(&err),
+                ));
+                return;
+            }
+        }
+        let bytes = match socket.send_to(prepared.bytes, remote) {
+            Ok(bytes) => bytes,
+            Err(err) => {
+                let err = ClientError::Socket(err);
+                target.mark_finished(ManagedTargetEndReason::Failed(
+                    ManagedTargetFailure::runtime(&err),
+                ));
+                return;
+            }
+        };
+        #[cfg(not(test))]
+        let sent_at = ClientTimestamp::now();
+        #[cfg(test)]
+        let sent_at = target
+            .close_sent_at
+            .take()
+            .unwrap_or_else(ClientTimestamp::now);
+        let event = target.runtime.commit_local_close(prepared.commit, sent_at);
+        target.schedule = None;
+        #[cfg(test)]
+        let bytes = reported_bytes.unwrap_or(bytes);
+        if let Err(err) = validate_datagram_length(expected_bytes, bytes) {
+            target.mark_finished(ManagedTargetEndReason::Failed(
+                ManagedTargetFailure::runtime(&err),
+            ));
+            return;
+        }
+        events.push(event);
+        publish_events(hub, target, events);
     }
     target.mark_finished(reason);
 }
@@ -2085,7 +2170,8 @@ mod tests {
         compute_hmac_in_place, echo_packet_len,
         flags::{self, FLAG_OPEN, FLAG_REPLY},
         layout::PacketLayout,
-        Clock, Params, ReceivedStats, StampAt, TimestampFields, HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
+        Clock, OpenReply, Params, ReceivedStats, StampAt, TimestampFields, HMAC_SIZE, MAGIC,
+        PROTOCOL_VERSION,
     };
     use std::sync::mpsc;
 
@@ -2172,10 +2258,13 @@ mod tests {
     }
 
     fn active_target_fixture() -> ActiveTargetFixture {
+        active_target_fixture_at("127.0.0.1:2112".parse().unwrap())
+    }
+
+    fn active_target_fixture_at(remote: SocketAddr) -> ActiveTargetFixture {
         let interval = Duration::from_millis(10);
         let params = test_params(None, interval);
         let client_config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
-        let remote: SocketAddr = "127.0.0.1:2112".parse().unwrap();
         let hub = EventHub::new();
         let subscription = hub
             .subscribe(SubscriberConfig {
@@ -2894,6 +2983,7 @@ mod tests {
                 ReceiveMeta::default(),
             ));
             assert!(matches!(target.status, TargetStatus::Finished));
+            assert!(target.schedule.is_none());
             assert_eq!(
                 target.final_reason,
                 Some(ManagedTargetEndReason::PeerClosed)
@@ -2957,6 +3047,290 @@ mod tests {
         );
         assert_eq!(outcome.targets[0].packets_sent, 1);
         assert_eq!(outcome.targets[0].replies_received, 1);
+    }
+
+    #[test]
+    fn managed_close_success_commits_clears_schedule_and_publishes_once() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let fixture = active_target_fixture_at(peer.local_addr().unwrap());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4_567),
+            mono: Instant::now() + Duration::from_secs(8),
+        };
+        {
+            let mut target = fixture.target.lock().expect("target mutex poisoned");
+            target.close_sent_at = Some(sent_at);
+            close_locked_target(
+                &socket,
+                &fixture.hub,
+                &mut target,
+                ManagedTargetEndReason::TestComplete,
+            );
+            assert!(!target.runtime.is_open());
+            assert!(target.schedule.is_none());
+            assert_eq!(target.close_send_attempts, 1);
+            assert_eq!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::TestComplete)
+            );
+        }
+
+        let mut packet = [0_u8; 512];
+        let (len, _) = peer.recv_from(&mut packet).unwrap();
+        assert_eq!(packet[3], flags::FLAG_CLOSE);
+        assert_eq!(u64::from_le_bytes(packet[4..12].try_into().unwrap()), TOKEN);
+        assert_eq!(len, 12);
+        let events = drain_available_group_events(&fixture.subscription);
+        let closes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ManagedGroupEvent::Client(TargetEvent {
+                    event:
+                        ClientEvent::SessionClosed {
+                            token: TOKEN, at, ..
+                        },
+                    ..
+                }) => Some(*at),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closes, [sent_at]);
+    }
+
+    #[test]
+    fn managed_removal_and_cancellation_each_send_one_close() {
+        for reason in [
+            ManagedTargetEndReason::Removed,
+            ManagedTargetEndReason::Cancelled,
+        ] {
+            let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            peer.set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let fixture = active_target_fixture_at(peer.local_addr().unwrap());
+            let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+            {
+                let mut target = fixture.target.lock().expect("target mutex poisoned");
+                close_locked_target(&socket, &fixture.hub, &mut target, reason.clone());
+                assert_eq!(target.final_reason, Some(reason));
+                assert_eq!(target.close_send_attempts, 1);
+                assert!(!target.runtime.is_open());
+                assert!(target.schedule.is_none());
+            }
+
+            let mut packet = [0_u8; 512];
+            let (len, _) = peer.recv_from(&mut packet).unwrap();
+            assert_eq!(packet[3], flags::FLAG_CLOSE);
+            assert_eq!(len, 12);
+            assert!(matches!(
+                peer.recv_from(&mut packet),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    )
+            ));
+        }
+    }
+
+    #[test]
+    fn managed_close_send_failure_preserves_machine_and_requested_reason_is_not_recorded() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let fixture = active_target_fixture_at(peer.local_addr().unwrap());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(5_678),
+            mono: Instant::now() + Duration::from_secs(9),
+        };
+        {
+            let mut target = fixture.target.lock().expect("target mutex poisoned");
+            target.close_sent_at = Some(sent_at);
+            target.close_send_error = true;
+            close_locked_target(
+                &socket,
+                &fixture.hub,
+                &mut target,
+                ManagedTargetEndReason::Removed,
+            );
+            assert!(target.runtime.is_open());
+            assert!(target.schedule.is_some());
+            assert_eq!(target.close_send_attempts, 1);
+            assert_eq!(target.close_sent_at, Some(sent_at));
+            assert!(matches!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::Failed(_))
+            ));
+        }
+
+        let mut packet = [0_u8; 512];
+        assert!(matches!(
+            peer.recv_from(&mut packet),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        assert!(!drain_available_group_events(&fixture.subscription)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::SessionClosed { .. },
+                    ..
+                })
+            )));
+    }
+
+    #[test]
+    fn managed_short_close_commits_and_clears_schedule_before_failure() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let fixture = active_target_fixture_at(peer.local_addr().unwrap());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(6_789),
+            mono: Instant::now() + Duration::from_secs(10),
+        };
+        {
+            let mut target = fixture.target.lock().expect("target mutex poisoned");
+            let expected = target.runtime.prepare_close().unwrap().bytes.len();
+            target.close_sent_at = Some(sent_at);
+            target.close_reported_len = Some(expected - 1);
+            close_locked_target(
+                &socket,
+                &fixture.hub,
+                &mut target,
+                ManagedTargetEndReason::Cancelled,
+            );
+            assert!(!target.runtime.is_open());
+            assert!(target.schedule.is_none());
+            assert_eq!(target.close_send_attempts, 1);
+            assert_eq!(target.close_sent_at, None);
+            let failure = target
+                .final_reason
+                .as_ref()
+                .and_then(ManagedTargetEndReason::failure)
+                .expect("short close must use managed failure policy");
+            assert_eq!(failure.kind, ManagedTargetFailureKind::RuntimeProtocol);
+            assert!(failure.message.contains("UDP accepted"));
+        }
+
+        let mut packet = [0_u8; 512];
+        peer.recv_from(&mut packet).unwrap();
+        assert!(!drain_available_group_events(&fixture.subscription)
+            .iter()
+            .any(|event| matches!(
+                event,
+                ManagedGroupEvent::Client(TargetEvent {
+                    event: ClientEvent::SessionClosed { .. },
+                    ..
+                })
+            )));
+    }
+
+    #[test]
+    fn managed_close_reservation_failure_precedes_send() {
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let fixture = active_target_fixture_at(peer.local_addr().unwrap());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        {
+            let mut target = fixture.target.lock().expect("target mutex poisoned");
+            target.close_event_reserve_error = true;
+            close_locked_target(
+                &socket,
+                &fixture.hub,
+                &mut target,
+                ManagedTargetEndReason::TestComplete,
+            );
+            assert!(target.runtime.is_open());
+            assert!(target.schedule.is_some());
+            assert_eq!(target.close_send_attempts, 0);
+            assert!(matches!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::Failed(_))
+            ));
+        }
+
+        let mut packet = [0_u8; 512];
+        assert!(matches!(
+            peer.recv_from(&mut packet),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn managed_peer_close_affects_only_the_matching_target() {
+        let peer = active_target_fixture_at("127.0.0.1:2112".parse().unwrap());
+        let other = active_target_fixture_at("127.0.0.1:2113".parse().unwrap());
+
+        {
+            let mut target = peer.target.lock().expect("target mutex poisoned");
+            assert!(process_active_target_packet(
+                &peer.hub,
+                &mut target,
+                &peer.close_reply,
+                ClientTimestamp::now(),
+                ReceiveMeta::default(),
+            ));
+            assert!(target.runtime.is_peer_closed());
+            assert!(target.schedule.is_none());
+            assert_eq!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::PeerClosed)
+            );
+        }
+
+        let target = other.target.lock().expect("target mutex poisoned");
+        assert!(target.runtime.is_open());
+        assert!(matches!(target.status, TargetStatus::Active));
+        assert!(target.schedule.is_some());
+        assert_eq!(target.final_reason, None);
+    }
+
+    #[test]
+    fn managed_non_active_states_do_not_attempt_local_close() {
+        let remote: SocketAddr = "127.0.0.1:2112".parse().unwrap();
+        let mut normal_config = group_config(
+            None,
+            Duration::from_millis(10),
+            ManagedGroupPacing::Staggered,
+        )
+        .client;
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let hub = EventHub::new();
+        let mut opening =
+            TargetState::new(&normal_config, target("opening", remote), 0, Instant::now()).unwrap();
+        close_locked_target(&socket, &hub, &mut opening, ManagedTargetEndReason::Removed);
+        assert_eq!(opening.close_send_attempts, 0);
+
+        normal_config.run_mode = crate::RunMode::NoTest;
+        let no_test_params = params_from_config(&normal_config).unwrap();
+        let mut no_test =
+            TargetState::new(&normal_config, target("no-test", remote), 0, Instant::now()).unwrap();
+        let reply = OpenReply {
+            flags: FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE,
+            token: 0,
+            params: no_test_params,
+        };
+        let prepared = no_test
+            .runtime
+            .prepare_open_acceptance(reply, ClientTimestamp::now())
+            .unwrap();
+        no_test.runtime.commit_open(prepared);
+        close_locked_target(
+            &socket,
+            &hub,
+            &mut no_test,
+            ManagedTargetEndReason::Cancelled,
+        );
+        assert_eq!(no_test.close_send_attempts, 0);
     }
 
     #[test]

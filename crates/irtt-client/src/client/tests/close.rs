@@ -29,12 +29,176 @@ fn close_sends_one_close_packet_with_negotiated_token() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_234),
+        mono: Instant::now() + Duration::from_secs(5),
+    };
+    client.test_hooks.close_sent_at.set(Some(sent_at));
     let events = client.close().unwrap();
-    assert_eq!(events.len(), 1);
+    assert!(matches!(
+        events.as_slice(),
+        [ClientEvent::SessionClosed {
+            token: TOKEN,
+            at,
+            ..
+        }] if *at == sent_at
+    ));
+    assert!(!client.runtime.is_open());
+    assert!(client.schedule.is_none());
+    assert_eq!(client.applied_dscp, None);
     let packets: Vec<_> = server.rx.iter().take(2).collect();
     let close = &packets[1];
     assert_eq!(close[3], flags::FLAG_CLOSE);
     assert_eq!(u64::from_le_bytes(close[4..12].try_into().unwrap()), TOKEN);
+    server.join();
+}
+
+#[test]
+fn close_event_reservation_failure_precedes_dscp_clear_and_send() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+        let _ = recv_request(&socket, &tx);
+    });
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+    client.test_hooks.fail_close_event_reserve.set(true);
+    client.test_hooks.fail_close_dscp_clear.set(true);
+
+    assert!(matches!(
+        client.close(),
+        Err(ClientError::AllocationFailed {
+            operation: "close event result",
+            ..
+        })
+    ));
+    assert_eq!(client.test_hooks.close_send_attempts.get(), 0);
+    assert!(client.test_hooks.fail_close_dscp_clear.get());
+    assert!(client.runtime.is_open());
+    assert!(client.schedule.is_some());
+    assert_eq!(client.applied_dscp, Some(0));
+
+    client.test_hooks.fail_close_dscp_clear.set(false);
+    client.close().unwrap();
+    assert_eq!(client.test_hooks.close_send_attempts.get(), 1);
+    server.join();
+}
+
+#[test]
+fn close_dscp_clear_failure_precedes_send_and_preserves_open_state() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+        let _ = recv_request(&socket, &tx);
+    });
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+    client.test_hooks.fail_close_dscp_clear.set(true);
+
+    assert!(matches!(
+        client.close(),
+        Err(ClientError::SocketOption { .. })
+    ));
+    assert_eq!(client.test_hooks.close_send_attempts.get(), 0);
+    assert!(client.runtime.is_open());
+    assert!(client.schedule.is_some());
+    assert_eq!(client.applied_dscp, Some(0));
+
+    client.close().unwrap();
+    assert_eq!(client.test_hooks.close_send_attempts.get(), 1);
+    server.join();
+}
+
+#[test]
+fn close_send_failure_leaves_machine_and_schedule_open_for_retry() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+        let _ = recv_request(&socket, &tx);
+    });
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(2_345),
+        mono: Instant::now() + Duration::from_secs(6),
+    };
+    client.test_hooks.close_sent_at.set(Some(sent_at));
+    client.test_hooks.fail_close_send.set(true);
+
+    assert!(matches!(client.close(), Err(ClientError::Socket(_))));
+    assert_eq!(client.test_hooks.close_sent_at.get(), Some(sent_at));
+    assert!(client.runtime.is_open());
+    assert!(client.schedule.is_some());
+    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.test_hooks.close_send_attempts.get(), 1);
+
+    assert!(matches!(
+        client.close().unwrap().as_slice(),
+        [ClientEvent::SessionClosed {
+            token: TOKEN,
+            at,
+            ..
+        }] if *at == sent_at
+    ));
+    assert_eq!(client.test_hooks.close_sent_at.get(), None);
+    assert_eq!(client.test_hooks.close_send_attempts.get(), 2);
+    assert!(matches!(client.close(), Err(ClientError::AlreadyClosed)));
+    server.join();
+}
+
+#[test]
+fn short_successful_close_commits_before_length_mismatch() {
+    let params = default_params();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+        let _ = recv_request(&socket, &tx);
+    });
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+    let expected = client.runtime.prepare_close().unwrap().bytes.len();
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(3_456),
+        mono: Instant::now() + Duration::from_secs(7),
+    };
+    client.test_hooks.close_sent_at.set(Some(sent_at));
+    client.test_hooks.close_reported_len.set(Some(expected - 1));
+
+    assert!(matches!(
+        client.close(),
+        Err(ClientError::DatagramLengthMismatch {
+            expected: error_expected,
+            actual,
+        }) if error_expected == expected && actual + 1 == expected
+    ));
+    assert!(!client.runtime.is_open());
+    assert!(client.schedule.is_none());
+    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.test_hooks.close_sent_at.get(), None);
+    assert!(matches!(client.close(), Err(ClientError::AlreadyClosed)));
     server.join();
 }
 
@@ -129,6 +293,117 @@ fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
     assert_eq!(first[3] & FLAG_OPEN, FLAG_OPEN);
     assert_eq!(second[3] & flags::FLAG_CLOSE, 0);
     assert!(server.rx.recv_timeout(Duration::from_millis(400)).is_err());
+    server.join();
+}
+
+#[test]
+fn peer_close_dscp_cleanup_failure_preserves_events_and_closed_state() {
+    let params = default_params();
+    let server = start_fake_server({
+        let params = params.clone();
+        move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            socket
+                .send_to(
+                    &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                    peer,
+                )
+                .unwrap();
+            let (request, _) = recv_request(&socket, &tx);
+            let seq = u32::from_le_bytes(request[12..16].try_into().unwrap());
+            socket
+                .send_to(
+                    &echo_reply_packet_with_flags(
+                        TOKEN,
+                        seq,
+                        &params,
+                        &TimestampFields::default(),
+                        None,
+                        FLAG_REPLY | flags::FLAG_CLOSE,
+                    ),
+                    peer,
+                )
+                .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_millis(250)))
+                .unwrap();
+            while recv_request_timeout(&socket, &tx).is_some() {}
+        }
+    });
+    let mut client = Client::connect(ClientConfig {
+        socket_config: crate::SocketConfig {
+            recv_timeout: Some(Duration::from_millis(200)),
+            ..Default::default()
+        },
+        ..default_test_config(server.addr)
+    })
+    .unwrap();
+    assert_open_started(client.open().unwrap());
+    client.send_probe().unwrap();
+    client.test_hooks.fail_close_dscp_clear.set(true);
+
+    assert!(matches!(
+        client.recv_once().unwrap().as_slice(),
+        [
+            ClientEvent::EchoReply { .. },
+            ClientEvent::SessionClosed { token: TOKEN, .. }
+        ]
+    ));
+    assert!(client.is_peer_closed());
+    assert!(client.schedule.is_none());
+    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.test_hooks.close_send_attempts.get(), 0);
+    let open = server.rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    let echo = server.rx.recv_timeout(Duration::from_millis(100)).unwrap();
+    assert_ne!(open[3] & FLAG_OPEN, 0);
+    assert_eq!(echo[3] & flags::FLAG_CLOSE, 0);
+    assert!(server.rx.recv_timeout(Duration::from_millis(400)).is_err());
+    server.join();
+}
+
+#[test]
+fn recv_available_stops_after_peer_close() {
+    let params = default_params();
+    let server = start_fake_server({
+        let params = params.clone();
+        move |socket, tx| {
+            let (_, peer) = recv_request(&socket, &tx);
+            socket
+                .send_to(
+                    &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                    peer,
+                )
+                .unwrap();
+            let (request, _) = recv_request(&socket, &tx);
+            let seq = u32::from_le_bytes(request[12..16].try_into().unwrap());
+            let close = echo_reply_packet_with_flags(
+                TOKEN,
+                seq,
+                &params,
+                &TimestampFields::default(),
+                None,
+                FLAG_REPLY | flags::FLAG_CLOSE,
+            );
+            socket.send_to(&close, peer).unwrap();
+            socket.send_to(&close, peer).unwrap();
+        }
+    });
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+    client.send_probe().unwrap();
+
+    let events = client
+        .recv_available(RecvBudget { max_packets: 8 })
+        .unwrap();
+
+    assert!(matches!(
+        events.as_slice(),
+        [
+            ClientEvent::EchoReply { .. },
+            ClientEvent::SessionClosed { token: TOKEN, .. }
+        ]
+    ));
+    assert!(client.is_peer_closed());
     server.join();
 }
 

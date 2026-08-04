@@ -53,6 +53,7 @@ enum CloseSource {
 struct ActiveSession {
     token: u64,
     negotiated: NegotiatedParams,
+    local_close_packet: Box<[u8]>,
     next_wire_seq: u32,
     highest_received_seq: Option<u32>,
     packets_sent: u64,
@@ -76,7 +77,6 @@ pub(crate) enum OpenDatagramDisposition {
 pub(crate) struct PreparedOpenAcceptance {
     next_state: MachineState,
     outcome: OpenOutcome,
-    cleanup_close: Option<Box<[u8]>>,
 }
 
 impl PreparedOpenAcceptance {
@@ -91,13 +91,31 @@ impl PreparedOpenAcceptance {
     }
 
     pub(crate) fn cleanup_close_packet(&self) -> Option<&[u8]> {
-        self.cleanup_close.as_deref()
+        match &self.next_state {
+            MachineState::Open(session) => Some(&session.local_close_packet),
+            MachineState::NoTestCompleted => None,
+            MachineState::Connected | MachineState::Closed { .. } => {
+                unreachable!("open acceptance only prepares open or no-test state")
+            }
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn has_prepared_active_session(&self) -> bool {
         matches!(self.next_state, MachineState::Open(_))
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedClose<'a> {
+    pub(crate) bytes: &'a [u8],
+    pub(crate) commit: CloseCommit,
+}
+
+#[derive(Debug)]
+pub(crate) struct CloseCommit {
+    packets_sent: u64,
+    token: u64,
 }
 
 #[derive(Debug)]
@@ -401,28 +419,35 @@ impl SessionMachine {
         Ok(events)
     }
 
-    pub(crate) fn close_with<F>(&mut self, send: F) -> Result<Vec<ClientEvent>, ClientError>
-    where
-        F: FnOnce(&[u8]) -> Result<(), ClientError>,
-    {
-        let token = match &self.state {
-            MachineState::Open(session) => session.token,
-            MachineState::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            MachineState::Connected | MachineState::NoTestCompleted => {
-                return Err(ClientError::NotOpen)
-            }
+    pub(crate) fn prepare_close(&self) -> Result<PreparedClose<'_>, ClientError> {
+        let session = self.open_session()?;
+        Ok(PreparedClose {
+            bytes: &session.local_close_packet,
+            commit: CloseCommit {
+                packets_sent: session.packets_sent,
+                token: session.token,
+            },
+        })
+    }
+
+    pub(crate) fn commit_local_close(
+        &mut self,
+        commit: CloseCommit,
+        sent_at: ClientTimestamp,
+    ) -> ClientEvent {
+        debug_assert!(
+            matches!(self.state, MachineState::Open(_)),
+            "local close commits only from open state"
+        );
+        self.state = MachineState::Closed {
+            source: CloseSource::Local,
+            packets_sent: commit.packets_sent,
         };
-
-        let packet =
-            encode_close_request(&CloseRequest { token }, self.config.hmac_key.as_deref())?;
-        send(&packet)?;
-        self.transition_to_closed(CloseSource::Local);
-
-        Ok(vec![ClientEvent::SessionClosed {
+        ClientEvent::SessionClosed {
             remote: self.remote,
-            token,
-            at: ClientTimestamp::now(),
-        }])
+            token: commit.token,
+            at: sent_at,
+        }
     }
 
     pub(crate) fn pending_is_empty(&self) -> bool {
@@ -488,9 +513,12 @@ impl SessionMachine {
             Ok(negotiated) => negotiated,
             Err(primary) => return Err(OpenAcceptanceFailure::new(primary, cleanup_close)),
         };
+        let local_close_packet =
+            cleanup_close.expect("normal non-zero-token replies prepare a cleanup close");
         let next_state = MachineState::Open(Box::new(ActiveSession {
             token,
             negotiated: negotiated.clone(),
+            local_close_packet,
             next_wire_seq: 0,
             highest_received_seq: None,
             packets_sent: 0,
@@ -515,7 +543,6 @@ impl SessionMachine {
         Ok(PreparedOpenAcceptance {
             next_state,
             outcome,
-            cleanup_close,
         })
     }
 
@@ -543,7 +570,6 @@ impl SessionMachine {
         Ok(PreparedOpenAcceptance {
             next_state: MachineState::NoTestCompleted,
             outcome,
-            cleanup_close: None,
         })
     }
 
@@ -981,6 +1007,14 @@ mod tests {
         machine.state = MachineState::Open(Box::new(ActiveSession {
             token: 0x0102_0304_0506_0708,
             negotiated,
+            local_close_packet: encode_close_request(
+                &CloseRequest {
+                    token: 0x0102_0304_0506_0708,
+                },
+                None,
+            )
+            .unwrap()
+            .into_boxed_slice(),
             next_wire_seq: 0,
             highest_received_seq: None,
             packets_sent: 0,
@@ -1268,6 +1302,7 @@ mod tests {
             )
             .unwrap();
 
+        let expected_close = prepared.cleanup_close_packet().unwrap().to_vec();
         let outcome = machine.commit_open(prepared);
 
         assert!(matches!(
@@ -1278,6 +1313,7 @@ mod tests {
             } if outcome_token == token
         ));
         assert!(machine.is_open());
+        assert_eq!(active(&machine).local_close_packet.as_ref(), expected_close);
         assert!(matches!(
             machine.prepare_open_request(),
             Err(ClientError::AlreadyOpen)
@@ -1335,6 +1371,146 @@ mod tests {
             token
         );
         assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn prepare_close_is_stable_inert_and_does_not_determine_event_timestamp() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        active_mut(&mut machine).packets_sent = 7;
+
+        let first_bytes = {
+            let prepared = machine.prepare_close().unwrap();
+            assert_eq!(
+                prepared.bytes,
+                encode_close_request(
+                    &CloseRequest {
+                        token: 0x0102_0304_0506_0708,
+                    },
+                    None,
+                )
+                .unwrap()
+            );
+            assert_eq!(prepared.commit.packets_sent, 7);
+            assert_eq!(prepared.commit.token, 0x0102_0304_0506_0708);
+            prepared.bytes.to_vec()
+        };
+        assert!(machine.is_open());
+        assert_eq!(active(&machine).packets_sent, 7);
+
+        let prepared = machine.prepare_close().unwrap();
+        assert_eq!(prepared.bytes, first_bytes);
+        assert_eq!(prepared.commit.packets_sent, 7);
+        assert_eq!(prepared.commit.token, 0x0102_0304_0506_0708);
+        assert!(machine.is_open());
+    }
+
+    #[test]
+    fn local_close_commit_uses_supplied_exact_timestamp() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let remote = machine.remote;
+        active_mut(&mut machine).packets_sent = 7;
+        let prepared = machine.prepare_close().unwrap();
+        let sent_at = ClientTimestamp {
+            wall: UNIX_EPOCH + Duration::from_secs(1_234),
+            mono: Instant::now() + Duration::from_secs(5),
+        };
+        let event = machine.commit_local_close(prepared.commit, sent_at);
+
+        assert!(matches!(
+            event,
+            ClientEvent::SessionClosed {
+                remote: event_remote,
+                token: 0x0102_0304_0506_0708,
+                at,
+            } if event_remote == remote
+                && at == sent_at
+        ));
+        assert!(matches!(
+            machine.state,
+            MachineState::Closed {
+                source: CloseSource::Local,
+                packets_sent: 7,
+            }
+        ));
+        assert!(matches!(
+            machine.prepare_close(),
+            Err(ClientError::AlreadyClosed)
+        ));
+    }
+
+    #[test]
+    fn prepared_close_reuses_hmac_packet_built_during_open_acceptance() {
+        let key = b"close-key".to_vec();
+        let mut machine = connected_machine(ClientConfig {
+            hmac_key: Some(key.clone()),
+            ..ClientConfig::default()
+        });
+        let token = 0x1020_3040_5060_7080;
+        let prepared_open = machine
+            .prepare_open_acceptance(
+                normal_open_reply(&machine, token),
+                timestamp(Instant::now()),
+            )
+            .unwrap();
+        let opening_close = prepared_open.cleanup_close_packet().unwrap().to_vec();
+        machine.commit_open(prepared_open);
+
+        let prepared_close = machine.prepare_close().unwrap();
+        assert_eq!(prepared_close.bytes, opening_close);
+        assert_eq!(
+            prepared_close.bytes[3],
+            flags::FLAG_CLOSE | flags::FLAG_HMAC
+        );
+        irtt_proto::verify_hmac(&key, prepared_close.bytes, 4).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(
+                prepared_close.bytes[4 + irtt_proto::HMAC_SIZE..12 + irtt_proto::HMAC_SIZE]
+                    .try_into()
+                    .unwrap()
+            ),
+            token
+        );
+    }
+
+    #[test]
+    fn close_preparation_preserves_non_open_errors_and_peer_source() {
+        let connected = connected_machine(ClientConfig::default());
+        assert!(matches!(
+            connected.prepare_close(),
+            Err(ClientError::NotOpen)
+        ));
+
+        let mut no_test = connected_machine(ClientConfig {
+            run_mode: RunMode::NoTest,
+            ..ClientConfig::default()
+        });
+        let reply = OpenReply {
+            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
+            token: 0,
+            params: no_test.requested.clone(),
+        };
+        let prepared = no_test
+            .prepare_open_acceptance(reply, timestamp(Instant::now()))
+            .unwrap();
+        no_test.commit_open(prepared);
+        assert!(matches!(
+            no_test.prepare_close(),
+            Err(ClientError::AlreadyCompleted)
+        ));
+
+        let mut peer_closed = open_machine(4, Duration::from_secs(1));
+        peer_closed.transition_to_closed(CloseSource::Peer);
+        assert!(matches!(
+            peer_closed.state,
+            MachineState::Closed {
+                source: CloseSource::Peer,
+                ..
+            }
+        ));
+        assert!(matches!(
+            peer_closed.prepare_close(),
+            Err(ClientError::AlreadyClosed)
+        ));
     }
 
     #[test]
