@@ -17,7 +17,7 @@ use tokio::runtime::{Builder, Runtime};
 
 use super::*;
 use crate::{
-    socket::resolution_call_counts, socket_options::tokio_socket_traffic_class, RunMode,
+    socket::resolution_call_counts, socket_options::tokio_socket_traffic_class, Client, RunMode,
     SocketConfig, WarningKind,
 };
 
@@ -189,6 +189,87 @@ fn start_peer_close_server() -> TestServer {
                 peer,
             )
             .unwrap();
+    })
+}
+
+fn start_echo_close_server(key: Option<Vec<u8>>) -> TestServer {
+    start_server(move |socket, tx| {
+        let (open_packet, peer) = recv_packet(&socket, &tx);
+        let request = decode_open_request(&open_packet, key.as_deref()).unwrap();
+        send_open_reply(
+            &socket,
+            peer,
+            request.params.clone(),
+            key.as_deref(),
+            flags::FLAG_OPEN | flags::FLAG_REPLY,
+            TOKEN,
+        );
+
+        let (probe_packet, _) = recv_packet(&socket, &tx);
+        let probe = decode_echo_request(&probe_packet, &request.params, key.as_deref()).unwrap();
+        socket
+            .send_to(
+                &echo_reply(
+                    &request.params,
+                    probe.sequence,
+                    TOKEN,
+                    flags::FLAG_REPLY,
+                    key.as_deref(),
+                ),
+                peer,
+            )
+            .unwrap();
+
+        let (close_packet, _) = recv_packet(&socket, &tx);
+        assert_eq!(
+            decode_close_request(&close_packet, key.as_deref())
+                .unwrap()
+                .token,
+            TOKEN
+        );
+    })
+}
+
+fn start_timeout_server() -> TestServer {
+    start_server(move |socket, tx| {
+        let (open_packet, peer) = recv_packet(&socket, &tx);
+        let request = decode_open_request(&open_packet, None).unwrap();
+        send_open_reply(
+            &socket,
+            peer,
+            request.params,
+            None,
+            flags::FLAG_OPEN | flags::FLAG_REPLY,
+            TOKEN,
+        );
+        let _ = recv_packet(&socket, &tx);
+    })
+}
+
+fn start_filtered_open_server(key: Vec<u8>) -> TestServer {
+    start_server(move |socket, tx| {
+        let (open_packet, peer) = recv_packet(&socket, &tx);
+        let request = decode_open_request(&open_packet, Some(&key)).unwrap();
+        socket.send_to(&[0_u8], peer).unwrap();
+        let mut bad_hmac = encode_open_reply(
+            &OpenReply {
+                flags: flags::FLAG_OPEN | flags::FLAG_REPLY,
+                token: TOKEN,
+                params: request.params.clone(),
+            },
+            Some(&key),
+        )
+        .unwrap();
+        bad_hmac[4] ^= 0xff;
+        socket.send_to(&bad_hmac, peer).unwrap();
+        send_open_reply(
+            &socket,
+            peer,
+            request.params,
+            Some(&key),
+            flags::FLAG_OPEN | flags::FLAG_REPLY,
+            TOKEN,
+        );
     })
 }
 
@@ -1189,4 +1270,233 @@ fn close_timestamp_is_sampled_after_success_and_short_send_commits() {
         assert_eq!(server.finish().len(), 2);
     });
     assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
+fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
+    let key = b"async-equivalence-key".to_vec();
+    let blocking_server = start_echo_close_server(Some(key.clone()));
+    let mut blocking =
+        Client::connect(config(blocking_server.addr, Some(key.clone()), 46)).unwrap();
+    let blocking_open = blocking.open().unwrap();
+    let blocking_sent = blocking.send_probe().unwrap();
+    let blocking_reply = blocking.recv_once().unwrap();
+    let blocking_close = blocking.close().unwrap();
+    assert_eq!(blocking_server.finish().len(), 3);
+
+    let async_server = start_echo_close_server(Some(key.clone()));
+    let (async_open, async_sent, async_reply, async_close) = runtime().block_on(async {
+        let mut client = AsyncClient::connect(config(async_server.addr, Some(key), 46))
+            .await
+            .unwrap();
+        let opened = client.open().await.unwrap();
+        assert_eq!(
+            tokio_socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
+            46 << 2
+        );
+        let sent = client.send_probe().await.unwrap();
+        let reply = client.recv().await.unwrap();
+        let closed = client.close().await.unwrap();
+        (opened, sent, reply, closed)
+    });
+    assert_eq!(async_server.finish().len(), 3);
+
+    assert_eq!(
+        open_negotiated(&blocking_open),
+        open_negotiated(&async_open)
+    );
+    assert_eq!(open_negotiated(&async_open).params.dscp, 46);
+    assert_matching_event_shape(&blocking_sent[0], &async_sent[0]);
+    assert_matching_event_shape(&blocking_reply[0], &async_reply[0]);
+    assert_matching_event_shape(&blocking_close[0], &async_close[0]);
+}
+
+#[test]
+fn blocking_and_async_no_test_timeout_and_peer_close_are_equivalent() {
+    let blocking_no_test_server = start_no_test_server();
+    let mut blocking_no_test_config = config(blocking_no_test_server.addr, None, 0);
+    blocking_no_test_config.run_mode = RunMode::NoTest;
+    let mut blocking_no_test = Client::connect(blocking_no_test_config).unwrap();
+    let blocking_no_test_open = blocking_no_test.open().unwrap();
+    assert!(blocking_no_test.is_run_complete());
+    assert_eq!(blocking_no_test_server.finish().len(), 1);
+
+    let async_no_test_server = start_no_test_server();
+    let mut async_no_test_config = config(async_no_test_server.addr, None, 0);
+    async_no_test_config.run_mode = RunMode::NoTest;
+    let async_no_test_open = runtime().block_on(async {
+        let mut client = AsyncClient::connect(async_no_test_config).await.unwrap();
+        let opened = client.open().await.unwrap();
+        assert!(client.is_run_complete());
+        opened
+    });
+    assert_eq!(async_no_test_server.finish().len(), 1);
+    assert!(matches!(
+        blocking_no_test_open,
+        OpenOutcome::NoTestCompleted { .. }
+    ));
+    assert!(matches!(
+        async_no_test_open,
+        OpenOutcome::NoTestCompleted { .. }
+    ));
+    assert_eq!(
+        open_negotiated(&blocking_no_test_open),
+        open_negotiated(&async_no_test_open)
+    );
+
+    let blocking_timeout_server = start_timeout_server();
+    let mut blocking_timeout_config = config(blocking_timeout_server.addr, None, 0);
+    blocking_timeout_config.probe_timeout = Duration::from_millis(5);
+    let mut blocking_timeout = Client::connect(blocking_timeout_config).unwrap();
+    blocking_timeout.open().unwrap();
+    blocking_timeout.send_probe().unwrap();
+    thread::sleep(Duration::from_millis(10));
+    let blocking_loss = blocking_timeout.poll_timeouts().unwrap();
+    assert_eq!(blocking_timeout_server.finish().len(), 2);
+
+    let async_timeout_server = start_timeout_server();
+    let mut async_timeout_config = config(async_timeout_server.addr, None, 0);
+    async_timeout_config.probe_timeout = Duration::from_millis(5);
+    let async_loss = runtime().block_on(async {
+        let mut client = AsyncClient::connect(async_timeout_config).await.unwrap();
+        client.open().await.unwrap();
+        client.send_probe().await.unwrap();
+        time::sleep(Duration::from_millis(10)).await;
+        client.poll_timeouts().unwrap()
+    });
+    assert_eq!(async_timeout_server.finish().len(), 2);
+    assert_matching_event_shape(&blocking_loss[0], &async_loss[0]);
+
+    let blocking_peer_close_server = start_peer_close_server();
+    let mut blocking_peer_close =
+        Client::connect(config(blocking_peer_close_server.addr, None, 0)).unwrap();
+    blocking_peer_close.open().unwrap();
+    blocking_peer_close.send_probe().unwrap();
+    let blocking_peer_close_events = blocking_peer_close.recv_once().unwrap();
+    assert!(blocking_peer_close.is_peer_closed());
+    assert_eq!(blocking_peer_close_server.finish().len(), 2);
+
+    let async_peer_close_server = start_peer_close_server();
+    let async_peer_close_events = runtime().block_on(async {
+        let mut client = AsyncClient::connect(config(async_peer_close_server.addr, None, 0))
+            .await
+            .unwrap();
+        client.open().await.unwrap();
+        client.send_probe().await.unwrap();
+        let events = client.recv().await.unwrap();
+        assert!(client.is_peer_closed());
+        events
+    });
+    assert_eq!(async_peer_close_server.finish().len(), 2);
+    assert_eq!(
+        blocking_peer_close_events.len(),
+        async_peer_close_events.len()
+    );
+    for (blocking, asynchronous) in blocking_peer_close_events
+        .iter()
+        .zip(&async_peer_close_events)
+    {
+        assert_matching_event_shape(blocking, asynchronous);
+    }
+}
+
+#[test]
+fn blocking_and_async_filtered_open_and_finite_completion_are_equivalent() {
+    let key = b"filtered-open-equivalence".to_vec();
+    let blocking_server = start_filtered_open_server(key.clone());
+    let mut blocking = Client::connect(config(blocking_server.addr, Some(key.clone()), 0)).unwrap();
+    let blocking_open = blocking.open().unwrap();
+    assert_eq!(blocking_server.finish().len(), 1);
+
+    let async_server = start_filtered_open_server(key.clone());
+    let async_open = runtime().block_on(async {
+        let mut client = AsyncClient::connect(config(async_server.addr, Some(key), 0))
+            .await
+            .unwrap();
+        client.open().await.unwrap()
+    });
+    assert_eq!(async_server.finish().len(), 1);
+    assert_eq!(
+        open_negotiated(&blocking_open),
+        open_negotiated(&async_open)
+    );
+
+    let blocking_finite_server = start_open_server(None, 0);
+    let mut blocking_config = config(blocking_finite_server.addr, None, 0);
+    blocking_config.interval = Duration::from_millis(5);
+    blocking_config.duration = Some(Duration::from_millis(20));
+    let mut blocking = Client::connect(blocking_config).unwrap();
+    blocking.open().unwrap();
+    thread::sleep(Duration::from_millis(25));
+    assert!(blocking.send_probe().unwrap().is_empty());
+    assert!(blocking.is_run_complete());
+    assert_eq!(blocking_finite_server.finish().len(), 1);
+
+    let async_finite_server = start_open_server(None, 0);
+    let mut async_config = config(async_finite_server.addr, None, 0);
+    async_config.interval = Duration::from_millis(5);
+    async_config.duration = Some(Duration::from_millis(20));
+    runtime().block_on(async {
+        let mut client = AsyncClient::connect(async_config).await.unwrap();
+        client.open().await.unwrap();
+        time::sleep(Duration::from_millis(25)).await;
+        assert!(client.send_probe().await.unwrap().is_empty());
+        assert!(client.is_run_complete());
+    });
+    assert_eq!(async_finite_server.finish().len(), 1);
+}
+
+fn open_negotiated(outcome: &OpenOutcome) -> &crate::NegotiatedParams {
+    match outcome {
+        OpenOutcome::Started { negotiated, .. }
+        | OpenOutcome::NoTestCompleted { negotiated, .. } => negotiated,
+    }
+}
+
+fn assert_matching_event_shape(blocking: &ClientEvent, asynchronous: &ClientEvent) {
+    match (blocking, asynchronous) {
+        (
+            ClientEvent::EchoSent {
+                seq: left_seq,
+                bytes: left_bytes,
+                ..
+            },
+            ClientEvent::EchoSent {
+                seq: right_seq,
+                bytes: right_bytes,
+                ..
+            },
+        ) => {
+            assert_eq!(left_seq, right_seq);
+            assert_eq!(left_bytes, right_bytes);
+        }
+        (
+            ClientEvent::EchoReply {
+                seq: left_seq,
+                bytes: left_bytes,
+                ..
+            },
+            ClientEvent::EchoReply {
+                seq: right_seq,
+                bytes: right_bytes,
+                ..
+            },
+        ) => {
+            assert_eq!(left_seq, right_seq);
+            assert_eq!(left_bytes, right_bytes);
+        }
+        (
+            ClientEvent::SessionClosed {
+                token: left_token, ..
+            },
+            ClientEvent::SessionClosed {
+                token: right_token, ..
+            },
+        ) => assert_eq!(left_token, right_token),
+        (
+            ClientEvent::EchoLoss { seq: left_seq, .. },
+            ClientEvent::EchoLoss { seq: right_seq, .. },
+        ) => assert_eq!(left_seq, right_seq),
+        pair => panic!("event shapes differ: {pair:?}"),
+    }
 }
