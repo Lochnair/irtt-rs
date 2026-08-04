@@ -169,6 +169,18 @@ impl SessionMachine {
         config: ClientConfig,
         remote: std::net::SocketAddr,
     ) -> Result<Self, ClientError> {
+        Self::validate_config(&config)?;
+        let requested = params_from_config(&config)?;
+
+        Ok(Self {
+            config,
+            remote,
+            requested,
+            state: MachineState::Connected,
+        })
+    }
+
+    pub(crate) fn validate_config(config: &ClientConfig) -> Result<(), ClientError> {
         if config.max_pending_probes == 0 {
             return Err(ClientError::InvalidConfig {
                 reason: "max_pending_probes must be greater than zero".to_owned(),
@@ -179,14 +191,7 @@ impl SessionMachine {
                 reason: "probe_timeout must be greater than zero".to_owned(),
             });
         }
-        let requested = params_from_config(&config)?;
-
-        Ok(Self {
-            config,
-            remote,
-            requested,
-            state: MachineState::Connected,
-        })
+        params_from_config(config).map(|_| ())
     }
 
     pub(crate) fn config(&self) -> &ClientConfig {
@@ -487,6 +492,31 @@ impl SessionMachine {
             MachineState::Open(session) => session.packets_sent,
             MachineState::Closed { packets_sent, .. } => *packets_sent,
             MachineState::Connected | MachineState::NoTestCompleted => 0,
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn next_probe_timeout_deadline(&self) -> Option<Instant> {
+        match &self.state {
+            MachineState::Open(session) => session.pending.next_timeout_deadline(),
+            MachineState::Connected
+            | MachineState::NoTestCompleted
+            | MachineState::Closed { .. } => None,
+        }
+    }
+
+    #[cfg(feature = "tokio")]
+    pub(crate) fn latest_probe_timeout_deadline(&self) -> Option<Instant> {
+        match &self.state {
+            MachineState::Open(session) => session
+                .pending
+                .latest_timeout_deadline()
+                .into_iter()
+                .chain(session.timed_out.latest_timeout_deadline())
+                .max(),
+            MachineState::Connected
+            | MachineState::NoTestCompleted
+            | MachineState::Closed { .. } => None,
         }
     }
 

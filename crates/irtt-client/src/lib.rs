@@ -59,7 +59,7 @@ mod client;
 mod config;
 mod error;
 mod event;
-mod managed;
+pub mod managed;
 mod metadata;
 mod probe;
 mod receive;
@@ -80,14 +80,15 @@ pub use event::{
     ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
     ServerTiming, SignedDuration, WarningKind,
 };
-pub use managed::{
+pub use managed::legacy::{
     CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientGroup,
     ManagedClientGroupConfig, ManagedClientGroupSession, ManagedClientSession,
     ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, ManagedGroupOutcome,
     ManagedGroupPacing, ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure,
     ManagedTargetFailureKind, ManagedTargetOutcome, SessionEndReason, SessionOutcome,
-    SubscriberConfig, SubscriberOverflow, TargetEvent, TargetEventSubscription, TargetId,
+    SubscriberConfig, SubscriberOverflow, TargetEvent, TargetEventSubscription,
     MANAGED_GROUP_OUTCOME_HISTORY_LIMIT,
 };
+pub use managed::TargetId;
 pub use session::{NegotiatedParams, NegotiationRestriction};
 pub use timing::ClientTimestamp;

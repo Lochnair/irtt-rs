@@ -50,6 +50,11 @@ impl ProbeSchedule {
         self.next_send_at
     }
 
+    #[cfg(feature = "tokio")]
+    pub(crate) fn interval(&self) -> Duration {
+        self.interval
+    }
+
     pub(crate) fn permit_probe_at(&mut self, now: Instant) -> bool {
         if self.next_send_at.is_none() {
             return false;
