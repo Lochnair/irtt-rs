@@ -142,6 +142,8 @@ impl Future for ManagedStopReceipt {
 type ConnectFuture =
     Pin<Box<dyn Future<Output = Result<AsyncClient, ClientError>> + Send + 'static>>;
 type WakeFuture = Pin<Box<dyn Future<Output = Option<watch::Receiver<()>>> + Send + 'static>>;
+#[cfg(test)]
+type EventObservations = Arc<std::sync::Mutex<Vec<(ManagedEvent, Arc<ManagedStatus>)>>>;
 
 fn arm_wake(mut receiver: watch::Receiver<()>) -> WakeFuture {
     Box::pin(async move {
@@ -313,6 +315,8 @@ pub struct ManagedClientTask {
     stop_observed: bool,
     final_outcome: Option<Arc<ManagedOutcome>>,
     _next_generation: u64,
+    #[cfg(test)]
+    event_observations: Option<EventObservations>,
 }
 
 impl ManagedClientTask {
@@ -323,6 +327,13 @@ impl ManagedClientTask {
     }
 
     fn publish_event(&self, event: ManagedEvent) {
+        #[cfg(test)]
+        if let Some(observations) = &self.event_observations {
+            observations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push((event.clone(), Arc::clone(&self.resources().status.borrow())));
+        }
         if let Some(events) = &self.resources().events {
             let _ = events.send(event);
         }
@@ -1180,6 +1191,8 @@ fn build_task(
         stop_observed: false,
         final_outcome: None,
         _next_generation: next_generation,
+        #[cfg(test)]
+        event_observations: None,
     };
     let handle = ManagedClientHandle {
         stop,
@@ -1218,3 +1231,7 @@ fn close_timeout_failure() -> ManagedTargetFailure {
         message: Arc::from("best-effort close did not become writable before its deadline"),
     }
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
