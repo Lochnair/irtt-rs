@@ -62,6 +62,64 @@ struct ActiveSession {
 }
 
 #[derive(Debug)]
+pub(crate) struct PreparedOpenRequest {
+    pub(crate) bytes: Box<[u8]>,
+}
+
+#[derive(Debug)]
+pub(crate) enum OpenDatagramDisposition {
+    Ignore,
+    Trusted(OpenReply),
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedOpenAcceptance {
+    next_state: MachineState,
+    outcome: OpenOutcome,
+    cleanup_close: Option<Box<[u8]>>,
+}
+
+impl PreparedOpenAcceptance {
+    pub(crate) fn normal_negotiated(&self) -> Option<&NegotiatedParams> {
+        match &self.next_state {
+            MachineState::Open(session) => Some(&session.negotiated),
+            MachineState::NoTestCompleted => None,
+            MachineState::Connected | MachineState::Closed { .. } => {
+                unreachable!("open acceptance only prepares open or no-test state")
+            }
+        }
+    }
+
+    pub(crate) fn cleanup_close_packet(&self) -> Option<&[u8]> {
+        self.cleanup_close.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_prepared_active_session(&self) -> bool {
+        matches!(self.next_state, MachineState::Open(_))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct OpenAcceptanceFailure {
+    pub(crate) primary: ClientError,
+    pub(crate) cleanup_close: Option<Box<[u8]>>,
+}
+
+impl OpenAcceptanceFailure {
+    fn new(primary: ClientError, cleanup_close: Option<Box<[u8]>>) -> Self {
+        Self {
+            primary,
+            cleanup_close,
+        }
+    }
+
+    fn without_cleanup(primary: ClientError) -> Self {
+        Self::new(primary, None)
+    }
+}
+
+#[derive(Debug)]
 pub(crate) struct PreparedProbe {
     pub(crate) bytes: Box<[u8]>,
     pub(crate) seq: u32,
@@ -121,58 +179,99 @@ impl SessionMachine {
         self.config.hmac_key.is_some()
     }
 
-    pub(crate) fn open_packet(&self) -> Result<Vec<u8>, ClientError> {
-        match self.state {
-            MachineState::Connected => {}
-            MachineState::Open(_) => return Err(ClientError::AlreadyOpen),
-            MachineState::Closed { .. } => return Err(ClientError::AlreadyClosed),
-            MachineState::NoTestCompleted => return Err(ClientError::AlreadyCompleted),
-        }
-
+    pub(crate) fn prepare_open_request(&self) -> Result<PreparedOpenRequest, ClientError> {
+        self.ensure_connected()?;
         let request = OpenRequest {
             params: self.requested.clone(),
             close: self.config.run_mode == RunMode::NoTest,
         };
-        Ok(encode_open_request(
-            &request,
-            self.config.hmac_key.as_deref(),
-        )?)
+        let bytes = encode_open_request(&request, self.config.hmac_key.as_deref())?;
+        Ok(PreparedOpenRequest {
+            bytes: bytes.into_boxed_slice(),
+        })
     }
 
-    pub(crate) fn decode_open_reply(&self, packet: &[u8]) -> Result<OpenReply, ClientError> {
-        Ok(irtt_proto::decode_open_reply(
-            packet,
-            self.config.hmac_key.as_deref(),
-        )?)
+    pub(crate) fn inspect_open_datagram(
+        &self,
+        packet: &[u8],
+    ) -> Result<OpenDatagramDisposition, ClientError> {
+        self.ensure_connected()?;
+        match irtt_proto::decode_open_reply(packet, self.config.hmac_key.as_deref()) {
+            Ok(reply) => Ok(OpenDatagramDisposition::Trusted(reply)),
+            Err(error @ irtt_proto::ProtoError::ZeroToken) => Err(ClientError::Protocol(error)),
+            Err(
+                error @ (irtt_proto::ProtoError::TruncatedVarint
+                | irtt_proto::ProtoError::VarintOverflow
+                | irtt_proto::ProtoError::InvalidUtf8
+                | irtt_proto::ProtoError::InvalidEnum { .. }
+                | irtt_proto::ProtoError::NegativePacketLength { .. }
+                | irtt_proto::ProtoError::ParameterLengthTooLarge { .. }
+                | irtt_proto::ProtoError::MalformedParams),
+            ) => Err(ClientError::Protocol(error)),
+            Err(_) => Ok(OpenDatagramDisposition::Ignore),
+        }
     }
 
-    pub(crate) fn accept_open_reply<F>(
-        &mut self,
+    pub(crate) fn prepare_open_acceptance(
+        &self,
         reply: OpenReply,
         now: ClientTimestamp,
-        before_normal_open: F,
-    ) -> Result<OpenOutcome, ClientError>
-    where
-        F: FnOnce(&NegotiatedParams) -> Result<(), ClientError>,
-    {
-        if reply.params.protocol_version != PROTOCOL_VERSION {
-            return Err(ClientError::ProtocolVersionMismatch {
-                requested: PROTOCOL_VERSION,
-                received: reply.params.protocol_version,
-            });
-        }
+    ) -> Result<PreparedOpenAcceptance, OpenAcceptanceFailure> {
+        self.ensure_connected()
+            .map_err(OpenAcceptanceFailure::without_cleanup)?;
 
         let reply_is_close = flags::has(reply.flags, flags::FLAG_CLOSE);
-        match self.config.run_mode {
-            RunMode::Normal if reply_is_close => Err(ClientError::ServerRejected),
-            RunMode::Normal if reply.token == 0 => Err(ClientError::ZeroToken),
-            RunMode::Normal => self.accept_normal_open(reply, now, before_normal_open),
-            RunMode::NoTest if !reply_is_close => Err(ClientError::UnexpectedNoTestReply),
-            RunMode::NoTest if reply.token != 0 => {
-                Err(ClientError::NonZeroNoTestToken { token: reply.token })
-            }
-            RunMode::NoTest => self.accept_no_test_open(reply, now),
+        let cleanup_close = if !reply_is_close && reply.token != 0 {
+            let bytes = encode_close_request(
+                &CloseRequest { token: reply.token },
+                self.config.hmac_key.as_deref(),
+            )
+            .map_err(ClientError::from)
+            .map_err(OpenAcceptanceFailure::without_cleanup)?;
+            Some(bytes.into_boxed_slice())
+        } else {
+            None
+        };
+
+        if reply.params.protocol_version != PROTOCOL_VERSION {
+            return Err(OpenAcceptanceFailure::new(
+                ClientError::ProtocolVersionMismatch {
+                    requested: PROTOCOL_VERSION,
+                    received: reply.params.protocol_version,
+                },
+                cleanup_close,
+            ));
         }
+
+        match self.config.run_mode {
+            RunMode::Normal if reply_is_close => Err(OpenAcceptanceFailure::new(
+                ClientError::ServerRejected,
+                cleanup_close,
+            )),
+            RunMode::Normal if reply.token == 0 => Err(OpenAcceptanceFailure::new(
+                ClientError::ZeroToken,
+                cleanup_close,
+            )),
+            RunMode::Normal => self.prepare_normal_open(reply, now, cleanup_close),
+            RunMode::NoTest if !reply_is_close => Err(OpenAcceptanceFailure::new(
+                ClientError::UnexpectedNoTestReply,
+                cleanup_close,
+            )),
+            RunMode::NoTest if reply.token != 0 => Err(OpenAcceptanceFailure::new(
+                ClientError::NonZeroNoTestToken { token: reply.token },
+                cleanup_close,
+            )),
+            RunMode::NoTest => self.prepare_no_test_open(reply, now),
+        }
+    }
+
+    pub(crate) fn commit_open(&mut self, prepared: PreparedOpenAcceptance) -> OpenOutcome {
+        debug_assert!(
+            matches!(self.state, MachineState::Connected),
+            "open acceptance commits only from connected state"
+        );
+        self.state = prepared.next_state;
+        prepared.outcome
     }
 
     pub(crate) fn probe_timeout(&self) -> Duration {
@@ -374,24 +473,22 @@ impl SessionMachine {
         self.open_session().map(|_| ())
     }
 
-    fn accept_normal_open<F>(
-        &mut self,
+    fn prepare_normal_open(
+        &self,
         reply: OpenReply,
         now: ClientTimestamp,
-        before_normal_open: F,
-    ) -> Result<OpenOutcome, ClientError>
-    where
-        F: FnOnce(&NegotiatedParams) -> Result<(), ClientError>,
-    {
+        cleanup_close: Option<Box<[u8]>>,
+    ) -> Result<PreparedOpenAcceptance, OpenAcceptanceFailure> {
         let token = reply.token;
-        let negotiated = negotiate_params(
+        let negotiated = match negotiate_params(
             &self.requested,
             reply.params,
             self.config.negotiation_policy,
-        )?;
-        before_normal_open(&negotiated)?;
-
-        self.state = MachineState::Open(Box::new(ActiveSession {
+        ) {
+            Ok(negotiated) => negotiated,
+            Err(primary) => return Err(OpenAcceptanceFailure::new(primary, cleanup_close)),
+        };
+        let next_state = MachineState::Open(Box::new(ActiveSession {
             token,
             negotiated: negotiated.clone(),
             next_wire_seq: 0,
@@ -409,34 +506,44 @@ impl SessionMachine {
             at: now,
         };
 
-        Ok(OpenOutcome::Started {
+        let outcome = OpenOutcome::Started {
             remote: self.remote,
             token,
             negotiated,
             event,
+        };
+        Ok(PreparedOpenAcceptance {
+            next_state,
+            outcome,
+            cleanup_close,
         })
     }
 
-    fn accept_no_test_open(
-        &mut self,
+    fn prepare_no_test_open(
+        &self,
         reply: OpenReply,
         now: ClientTimestamp,
-    ) -> Result<OpenOutcome, ClientError> {
+    ) -> Result<PreparedOpenAcceptance, OpenAcceptanceFailure> {
         let negotiated = negotiate_params(
             &self.requested,
             reply.params,
             self.config.negotiation_policy,
-        )?;
-        self.state = MachineState::NoTestCompleted;
+        )
+        .map_err(OpenAcceptanceFailure::without_cleanup)?;
         let event = ClientEvent::NoTestCompleted {
             remote: self.remote,
             negotiated: negotiated.clone(),
             at: now,
         };
-        Ok(OpenOutcome::NoTestCompleted {
+        let outcome = OpenOutcome::NoTestCompleted {
             remote: self.remote,
             negotiated,
             event,
+        };
+        Ok(PreparedOpenAcceptance {
+            next_state: MachineState::NoTestCompleted,
+            outcome,
+            cleanup_close: None,
         })
     }
 
@@ -616,6 +723,15 @@ impl SessionMachine {
             MachineState::Open(session) => Ok(session),
             MachineState::Closed { .. } => Err(ClientError::AlreadyClosed),
             MachineState::Connected => Err(ClientError::NotOpen),
+            MachineState::NoTestCompleted => Err(ClientError::AlreadyCompleted),
+        }
+    }
+
+    fn ensure_connected(&self) -> Result<(), ClientError> {
+        match self.state {
+            MachineState::Connected => Ok(()),
+            MachineState::Open(_) => Err(ClientError::AlreadyOpen),
+            MachineState::Closed { .. } => Err(ClientError::AlreadyClosed),
             MachineState::NoTestCompleted => Err(ClientError::AlreadyCompleted),
         }
     }
@@ -894,6 +1010,331 @@ mod tests {
             mono,
             wall: SystemTime::now(),
         }
+    }
+
+    fn connected_machine(config: ClientConfig) -> SessionMachine {
+        SessionMachine::new(config, "127.0.0.1:2112".parse().unwrap()).unwrap()
+    }
+
+    fn normal_open_reply(machine: &SessionMachine, token: u64) -> OpenReply {
+        OpenReply {
+            flags: flags::FLAG_OPEN | flags::FLAG_REPLY,
+            token,
+            params: machine.requested.clone(),
+        }
+    }
+
+    fn encoded_open_reply(
+        machine: &SessionMachine,
+        reply: &OpenReply,
+    ) -> Result<Vec<u8>, irtt_proto::ProtoError> {
+        irtt_proto::encode_open_reply(reply, machine.config.hmac_key.as_deref())
+    }
+
+    #[test]
+    fn prepared_open_request_is_exact_and_inert_when_dropped() {
+        let machine = connected_machine(ClientConfig::default());
+        let first = machine.prepare_open_request().unwrap();
+        let second = machine.prepare_open_request().unwrap();
+
+        assert_eq!(first.bytes, second.bytes);
+        assert!(!first.bytes.is_empty());
+        drop(first);
+        drop(second);
+        assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn malformed_wrong_direction_and_invalid_flags_are_ignored() {
+        let machine = connected_machine(ClientConfig::default());
+        assert!(matches!(
+            machine.inspect_open_datagram(&[0_u8]),
+            Ok(OpenDatagramDisposition::Ignore)
+        ));
+
+        let request = machine.prepare_open_request().unwrap();
+        assert!(matches!(
+            machine.inspect_open_datagram(&request.bytes),
+            Ok(OpenDatagramDisposition::Ignore)
+        ));
+
+        let reply = normal_open_reply(&machine, 0x1020_3040_5060_7080);
+        let mut reserved = encoded_open_reply(&machine, &reply).unwrap();
+        reserved[3] |= 0x10;
+        assert!(matches!(
+            machine.inspect_open_datagram(&reserved),
+            Ok(OpenDatagramDisposition::Ignore)
+        ));
+        assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn missing_unexpected_and_bad_hmac_are_ignored() {
+        let key = b"open-key".to_vec();
+        let authenticated = connected_machine(ClientConfig {
+            hmac_key: Some(key.clone()),
+            ..ClientConfig::default()
+        });
+        let reply = normal_open_reply(&authenticated, 0x1020_3040_5060_7080);
+        let plain = irtt_proto::encode_open_reply(&reply, None).unwrap();
+        assert!(matches!(
+            authenticated.inspect_open_datagram(&plain),
+            Ok(OpenDatagramDisposition::Ignore)
+        ));
+
+        let mut bad = encoded_open_reply(&authenticated, &reply).unwrap();
+        *bad.last_mut().unwrap() ^= 0x80;
+        assert!(matches!(
+            authenticated.inspect_open_datagram(&bad),
+            Ok(OpenDatagramDisposition::Ignore)
+        ));
+
+        let plain_machine = connected_machine(ClientConfig::default());
+        let unexpected = irtt_proto::encode_open_reply(&reply, Some(&key)).unwrap();
+        assert!(matches!(
+            plain_machine.inspect_open_datagram(&unexpected),
+            Ok(OpenDatagramDisposition::Ignore)
+        ));
+    }
+
+    #[test]
+    fn authenticated_zero_token_is_trusted_and_terminal() {
+        let key = b"open-key".to_vec();
+        let machine = connected_machine(ClientConfig {
+            hmac_key: Some(key.clone()),
+            ..ClientConfig::default()
+        });
+        let reply = normal_open_reply(&machine, 0x1020_3040_5060_7080);
+        let mut packet = encoded_open_reply(&machine, &reply).unwrap();
+        let token_offset = 4 + irtt_proto::HMAC_SIZE;
+        packet[token_offset..token_offset + 8].fill(0);
+        irtt_proto::compute_hmac_in_place(&key, &mut packet, 4).unwrap();
+
+        assert!(matches!(
+            machine.inspect_open_datagram(&packet),
+            Err(ClientError::Protocol(irtt_proto::ProtoError::ZeroToken))
+        ));
+        assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn trusted_invalid_parameter_encoding_is_terminal() {
+        let machine = connected_machine(ClientConfig::default());
+        let mut packet = irtt_proto::MAGIC.to_vec();
+        packet.push(flags::FLAG_OPEN | flags::FLAG_REPLY);
+        packet.extend_from_slice(&0x1020_3040_5060_7080_u64.to_le_bytes());
+        packet.push(0x80);
+
+        assert!(matches!(
+            machine.inspect_open_datagram(&packet),
+            Err(ClientError::Protocol(
+                irtt_proto::ProtoError::TruncatedVarint
+            ))
+        ));
+        assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn trusted_rejection_version_and_run_mode_failures_do_not_open() {
+        let machine = connected_machine(ClientConfig::default());
+        let rejection = OpenReply {
+            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
+            token: 0,
+            params: machine.requested.clone(),
+        };
+        assert!(matches!(
+            machine
+                .prepare_open_acceptance(rejection, timestamp(Instant::now()))
+                .unwrap_err()
+                .primary,
+            ClientError::ServerRejected
+        ));
+
+        let mut version = normal_open_reply(&machine, 0x1020_3040_5060_7080);
+        version.params.protocol_version += 1;
+        assert!(matches!(
+            machine
+                .prepare_open_acceptance(version, timestamp(Instant::now()))
+                .unwrap_err()
+                .primary,
+            ClientError::ProtocolVersionMismatch { .. }
+        ));
+
+        let no_test = connected_machine(ClientConfig {
+            run_mode: RunMode::NoTest,
+            ..ClientConfig::default()
+        });
+        assert!(matches!(
+            no_test
+                .prepare_open_acceptance(
+                    normal_open_reply(&no_test, 0x1020_3040_5060_7080),
+                    timestamp(Instant::now()),
+                )
+                .unwrap_err()
+                .primary,
+            ClientError::UnexpectedNoTestReply
+        ));
+        assert!(matches!(machine.state, MachineState::Connected));
+        assert!(matches!(no_test.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn no_test_non_close_reply_prepares_authenticated_cleanup_without_state_change() {
+        let key = b"cleanup-key".to_vec();
+        let machine = connected_machine(ClientConfig {
+            run_mode: RunMode::NoTest,
+            hmac_key: Some(key.clone()),
+            ..ClientConfig::default()
+        });
+        let token = 0x1020_3040_5060_7080;
+
+        let failure = machine
+            .prepare_open_acceptance(
+                normal_open_reply(&machine, token),
+                timestamp(Instant::now()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            failure.primary,
+            ClientError::UnexpectedNoTestReply
+        ));
+        let cleanup = failure.cleanup_close.as_deref().unwrap();
+        assert_eq!(cleanup[3], flags::FLAG_CLOSE | flags::FLAG_HMAC);
+        irtt_proto::verify_hmac(&key, cleanup, 4).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(
+                cleanup[4 + irtt_proto::HMAC_SIZE..12 + irtt_proto::HMAC_SIZE]
+                    .try_into()
+                    .unwrap()
+            ),
+            token
+        );
+        drop(failure);
+        assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn no_test_close_replies_do_not_prepare_cleanup() {
+        let machine = connected_machine(ClientConfig {
+            run_mode: RunMode::NoTest,
+            ..ClientConfig::default()
+        });
+        let reply = |token| OpenReply {
+            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
+            token,
+            params: machine.requested.clone(),
+        };
+
+        let prepared = machine
+            .prepare_open_acceptance(reply(0), timestamp(Instant::now()))
+            .unwrap();
+        assert!(prepared.cleanup_close_packet().is_none());
+
+        let failure = machine
+            .prepare_open_acceptance(reply(0x1020_3040_5060_7080), timestamp(Instant::now()))
+            .unwrap_err();
+        assert!(matches!(
+            failure.primary,
+            ClientError::NonZeroNoTestToken { .. }
+        ));
+        assert!(failure.cleanup_close.is_none());
+    }
+
+    #[test]
+    fn dropping_prepared_acceptance_leaves_connected_state() {
+        let machine = connected_machine(ClientConfig::default());
+        let prepared = machine
+            .prepare_open_acceptance(
+                normal_open_reply(&machine, 0x1020_3040_5060_7080),
+                timestamp(Instant::now()),
+            )
+            .unwrap();
+
+        assert!(prepared.has_prepared_active_session());
+        assert!(prepared.cleanup_close_packet().is_some());
+        drop(prepared);
+        assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn commit_open_assigns_prebuilt_state_once() {
+        let mut machine = connected_machine(ClientConfig::default());
+        let token = 0x1020_3040_5060_7080;
+        let prepared = machine
+            .prepare_open_acceptance(
+                normal_open_reply(&machine, token),
+                timestamp(Instant::now()),
+            )
+            .unwrap();
+
+        let outcome = machine.commit_open(prepared);
+
+        assert!(matches!(
+            outcome,
+            OpenOutcome::Started {
+                token: outcome_token,
+                ..
+            } if outcome_token == token
+        ));
+        assert!(machine.is_open());
+        assert!(matches!(
+            machine.prepare_open_request(),
+            Err(ClientError::AlreadyOpen)
+        ));
+    }
+
+    #[test]
+    fn no_test_preparation_completes_without_active_session() {
+        let config = ClientConfig {
+            run_mode: RunMode::NoTest,
+            ..ClientConfig::default()
+        };
+        let mut machine = connected_machine(config);
+        let reply = OpenReply {
+            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
+            token: 0,
+            params: machine.requested.clone(),
+        };
+        let prepared = machine
+            .prepare_open_acceptance(reply, timestamp(Instant::now()))
+            .unwrap();
+
+        assert!(prepared.normal_negotiated().is_none());
+        assert!(prepared.cleanup_close_packet().is_none());
+        assert!(matches!(machine.state, MachineState::Connected));
+        let outcome = machine.commit_open(prepared);
+        assert!(matches!(outcome, OpenOutcome::NoTestCompleted { .. }));
+        assert!(matches!(machine.state, MachineState::NoTestCompleted));
+    }
+
+    #[test]
+    fn cleanup_close_is_preencoded_with_token_and_hmac() {
+        let key = b"cleanup-key".to_vec();
+        let machine = connected_machine(ClientConfig {
+            hmac_key: Some(key.clone()),
+            ..ClientConfig::default()
+        });
+        let token = 0x1020_3040_5060_7080;
+        let prepared = machine
+            .prepare_open_acceptance(
+                normal_open_reply(&machine, token),
+                timestamp(Instant::now()),
+            )
+            .unwrap();
+        let cleanup = prepared.cleanup_close_packet().unwrap();
+
+        assert_eq!(cleanup[3], flags::FLAG_CLOSE | flags::FLAG_HMAC);
+        irtt_proto::verify_hmac(&key, cleanup, 4).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(
+                cleanup[4 + irtt_proto::HMAC_SIZE..12 + irtt_proto::HMAC_SIZE]
+                    .try_into()
+                    .unwrap()
+            ),
+            token
+        );
+        assert!(matches!(machine.state, MachineState::Connected));
     }
 
     #[test]

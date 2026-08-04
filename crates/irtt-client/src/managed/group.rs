@@ -21,8 +21,11 @@ use crate::{
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
     metadata::ReceiveMeta,
-    receive::recv_datagram_from,
-    session::machine::{params_from_config, SessionMachine},
+    receive::{recv_datagram_from, ReceivedDatagramFrom},
+    session::machine::{
+        params_from_config, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
+        SessionMachine,
+    },
     socket::{bind_unconnected_udp_socket, validate_open_timeouts},
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
@@ -190,6 +193,12 @@ impl ManagedGroupEvent {
 pub type TargetEventSubscription = EventSubscription<ManagedGroupEvent>;
 
 /// Entry point for running a shared-socket multi-target managed client group.
+///
+/// Each opening attempt sends one reusable request and may inspect several
+/// datagrams until its absolute deadline. Malformed, unrelated, and
+/// unauthenticated traffic is ignored; authenticated incompatibility is
+/// terminal. A trusted token followed by group-policy or schedule rejection
+/// triggers a best-effort cleanup close without replacing the primary failure.
 #[derive(Debug)]
 pub struct ManagedClientGroup;
 
@@ -473,6 +482,7 @@ impl ManagedClientGroup {
             cancellation: cancellation.clone(),
             control_tx: control_tx.clone(),
             peer_closed_target_count: peer_closed_target_count.clone(),
+            receiver_drain: Mutex::new(ReceiverDrainState::default()),
             requested_interval_ns: requested.interval_ns,
             requested_dscp: requested.dscp,
             family_remote,
@@ -604,9 +614,78 @@ struct GroupShared {
     cancellation: CancellationToken,
     control_tx: mpsc::Sender<ControlMessage>,
     peer_closed_target_count: Arc<AtomicU64>,
+    receiver_drain: Mutex<ReceiverDrainState>,
     requested_interval_ns: i64,
     requested_dscp: i64,
     family_remote: SocketAddr,
+}
+
+#[derive(Debug, Default)]
+struct ReceiverDrainState {
+    requested: u64,
+    completed: u64,
+}
+
+impl ReceiverDrainState {
+    fn request_or_join(&mut self) -> Result<u64, ClientError> {
+        if self.requested == self.completed {
+            self.requested = self
+                .requested
+                .checked_add(1)
+                .ok_or(ClientError::CounterOverflow {
+                    counter: "receiver_drain_generation",
+                })?;
+        }
+        Ok(self.requested)
+    }
+
+    fn complete_observed(&mut self, observed_generation: u64) -> bool {
+        let observed_generation = observed_generation.min(self.requested);
+        if observed_generation > self.completed {
+            self.completed = observed_generation;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+fn request_receiver_drain(shared: &GroupShared) -> Result<u64, ClientError> {
+    shared
+        .receiver_drain
+        .lock()
+        .expect("receiver drain mutex poisoned")
+        .request_or_join()
+}
+
+fn requested_receiver_drain(shared: &GroupShared) -> u64 {
+    shared
+        .receiver_drain
+        .lock()
+        .expect("receiver drain mutex poisoned")
+        .requested
+}
+
+fn completed_receiver_drain(shared: &GroupShared) -> u64 {
+    shared
+        .receiver_drain
+        .lock()
+        .expect("receiver drain mutex poisoned")
+        .completed
+}
+
+fn complete_receiver_drain(shared: &GroupShared, observed_generation: u64) {
+    let advanced = {
+        let mut state = shared
+            .receiver_drain
+            .lock()
+            .expect("receiver drain mutex poisoned");
+        state.complete_observed(observed_generation)
+    };
+    if advanced {
+        let _ = shared.control_tx.send(ControlMessage::Wake);
+    }
 }
 
 struct GroupSchedulerCleanup {
@@ -636,7 +715,7 @@ struct TargetState {
     runtime: SessionMachine,
     schedule: Option<ProbeSchedule>,
     status: TargetStatus,
-    open_packet: Vec<u8>,
+    open_request: PreparedOpenRequest,
     counters: TargetCounters,
     order: u64,
     final_reason: Option<ManagedTargetEndReason>,
@@ -655,12 +734,25 @@ enum TargetStatus {
     Opening {
         attempt: usize,
         next_send_at: Instant,
+        awaiting_receiver_generation: Option<u64>,
     },
     Active,
     Draining {
         deadline: Instant,
     },
     Finished,
+}
+
+#[derive(Debug)]
+struct PreparedGroupOpen {
+    machine: PreparedOpenAcceptance,
+    schedule: Option<ProbeSchedule>,
+}
+
+#[derive(Debug)]
+struct PreparedGroupOpenFailure {
+    primary: ClientError,
+    machine: PreparedOpenAcceptance,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -725,7 +817,7 @@ impl TargetState {
             config.hmac_key = auth.hmac_key.clone();
         }
         let runtime = SessionMachine::new(config, target.remote)?;
-        let open_packet = runtime.open_packet()?;
+        let open_request = runtime.prepare_open_request()?;
         Ok(Self {
             id: target.id,
             remote: target.remote,
@@ -735,8 +827,9 @@ impl TargetState {
             status: TargetStatus::Opening {
                 attempt: 0,
                 next_send_at: now,
+                awaiting_receiver_generation: None,
             },
-            open_packet,
+            open_request,
             counters: TargetCounters::default(),
             order,
             final_reason: None,
@@ -859,6 +952,8 @@ fn run_group_scheduler(
 fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(), ClientError> {
     let mut buf = vec![0_u8; RECV_BUFFER_SIZE];
     while !shared.cancellation.is_cancelled() {
+        // A timeout only proves requests visible before this receive began.
+        let observed_drain_generation = requested_receiver_drain(&shared);
         let datagram = match recv_datagram_from(&socket, &mut buf) {
             Ok(datagram) => datagram,
             Err(err)
@@ -867,6 +962,7 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
+                complete_receiver_drain(&shared, observed_drain_generation);
                 continue;
             }
             Err(err) => {
@@ -882,70 +978,113 @@ fn run_group_receiver(socket: UdpSocket, shared: Arc<GroupShared>) -> Result<(),
             }
         };
 
-        let target = {
-            let registry = shared
-                .registry
-                .lock()
-                .expect("target registry mutex poisoned");
-            let Some(id) = registry.remotes.get(&datagram.source) else {
-                continue;
-            };
-            registry.targets.get(id).cloned()
-        };
-        let Some(target) = target else {
-            continue;
-        };
-
-        let packet = &buf[..datagram.len];
-        let mut wake_scheduler = false;
-        {
-            let mut target = target.lock().expect("target mutex poisoned");
-            match target.status {
-                TargetStatus::Opening { .. } => {
-                    let opened_at = datagram.received_at;
-                    let mut schedule = None;
-                    let result = target.runtime.decode_open_reply(packet).and_then(|reply| {
-                        target
-                            .runtime
-                            .accept_open_reply(reply, opened_at, |negotiated| {
-                                validate_group_negotiation(&shared, negotiated)?;
-                                schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
-                                Ok(())
-                            })
-                    });
-
-                    match result {
-                        Ok(outcome) => {
-                            target.schedule = schedule;
-                            publish_open_outcome(&shared.hub, &mut target, outcome);
-                            wake_scheduler = true;
-                        }
-                        Err(err) => {
-                            target.mark_finished(ManagedTargetEndReason::OpenFailed(
-                                ManagedTargetFailure::opening(&err),
-                            ));
-                            wake_scheduler = true;
-                        }
-                    }
-                }
-                TargetStatus::Active | TargetStatus::Draining { .. } => {
-                    wake_scheduler = process_active_target_packet(
-                        &shared.hub,
-                        &mut target,
-                        packet,
-                        datagram.received_at,
-                        datagram.meta,
-                    );
-                }
-                TargetStatus::Finished => {}
-            }
-        }
-
-        if wake_scheduler {
-            let _ = shared.control_tx.send(ControlMessage::Wake);
-        }
+        process_group_datagram(&socket, &shared, datagram, &buf[..datagram.len]);
     }
     Ok(())
+}
+
+fn process_group_datagram(
+    socket: &UdpSocket,
+    shared: &GroupShared,
+    datagram: ReceivedDatagramFrom,
+    packet: &[u8],
+) {
+    // The single receiver thread cannot advance completion while processing
+    // this datagram, so one snapshot consistently classifies its target.
+    let completed_drain_generation = completed_receiver_drain(shared);
+    let target = {
+        let registry = shared
+            .registry
+            .lock()
+            .expect("target registry mutex poisoned");
+        let Some(id) = registry.remotes.get(&datagram.source) else {
+            return;
+        };
+        registry.targets.get(id).cloned()
+    };
+    let Some(target) = target else {
+        return;
+    };
+
+    let mut wake_scheduler = false;
+    {
+        let mut target = target.lock().expect("target mutex poisoned");
+        match target.status {
+            TargetStatus::Opening {
+                attempt,
+                awaiting_receiver_generation,
+                ..
+            } => {
+                if attempt == 0
+                    || awaiting_receiver_generation
+                        .is_some_and(|generation| completed_drain_generation >= generation)
+                {
+                    return;
+                }
+                let opened_at = datagram.received_at;
+                let reply = match target.runtime.inspect_open_datagram(packet) {
+                    Ok(OpenDatagramDisposition::Ignore) => return,
+                    Ok(OpenDatagramDisposition::Trusted(reply)) => reply,
+                    Err(err) => {
+                        target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                            ManagedTargetFailure::opening(&err),
+                        ));
+                        let _ = shared.control_tx.send(ControlMessage::Wake);
+                        return;
+                    }
+                };
+                let machine = match target.runtime.prepare_open_acceptance(reply, opened_at) {
+                    Ok(machine) => machine,
+                    Err(failure) => {
+                        send_group_cleanup_close_best_effort(
+                            socket,
+                            target.remote,
+                            failure.cleanup_close.as_deref(),
+                        );
+                        target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                            ManagedTargetFailure::opening(&failure.primary),
+                        ));
+                        let _ = shared.control_tx.send(ControlMessage::Wake);
+                        return;
+                    }
+                };
+
+                match prepare_group_open(shared, machine, opened_at) {
+                    Ok(prepared) => {
+                        let outcome = target.runtime.commit_open(prepared.machine);
+                        target.schedule = prepared.schedule;
+                        publish_open_outcome(&shared.hub, &mut target, outcome);
+                        wake_scheduler = true;
+                    }
+                    Err(failure) => {
+                        send_group_cleanup_close_best_effort(
+                            socket,
+                            target.remote,
+                            failure.machine.cleanup_close_packet(),
+                        );
+                        target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                            ManagedTargetFailure::opening(&failure.primary),
+                        ));
+                        wake_scheduler = true;
+                    }
+                }
+            }
+            TargetStatus::Active | TargetStatus::Draining { .. } => {
+                wake_scheduler = process_active_target_packet(
+                    &shared.hub,
+                    &mut target,
+                    packet,
+                    datagram.received_at,
+                    datagram.meta,
+                );
+            }
+            TargetStatus::Finished => {}
+        }
+    }
+
+    if wake_scheduler {
+        let _ = shared.control_tx.send(ControlMessage::Wake);
+    }
 }
 
 fn validate_group_negotiation(
@@ -965,6 +1104,35 @@ fn validate_group_negotiation(
         });
     }
     Ok(())
+}
+
+fn prepare_group_open(
+    shared: &GroupShared,
+    machine: PreparedOpenAcceptance,
+    opened_at: ClientTimestamp,
+) -> Result<PreparedGroupOpen, Box<PreparedGroupOpenFailure>> {
+    let schedule = if let Some(negotiated) = machine.normal_negotiated() {
+        if let Err(primary) = validate_group_negotiation(shared, negotiated) {
+            return Err(Box::new(PreparedGroupOpenFailure { primary, machine }));
+        }
+        match ProbeSchedule::new(opened_at.mono, negotiated) {
+            Ok(schedule) => Some(schedule),
+            Err(primary) => return Err(Box::new(PreparedGroupOpenFailure { primary, machine })),
+        }
+    } else {
+        None
+    };
+    Ok(PreparedGroupOpen { machine, schedule })
+}
+
+fn send_group_cleanup_close_best_effort(
+    socket: &UdpSocket,
+    remote: SocketAddr,
+    packet: Option<&[u8]>,
+) {
+    if let Some(packet) = packet {
+        let _ = socket.send_to(packet, remote);
+    }
 }
 
 fn publish_open_outcome(
@@ -1224,11 +1392,16 @@ fn drive_open_attempts(
     shared: &GroupShared,
     now: Instant,
 ) {
-    for target in all_targets(shared) {
+    let targets = all_targets(shared);
+    register_due_open_drains(shared, &targets, now);
+    let completed_drain_generation = completed_receiver_drain(shared);
+
+    for target in targets {
         let mut target = target.lock().expect("target mutex poisoned");
         let TargetStatus::Opening {
             attempt,
             next_send_at,
+            awaiting_receiver_generation,
         } = target.status
         else {
             continue;
@@ -1238,6 +1411,14 @@ fn drive_open_attempts(
             continue;
         }
 
+        if attempt > 0 {
+            match awaiting_receiver_generation {
+                None => continue,
+                Some(generation) if completed_drain_generation < generation => continue,
+                Some(_) => {}
+            }
+        }
+
         if attempt >= config.open_timeouts.len() {
             target.mark_finished(ManagedTargetEndReason::OpenFailed(
                 ManagedTargetFailure::opening(&ClientError::OpenTimeout),
@@ -1245,11 +1426,23 @@ fn drive_open_attempts(
             continue;
         }
 
-        match socket.send_to(&target.open_packet, target.remote) {
+        let sent_at = Instant::now();
+        let deadline = match sent_at.checked_add(config.open_timeouts[attempt]) {
+            Some(deadline) => deadline,
+            None => {
+                target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                    ManagedTargetFailure::opening(&ClientError::DurationOverflow),
+                ));
+                continue;
+            }
+        };
+
+        match socket.send_to(&target.open_request.bytes, target.remote) {
             Ok(_) => {
                 target.status = TargetStatus::Opening {
                     attempt: attempt + 1,
-                    next_send_at: now + config.open_timeouts[attempt],
+                    next_send_at: deadline,
+                    awaiting_receiver_generation: None,
                 };
             }
             Err(err) => {
@@ -1257,6 +1450,45 @@ fn drive_open_attempts(
                     ManagedTargetFailure::opening(&ClientError::Socket(err)),
                 ));
             }
+        }
+    }
+}
+
+fn register_due_open_drains(
+    shared: &GroupShared,
+    targets: &[Arc<Mutex<TargetState>>],
+    now: Instant,
+) {
+    // Register every currently due target while completion is excluded so one
+    // empty-queue boundary can release the whole batch.
+    let mut drain = shared
+        .receiver_drain
+        .lock()
+        .expect("receiver drain mutex poisoned");
+    for target in targets {
+        let mut target = target.lock().expect("target mutex poisoned");
+        let TargetStatus::Opening {
+            attempt,
+            next_send_at,
+            awaiting_receiver_generation: None,
+        } = target.status
+        else {
+            continue;
+        };
+        if attempt == 0 || next_send_at > now {
+            continue;
+        }
+        match drain.request_or_join() {
+            Ok(generation) => {
+                target.status = TargetStatus::Opening {
+                    attempt,
+                    next_send_at,
+                    awaiting_receiver_generation: Some(generation),
+                };
+            }
+            Err(err) => target.mark_finished(ManagedTargetEndReason::OpenFailed(
+                ManagedTargetFailure::opening(&err),
+            )),
         }
     }
 }
@@ -1811,7 +2043,11 @@ fn next_open_deadline(shared: &GroupShared) -> Option<Instant> {
         .filter_map(|target| {
             let target = target.lock().expect("target mutex poisoned");
             match target.status {
-                TargetStatus::Opening { next_send_at, .. } => Some(next_send_at),
+                TargetStatus::Opening {
+                    next_send_at,
+                    awaiting_receiver_generation: None,
+                    ..
+                } => Some(next_send_at),
                 _ => None,
             }
         })
@@ -1846,10 +2082,10 @@ mod tests {
         config::NegotiationPolicy, managed::SubscriberOverflow, EventSubscriptionError, WarningKind,
     };
     use irtt_proto::{
-        echo_packet_len,
+        compute_hmac_in_place, echo_packet_len,
         flags::{self, FLAG_OPEN, FLAG_REPLY},
         layout::PacketLayout,
-        Clock, Params, ReceivedStats, StampAt, TimestampFields, MAGIC, PROTOCOL_VERSION,
+        Clock, Params, ReceivedStats, StampAt, TimestampFields, HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
     };
     use std::sync::mpsc;
 
@@ -1951,16 +2187,19 @@ mod tests {
             TargetState::new(&client_config, target("peer", remote), 0, Instant::now()).unwrap();
 
         let open_packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params);
-        let open_reply = target.runtime.decode_open_reply(&open_packet).unwrap();
+        let open_reply = match target.runtime.inspect_open_datagram(&open_packet).unwrap() {
+            OpenDatagramDisposition::Trusted(reply) => reply,
+            OpenDatagramDisposition::Ignore => panic!("fixture open reply must be trusted"),
+        };
         let opened_at = ClientTimestamp::now();
-        let mut opened_schedule = None;
-        let open_outcome = target
+        let prepared = target
             .runtime
-            .accept_open_reply(open_reply, opened_at, |negotiated| {
-                opened_schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
-                Ok(())
-            })
+            .prepare_open_acceptance(open_reply, opened_at)
             .unwrap();
+        let opened_schedule = Some(
+            ProbeSchedule::new(opened_at.mono, prepared.normal_negotiated().unwrap()).unwrap(),
+        );
+        let open_outcome = target.runtime.commit_open(prepared);
         target.schedule = opened_schedule;
         publish_open_outcome(&hub, &mut target, open_outcome);
 
@@ -2016,27 +2255,43 @@ mod tests {
         hub: EventHub<ManagedGroupEvent>,
         target: Arc<Mutex<TargetState>>,
     ) -> GroupShared {
-        let requested = params_from_config(client_config).unwrap();
-        let (id, remote) = {
-            let target = target.lock().expect("target mutex poisoned");
-            (target.id.clone(), target.remote)
-        };
-        let mut registry = TargetRegistry::default();
-        registry.desired.insert(id.clone());
-        registry.remotes.insert(remote, id.clone());
-        registry.targets.insert(id, target);
-        let (control_tx, _control_rx) = mpsc::channel();
+        shared_with_targets(client_config, hub, vec![target]).0
+    }
 
-        GroupShared {
-            registry: Mutex::new(registry),
-            hub,
-            cancellation: CancellationToken::new(),
-            control_tx,
-            peer_closed_target_count: Arc::new(AtomicU64::new(0)),
-            requested_interval_ns: requested.interval_ns,
-            requested_dscp: requested.dscp,
-            family_remote: remote,
+    fn shared_with_targets(
+        client_config: &ClientConfig,
+        hub: EventHub<ManagedGroupEvent>,
+        targets: Vec<Arc<Mutex<TargetState>>>,
+    ) -> (GroupShared, mpsc::Receiver<ControlMessage>) {
+        let requested = params_from_config(client_config).unwrap();
+        let mut registry = TargetRegistry::default();
+        let mut family_remote = None;
+        for target in targets {
+            let (id, remote) = {
+                let target = target.lock().expect("target mutex poisoned");
+                (target.id.clone(), target.remote)
+            };
+            family_remote.get_or_insert(remote);
+            registry.desired.insert(id.clone());
+            registry.remotes.insert(remote, id.clone());
+            registry.targets.insert(id, target);
         }
+        let (control_tx, control_rx) = mpsc::channel();
+
+        (
+            GroupShared {
+                registry: Mutex::new(registry),
+                hub,
+                cancellation: CancellationToken::new(),
+                control_tx,
+                peer_closed_target_count: Arc::new(AtomicU64::new(0)),
+                receiver_drain: Mutex::new(ReceiverDrainState::default()),
+                requested_interval_ns: requested.interval_ns,
+                requested_dscp: requested.dscp,
+                family_remote: family_remote.expect("test shared state requires a target"),
+            },
+            control_rx,
+        )
     }
 
     fn drain_available_group_events(
@@ -2066,16 +2321,18 @@ mod tests {
         let mut target =
             TargetState::new(config, target("peer", remote), 0, opened_at.mono).unwrap();
         let packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, params);
-        let reply = target.runtime.decode_open_reply(&packet).unwrap();
-        let mut schedule = None;
-        target
+        let reply = match target.runtime.inspect_open_datagram(&packet).unwrap() {
+            OpenDatagramDisposition::Trusted(reply) => reply,
+            OpenDatagramDisposition::Ignore => panic!("test open reply must be trusted"),
+        };
+        let prepared = target
             .runtime
-            .accept_open_reply(reply, opened_at, |negotiated| {
-                schedule = Some(ProbeSchedule::new(opened_at.mono, negotiated)?);
-                Ok(())
-            })
+            .prepare_open_acceptance(reply, opened_at)
             .unwrap();
-        target.schedule = schedule;
+        target.schedule = Some(
+            ProbeSchedule::new(opened_at.mono, prepared.normal_negotiated().unwrap()).unwrap(),
+        );
+        target.runtime.commit_open(prepared);
         target.status = TargetStatus::Active;
         target
     }
@@ -2339,12 +2596,30 @@ mod tests {
             .map(|(size, peer)| (buf[..size].to_vec(), peer))
     }
 
+    fn recv_group_datagram(socket: &UdpSocket) -> (ReceivedDatagramFrom, Vec<u8>) {
+        let mut packet = vec![0_u8; RECV_BUFFER_SIZE];
+        let datagram = recv_datagram_from(socket, &mut packet).unwrap();
+        packet.truncate(datagram.len);
+        (datagram, packet)
+    }
+
     fn open_reply(flags: u8, token: u64, params: &Params) -> Vec<u8> {
         let mut packet = Vec::new();
         packet.extend_from_slice(&MAGIC);
         packet.push(flags);
         packet.extend_from_slice(&token.to_le_bytes());
         packet.extend_from_slice(&params.encode());
+        packet
+    }
+
+    fn hmac_open_reply(flags: u8, token: u64, params: &Params, key: &[u8]) -> Vec<u8> {
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&MAGIC);
+        packet.push(flags | flags::FLAG_HMAC);
+        packet.extend_from_slice(&[0_u8; HMAC_SIZE]);
+        packet.extend_from_slice(&token.to_le_bytes());
+        packet.extend_from_slice(&params.encode());
+        compute_hmac_in_place(key, &mut packet, 4).unwrap();
         packet
     }
 
@@ -3027,6 +3302,866 @@ mod tests {
             .targets
             .iter()
             .all(|target| target.end_reason.failure().is_some()));
+    }
+
+    #[test]
+    fn bad_open_packet_followed_by_valid_reply_succeeds_without_retry() {
+        let interval = Duration::from_millis(10);
+        let params = test_params(None, interval);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & FLAG_OPEN, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket.send_to(&[0_u8], peer).unwrap();
+            socket
+                .send_to(
+                    &open_reply(FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE, 0, &params),
+                    peer,
+                )
+                .unwrap();
+        });
+        let server = FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        };
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.client.run_mode = crate::RunMode::NoTest;
+
+        let outcome = ManagedClientGroup::start(config, vec![target("peer", server.addr)])
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(server._observations.try_iter().collect::<Vec<_>>().len(), 1);
+        server.join();
+    }
+
+    #[test]
+    fn bad_hmac_open_packet_followed_by_valid_reply_succeeds_without_retry() {
+        let interval = Duration::from_millis(10);
+        let params = test_params(None, interval);
+        let key = b"group-secret".to_vec();
+        let wrong_key = b"wrong".to_vec();
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let server_key = key.clone();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & FLAG_OPEN, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(
+                    &hmac_open_reply(
+                        FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE,
+                        0,
+                        &params,
+                        &wrong_key,
+                    ),
+                    peer,
+                )
+                .unwrap();
+            socket
+                .send_to(
+                    &hmac_open_reply(
+                        FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE,
+                        0,
+                        &params,
+                        &server_key,
+                    ),
+                    peer,
+                )
+                .unwrap();
+        });
+        let server = FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        };
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.client.run_mode = crate::RunMode::NoTest;
+        config.client.hmac_key = Some(key);
+
+        let outcome = ManagedClientGroup::start(config, vec![target("peer", server.addr)])
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(outcome.successful_target_outcomes, 1);
+        assert_eq!(server._observations.try_iter().collect::<Vec<_>>().len(), 1);
+        server.join();
+    }
+
+    #[test]
+    fn trusted_group_incompatibility_sends_cleanup_and_fails_without_retry() {
+        let interval = Duration::from_millis(10);
+        let mut returned = test_params(None, interval);
+        returned.interval_ns = duration_ns_i64(Duration::from_millis(20));
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & FLAG_OPEN, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &returned), peer)
+                .unwrap();
+            let (cleanup, _) =
+                recv_request_timeout(&socket).expect("missing post-token cleanup close");
+            assert_eq!(cleanup[3], flags::FLAG_CLOSE);
+            assert_eq!(
+                u64::from_le_bytes(cleanup[4..12].try_into().unwrap()),
+                TOKEN
+            );
+            tx.send(ServerObservation::Close { at: Instant::now() })
+                .unwrap();
+        });
+        let server = FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        };
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.client.negotiation_policy = NegotiationPolicy::Loose;
+
+        let outcome = ManagedClientGroup::start(config, vec![target("peer", server.addr)])
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(outcome.failed_target_outcomes, 1);
+        assert!(matches!(
+            outcome.targets[0].end_reason,
+            ManagedTargetEndReason::OpenFailed(ManagedTargetFailure {
+                kind: ManagedTargetFailureKind::OpeningProtocol,
+                ..
+            })
+        ));
+        assert_eq!(server._observations.try_iter().collect::<Vec<_>>().len(), 2);
+        server.join();
+    }
+
+    #[test]
+    fn no_test_non_close_reply_sends_cleanup_and_fails_without_retry() {
+        let interval = Duration::from_millis(10);
+        let params = test_params(None, interval);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & flags::FLAG_CLOSE, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+            let (cleanup, _) =
+                recv_request_timeout(&socket).expect("missing no-test cleanup close");
+            assert_eq!(cleanup[3], flags::FLAG_CLOSE);
+            assert_eq!(
+                u64::from_le_bytes(cleanup[4..12].try_into().unwrap()),
+                TOKEN
+            );
+            tx.send(ServerObservation::Close { at: Instant::now() })
+                .unwrap();
+        });
+        let server = FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        };
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.client.run_mode = crate::RunMode::NoTest;
+
+        let outcome = ManagedClientGroup::start(config, vec![target("peer", server.addr)])
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(outcome.failed_target_outcomes, 1);
+        assert!(matches!(
+            outcome.targets[0].end_reason,
+            ManagedTargetEndReason::OpenFailed(ManagedTargetFailure {
+                kind: ManagedTargetFailureKind::OpeningProtocol,
+                ..
+            })
+        ));
+        assert_eq!(server._observations.try_iter().collect::<Vec<_>>().len(), 2);
+        server.join();
+    }
+
+    #[test]
+    fn loose_no_test_group_skips_active_interval_and_dscp_policy() {
+        let interval = Duration::from_millis(10);
+        let mut changed_interval = test_params(None, interval);
+        changed_interval.interval_ns += 1;
+        let changed_dscp = test_params(None, interval);
+
+        for (requested_dscp, params) in [(0, changed_interval), (1, changed_dscp)] {
+            let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let remote = peer.local_addr().unwrap();
+            let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+            config.run_mode = crate::RunMode::NoTest;
+            config.negotiation_policy = NegotiationPolicy::Loose;
+            config.dscp = requested_dscp;
+            let target = Arc::new(Mutex::new(
+                TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap(),
+            ));
+            let shared = shared_with_target(&config, EventHub::new(), target.clone());
+            let opened_at = ClientTimestamp::now();
+
+            let mut target = target.lock().expect("target mutex poisoned");
+            let packet = open_reply(FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE, 0, &params);
+            let reply = match target.runtime.inspect_open_datagram(&packet).unwrap() {
+                OpenDatagramDisposition::Trusted(reply) => reply,
+                OpenDatagramDisposition::Ignore => panic!("no-test reply must be trusted"),
+            };
+            let machine = target
+                .runtime
+                .prepare_open_acceptance(reply, opened_at)
+                .unwrap();
+            let prepared = prepare_group_open(&shared, machine, opened_at).unwrap();
+            assert!(prepared.schedule.is_none());
+            let outcome = target.runtime.commit_open(prepared.machine);
+            target.schedule = prepared.schedule;
+            publish_open_outcome(&shared.hub, &mut target, outcome);
+
+            assert!(matches!(target.status, TargetStatus::Finished));
+            assert_eq!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::NoTestComplete)
+            );
+        }
+    }
+
+    #[test]
+    fn normal_and_strict_sessions_preserve_group_negotiation_checks() {
+        let interval = Duration::from_millis(10);
+        let mut changed_interval = test_params(None, interval);
+        changed_interval.interval_ns += 1;
+        let changed_dscp = test_params(None, interval);
+
+        for (requested_dscp, params) in [(0, changed_interval.clone()), (1, changed_dscp)] {
+            let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let remote = peer.local_addr().unwrap();
+            let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+            config.negotiation_policy = NegotiationPolicy::Loose;
+            config.dscp = requested_dscp;
+            let target = Arc::new(Mutex::new(
+                TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap(),
+            ));
+            let shared = shared_with_target(&config, EventHub::new(), target.clone());
+            let opened_at = ClientTimestamp::now();
+            let target = target.lock().expect("target mutex poisoned");
+            let packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params);
+            let reply = match target.runtime.inspect_open_datagram(&packet).unwrap() {
+                OpenDatagramDisposition::Trusted(reply) => reply,
+                OpenDatagramDisposition::Ignore => panic!("normal reply must be trusted"),
+            };
+            let machine = target
+                .runtime
+                .prepare_open_acceptance(reply, opened_at)
+                .unwrap();
+            let failure = prepare_group_open(&shared, machine, opened_at).unwrap_err();
+            assert!(matches!(
+                failure.primary,
+                ClientError::NegotiationRejected { .. }
+            ));
+        }
+
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        config.run_mode = crate::RunMode::NoTest;
+        let target = TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap();
+        let packet = open_reply(
+            FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE,
+            0,
+            &changed_interval,
+        );
+        let reply = match target.runtime.inspect_open_datagram(&packet).unwrap() {
+            OpenDatagramDisposition::Trusted(reply) => reply,
+            OpenDatagramDisposition::Ignore => panic!("strict no-test reply must be trusted"),
+        };
+        let failure = target
+            .runtime
+            .prepare_open_acceptance(reply, ClientTimestamp::now())
+            .unwrap_err();
+        assert!(matches!(
+            failure.primary,
+            ClientError::NegotiationRejected { .. }
+        ));
+    }
+
+    #[test]
+    fn group_open_deadline_overflow_fails_before_send() {
+        let silent_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = silent_peer.local_addr().unwrap();
+        let mut config = group_config(
+            None,
+            Duration::from_millis(10),
+            ManagedGroupPacing::Staggered,
+        );
+        config.client.open_timeouts = vec![Duration::MAX];
+
+        let outcome = ManagedClientGroup::start(config, vec![target("peer", remote)])
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(outcome.failed_target_outcomes, 1);
+        let failure = outcome.targets[0].end_reason.failure().unwrap();
+        assert!(failure.message.contains("duration"));
+        silent_peer.set_nonblocking(true).unwrap();
+        let mut packet = [0_u8; 512];
+        assert!(matches!(
+            silent_peer.recv_from(&mut packet),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
+
+    #[test]
+    fn receiver_drain_completion_is_monotonic_and_wakes_waiting_scheduler() {
+        let interval = Duration::from_millis(10);
+        let config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let now = Instant::now();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, now).unwrap(),
+        ));
+        let (shared, control_rx) = shared_with_targets(&config, EventHub::new(), vec![target]);
+        let shared = Arc::new(shared);
+        let generation = request_receiver_drain(&shared).unwrap();
+        let waiter_shared = shared.clone();
+        let waiter = thread::spawn(move || {
+            wait_for_scheduler_control(&control_rx, &waiter_shared.cancellation, None)
+        });
+
+        complete_receiver_drain(&shared, generation);
+
+        assert!(matches!(waiter.join().unwrap(), Some(ControlMessage::Wake)));
+        assert_eq!(completed_receiver_drain(&shared), generation);
+        complete_receiver_drain(&shared, 0);
+        complete_receiver_drain(&shared, generation);
+        assert_eq!(completed_receiver_drain(&shared), generation);
+    }
+
+    #[test]
+    fn expired_attempt_waits_for_receiver_drain_before_retrying() {
+        let interval = Duration::from_millis(10);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        config.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let remote = peer.local_addr().unwrap();
+        let now = Instant::now();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, now).unwrap(),
+        ));
+        let shared = shared_with_target(&config, EventHub::new(), target.clone());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, now);
+        let deadline = {
+            let target = target.lock().expect("target mutex poisoned");
+            match target.status {
+                TargetStatus::Opening {
+                    attempt: 1,
+                    next_send_at,
+                    ..
+                } => next_send_at,
+                ref status => panic!("unexpected target status after open send: {status:?}"),
+            }
+        };
+        assert!(recv_request_timeout(&peer).is_some());
+
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        let generation = match target.lock().expect("target mutex poisoned").status {
+            TargetStatus::Opening {
+                attempt: 1,
+                awaiting_receiver_generation: Some(generation),
+                ..
+            } => generation,
+            ref status => panic!("unexpected waiting status: {status:?}"),
+        };
+        assert!(recv_request_timeout(&peer).is_none());
+
+        complete_receiver_drain(&shared, generation);
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        assert!(matches!(
+            target.lock().expect("target mutex poisoned").status,
+            TargetStatus::Opening {
+                attempt: 2,
+                awaiting_receiver_generation: None,
+                ..
+            }
+        ));
+        assert!(recv_request_timeout(&peer).is_some());
+    }
+
+    #[test]
+    fn queued_reply_dequeued_after_deadline_opens_without_retry() {
+        let interval = Duration::from_millis(10);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        config.open_timeouts = vec![Duration::from_millis(200)];
+        let params = test_params(None, interval);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let remote = peer.local_addr().unwrap();
+        let now = Instant::now();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, now).unwrap(),
+        ));
+        let shared = shared_with_target(&config, EventHub::new(), target.clone());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, now);
+        let deadline = {
+            let target = target.lock().expect("target mutex poisoned");
+            match target.status {
+                TargetStatus::Opening { next_send_at, .. } => next_send_at,
+                ref status => panic!("unexpected opening status: {status:?}"),
+            }
+        };
+        let (_, client_addr) = recv_request_timeout(&peer).expect("missing first open request");
+        peer.send_to(
+            &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params),
+            client_addr,
+        )
+        .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "reply must queue before deadline"
+        );
+        while Instant::now() < deadline {
+            thread::yield_now();
+        }
+
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        assert!(matches!(
+            target.lock().expect("target mutex poisoned").status,
+            TargetStatus::Opening {
+                awaiting_receiver_generation: Some(_),
+                ..
+            }
+        ));
+
+        let (datagram, packet) = recv_group_datagram(&socket);
+        assert!(datagram.received_at.mono >= deadline);
+        process_group_datagram(&socket, &shared, datagram, &packet);
+
+        let target = target.lock().expect("target mutex poisoned");
+        assert!(matches!(target.status, TargetStatus::Active));
+        assert!(target.final_reason.is_none());
+        drop(target);
+        assert!(recv_request_timeout(&peer).is_none());
+    }
+
+    #[test]
+    fn generation_requested_after_receive_snapshot_needs_later_empty_boundary() {
+        let interval = Duration::from_millis(10);
+        let config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap(),
+        ));
+        let shared = shared_with_target(&config, EventHub::new(), target);
+
+        let observed_before_request = requested_receiver_drain(&shared);
+        let generation = request_receiver_drain(&shared).unwrap();
+        complete_receiver_drain(&shared, observed_before_request);
+        assert!(completed_receiver_drain(&shared) < generation);
+
+        let observed_after_request = requested_receiver_drain(&shared);
+        complete_receiver_drain(&shared, observed_after_request);
+        assert_eq!(completed_receiver_drain(&shared), generation);
+    }
+
+    #[test]
+    fn malformed_packet_requires_empty_receive_to_complete_drain() {
+        let interval = Duration::from_millis(10);
+        let config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let remote = peer.local_addr().unwrap();
+        let now = Instant::now();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, now).unwrap(),
+        ));
+        let (shared, control_rx) =
+            shared_with_targets(&config, EventHub::new(), vec![target.clone()]);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, now);
+        let deadline = match target.lock().expect("target mutex poisoned").status {
+            TargetStatus::Opening { next_send_at, .. } => next_send_at,
+            ref status => panic!("unexpected opening status: {status:?}"),
+        };
+        let (_, client_addr) = recv_request_timeout(&peer).expect("missing open request");
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        let generation = match target.lock().expect("target mutex poisoned").status {
+            TargetStatus::Opening {
+                awaiting_receiver_generation: Some(generation),
+                ..
+            } => generation,
+            ref status => panic!("unexpected waiting status: {status:?}"),
+        };
+
+        peer.send_to(&[0_u8], client_addr).unwrap();
+        let (datagram, packet) = recv_group_datagram(&socket);
+        process_group_datagram(&socket, &shared, datagram, &packet);
+        assert!(completed_receiver_drain(&shared) < generation);
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
+
+        let observed_generation = requested_receiver_drain(&shared);
+        socket.set_nonblocking(true).unwrap();
+        let mut buf = [0_u8; 1];
+        assert!(matches!(
+            recv_datagram_from(&socket, &mut buf),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock
+        ));
+        complete_receiver_drain(&shared, observed_generation);
+        assert_eq!(completed_receiver_drain(&shared), generation);
+        assert!(matches!(control_rx.recv().unwrap(), ControlMessage::Wake));
+    }
+
+    #[test]
+    fn opening_reply_before_first_request_is_ignored() {
+        let interval = Duration::from_millis(10);
+        let config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let params = test_params(None, interval);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap(),
+        ));
+        let shared = shared_with_target(&config, EventHub::new(), target.clone());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        peer.send_to(
+            &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params),
+            socket.local_addr().unwrap(),
+        )
+        .unwrap();
+        let (datagram, packet) = recv_group_datagram(&socket);
+        process_group_datagram(&socket, &shared, datagram, &packet);
+
+        let target = target.lock().expect("target mutex poisoned");
+        assert!(matches!(
+            target.status,
+            TargetStatus::Opening {
+                attempt: 0,
+                awaiting_receiver_generation: None,
+                ..
+            }
+        ));
+        assert!(target.runtime.prepare_open_request().is_ok());
+    }
+
+    #[test]
+    fn post_drain_reply_cannot_open_expired_attempt() {
+        let interval = Duration::from_millis(10);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        config.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+        let params = test_params(None, interval);
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let remote = peer.local_addr().unwrap();
+        let now = Instant::now();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, now).unwrap(),
+        ));
+        let shared = shared_with_target(&config, EventHub::new(), target.clone());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, now);
+        let deadline = match target.lock().expect("target mutex poisoned").status {
+            TargetStatus::Opening { next_send_at, .. } => next_send_at,
+            ref status => panic!("unexpected opening status: {status:?}"),
+        };
+        let (_, client_addr) = recv_request_timeout(&peer).expect("missing open request");
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        let generation = match target.lock().expect("target mutex poisoned").status {
+            TargetStatus::Opening {
+                awaiting_receiver_generation: Some(generation),
+                ..
+            } => generation,
+            ref status => panic!("unexpected waiting status: {status:?}"),
+        };
+        complete_receiver_drain(&shared, generation);
+
+        peer.send_to(
+            &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params),
+            client_addr,
+        )
+        .unwrap();
+        let (datagram, packet) = recv_group_datagram(&socket);
+        process_group_datagram(&socket, &shared, datagram, &packet);
+        {
+            let target = target.lock().expect("target mutex poisoned");
+            assert!(matches!(
+                target.status,
+                TargetStatus::Opening {
+                    attempt: 1,
+                    awaiting_receiver_generation: Some(waiting),
+                    ..
+                } if waiting == generation
+            ));
+            assert!(target.runtime.prepare_open_request().is_ok());
+        }
+
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        assert!(matches!(
+            target.lock().expect("target mutex poisoned").status,
+            TargetStatus::Opening {
+                attempt: 2,
+                awaiting_receiver_generation: None,
+                ..
+            }
+        ));
+        assert!(recv_request_timeout(&peer).is_some());
+    }
+
+    #[test]
+    fn multiple_expired_targets_share_one_receiver_drain_generation() {
+        let interval = Duration::from_millis(10);
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        config.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+        let first_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let second_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        for peer in [&first_peer, &second_peer] {
+            peer.set_read_timeout(Some(Duration::from_millis(100)))
+                .unwrap();
+        }
+        let now = Instant::now();
+        let first = Arc::new(Mutex::new(
+            TargetState::new(
+                &config,
+                target("first", first_peer.local_addr().unwrap()),
+                0,
+                now,
+            )
+            .unwrap(),
+        ));
+        let second = Arc::new(Mutex::new(
+            TargetState::new(
+                &config,
+                target("second", second_peer.local_addr().unwrap()),
+                1,
+                now,
+            )
+            .unwrap(),
+        ));
+        let (shared, _control_rx) = shared_with_targets(
+            &config,
+            EventHub::new(),
+            vec![first.clone(), second.clone()],
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, now);
+        assert!(recv_request_timeout(&first_peer).is_some());
+        assert!(recv_request_timeout(&second_peer).is_some());
+        let deadline = [&first, &second]
+            .into_iter()
+            .filter_map(|target| match target.lock().unwrap().status {
+                TargetStatus::Opening { next_send_at, .. } => Some(next_send_at),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        let generations = [&first, &second].map(|target| match target.lock().unwrap().status {
+            TargetStatus::Opening {
+                awaiting_receiver_generation: Some(generation),
+                ..
+            } => generation,
+            ref status => panic!("unexpected waiting status: {status:?}"),
+        });
+        assert_eq!(generations[0], generations[1]);
+
+        complete_receiver_drain(&shared, generations[0]);
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        for target in [&first, &second] {
+            assert!(matches!(
+                target.lock().unwrap().status,
+                TargetStatus::Opening {
+                    attempt: 2,
+                    awaiting_receiver_generation: None,
+                    ..
+                }
+            ));
+        }
+        assert!(recv_request_timeout(&first_peer).is_some());
+        assert!(recv_request_timeout(&second_peer).is_some());
+
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        assert!(recv_request_timeout(&first_peer).is_none());
+        assert!(recv_request_timeout(&second_peer).is_none());
+    }
+
+    #[test]
+    fn removal_and_cancellation_release_targets_waiting_for_receiver_drain() {
+        let interval = Duration::from_millis(10);
+        let config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let first_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let second_peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let now = Instant::now();
+        let first_config = target("first", first_peer.local_addr().unwrap());
+        let second_config = target("second", second_peer.local_addr().unwrap());
+        let first = Arc::new(Mutex::new(
+            TargetState::new(&config, first_config.clone(), 0, now).unwrap(),
+        ));
+        let second = Arc::new(Mutex::new(
+            TargetState::new(&config, second_config, 1, now).unwrap(),
+        ));
+        let (shared, _control_rx) = shared_with_targets(
+            &config,
+            EventHub::new(),
+            vec![first.clone(), second.clone()],
+        );
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, now);
+        let deadline = [&first, &second]
+            .into_iter()
+            .filter_map(|target| match target.lock().unwrap().status {
+                TargetStatus::Opening { next_send_at, .. } => Some(next_send_at),
+                _ => None,
+            })
+            .max()
+            .unwrap();
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        for target in [&first, &second] {
+            assert!(matches!(
+                target.lock().unwrap().status,
+                TargetStatus::Opening {
+                    awaiting_receiver_generation: Some(_),
+                    ..
+                }
+            ));
+        }
+
+        let mut next_order = 2;
+        let mut records = TargetOutcomeHistory::default();
+        apply_target_update(
+            &config,
+            &socket,
+            &shared,
+            vec![first_config],
+            &mut next_order,
+            &mut records,
+        )
+        .unwrap();
+        assert!(matches!(
+            second.lock().unwrap().final_reason,
+            Some(ManagedTargetEndReason::Removed)
+        ));
+
+        shared.cancellation.cancel();
+        cancel_remaining_targets(&socket, &shared, &mut records);
+        assert!(matches!(
+            first.lock().unwrap().final_reason,
+            Some(ManagedTargetEndReason::Cancelled)
+        ));
+        assert_eq!(records.total, 2);
+        assert!(matches!(
+            records.recent.front().map(|outcome| &outcome.end_reason),
+            Some(ManagedTargetEndReason::Removed)
+        ));
+        assert!(matches!(
+            records.recent.back().map(|outcome| &outcome.end_reason),
+            Some(ManagedTargetEndReason::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn final_open_timeout_waits_until_receiver_drain_completes() {
+        let interval = Duration::from_millis(10);
+        let config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let now = Instant::now();
+        let target = Arc::new(Mutex::new(
+            TargetState::new(&config, target("peer", remote), 0, now).unwrap(),
+        ));
+        let shared = shared_with_target(&config, EventHub::new(), target.clone());
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+
+        drive_open_attempts(&config, &socket, &shared, now);
+        let deadline = {
+            let target = target.lock().expect("target mutex poisoned");
+            match target.status {
+                TargetStatus::Opening {
+                    attempt: 1,
+                    next_send_at,
+                    ..
+                } => next_send_at,
+                ref status => panic!("unexpected target status after open send: {status:?}"),
+            }
+        };
+
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        let generation = {
+            let target = target.lock().expect("target mutex poisoned");
+            let generation = match target.status {
+                TargetStatus::Opening {
+                    attempt: 1,
+                    awaiting_receiver_generation: Some(generation),
+                    ..
+                } => generation,
+                ref status => panic!("unexpected waiting status: {status:?}"),
+            };
+            assert!(target.final_reason.is_none());
+            generation
+        };
+
+        complete_receiver_drain(&shared, generation);
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        let reason = {
+            let target = target.lock().expect("target mutex poisoned");
+            assert!(matches!(target.status, TargetStatus::Finished));
+            assert!(matches!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::OpenFailed(ManagedTargetFailure {
+                    kind: ManagedTargetFailureKind::OpeningTimeout,
+                    ..
+                }))
+            ));
+            target.final_reason.clone()
+        };
+
+        drive_open_attempts(&config, &socket, &shared, deadline);
+        assert_eq!(
+            target.lock().expect("target mutex poisoned").final_reason,
+            reason
+        );
     }
 
     #[test]

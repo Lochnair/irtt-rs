@@ -38,8 +38,8 @@ pub enum ClientError {
     },
     /// Restoring the configured read timeout after open negotiation failed.
     ///
-    /// The session may have opened successfully, but the socket could not be
-    /// returned to the caller's requested receive-timeout behavior.
+    /// The prepared session was not committed, and the client remains
+    /// connected rather than partially open.
     #[error("failed to restore configured socket read timeout after open negotiation: {source}")]
     ReadTimeoutRestore { source: io::Error },
     /// A packet failed IRTT protocol parsing or authentication.
