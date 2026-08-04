@@ -14,7 +14,6 @@ pub(crate) struct ProbeSchedule {
 pub(crate) struct ScheduleCommit {
     pub(crate) scheduled_at: Instant,
     pub(crate) next_send_at: Option<Instant>,
-    pub(crate) timer_error: Duration,
 }
 
 impl ProbeSchedule {
@@ -64,7 +63,6 @@ impl ProbeSchedule {
 
     pub(crate) fn preflight_caller_commit(
         &self,
-        sent_at: Instant,
         next_packets_sent: u64,
     ) -> Result<ScheduleCommit, ClientError> {
         let scheduled_at = self
@@ -73,17 +71,17 @@ impl ProbeSchedule {
         let interval_ns =
             u64::try_from(self.interval.as_nanos()).map_err(|_| ClientError::DurationOverflow)?;
         let next_send_at = next_probe_deadline(self.start_at, interval_ns, next_packets_sent)?;
-        Ok(self.finish_commit(scheduled_at, next_send_at, sent_at))
+        Ok(self.finish_commit(scheduled_at, next_send_at))
     }
 
     pub(crate) fn preflight_managed_commit(
         &self,
         scheduled_at: Instant,
-        sent_at: Instant,
+        permission_at: Instant,
     ) -> Result<ScheduleCommit, ClientError> {
         let (scheduled_at, next_send_at, _) =
-            advance_cadence(scheduled_at, self.interval, sent_at)?;
-        Ok(self.finish_commit(scheduled_at, next_send_at, sent_at))
+            advance_cadence(scheduled_at, self.interval, permission_at)?;
+        Ok(self.finish_commit(scheduled_at, next_send_at))
     }
 
     pub(crate) fn commit(&mut self, commit: ScheduleCommit) {
@@ -94,12 +92,7 @@ impl ProbeSchedule {
         self.next_send_at.is_none()
     }
 
-    fn finish_commit(
-        &self,
-        scheduled_at: Instant,
-        next_send_at: Instant,
-        sent_at: Instant,
-    ) -> ScheduleCommit {
+    fn finish_commit(&self, scheduled_at: Instant, next_send_at: Instant) -> ScheduleCommit {
         ScheduleCommit {
             scheduled_at,
             next_send_at: if self.end_at.is_some_and(|end| next_send_at >= end) {
@@ -107,7 +100,6 @@ impl ProbeSchedule {
             } else {
                 Some(next_send_at)
             },
-            timer_error: instant_abs_diff(sent_at, scheduled_at),
         }
     }
 }
@@ -173,7 +165,7 @@ fn duration_from_nanos(nanos: u128) -> Result<Duration, ClientError> {
     Ok(Duration::new(seconds, subsec_nanos))
 }
 
-fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
+pub(crate) fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
     left.checked_duration_since(right)
         .or_else(|| right.checked_duration_since(left))
         .unwrap_or(Duration::ZERO)
@@ -209,13 +201,11 @@ mod tests {
     fn caller_preflight_keeps_absolute_cadence_without_mutation() {
         let start = Instant::now();
         let schedule = ProbeSchedule::new(start, &negotiated(10_000_000, 0)).unwrap();
-        let sent_at = start + Duration::from_millis(4);
 
-        let commit = schedule.preflight_caller_commit(sent_at, 3).unwrap();
+        let commit = schedule.preflight_caller_commit(3).unwrap();
 
         assert_eq!(commit.scheduled_at, start);
         assert_eq!(commit.next_send_at, Some(start + Duration::from_millis(30)));
-        assert_eq!(commit.timer_error, Duration::from_millis(4));
         assert_eq!(schedule.next_send_deadline(), Some(start));
     }
 
@@ -224,7 +214,7 @@ mod tests {
         let start = Instant::now();
         let mut schedule = ProbeSchedule::new(start, &negotiated(10_000_000, 0)).unwrap();
 
-        let commit = schedule.preflight_caller_commit(start, 1).unwrap();
+        let commit = schedule.preflight_caller_commit(1).unwrap();
         assert_eq!(schedule.next_send_deadline(), Some(start));
 
         schedule.commit(commit);
@@ -239,16 +229,14 @@ mod tests {
         let start = Instant::now();
         let mut schedule = ProbeSchedule::new(start, &negotiated(10_000_000, 20_000_000)).unwrap();
 
-        let first = schedule.preflight_caller_commit(start, 1).unwrap();
+        let first = schedule.preflight_caller_commit(1).unwrap();
         schedule.commit(first);
         assert_eq!(
             schedule.next_send_deadline(),
             Some(start + Duration::from_millis(10))
         );
 
-        let second = schedule
-            .preflight_caller_commit(start + Duration::from_millis(10), 2)
-            .unwrap();
+        let second = schedule.preflight_caller_commit(2).unwrap();
         schedule.commit(second);
 
         assert!(schedule.is_finished());
@@ -276,7 +264,6 @@ mod tests {
 
         assert_eq!(commit.scheduled_at, start + Duration::from_millis(40));
         assert_eq!(commit.next_send_at, Some(start + Duration::from_millis(50)));
-        assert_eq!(commit.timer_error, Duration::from_millis(5));
         assert_eq!(schedule.next_send_deadline(), Some(start));
     }
 
@@ -304,9 +291,20 @@ mod tests {
         let schedule = ProbeSchedule::new(start, &negotiated(2, 0)).unwrap();
 
         assert!(matches!(
-            schedule.preflight_caller_commit(start, u64::MAX),
+            schedule.preflight_caller_commit(u64::MAX),
             Err(ClientError::DurationOverflow)
         ));
         assert_eq!(schedule.next_send_deadline(), Some(start));
+    }
+
+    #[test]
+    fn timer_error_is_adapter_owned() {
+        let scheduled_at = Instant::now();
+        let sent_at = scheduled_at + Duration::from_millis(7);
+
+        assert_eq!(
+            instant_abs_diff(sent_at, scheduled_at),
+            Duration::from_millis(7)
+        );
     }
 }

@@ -20,12 +20,21 @@ use crate::{
 
 pub(crate) mod schedule;
 
-use schedule::ProbeSchedule;
+use schedule::{instant_abs_diff, ProbeSchedule};
 
 #[derive(Debug, Clone, Copy)]
 enum ProbeScheduleMode {
     CallerPaced,
     Managed { scheduled_at: Instant },
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ProbeSendTimestamps {
+    pub(crate) permission_at: Instant,
+    pub(crate) sent_at: ClientTimestamp,
+    pub(crate) send_call_start: Instant,
+    pub(crate) send_finished_at: Instant,
 }
 
 #[cfg(test)]
@@ -55,6 +64,8 @@ pub struct Client {
     probe_reported_len: Option<usize>,
     #[cfg(test)]
     probe_send_error: bool,
+    #[cfg(test)]
+    probe_send_timestamps: Option<ProbeSendTimestamps>,
 }
 
 impl Client {
@@ -79,6 +90,8 @@ impl Client {
             probe_reported_len: None,
             #[cfg(test)]
             probe_send_error: false,
+            #[cfg(test)]
+            probe_send_timestamps: None,
         })
     }
 
@@ -184,7 +197,7 @@ impl Client {
     /// list when the run duration has elapsed and no further probe should be
     /// sent.
     pub fn send_probe(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
-        self.send_probe_inner(None)
+        self.send_probe_transaction(ProbeScheduleMode::CallerPaced)
     }
 
     /// Receive and classify at most one datagram from the socket.
@@ -309,31 +322,16 @@ impl Client {
         &mut self,
         scheduled_at: Instant,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        self.send_managed_probe_inner(scheduled_at, None)
-    }
-
-    fn send_probe_inner(
-        &mut self,
-        override_ts: Option<ClientTimestamp>,
-    ) -> Result<Vec<ClientEvent>, ClientError> {
-        self.send_probe_transaction(override_ts, ProbeScheduleMode::CallerPaced)
-    }
-
-    fn send_managed_probe_inner(
-        &mut self,
-        scheduled_at: Instant,
-        override_ts: Option<ClientTimestamp>,
-    ) -> Result<Vec<ClientEvent>, ClientError> {
-        self.send_probe_transaction(override_ts, ProbeScheduleMode::Managed { scheduled_at })
+        self.send_probe_transaction(ProbeScheduleMode::Managed { scheduled_at })
     }
 
     fn send_probe_transaction(
         &mut self,
-        override_ts: Option<ClientTimestamp>,
         mode: ProbeScheduleMode,
     ) -> Result<Vec<ClientEvent>, ClientError> {
         self.runtime.ensure_open()?;
-        let sent_at = override_ts.unwrap_or_else(ClientTimestamp::now);
+        #[cfg(test)]
+        let test_timestamps = self.probe_send_timestamps.take();
         #[cfg(test)]
         let fail_send = std::mem::take(&mut self.probe_send_error);
         let remote = self.remote;
@@ -341,20 +339,26 @@ impl Client {
         let schedule = schedule
             .as_mut()
             .expect("open sessions always have a probe schedule");
-        if !schedule.permit_probe_at(sent_at.mono) {
+        #[cfg(not(test))]
+        let permission_at = Instant::now();
+        #[cfg(test)]
+        let permission_at = test_timestamps
+            .map(|timestamps| timestamps.permission_at)
+            .unwrap_or_else(Instant::now);
+        if !schedule.permit_probe_at(permission_at) {
             return Ok(Vec::new());
         }
 
         let Some(prepared) = runtime.prepare_probe()? else {
             return Ok(Vec::new());
         };
-        let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at)?;
+        let machine_preflight = runtime.preflight_probe_commit(&prepared)?;
         let schedule_commit = match mode {
             ProbeScheduleMode::CallerPaced => {
-                schedule.preflight_caller_commit(sent_at.mono, machine_commit.next_packets_sent)?
+                schedule.preflight_caller_commit(machine_preflight.next_packets_sent)?
             }
             ProbeScheduleMode::Managed { scheduled_at } => {
-                schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?
+                schedule.preflight_managed_commit(scheduled_at, permission_at)?
             }
         };
         let mut events = Vec::new();
@@ -367,21 +371,39 @@ impl Client {
 
         let expected_bytes = prepared.bytes.len();
         let scheduled_at = schedule_commit.scheduled_at;
-        let timer_error = schedule_commit.timer_error;
         #[cfg(test)]
         let reported_bytes = self.probe_reported_len.take();
+        #[cfg(not(test))]
+        let sent_at = ClientTimestamp::now();
+        #[cfg(test)]
+        let sent_at = test_timestamps
+            .map(|timestamps| timestamps.sent_at)
+            .unwrap_or_else(ClientTimestamp::now);
+        let machine_commit = runtime.finalize_probe_commit(machine_preflight, sent_at)?;
+        #[cfg(not(test))]
+        let send_call_start = Instant::now();
+        #[cfg(test)]
+        let send_call_start = test_timestamps
+            .map(|timestamps| timestamps.send_call_start)
+            .unwrap_or_else(Instant::now);
         #[cfg(test)]
         if fail_send {
             return Err(ClientError::Socket(io::Error::other(
                 "injected probe send failure",
             )));
         }
-        let send_call_start = Instant::now();
         let bytes = socket.send(&prepared.bytes)?;
+        #[cfg(not(test))]
+        let send_finished_at = Instant::now();
+        #[cfg(test)]
+        let send_finished_at = test_timestamps
+            .map(|timestamps| timestamps.send_finished_at)
+            .unwrap_or_else(Instant::now);
         let sent = runtime.commit_probe_sent(machine_commit, bytes);
         schedule.commit(schedule_commit);
 
-        let send_call = send_call_start.elapsed();
+        let send_call = send_finished_at.saturating_duration_since(send_call_start);
+        let timer_error = instant_abs_diff(sent_at.mono, scheduled_at);
         #[cfg(test)]
         let bytes = reported_bytes.unwrap_or(bytes);
         validate_datagram_length(expected_bytes, bytes)?;
@@ -425,16 +447,21 @@ pub(crate) fn validate_datagram_length(expected: usize, actual: usize) -> Result
 
 #[cfg(test)]
 impl Client {
-    fn send_probe_at(&mut self, ts: ClientTimestamp) -> Result<Vec<ClientEvent>, ClientError> {
-        self.send_probe_inner(Some(ts))
+    fn send_probe_at(
+        &mut self,
+        timestamps: ProbeSendTimestamps,
+    ) -> Result<Vec<ClientEvent>, ClientError> {
+        self.probe_send_timestamps = Some(timestamps);
+        self.send_probe()
     }
 
     fn send_managed_probe_at(
         &mut self,
         scheduled_at: Instant,
-        ts: ClientTimestamp,
+        timestamps: ProbeSendTimestamps,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        self.send_managed_probe_inner(scheduled_at, Some(ts))
+        self.probe_send_timestamps = Some(timestamps);
+        self.send_managed_probe(scheduled_at)
     }
 }
 
