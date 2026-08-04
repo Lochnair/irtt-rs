@@ -171,6 +171,7 @@ enum TargetState {
     },
     Draining {
         client: AsyncClient,
+        drain_started_at: Instant,
         deadline: Instant,
         primary_end: ManagedTargetEndReason,
         cleanup_failure: Option<ManagedTargetFailure>,
@@ -213,7 +214,6 @@ struct TargetRuntime {
     server_addr: Arc<str>,
     remote: Option<std::net::SocketAddr>,
     counters: TargetCounters,
-    latest_committed_timeout: Option<Instant>,
     send_waiting: bool,
     active: bool,
     state: TargetState,
@@ -300,6 +300,12 @@ enum DriverState {
     Running,
     Stopping,
     Finished,
+}
+
+#[derive(Clone, Copy)]
+enum OpenSessionFailureCleanup {
+    Drain,
+    Close,
 }
 
 /// The sole authoritative zero-or-many target driver.
@@ -416,11 +422,14 @@ impl ManagedClientTask {
     fn install_target_state(&mut self, index: usize, state: TargetState) {
         let lifecycle = state.lifecycle();
         let active = matches!(state, TargetState::Active { .. });
-        let membership_changed = self.targets[index].active != active;
+        let was_active = self.targets[index].active;
         self.targets[index].active = active;
         self.targets[index].state = state;
-        if membership_changed {
-            self.recompute_stagger_gate(Instant::now());
+        let now = Instant::now();
+        match (was_active, active) {
+            (false, true) => self.stagger_target_added(now),
+            (true, false) => self.stagger_target_removed(now),
+            _ => {}
         }
         self.replace_status();
         self.publish_event(ManagedEvent::TargetStateChanged {
@@ -491,6 +500,26 @@ impl ManagedClientTask {
     fn fail_target(&mut self, index: usize, phase: ManagedTargetFailurePhase, error: ClientError) {
         let failure = classify_client_error(phase, &error);
         self.finish_target(index, ManagedTargetEndReason::Failed(failure), None);
+    }
+
+    fn begin_open_session_failure(
+        &mut self,
+        index: usize,
+        mut client: AsyncClient,
+        phase: ManagedTargetFailurePhase,
+        error: ClientError,
+        now: Instant,
+        cleanup: OpenSessionFailureCleanup,
+    ) -> bool {
+        let primary_end = ManagedTargetEndReason::Failed(classify_client_error(phase, &error));
+        client.discard_prepared_probe();
+        self.targets[index].counters.packets_sent = client.packets_sent();
+        match cleanup {
+            OpenSessionFailureCleanup::Drain => self.begin_drain(index, client, primary_end, now),
+            OpenSessionFailureCleanup::Close => {
+                self.begin_close(index, client, primary_end, None, now)
+            }
+        }
     }
 
     fn begin_running(&mut self) -> Result<(), ManagedDriverFailure> {
@@ -631,9 +660,14 @@ impl ManagedClientTask {
                     match client.poll_timeouts_at(now) {
                         Ok(events) => self.publish_client_events(index, events),
                         Err(error) => {
-                            self.targets[index].counters.packets_sent = client.packets_sent();
-                            self.fail_target(index, ManagedTargetFailurePhase::Timing, error);
-                            return false;
+                            return self.begin_open_session_failure(
+                                index,
+                                client,
+                                ManagedTargetFailurePhase::Timing,
+                                error,
+                                now,
+                                OpenSessionFailureCleanup::Close,
+                            );
                         }
                     }
                 }
@@ -644,9 +678,14 @@ impl ManagedClientTask {
                         true
                     }
                     Poll::Ready(Err(error)) => {
-                        self.targets[index].counters.packets_sent = client.packets_sent();
-                        self.fail_target(index, ManagedTargetFailurePhase::Receiving, error);
-                        return false;
+                        return self.begin_open_session_failure(
+                            index,
+                            client,
+                            ManagedTargetFailurePhase::Receiving,
+                            error,
+                            now,
+                            OpenSessionFailureCleanup::Close,
+                        );
                     }
                 };
                 if client.is_peer_closed() {
@@ -668,6 +707,7 @@ impl ManagedClientTask {
             }
             TargetState::Draining {
                 mut client,
+                drain_started_at,
                 deadline,
                 primary_end,
                 mut cleanup_failure,
@@ -680,6 +720,7 @@ impl ManagedClientTask {
                 if defer_work {
                     self.targets[index].state = TargetState::Draining {
                         client,
+                        drain_started_at,
                         deadline,
                         primary_end,
                         cleanup_failure,
@@ -692,12 +733,16 @@ impl ManagedClientTask {
                 let injected_receive_failure = self.take_drain_receive_failure();
                 #[cfg(not(test))]
                 let injected_receive_failure = None;
+                let mut retained_state_changed = false;
                 if client
                     .next_probe_timeout_deadline()
                     .is_some_and(|timeout| timeout <= now)
                 {
                     match client.poll_timeouts_at(now) {
-                        Ok(events) => self.publish_client_events(index, events),
+                        Ok(events) => {
+                            self.publish_client_events(index, events);
+                            retained_state_changed = true;
+                        }
                         Err(error) => {
                             self.targets[index].counters.packets_sent = client.packets_sent();
                             cleanup_failure.get_or_insert_with(|| {
@@ -717,6 +762,7 @@ impl ManagedClientTask {
                     Poll::Pending => false,
                     Poll::Ready(Ok(events)) => {
                         self.publish_client_events(index, events);
+                        retained_state_changed = true;
                         true
                     }
                     Poll::Ready(Err(error)) => {
@@ -739,11 +785,29 @@ impl ManagedClientTask {
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, cleanup_failure);
                     return false;
                 }
+                let deadline = if retained_state_changed {
+                    match self.drain_deadline(&client, drain_started_at) {
+                        Some(candidate) => deadline.min(candidate),
+                        None => {
+                            cleanup_failure.get_or_insert_with(duration_overflow_failure);
+                            return self.begin_close(
+                                index,
+                                client,
+                                primary_end,
+                                cleanup_failure,
+                                now,
+                            );
+                        }
+                    }
+                } else {
+                    deadline
+                };
                 if now >= deadline {
                     if received && post_deadline_receives_remaining > 1 {
                         post_deadline_receives_remaining -= 1;
                         self.targets[index].state = TargetState::Draining {
                             client,
+                            drain_started_at,
                             deadline,
                             primary_end,
                             cleanup_failure,
@@ -756,6 +820,7 @@ impl ManagedClientTask {
                 } else {
                     self.targets[index].state = TargetState::Draining {
                         client,
+                        drain_started_at,
                         deadline,
                         primary_end,
                         cleanup_failure,
@@ -824,23 +889,24 @@ impl ManagedClientTask {
         index: usize,
         client: AsyncClient,
         primary_end: ManagedTargetEndReason,
-        now: Instant,
+        _now: Instant,
     ) -> bool {
-        let latest = self.targets[index]
-            .latest_committed_timeout
-            .into_iter()
-            .chain(client.latest_probe_timeout_deadline())
-            .max()
-            .unwrap_or(now)
-            .max(now);
-        let Some(deadline) = latest.checked_add(self.config.final_drain) else {
+        let drain_started_at = Instant::now();
+        let Some(deadline) = self.drain_deadline(&client, drain_started_at) else {
             let cleanup_failure = Some(duration_overflow_failure());
-            return self.begin_close(index, client, primary_end, cleanup_failure, now);
+            return self.begin_close(
+                index,
+                client,
+                primary_end,
+                cleanup_failure,
+                drain_started_at,
+            );
         };
         self.install_target_state(
             index,
             TargetState::Draining {
                 client,
+                drain_started_at,
                 deadline,
                 primary_end,
                 cleanup_failure: None,
@@ -848,6 +914,14 @@ impl ManagedClientTask {
             },
         );
         true
+    }
+
+    fn drain_deadline(&self, client: &AsyncClient, drain_started_at: Instant) -> Option<Instant> {
+        client
+            .latest_probe_timeout_deadline()
+            .unwrap_or(drain_started_at)
+            .max(drain_started_at)
+            .checked_add(self.config.final_drain)
     }
 
     fn begin_close(
@@ -914,15 +988,50 @@ impl ManagedClientTask {
         minimum.map(|interval| (active, stagger_spacing(interval, active)))
     }
 
-    fn recompute_stagger_gate(&mut self, now: Instant) {
-        self.send_gate = self
+    fn stagger_target_added(&mut self, now: Instant) {
+        let Some(existing) = self.send_gate.filter(|gate| *gate > now) else {
+            self.send_gate = None;
+            return;
+        };
+        let candidate = self
             .last_stagger_send
             .zip(self.active_stagger_spacing())
             .and_then(|(last, (_, spacing))| last.checked_add(spacing))
             .filter(|gate| *gate > now);
+        self.send_gate = candidate.map(|candidate| existing.min(candidate));
     }
 
-    fn poll_one_send(&mut self, index: usize, cx: &mut Context<'_>, now: Instant) -> SendResult {
+    fn stagger_target_removed(&mut self, now: Instant) {
+        self.send_gate = self.send_gate.filter(|gate| *gate > now);
+    }
+
+    fn record_stagger_acceptance(
+        &mut self,
+        result: SendResult,
+        stagger_spacing: Option<(usize, Duration)>,
+        accepted_at: Instant,
+    ) {
+        if !result.accepted() {
+            return;
+        }
+        let Some((_active, spacing)) = stagger_spacing else {
+            return;
+        };
+        self.last_stagger_send = Some(accepted_at);
+        self.send_gate = accepted_at.checked_add(spacing);
+        #[cfg(test)]
+        if let Some(observations) = &self.stagger_observations {
+            observations.lock().unwrap().push((_active, spacing));
+        }
+    }
+
+    fn poll_one_send(
+        &mut self,
+        index: usize,
+        cx: &mut Context<'_>,
+        now: Instant,
+        stagger_spacing: Option<(usize, Duration)>,
+    ) -> SendResult {
         let state = mem::replace(&mut self.targets[index].state, TargetState::Terminal);
         let TargetState::Active { mut client } = state else {
             self.targets[index].state = state;
@@ -940,18 +1049,17 @@ impl ManagedClientTask {
         let result = client.poll_send_probe(cx);
         let after = client.packets_sent();
         let accepted = after > before;
+        let send_result = match &result {
+            Poll::Pending => SendResult::Pending,
+            Poll::Ready(Ok(_)) => SendResult::Ready { accepted },
+            Poll::Ready(Err(_)) => SendResult::Failed { accepted },
+        };
+        self.record_stagger_acceptance(send_result, stagger_spacing, Instant::now());
         let schedule_error = accepted
             .then(|| client.skip_missed_probe_slots_at(Instant::now()))
             .transpose()
             .err();
         self.targets[index].counters.packets_sent = after;
-        if accepted {
-            self.targets[index].latest_committed_timeout = client
-                .latest_probe_timeout_deadline()
-                .into_iter()
-                .chain(self.targets[index].latest_committed_timeout)
-                .max();
-        }
         match result {
             Poll::Pending => {
                 self.targets[index].send_waiting = true;
@@ -963,7 +1071,19 @@ impl ManagedClientTask {
                 self.targets[index].state = TargetState::Active { client };
                 self.publish_client_events(index, events);
                 if let Some(error) = schedule_error {
-                    self.fail_target(index, ManagedTargetFailurePhase::Timing, error);
+                    let TargetState::Active { client } =
+                        mem::replace(&mut self.targets[index].state, TargetState::Terminal)
+                    else {
+                        unreachable!("probe sender remained active while publishing send events");
+                    };
+                    self.begin_open_session_failure(
+                        index,
+                        client,
+                        ManagedTargetFailurePhase::Timing,
+                        error,
+                        now,
+                        OpenSessionFailureCleanup::Drain,
+                    );
                     SendResult::Failed { accepted }
                 } else {
                     SendResult::Ready { accepted }
@@ -971,7 +1091,14 @@ impl ManagedClientTask {
             }
             Poll::Ready(Err(error)) => {
                 self.targets[index].send_waiting = false;
-                self.fail_target(index, ManagedTargetFailurePhase::Sending, error);
+                self.begin_open_session_failure(
+                    index,
+                    client,
+                    ManagedTargetFailurePhase::Sending,
+                    error,
+                    now,
+                    OpenSessionFailureCleanup::Drain,
+                );
                 SendResult::Failed { accepted }
             }
         }
@@ -992,24 +1119,12 @@ impl ManagedClientTask {
             if !matches!(self.targets[index].state, TargetState::Active { .. }) {
                 continue;
             }
-            #[cfg(test)]
             let stagger_spacing = self.active_stagger_spacing();
-            let result = self.poll_one_send(index, cx, now);
+            let result = self.poll_one_send(index, cx, now, stagger_spacing);
             if result == SendResult::NotAttempted {
                 continue;
             }
             self.stagger_remaining = 0;
-            if result.accepted() {
-                #[cfg(test)]
-                if let Some((_active, spacing)) = stagger_spacing {
-                    if let Some(observations) = &self.stagger_observations {
-                        observations.lock().unwrap().push((_active, spacing));
-                    }
-                }
-                let accepted_at = Instant::now();
-                self.last_stagger_send = Some(accepted_at);
-                self.recompute_stagger_gate(accepted_at);
-            }
             return matches!(result, SendResult::Ready { .. } | SendResult::Failed { .. });
         }
         self.stagger_remaining > 0
@@ -1028,7 +1143,7 @@ impl ManagedClientTask {
             let index = self.send_cursor % self.targets.len();
             self.send_cursor = (self.send_cursor + 1) % self.targets.len();
             self.burst_remaining -= 1;
-            let result = self.poll_one_send(index, cx, now);
+            let result = self.poll_one_send(index, cx, now, None);
             immediate |= matches!(result, SendResult::Ready { .. } | SendResult::Failed { .. });
         }
         immediate || self.burst_remaining > 0
@@ -1319,7 +1434,6 @@ fn build_task(
             server_addr: Arc::from(target.server_addr),
             remote: None,
             counters: TargetCounters::default(),
-            latest_committed_timeout: None,
             send_waiting: false,
             active: false,
             state: TargetState::Pending { client_config },

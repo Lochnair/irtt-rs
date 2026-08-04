@@ -1,5 +1,6 @@
 use std::{
     future::{poll_fn, Future},
+    mem,
     net::{SocketAddr, UdpSocket},
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
@@ -524,14 +525,19 @@ fn pre_poll_stop() {
 }
 
 #[test]
-fn finite_one_target_lifecycle() {
+fn finite_immediate_replies_use_retained_drain_deadline() {
     let server = start_server(ServerBehavior::Echo, None);
-    let (task, _) = ManagedClient::task(
-        config(ManagedPacing::Staggered),
-        vec![target("one", server.addr)],
-    )
-    .unwrap();
-    let outcome = runtime().block_on(task);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.client.probe_timeout = Duration::from_secs(3);
+    managed.final_drain = Duration::from_millis(30);
+    let (task, _) = ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    let started_at = Instant::now();
+    let outcome = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("replied probes must not hold the drain until their obsolete timeout")
+    });
+    assert!(started_at.elapsed() < Duration::from_secs(1));
     let records = server.finish();
     assert_eq!(outcome.end_reason, ManagedEndReason::TargetsComplete);
     assert!(matches!(
@@ -793,7 +799,8 @@ fn staggered_pacing_uses_all_active_negotiated_intervals() {
 
 #[test]
 fn stagger_gate_tracks_active_membership() {
-    let first = start_server_negotiating(ServerBehavior::Echo, None, Some(Duration::from_secs(1)));
+    let first =
+        start_server_negotiating(ServerBehavior::Echo, None, Some(Duration::from_millis(100)));
     let second_gate = Arc::new(PacketGate::default());
     let second = start_server_with_gates(
         ServerBehavior::Echo,
@@ -803,7 +810,7 @@ fn stagger_gate_tracks_active_membership() {
         None,
     );
     let mut managed = config(ManagedPacing::Staggered);
-    managed.client.duration = Some(Duration::from_secs(2));
+    managed.client.duration = Some(Duration::from_millis(1_250));
     managed.client.interval = Duration::from_secs(1);
     managed.client.negotiation_policy = NegotiationPolicy::Loose;
     managed.client.open_timeouts = vec![Duration::from_secs(2)];
@@ -818,19 +825,44 @@ fn stagger_gate_tracks_active_membership() {
         task.targets[0].counters.packets_sent == 1
     });
     let one_target_last = task.last_stagger_send.unwrap();
+    let one_target_gate = task.send_gate.unwrap();
     assert_eq!(
         task.send_gate,
-        one_target_last.checked_add(Duration::from_secs(1))
+        one_target_last.checked_add(Duration::from_millis(100))
     );
     second_gate.release();
     drive_task_until(&runtime, &mut task, |task| task.active_count() == 2);
     let last = task.last_stagger_send.unwrap();
     let gate = task.send_gate.unwrap();
-    assert_eq!(gate, last.checked_add(Duration::from_millis(500)).unwrap());
-    assert!(gate > last && gate < last.checked_add(Duration::from_secs(1)).unwrap());
+    assert_eq!(gate, last.checked_add(Duration::from_millis(50)).unwrap());
+    assert!(gate <= one_target_gate);
+    assert!(gate > last && gate < last.checked_add(Duration::from_millis(100)).unwrap());
     drive_task_until(&runtime, &mut task, |task| {
         task.targets[1].counters.packets_sent == 1
     });
+
+    let accepted_at = Instant::now();
+    task.record_stagger_acceptance(
+        SendResult::Failed { accepted: true },
+        Some((2, Duration::from_millis(50))),
+        accepted_at,
+    );
+    assert_eq!(
+        task.send_gate,
+        accepted_at.checked_add(Duration::from_millis(50))
+    );
+    let preserved_gate = task.send_gate;
+    let TargetState::Active { client } =
+        mem::replace(&mut task.targets[0].state, TargetState::Terminal)
+    else {
+        panic!("fast target was not active before removal");
+    };
+    assert!(task.begin_drain(0, client, ManagedTargetEndReason::Stopped, Instant::now()));
+    assert_eq!(task.send_gate, preserved_gate);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[1].counters.packets_sent == 2
+    });
+
     drop(handle.stop());
     let outcome = runtime.block_on(task);
     assert_eq!(outcome.failed_target_outcomes, 0);
@@ -907,37 +939,125 @@ fn overdue_queued_reply_is_lost_then_late() {
 }
 
 #[test]
-fn committed_probe_graceful_drain() {
-    let server = start_server(ServerBehavior::DelayedEcho(Duration::from_millis(25)), None);
-    let mut config = config(ManagedPacing::Staggered);
-    config.completion = ManagedCompletionPolicy::ExplicitStop;
-    config.client.duration = None;
-    config.client.interval = Duration::from_millis(100);
-    config.client.probe_timeout = Duration::from_millis(80);
-    config.final_drain = Duration::from_millis(5);
-    let (task, handle) = ManagedClient::task(config, vec![target("one", server.addr)]).unwrap();
-    let stop_handle = handle.clone();
-    let seen = Arc::clone(&server.probe_seen);
-    let stopper = thread::spawn(move || {
-        let (flag, ready) = &*seen;
-        let guard = flag.lock().unwrap();
-        let (guard, timeout) = ready
-            .wait_timeout_while(guard, Duration::from_secs(2), |seen| !*seen)
-            .unwrap();
-        let probe_seen = *guard;
-        drop(guard);
-        drop(stop_handle.stop());
-        assert!(probe_seen && !timeout.timed_out());
+fn retained_probe_deadline_shortens_after_late_reply() {
+    let reply_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&reply_gate)),
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.interval = Duration::from_secs(1);
+    managed.client.probe_timeout = Duration::from_millis(100);
+    managed.final_drain = Duration::from_millis(200);
+    let final_drain = managed.final_drain;
+    let (task, handle) = ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent == 1
     });
-    let outcome = runtime().block_on(task);
-    stopper.join().unwrap();
+    drop(handle.stop());
+    drive_task_until(&runtime, &mut task, |task| {
+        matches!(task.targets[0].state, TargetState::Draining { .. })
+    });
+    let (drain_started_at, initial_deadline, timeout_at) = match &task.targets[0].state {
+        TargetState::Draining {
+            client,
+            drain_started_at,
+            deadline,
+            ..
+        } => (
+            *drain_started_at,
+            *deadline,
+            client.next_probe_timeout_deadline().unwrap(),
+        ),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        initial_deadline,
+        timeout_at.checked_add(final_drain).unwrap()
+    );
+    thread::sleep(timeout_at.saturating_duration_since(Instant::now()));
+    while Instant::now() <= timeout_at {
+        thread::yield_now();
+    }
+    drive_task_until(&runtime, &mut task, |task| match &task.targets[0].state {
+        TargetState::Draining { client, .. } => {
+            client.next_probe_timeout_deadline().is_none()
+                && client.latest_probe_timeout_deadline() == Some(timeout_at)
+        }
+        _ => false,
+    });
+    let retained_deadline = match &task.targets[0].state {
+        TargetState::Draining { deadline, .. } => *deadline,
+        _ => unreachable!(),
+    };
+    assert_eq!(retained_deadline, initial_deadline);
+    reply_gate.release();
+    wait_flag(&server.reply_sent);
+    let shortened_deadline = drain_started_at.checked_add(final_drain).unwrap();
+    drive_task_until(&runtime, &mut task, |task| {
+        matches!(
+            task.targets[0].state,
+            TargetState::Draining { deadline, .. } if deadline == shortened_deadline
+        )
+    });
+    assert!(shortened_deadline < initial_deadline);
+    let outcome = runtime.block_on(task);
     let records = server.finish();
     let target = &outcome.recent_target_outcomes[0];
     assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
     assert!(matches!(target.end_reason, ManagedTargetEndReason::Stopped));
     assert_eq!(target.packets_sent, 1);
+    assert_eq!(target.replies_received, 0);
+    assert_eq!(target.late, 1);
+    assert_eq!(probes(&records).len(), 1);
+}
+
+#[test]
+fn pending_limit_failure_drains_reply_and_closes_session() {
+    let key = b"managed-send-failure-cleanup".to_vec();
+    let server = start_server(
+        ServerBehavior::DelayedEcho(Duration::from_millis(80)),
+        Some(key.clone()),
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.client.duration = Some(Duration::from_millis(250));
+    managed.client.interval = Duration::from_millis(20);
+    managed.client.probe_timeout = Duration::from_secs(2);
+    managed.client.max_pending_probes = 1;
+    managed.final_drain = Duration::from_millis(50);
+    let mut configured = target("one", server.addr);
+    configured.auth = Some(ClientAuthConfig {
+        hmac_key: Some(key),
+    });
+    let (task, _) = ManagedClient::task(managed, vec![configured]).unwrap();
+    let outcome = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .expect("send failure cleanup must shorten after draining the committed reply")
+    });
+    let records = server.finish();
+    let target = &outcome.recent_target_outcomes[0];
+    assert_eq!(outcome.failed_target_outcomes, 1);
+    assert!(matches!(
+        target.end_reason,
+        ManagedTargetEndReason::Failed(ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Sending,
+            kind: ManagedTargetFailureKind::ResourceExhausted,
+            ..
+        })
+    ));
+    assert_eq!(target.cleanup_failure, None);
+    assert_eq!(target.packets_sent, 1);
     assert_eq!(target.replies_received, 1);
     assert_eq!(probes(&records).len(), 1);
+    assert!(has_close(&records));
 }
 
 #[test]
