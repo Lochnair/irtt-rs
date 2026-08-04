@@ -1092,10 +1092,10 @@ fn prepare_group_open(
     machine: PreparedOpenAcceptance,
     opened_at: ClientTimestamp,
 ) -> Result<PreparedGroupOpen, Box<PreparedGroupOpenFailure>> {
-    if let Err(primary) = validate_group_negotiation(shared, machine.negotiated()) {
-        return Err(Box::new(PreparedGroupOpenFailure { primary, machine }));
-    }
     let schedule = if let Some(negotiated) = machine.normal_negotiated() {
+        if let Err(primary) = validate_group_negotiation(shared, negotiated) {
+            return Err(Box::new(PreparedGroupOpenFailure { primary, machine }));
+        }
         match ProbeSchedule::new(opened_at.mono, negotiated) {
             Ok(schedule) => Some(schedule),
             Err(primary) => return Err(Box::new(PreparedGroupOpenFailure { primary, machine })),
@@ -3377,6 +3377,162 @@ mod tests {
         ));
         assert_eq!(server._observations.try_iter().collect::<Vec<_>>().len(), 2);
         server.join();
+    }
+
+    #[test]
+    fn no_test_non_close_reply_sends_cleanup_and_fails_without_retry() {
+        let interval = Duration::from_millis(10);
+        let params = test_params(None, interval);
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let addr = socket.local_addr().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let done = thread::spawn(move || {
+            let (open, peer) = recv_request_timeout(&socket).expect("missing open request");
+            assert_ne!(open[3] & flags::FLAG_CLOSE, 0);
+            tx.send(ServerObservation::Open { at: Instant::now() })
+                .unwrap();
+            socket
+                .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)
+                .unwrap();
+            let (cleanup, _) =
+                recv_request_timeout(&socket).expect("missing no-test cleanup close");
+            assert_eq!(cleanup[3], flags::FLAG_CLOSE);
+            assert_eq!(
+                u64::from_le_bytes(cleanup[4..12].try_into().unwrap()),
+                TOKEN
+            );
+            tx.send(ServerObservation::Close { at: Instant::now() })
+                .unwrap();
+        });
+        let server = FakeServer {
+            addr,
+            _observations: rx,
+            done,
+        };
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered);
+        config.client.run_mode = crate::RunMode::NoTest;
+
+        let outcome = ManagedClientGroup::start(config, vec![target("peer", server.addr)])
+            .unwrap()
+            .join()
+            .unwrap();
+
+        assert_eq!(outcome.failed_target_outcomes, 1);
+        assert!(matches!(
+            outcome.targets[0].end_reason,
+            ManagedTargetEndReason::OpenFailed(ManagedTargetFailure {
+                kind: ManagedTargetFailureKind::OpeningProtocol,
+                ..
+            })
+        ));
+        assert_eq!(server._observations.try_iter().collect::<Vec<_>>().len(), 2);
+        server.join();
+    }
+
+    #[test]
+    fn loose_no_test_group_skips_active_interval_and_dscp_policy() {
+        let interval = Duration::from_millis(10);
+        let mut changed_interval = test_params(None, interval);
+        changed_interval.interval_ns += 1;
+        let changed_dscp = test_params(None, interval);
+
+        for (requested_dscp, params) in [(0, changed_interval), (1, changed_dscp)] {
+            let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let remote = peer.local_addr().unwrap();
+            let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+            config.run_mode = crate::RunMode::NoTest;
+            config.negotiation_policy = NegotiationPolicy::Loose;
+            config.dscp = requested_dscp;
+            let target = Arc::new(Mutex::new(
+                TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap(),
+            ));
+            let shared = shared_with_target(&config, EventHub::new(), target.clone());
+            let opened_at = ClientTimestamp::now();
+
+            let mut target = target.lock().expect("target mutex poisoned");
+            let packet = open_reply(FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE, 0, &params);
+            let reply = match target.runtime.inspect_open_datagram(&packet).unwrap() {
+                OpenDatagramDisposition::Trusted(reply) => reply,
+                OpenDatagramDisposition::Ignore => panic!("no-test reply must be trusted"),
+            };
+            let machine = target
+                .runtime
+                .prepare_open_acceptance(reply, opened_at)
+                .unwrap();
+            let prepared = prepare_group_open(&shared, machine, opened_at).unwrap();
+            assert!(prepared.schedule.is_none());
+            let outcome = target.runtime.commit_open(prepared.machine);
+            target.schedule = prepared.schedule;
+            publish_open_outcome(&shared.hub, &mut target, outcome);
+
+            assert!(matches!(target.status, TargetStatus::Finished));
+            assert_eq!(
+                target.final_reason,
+                Some(ManagedTargetEndReason::NoTestComplete)
+            );
+        }
+    }
+
+    #[test]
+    fn normal_and_strict_sessions_preserve_group_negotiation_checks() {
+        let interval = Duration::from_millis(10);
+        let mut changed_interval = test_params(None, interval);
+        changed_interval.interval_ns += 1;
+        let changed_dscp = test_params(None, interval);
+
+        for (requested_dscp, params) in [(0, changed_interval.clone()), (1, changed_dscp)] {
+            let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let remote = peer.local_addr().unwrap();
+            let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+            config.negotiation_policy = NegotiationPolicy::Loose;
+            config.dscp = requested_dscp;
+            let target = Arc::new(Mutex::new(
+                TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap(),
+            ));
+            let shared = shared_with_target(&config, EventHub::new(), target.clone());
+            let opened_at = ClientTimestamp::now();
+            let target = target.lock().expect("target mutex poisoned");
+            let packet = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params);
+            let reply = match target.runtime.inspect_open_datagram(&packet).unwrap() {
+                OpenDatagramDisposition::Trusted(reply) => reply,
+                OpenDatagramDisposition::Ignore => panic!("normal reply must be trusted"),
+            };
+            let machine = target
+                .runtime
+                .prepare_open_acceptance(reply, opened_at)
+                .unwrap();
+            let failure = prepare_group_open(&shared, machine, opened_at).unwrap_err();
+            assert!(matches!(
+                failure.primary,
+                ClientError::NegotiationRejected { .. }
+            ));
+        }
+
+        let peer = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = peer.local_addr().unwrap();
+        let mut config = group_config(None, interval, ManagedGroupPacing::Staggered).client;
+        config.run_mode = crate::RunMode::NoTest;
+        let target = TargetState::new(&config, target("peer", remote), 0, Instant::now()).unwrap();
+        let packet = open_reply(
+            FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE,
+            0,
+            &changed_interval,
+        );
+        let reply = match target.runtime.inspect_open_datagram(&packet).unwrap() {
+            OpenDatagramDisposition::Trusted(reply) => reply,
+            OpenDatagramDisposition::Ignore => panic!("strict no-test reply must be trusted"),
+        };
+        let failure = target
+            .runtime
+            .prepare_open_acceptance(reply, ClientTimestamp::now())
+            .unwrap_err();
+        assert!(matches!(
+            failure.primary,
+            ClientError::NegotiationRejected { .. }
+        ));
     }
 
     #[test]

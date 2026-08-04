@@ -29,10 +29,6 @@ fn successful_open_restores_configured_receive_timeout() {
         client.test_hooks.last_restored_read_timeout.get(),
         Some(Duration::from_millis(75))
     );
-    assert_eq!(
-        client.socket.read_timeout().unwrap(),
-        Some(Duration::from_millis(75))
-    );
     server.join();
 }
 

@@ -80,13 +80,6 @@ pub(crate) struct PreparedOpenAcceptance {
 }
 
 impl PreparedOpenAcceptance {
-    pub(crate) fn negotiated(&self) -> &NegotiatedParams {
-        match &self.outcome {
-            OpenOutcome::Started { negotiated, .. }
-            | OpenOutcome::NoTestCompleted { negotiated, .. } => negotiated,
-        }
-    }
-
     pub(crate) fn normal_negotiated(&self) -> Option<&NegotiatedParams> {
         match &self.next_state {
             MachineState::Open(session) => Some(&session.negotiated),
@@ -228,18 +221,17 @@ impl SessionMachine {
             .map_err(OpenAcceptanceFailure::without_cleanup)?;
 
         let reply_is_close = flags::has(reply.flags, flags::FLAG_CLOSE);
-        let cleanup_close =
-            if self.config.run_mode == RunMode::Normal && !reply_is_close && reply.token != 0 {
-                let bytes = encode_close_request(
-                    &CloseRequest { token: reply.token },
-                    self.config.hmac_key.as_deref(),
-                )
-                .map_err(ClientError::from)
-                .map_err(OpenAcceptanceFailure::without_cleanup)?;
-                Some(bytes.into_boxed_slice())
-            } else {
-                None
-            };
+        let cleanup_close = if !reply_is_close && reply.token != 0 {
+            let bytes = encode_close_request(
+                &CloseRequest { token: reply.token },
+                self.config.hmac_key.as_deref(),
+            )
+            .map_err(ClientError::from)
+            .map_err(OpenAcceptanceFailure::without_cleanup)?;
+            Some(bytes.into_boxed_slice())
+        } else {
+            None
+        };
 
         if reply.params.protocol_version != PROTOCOL_VERSION {
             return Err(OpenAcceptanceFailure::new(
@@ -1184,6 +1176,69 @@ mod tests {
         ));
         assert!(matches!(machine.state, MachineState::Connected));
         assert!(matches!(no_test.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn no_test_non_close_reply_prepares_authenticated_cleanup_without_state_change() {
+        let key = b"cleanup-key".to_vec();
+        let machine = connected_machine(ClientConfig {
+            run_mode: RunMode::NoTest,
+            hmac_key: Some(key.clone()),
+            ..ClientConfig::default()
+        });
+        let token = 0x1020_3040_5060_7080;
+
+        let failure = machine
+            .prepare_open_acceptance(
+                normal_open_reply(&machine, token),
+                timestamp(Instant::now()),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            failure.primary,
+            ClientError::UnexpectedNoTestReply
+        ));
+        let cleanup = failure.cleanup_close.as_deref().unwrap();
+        assert_eq!(cleanup[3], flags::FLAG_CLOSE | flags::FLAG_HMAC);
+        irtt_proto::verify_hmac(&key, cleanup, 4).unwrap();
+        assert_eq!(
+            u64::from_le_bytes(
+                cleanup[4 + irtt_proto::HMAC_SIZE..12 + irtt_proto::HMAC_SIZE]
+                    .try_into()
+                    .unwrap()
+            ),
+            token
+        );
+        drop(failure);
+        assert!(matches!(machine.state, MachineState::Connected));
+    }
+
+    #[test]
+    fn no_test_close_replies_do_not_prepare_cleanup() {
+        let machine = connected_machine(ClientConfig {
+            run_mode: RunMode::NoTest,
+            ..ClientConfig::default()
+        });
+        let reply = |token| OpenReply {
+            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
+            token,
+            params: machine.requested.clone(),
+        };
+
+        let prepared = machine
+            .prepare_open_acceptance(reply(0), timestamp(Instant::now()))
+            .unwrap();
+        assert!(prepared.cleanup_close_packet().is_none());
+
+        let failure = machine
+            .prepare_open_acceptance(reply(0x1020_3040_5060_7080), timestamp(Instant::now()))
+            .unwrap_err();
+        assert!(matches!(
+            failure.primary,
+            ClientError::NonZeroNoTestToken { .. }
+        ));
+        assert!(failure.cleanup_close.is_none());
     }
 
     #[test]

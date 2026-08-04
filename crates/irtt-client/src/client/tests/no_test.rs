@@ -22,13 +22,55 @@ fn no_test_rejects_non_close_open_reply() {
     let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
     config.run_mode = RunMode::NoTest;
     let params = params_from_config(&config).unwrap();
-    let server = open_success_server(params);
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+        let _ = recv_request(&socket, &tx);
+    });
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(
         client.open(),
         Err(ClientError::UnexpectedNoTestReply)
     ));
+    let packets: Vec<_> = server.rx.iter().take(2).collect();
+    assert_eq!(packets[1][3], flags::FLAG_CLOSE);
+    assert_eq!(
+        u64::from_le_bytes(packets[1][4..12].try_into().unwrap()),
+        TOKEN
+    );
+    assert!(client.runtime.prepare_open_request().is_ok());
+    server.join();
+}
+
+#[test]
+fn no_test_cleanup_send_failure_preserves_unexpected_reply() {
+    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+    config.run_mode = RunMode::NoTest;
+    let params = params_from_config(&config).unwrap();
+    let server = start_fake_server(move |socket, tx| {
+        let (_, peer) = recv_request(&socket, &tx);
+        socket
+            .send_to(
+                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
+                peer,
+            )
+            .unwrap();
+    });
+    config.server_addr = server.addr.to_string();
+    let mut client = Client::connect(config).unwrap();
+    client.test_hooks.fail_cleanup_send.set(true);
+
+    assert!(matches!(
+        client.open(),
+        Err(ClientError::UnexpectedNoTestReply)
+    ));
+    assert!(client.runtime.prepare_open_request().is_ok());
     server.join();
 }
 
