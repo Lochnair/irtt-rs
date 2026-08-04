@@ -115,7 +115,7 @@ pub(crate) struct PreparedClose<'a> {
 #[derive(Debug)]
 pub(crate) struct CloseCommit {
     packets_sent: u64,
-    event: ClientEvent,
+    token: u64,
 }
 
 #[derive(Debug)]
@@ -425,16 +425,16 @@ impl SessionMachine {
             bytes: &session.local_close_packet,
             commit: CloseCommit {
                 packets_sent: session.packets_sent,
-                event: ClientEvent::SessionClosed {
-                    remote: self.remote,
-                    token: session.token,
-                    at: ClientTimestamp::now(),
-                },
+                token: session.token,
             },
         })
     }
 
-    pub(crate) fn commit_local_close(&mut self, commit: CloseCommit) -> ClientEvent {
+    pub(crate) fn commit_local_close(
+        &mut self,
+        commit: CloseCommit,
+        sent_at: ClientTimestamp,
+    ) -> ClientEvent {
         debug_assert!(
             matches!(self.state, MachineState::Open(_)),
             "local close commits only from open state"
@@ -443,7 +443,11 @@ impl SessionMachine {
             source: CloseSource::Local,
             packets_sent: commit.packets_sent,
         };
-        commit.event
+        ClientEvent::SessionClosed {
+            remote: self.remote,
+            token: commit.token,
+            at: sent_at,
+        }
     }
 
     pub(crate) fn pending_is_empty(&self) -> bool {
@@ -1370,9 +1374,8 @@ mod tests {
     }
 
     #[test]
-    fn prepared_close_is_stable_inert_and_commits_preserved_state() {
+    fn prepare_close_is_stable_inert_and_does_not_determine_event_timestamp() {
         let mut machine = open_machine(4, Duration::from_secs(1));
-        let remote = machine.remote;
         active_mut(&mut machine).packets_sent = 7;
 
         let first_bytes = {
@@ -1387,6 +1390,8 @@ mod tests {
                 )
                 .unwrap()
             );
+            assert_eq!(prepared.commit.packets_sent, 7);
+            assert_eq!(prepared.commit.token, 0x0102_0304_0506_0708);
             prepared.bytes.to_vec()
         };
         assert!(machine.is_open());
@@ -1394,15 +1399,31 @@ mod tests {
 
         let prepared = machine.prepare_close().unwrap();
         assert_eq!(prepared.bytes, first_bytes);
-        let event = machine.commit_local_close(prepared.commit);
+        assert_eq!(prepared.commit.packets_sent, 7);
+        assert_eq!(prepared.commit.token, 0x0102_0304_0506_0708);
+        assert!(machine.is_open());
+    }
+
+    #[test]
+    fn local_close_commit_uses_supplied_exact_timestamp() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let remote = machine.remote;
+        active_mut(&mut machine).packets_sent = 7;
+        let prepared = machine.prepare_close().unwrap();
+        let sent_at = ClientTimestamp {
+            wall: UNIX_EPOCH + Duration::from_secs(1_234),
+            mono: Instant::now() + Duration::from_secs(5),
+        };
+        let event = machine.commit_local_close(prepared.commit, sent_at);
 
         assert!(matches!(
             event,
             ClientEvent::SessionClosed {
                 remote: event_remote,
                 token: 0x0102_0304_0506_0708,
-                ..
+                at,
             } if event_remote == remote
+                && at == sent_at
         ));
         assert!(matches!(
             machine.state,

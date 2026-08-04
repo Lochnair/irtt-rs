@@ -733,6 +733,8 @@ struct TargetState {
     close_send_attempts: usize,
     #[cfg(test)]
     close_event_reserve_error: bool,
+    #[cfg(test)]
+    close_sent_at: Option<ClientTimestamp>,
 }
 
 type ScheduledTarget = (Arc<Mutex<TargetState>>, Instant);
@@ -855,6 +857,8 @@ impl TargetState {
             close_send_attempts: 0,
             #[cfg(test)]
             close_event_reserve_error: false,
+            #[cfg(test)]
+            close_sent_at: None,
         })
     }
 
@@ -1872,7 +1876,14 @@ fn close_locked_target(
                 return;
             }
         };
-        let event = target.runtime.commit_local_close(prepared.commit);
+        #[cfg(not(test))]
+        let sent_at = ClientTimestamp::now();
+        #[cfg(test)]
+        let sent_at = target
+            .close_sent_at
+            .take()
+            .unwrap_or_else(ClientTimestamp::now);
+        let event = target.runtime.commit_local_close(prepared.commit, sent_at);
         target.schedule = None;
         #[cfg(test)]
         let bytes = reported_bytes.unwrap_or(bytes);
@@ -3046,8 +3057,13 @@ mod tests {
         let fixture = active_target_fixture_at(peer.local_addr().unwrap());
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
 
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(4_567),
+            mono: Instant::now() + Duration::from_secs(8),
+        };
         {
             let mut target = fixture.target.lock().expect("target mutex poisoned");
+            target.close_sent_at = Some(sent_at);
             close_locked_target(
                 &socket,
                 &fixture.hub,
@@ -3069,19 +3085,20 @@ mod tests {
         assert_eq!(u64::from_le_bytes(packet[4..12].try_into().unwrap()), TOKEN);
         assert_eq!(len, 12);
         let events = drain_available_group_events(&fixture.subscription);
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(
-                    event,
-                    ManagedGroupEvent::Client(TargetEvent {
-                        event: ClientEvent::SessionClosed { token: TOKEN, .. },
-                        ..
-                    })
-                ))
-                .count(),
-            1
-        );
+        let closes: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                ManagedGroupEvent::Client(TargetEvent {
+                    event:
+                        ClientEvent::SessionClosed {
+                            token: TOKEN, at, ..
+                        },
+                    ..
+                }) => Some(*at),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closes, [sent_at]);
     }
 
     #[test]
@@ -3127,8 +3144,13 @@ mod tests {
         let fixture = active_target_fixture_at(peer.local_addr().unwrap());
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
 
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(5_678),
+            mono: Instant::now() + Duration::from_secs(9),
+        };
         {
             let mut target = fixture.target.lock().expect("target mutex poisoned");
+            target.close_sent_at = Some(sent_at);
             target.close_send_error = true;
             close_locked_target(
                 &socket,
@@ -3139,6 +3161,7 @@ mod tests {
             assert!(target.runtime.is_open());
             assert!(target.schedule.is_some());
             assert_eq!(target.close_send_attempts, 1);
+            assert_eq!(target.close_sent_at, Some(sent_at));
             assert!(matches!(
                 target.final_reason,
                 Some(ManagedTargetEndReason::Failed(_))
@@ -3169,9 +3192,14 @@ mod tests {
         let fixture = active_target_fixture_at(peer.local_addr().unwrap());
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
 
+        let sent_at = ClientTimestamp {
+            wall: std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(6_789),
+            mono: Instant::now() + Duration::from_secs(10),
+        };
         {
             let mut target = fixture.target.lock().expect("target mutex poisoned");
             let expected = target.runtime.prepare_close().unwrap().bytes.len();
+            target.close_sent_at = Some(sent_at);
             target.close_reported_len = Some(expected - 1);
             close_locked_target(
                 &socket,
@@ -3182,6 +3210,7 @@ mod tests {
             assert!(!target.runtime.is_open());
             assert!(target.schedule.is_none());
             assert_eq!(target.close_send_attempts, 1);
+            assert_eq!(target.close_sent_at, None);
             let failure = target
                 .final_reason
                 .as_ref()

@@ -29,10 +29,19 @@ fn close_sends_one_close_packet_with_negotiated_token() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1_234),
+        mono: Instant::now() + Duration::from_secs(5),
+    };
+    client.test_hooks.close_sent_at.set(Some(sent_at));
     let events = client.close().unwrap();
     assert!(matches!(
         events.as_slice(),
-        [ClientEvent::SessionClosed { token: TOKEN, .. }]
+        [ClientEvent::SessionClosed {
+            token: TOKEN,
+            at,
+            ..
+        }] if *at == sent_at
     ));
     assert!(!client.runtime.is_open());
     assert!(client.schedule.is_none());
@@ -127,9 +136,15 @@ fn close_send_failure_leaves_machine_and_schedule_open_for_retry() {
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(2_345),
+        mono: Instant::now() + Duration::from_secs(6),
+    };
+    client.test_hooks.close_sent_at.set(Some(sent_at));
     client.test_hooks.fail_close_send.set(true);
 
     assert!(matches!(client.close(), Err(ClientError::Socket(_))));
+    assert_eq!(client.test_hooks.close_sent_at.get(), Some(sent_at));
     assert!(client.runtime.is_open());
     assert!(client.schedule.is_some());
     assert_eq!(client.applied_dscp, Some(0));
@@ -137,8 +152,13 @@ fn close_send_failure_leaves_machine_and_schedule_open_for_retry() {
 
     assert!(matches!(
         client.close().unwrap().as_slice(),
-        [ClientEvent::SessionClosed { token: TOKEN, .. }]
+        [ClientEvent::SessionClosed {
+            token: TOKEN,
+            at,
+            ..
+        }] if *at == sent_at
     ));
+    assert_eq!(client.test_hooks.close_sent_at.get(), None);
     assert_eq!(client.test_hooks.close_send_attempts.get(), 2);
     assert!(matches!(client.close(), Err(ClientError::AlreadyClosed)));
     server.join();
@@ -160,6 +180,11 @@ fn short_successful_close_commits_before_length_mismatch() {
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
     assert_open_started(client.open().unwrap());
     let expected = client.runtime.prepare_close().unwrap().bytes.len();
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::UNIX_EPOCH + Duration::from_secs(3_456),
+        mono: Instant::now() + Duration::from_secs(7),
+    };
+    client.test_hooks.close_sent_at.set(Some(sent_at));
     client.test_hooks.close_reported_len.set(Some(expected - 1));
 
     assert!(matches!(
@@ -172,6 +197,7 @@ fn short_successful_close_commits_before_length_mismatch() {
     assert!(!client.runtime.is_open());
     assert!(client.schedule.is_none());
     assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.test_hooks.close_sent_at.get(), None);
     assert!(matches!(client.close(), Err(ClientError::AlreadyClosed)));
     server.join();
 }

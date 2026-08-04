@@ -60,6 +60,7 @@ struct ClientTestHooks {
     fail_close_send: Cell<bool>,
     close_reported_len: Cell<Option<usize>>,
     close_send_attempts: Cell<usize>,
+    close_sent_at: Cell<Option<ClientTimestamp>>,
     fail_cleanup_send: Cell<bool>,
     recv_buffer_len_override: Cell<Option<usize>>,
     fail_dscp_restore: Cell<bool>,
@@ -199,7 +200,15 @@ impl Client {
                 return Err(ClientError::Socket(err));
             }
         };
-        let event = self.runtime.commit_local_close(prepared.commit);
+        #[cfg(not(test))]
+        let sent_at = ClientTimestamp::now();
+        #[cfg(test)]
+        let sent_at = self
+            .test_hooks
+            .close_sent_at
+            .take()
+            .unwrap_or_else(ClientTimestamp::now);
+        let event = self.runtime.commit_local_close(prepared.commit, sent_at);
         self.schedule = None;
         self.applied_dscp = None;
 
