@@ -1,5 +1,5 @@
 use std::{
-    future::Future,
+    future::{poll_fn, Future},
     net::{SocketAddr, UdpSocket},
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
@@ -45,6 +45,7 @@ struct TestServer {
     addr: SocketAddr,
     records: Arc<Mutex<Vec<PacketRecord>>>,
     probe_seen: Arc<(Mutex<bool>, Condvar)>,
+    reply_sent: Arc<(Mutex<bool>, Condvar)>,
     thread: JoinHandle<()>,
 }
 
@@ -55,14 +56,47 @@ impl TestServer {
     }
 }
 
+#[derive(Default)]
+struct PacketGate {
+    seen: Mutex<bool>,
+    seen_ready: Condvar,
+    released: Mutex<bool>,
+    release_ready: Condvar,
+}
+
+impl PacketGate {
+    fn arrive_and_wait(&self) {
+        *self.seen.lock().unwrap() = true;
+        self.seen_ready.notify_all();
+        let released = self.released.lock().unwrap();
+        let (released, timeout) = self
+            .release_ready
+            .wait_timeout_while(released, Duration::from_secs(2), |released| !*released)
+            .unwrap();
+        assert!(*released && !timeout.timed_out());
+    }
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.release_ready.notify_all();
+    }
+}
 fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
     start_server_negotiating(behavior, key, None)
 }
-
 fn start_server_negotiating(
     behavior: ServerBehavior,
     key: Option<Vec<u8>>,
     interval: Option<Duration>,
+) -> TestServer {
+    start_server_with_gates(behavior, key, interval, None, None)
+}
+
+fn start_server_with_gates(
+    behavior: ServerBehavior,
+    key: Option<Vec<u8>>,
+    interval: Option<Duration>,
+    open_gate: Option<Arc<PacketGate>>,
+    reply_gate: Option<Arc<PacketGate>>,
 ) -> TestServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
@@ -73,6 +107,8 @@ fn start_server_negotiating(
     let thread_records = Arc::clone(&records);
     let probe_seen = Arc::new((Mutex::new(false), Condvar::new()));
     let thread_probe_seen = Arc::clone(&probe_seen);
+    let reply_sent = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_reply_sent = Arc::clone(&reply_sent);
     let thread = thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         let (open_len, peer) = socket.recv_from(&mut buffer).unwrap();
@@ -81,6 +117,9 @@ fn start_server_negotiating(
             at: Instant::now(),
         });
         let request = decode_open_request(&buffer[..open_len], key.as_deref()).unwrap();
+        if let Some(gate) = &open_gate {
+            gate.arrive_and_wait();
+        }
         let mut negotiated = request.params.clone();
         if let Some(interval) = interval {
             negotiated.interval_ns = i64::try_from(interval.as_nanos()).unwrap();
@@ -148,6 +187,9 @@ fn start_server_negotiating(
                     }
                     continue;
                 }
+                if let Some(gate) = &reply_gate {
+                    gate.arrive_and_wait();
+                }
                 let peer_close = matches!(behavior, ServerBehavior::PeerClose);
                 let reply = encode_echo_reply(
                     &EchoReply {
@@ -164,6 +206,9 @@ fn start_server_negotiating(
                 )
                 .unwrap();
                 socket.send_to(&reply, packet_peer).unwrap();
+                let (sent, ready) = &*thread_reply_sent;
+                *sent.lock().unwrap() = true;
+                ready.notify_all();
                 if peer_close {
                     return;
                 }
@@ -180,6 +225,7 @@ fn start_server_negotiating(
         addr,
         records,
         probe_seen,
+        reply_sent,
         thread,
     }
 }
@@ -215,6 +261,46 @@ fn target(id: &str, addr: SocketAddr) -> ManagedTargetConfig {
 
 fn poll_once<F: Future>(future: Pin<&mut F>) -> Poll<F::Output> {
     Future::poll(future, &mut Context::from_waker(Waker::noop()))
+}
+fn drive_task_until(
+    runtime: &Runtime,
+    task: &mut Pin<Box<ManagedClientTask>>,
+    condition: impl Fn(&ManagedClientTask) -> bool,
+) {
+    runtime.block_on(poll_fn(|cx| {
+        assert!(
+            task.as_mut().poll(cx).is_pending(),
+            "task completed before condition"
+        );
+        if condition(task.as_ref().get_ref()) {
+            Poll::Ready(())
+        } else {
+            Poll::Pending
+        }
+    }));
+}
+
+fn wait_flag(flag: &Arc<(Mutex<bool>, Condvar)>) {
+    let (flag, ready) = &**flag;
+    let value = flag.lock().unwrap();
+    let (value, timeout) = ready
+        .wait_timeout_while(value, Duration::from_secs(2), |value| !*value)
+        .unwrap();
+    assert!(*value && !timeout.timed_out());
+}
+
+fn client_events(
+    observations: &Mutex<Vec<(ManagedEvent, Arc<ManagedStatus>)>>,
+) -> Vec<ClientEvent> {
+    observations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(event, _)| match event {
+            ManagedEvent::Client { event, .. } => Some(event.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 fn probes(records: &[PacketRecord]) -> Vec<Instant> {
@@ -491,6 +577,114 @@ fn authenticated_peer_close_outcome() {
 }
 
 #[test]
+fn peer_close_during_stop_drain_remains_authoritative() {
+    let key = b"managed-drain-peer-close".to_vec();
+    let server = start_server(ServerBehavior::PeerClose, Some(key.clone()));
+    let mut configured = target("peer", server.addr);
+    configured.auth = Some(ClientAuthConfig {
+        hmac_key: Some(key),
+    });
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.interval = Duration::from_secs(1);
+    let (task, handle) = ManagedClient::task(managed, vec![configured]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent == 1
+    });
+    drop(handle.stop());
+    wait_flag(&server.reply_sent);
+    let outcome = runtime.block_on(task);
+    let records = server.finish();
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+    assert_eq!(outcome.peer_closed_target_outcomes, 1);
+    assert!(matches!(
+        outcome.recent_target_outcomes[0].end_reason,
+        ManagedTargetEndReason::PeerClosed
+    ));
+    assert!(!has_close(&records));
+}
+
+#[test]
+fn stop_during_opening_finishes_in_flight_work() {
+    let open_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        Some(Arc::clone(&open_gate)),
+        None,
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.open_timeouts = vec![Duration::from_secs(1), Duration::from_secs(1)];
+    let (task, handle) =
+        ManagedClient::task(managed, vec![target("success", server.addr)]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| match &task.targets[0].state {
+        TargetState::Opening { open, .. } => open.has_in_flight_work(),
+        _ => false,
+    });
+    drop(handle.stop());
+    open_gate.release();
+    let outcome = runtime.block_on(task);
+    let records = server.finish();
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+    assert!(matches!(
+        outcome.recent_target_outcomes[0].end_reason,
+        ManagedTargetEndReason::Stopped
+    ));
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| matches!(record.kind, PacketKind::Open))
+            .count(),
+        1
+    );
+    assert!(probes(&records).is_empty() && has_close(&records));
+    let key = b"managed-retained-open-cleanup".to_vec();
+    let cleanup_server = start_server(ServerBehavior::Echo, Some(key.clone()));
+    let mut configured = target("cleanup", cleanup_server.addr);
+    configured.auth = Some(ClientAuthConfig {
+        hmac_key: Some(key),
+    });
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(managed, vec![configured]).unwrap();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        matches!(task.targets[0].state, TargetState::Opening { .. })
+    });
+    let TargetState::Opening { client, .. } = &task.as_ref().get_ref().targets[0].state else {
+        unreachable!()
+    };
+    client.retain_open_cleanup_once();
+    drive_task_until(&runtime, &mut task, |task| match &task.targets[0].state {
+        TargetState::Opening { open, .. } => open.has_retained_cleanup(),
+        _ => false,
+    });
+    drop(handle.stop());
+    let outcome = runtime.block_on(task);
+    let records = cleanup_server.finish();
+    let target = &outcome.recent_target_outcomes[0];
+    assert!(matches!(target.end_reason, ManagedTargetEndReason::Stopped));
+    assert_eq!(outcome.failed_target_outcomes, 0);
+    assert!(matches!(
+        target.cleanup_failure,
+        Some(ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Opening,
+            ..
+        })
+    ));
+    assert!(probes(&records).is_empty() && has_close(&records));
+}
+
+#[test]
 fn static_multi_target_completion() {
     let first = start_server(ServerBehavior::Echo, None);
     let second = start_server(ServerBehavior::Echo, None);
@@ -598,6 +792,121 @@ fn staggered_pacing_uses_all_active_negotiated_intervals() {
 }
 
 #[test]
+fn stagger_gate_tracks_active_membership() {
+    let first = start_server_negotiating(ServerBehavior::Echo, None, Some(Duration::from_secs(1)));
+    let second_gate = Arc::new(PacketGate::default());
+    let second = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        Some(Duration::from_secs(1)),
+        Some(Arc::clone(&second_gate)),
+        None,
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.client.duration = Some(Duration::from_secs(2));
+    managed.client.interval = Duration::from_secs(1);
+    managed.client.negotiation_policy = NegotiationPolicy::Loose;
+    managed.client.open_timeouts = vec![Duration::from_secs(2)];
+    let (task, handle) = ManagedClient::task(
+        managed,
+        vec![target("first", first.addr), target("second", second.addr)],
+    )
+    .unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent == 1
+    });
+    let one_target_last = task.last_stagger_send.unwrap();
+    assert_eq!(
+        task.send_gate,
+        one_target_last.checked_add(Duration::from_secs(1))
+    );
+    second_gate.release();
+    drive_task_until(&runtime, &mut task, |task| task.active_count() == 2);
+    let last = task.last_stagger_send.unwrap();
+    let gate = task.send_gate.unwrap();
+    assert_eq!(gate, last.checked_add(Duration::from_millis(500)).unwrap());
+    assert!(gate > last && gate < last.checked_add(Duration::from_secs(1)).unwrap());
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[1].counters.packets_sent == 1
+    });
+    drop(handle.stop());
+    let outcome = runtime.block_on(task);
+    assert_eq!(outcome.failed_target_outcomes, 0);
+    first.finish();
+    second.finish();
+}
+
+#[test]
+fn overdue_queued_reply_is_lost_then_late() {
+    let reply_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&reply_gate)),
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.interval = Duration::from_secs(1);
+    managed.client.probe_timeout = Duration::from_millis(30);
+    let (mut task, handle) =
+        ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent == 1
+    });
+    let timeout = match &task.targets[0].state {
+        TargetState::Active { client } => client.next_probe_timeout_deadline().unwrap(),
+        _ => panic!("probe sender did not remain active"),
+    };
+    thread::sleep(timeout.saturating_duration_since(Instant::now()));
+    while Instant::now() <= timeout {
+        thread::yield_now();
+    }
+    reply_gate.release();
+    wait_flag(&server.reply_sent);
+    runtime.block_on(poll_fn(|cx| {
+        let ready = match &task.as_ref().get_ref().targets[0].state {
+            TargetState::Active { client } => client.poll_recv_ready_for_test(cx),
+            _ => panic!("probe sender did not remain active"),
+        };
+        ready.map(|result| result.unwrap())
+    }));
+    runtime.block_on(poll_fn(|cx| {
+        assert!(task.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }));
+    let classified = client_events(&observations)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ClientEvent::EchoLoss { .. }
+                    | ClientEvent::LateReply { .. }
+                    | ClientEvent::EchoReply { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        classified.as_slice(),
+        [ClientEvent::EchoLoss { .. }, ClientEvent::LateReply { .. }]
+    ));
+    drop(handle.stop());
+    let outcome = runtime.block_on(task);
+    let target = &outcome.recent_target_outcomes[0];
+    assert_eq!(target.replies_received, 0);
+    assert_eq!(target.late, 1);
+    server.finish();
+}
+
+#[test]
 fn committed_probe_graceful_drain() {
     let server = start_server(ServerBehavior::DelayedEcho(Duration::from_millis(25)), None);
     let mut config = config(ManagedPacing::Staggered);
@@ -695,6 +1004,46 @@ fn drain_failures_preserve_primary_outcome_and_first_cleanup_failure() {
 }
 
 #[test]
+fn final_drain_overflow_is_rejected_and_preserves_success() {
+    let mut invalid = config(ManagedPacing::Staggered);
+    invalid.final_drain = Duration::MAX;
+    assert!(matches!(
+        ManagedClient::task(
+            invalid,
+            vec![target("invalid", "127.0.0.1:9".parse().unwrap())]
+        ),
+        Err(ManagedConfigError::UnschedulableFinalDrain {
+            duration: Duration::MAX
+        })
+    ));
+
+    let server = start_server(ServerBehavior::Echo, None);
+    let (mut task, _) = ManagedClient::task(
+        config(ManagedPacing::Staggered),
+        vec![target("completed", server.addr)],
+    )
+    .unwrap();
+    task.config.final_drain = Duration::MAX;
+    let outcome = runtime().block_on(task);
+    let target = &outcome.recent_target_outcomes[0];
+    assert!(matches!(
+        target.end_reason,
+        ManagedTargetEndReason::TestComplete
+    ));
+    assert_eq!(outcome.successful_target_outcomes, 1);
+    assert_eq!(outcome.failed_target_outcomes, 0);
+    assert!(matches!(
+        target.cleanup_failure,
+        Some(ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Timing,
+            kind: ManagedTargetFailureKind::ResourceExhausted,
+            ..
+        })
+    ));
+    assert!(has_close(&server.finish()));
+}
+
+#[test]
 fn post_deadline_receive_sweep_drains_queued_packets_and_is_bounded() {
     let drained = run_deferred_drain_burst(3);
     let drained_target = &drained.recent_target_outcomes[0];
@@ -702,9 +1051,9 @@ fn post_deadline_receive_sweep_drains_queued_packets_and_is_bounded() {
         drained_target.end_reason,
         ManagedTargetEndReason::Stopped
     ));
-    assert_eq!(drained_target.replies_received, 1);
+    assert_eq!(drained_target.replies_received, 0);
     assert_eq!(drained_target.duplicates, 1);
-    assert_eq!(drained_target.late, 1);
+    assert_eq!(drained_target.late, 2);
 
     let bounded = run_deferred_drain_burst(POST_DEADLINE_RECEIVE_BUDGET + 64);
     let bounded_target = &bounded.recent_target_outcomes[0];

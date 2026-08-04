@@ -260,6 +260,8 @@ pub enum ManagedConfigError {
     ZeroEventCapacity,
     #[error("managed live-generation limit must be greater than zero")]
     ZeroLiveGenerationLimit,
+    #[error("managed final drain {duration:?} cannot be scheduled from the current instant")]
+    UnschedulableFinalDrain { duration: Duration },
     #[error("invalid managed target {id}: {source}")]
     InvalidTarget {
         id: TargetId,

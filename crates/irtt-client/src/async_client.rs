@@ -86,6 +86,8 @@ pub(crate) struct AsyncOpenState {
     deadline: Option<Instant>,
     deadline_timer: Option<Pin<Box<time::Sleep>>>,
     request_submitted: bool,
+    stop_after_current_attempt: bool,
+    stopped_after_current_attempt: bool,
     buffer: [u8; MAX_OPEN_PACKET_SIZE],
     cleanup: Option<AsyncOpenCleanup>,
 }
@@ -97,6 +99,8 @@ impl AsyncOpenState {
             deadline: None,
             deadline_timer: None,
             request_submitted: false,
+            stop_after_current_attempt: false,
+            stopped_after_current_attempt: false,
             buffer: [0_u8; MAX_OPEN_PACKET_SIZE],
             cleanup: None,
         }
@@ -117,6 +121,24 @@ impl AsyncOpenState {
         self.deadline = None;
         self.deadline_timer = None;
         self.request_submitted = false;
+        self.stopped_after_current_attempt = self.stop_after_current_attempt;
+    }
+
+    pub(crate) fn has_in_flight_work(&self) -> bool {
+        self.request_submitted || self.cleanup.is_some()
+    }
+
+    pub(crate) fn request_stop_after_current_attempt(&mut self) {
+        self.stop_after_current_attempt = true;
+    }
+
+    pub(crate) fn stopped_after_current_attempt(&self) -> bool {
+        self.stopped_after_current_attempt
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_retained_cleanup(&self) -> bool {
+        self.cleanup.is_some()
     }
 
     fn deadline(&self) -> Instant {
@@ -149,6 +171,7 @@ struct AsyncClientTestHooks {
     fail_cleanup_send: Cell<bool>,
     fail_peer_close_dscp: Cell<bool>,
     fail_dscp_restore: Cell<bool>,
+    pause_open_cleanup_before_send: Cell<bool>,
     pause_open_before_writable: Cell<bool>,
     pause_open_before_readable: Cell<bool>,
     pause_probe_before_writable: Cell<bool>,
@@ -301,6 +324,10 @@ impl AsyncClient {
             if state.attempt >= attempt_count {
                 return Poll::Ready(Err(ClientError::OpenTimeout));
             }
+            if state.stop_after_current_attempt && state.deadline.is_none() {
+                state.stopped_after_current_attempt = true;
+                return Poll::Ready(Err(ClientError::OpenTimeout));
+            }
             if state.deadline.is_none() {
                 let timeout = self.machine.config().open_timeouts[state.attempt];
                 if let Err(error) = state.start_attempt(timeout) {
@@ -333,10 +360,10 @@ impl AsyncClient {
                 let send_result = self.socket.try_send(&request.bytes);
                 match send_result {
                     Ok(bytes) => {
+                        state.request_submitted = true;
                         if let Err(error) = validate_datagram_length(request.bytes.len(), bytes) {
                             return Poll::Ready(Err(error));
                         }
-                        state.request_submitted = true;
                     }
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                     Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
@@ -352,6 +379,9 @@ impl AsyncClient {
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(false)) => {
                     state.finish_attempt();
+                    if state.stopped_after_current_attempt() {
+                        return Poll::Ready(Err(ClientError::OpenTimeout));
+                    }
                     continue;
                 }
                 Poll::Ready(Ok(true)) => {}
@@ -364,6 +394,9 @@ impl AsyncClient {
             };
             if datagram.received_at.mono > state.deadline() {
                 state.finish_attempt();
+                if state.stopped_after_current_attempt() {
+                    return Poll::Ready(Err(ClientError::OpenTimeout));
+                }
                 continue;
             }
 
@@ -709,6 +742,17 @@ impl AsyncClient {
         self.prepared_probe = None;
     }
 
+    #[cfg(test)]
+    pub(crate) fn retain_open_cleanup_once(&self) {
+        self.test_hooks.fail_open_dscp.set(true);
+        self.test_hooks.pause_open_cleanup_before_send.set(true);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn poll_recv_ready_for_test(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.socket.poll_recv_ready(cx)
+    }
+
     pub(crate) fn skip_missed_probe_slots_at(&mut self, now: Instant) -> Result<(), ClientError> {
         let Some(schedule) = self.schedule.as_mut() else {
             return Ok(());
@@ -820,6 +864,15 @@ impl AsyncClient {
             else {
                 return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
             };
+
+            #[cfg(test)]
+            if self
+                .test_hooks
+                .pause_open_cleanup_before_send
+                .replace(false)
+            {
+                return Poll::Pending;
+            }
 
             #[cfg(test)]
             if self.test_hooks.fail_cleanup_send.replace(false) {

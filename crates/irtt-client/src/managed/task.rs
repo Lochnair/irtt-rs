@@ -215,6 +215,7 @@ struct TargetRuntime {
     counters: TargetCounters,
     latest_committed_timeout: Option<Instant>,
     send_waiting: bool,
+    active: bool,
     state: TargetState,
 }
 
@@ -318,6 +319,7 @@ pub struct ManagedClientTask {
     burst_remaining: usize,
     stagger_remaining: usize,
     send_gate: Option<Instant>,
+    last_stagger_send: Option<Instant>,
     stop_observed: bool,
     final_outcome: Option<Arc<ManagedOutcome>>,
     _next_generation: u64,
@@ -413,7 +415,13 @@ impl ManagedClientTask {
 
     fn install_target_state(&mut self, index: usize, state: TargetState) {
         let lifecycle = state.lifecycle();
+        let active = matches!(state, TargetState::Active { .. });
+        let membership_changed = self.targets[index].active != active;
+        self.targets[index].active = active;
         self.targets[index].state = state;
+        if membership_changed {
+            self.recompute_stagger_gate(Instant::now());
+        }
         self.replace_status();
         self.publish_event(ManagedEvent::TargetStateChanged {
             target: self.targets[index].instance.clone(),
@@ -557,9 +565,12 @@ impl ManagedClientTask {
                 mut open,
             } => {
                 if self.state == DriverState::Stopping {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
-                    self.finish_target(index, ManagedTargetEndReason::Stopped, None);
-                    return false;
+                    if !open.has_in_flight_work() {
+                        self.targets[index].counters.packets_sent = client.packets_sent();
+                        self.finish_target(index, ManagedTargetEndReason::Stopped, None);
+                        return false;
+                    }
+                    open.request_stop_after_current_attempt();
                 }
                 match client.poll_open(&mut open, cx) {
                     Poll::Pending => {
@@ -567,17 +578,42 @@ impl ManagedClientTask {
                         false
                     }
                     Poll::Ready(Ok(OpenOutcome::Started { event, .. })) => {
-                        self.install_target_state(index, TargetState::Active { client });
                         self.publish_client_events(index, vec![event]);
-                        true
+                        if self.state == DriverState::Stopping {
+                            self.targets[index].counters.packets_sent = client.packets_sent();
+                            self.begin_drain(index, client, ManagedTargetEndReason::Stopped, now)
+                        } else {
+                            self.install_target_state(index, TargetState::Active { client });
+                            true
+                        }
                     }
                     Poll::Ready(Ok(OpenOutcome::NoTestCompleted { event, .. })) => {
                         self.publish_client_events(index, vec![event]);
-                        self.finish_target(index, ManagedTargetEndReason::NoTestComplete, None);
+                        let end_reason = if self.state == DriverState::Stopping {
+                            ManagedTargetEndReason::Stopped
+                        } else {
+                            ManagedTargetEndReason::NoTestComplete
+                        };
+                        self.finish_target(index, end_reason, None);
                         false
                     }
                     Poll::Ready(Err(error)) => {
-                        self.fail_target(index, ManagedTargetFailurePhase::Opening, error);
+                        if self.state == DriverState::Stopping {
+                            let cleanup_failure =
+                                (!open.stopped_after_current_attempt()).then(|| {
+                                    classify_client_error(
+                                        ManagedTargetFailurePhase::Opening,
+                                        &error,
+                                    )
+                                });
+                            self.finish_target(
+                                index,
+                                ManagedTargetEndReason::Stopped,
+                                cleanup_failure,
+                            );
+                        } else {
+                            self.fail_target(index, ManagedTargetFailurePhase::Opening, error);
+                        }
                         false
                     }
                 }
@@ -587,6 +623,19 @@ impl ManagedClientTask {
                     client.discard_prepared_probe();
                     self.targets[index].counters.packets_sent = client.packets_sent();
                     return self.begin_drain(index, client, ManagedTargetEndReason::Stopped, now);
+                }
+                if client
+                    .next_probe_timeout_deadline()
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    match client.poll_timeouts_at(now) {
+                        Ok(events) => self.publish_client_events(index, events),
+                        Err(error) => {
+                            self.targets[index].counters.packets_sent = client.packets_sent();
+                            self.fail_target(index, ManagedTargetFailurePhase::Timing, error);
+                            return false;
+                        }
+                    }
                 }
                 let received = match client.poll_recv(cx) {
                     Poll::Pending => false,
@@ -604,19 +653,6 @@ impl ManagedClientTask {
                     self.targets[index].counters.packets_sent = client.packets_sent();
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, None);
                     return false;
-                }
-                if client
-                    .next_probe_timeout_deadline()
-                    .is_some_and(|deadline| deadline <= now)
-                {
-                    match client.poll_timeouts_at(now) {
-                        Ok(events) => self.publish_client_events(index, events),
-                        Err(error) => {
-                            self.targets[index].counters.packets_sent = client.packets_sent();
-                            self.fail_target(index, ManagedTargetFailurePhase::Timing, error);
-                            return false;
-                        }
-                    }
                 }
                 if client.is_run_complete() {
                     self.targets[index].counters.packets_sent = client.packets_sent();
@@ -656,6 +692,27 @@ impl ManagedClientTask {
                 let injected_receive_failure = self.take_drain_receive_failure();
                 #[cfg(not(test))]
                 let injected_receive_failure = None;
+                if client
+                    .next_probe_timeout_deadline()
+                    .is_some_and(|timeout| timeout <= now)
+                {
+                    match client.poll_timeouts_at(now) {
+                        Ok(events) => self.publish_client_events(index, events),
+                        Err(error) => {
+                            self.targets[index].counters.packets_sent = client.packets_sent();
+                            cleanup_failure.get_or_insert_with(|| {
+                                classify_client_error(ManagedTargetFailurePhase::Timing, &error)
+                            });
+                            return self.begin_close(
+                                index,
+                                client,
+                                primary_end,
+                                cleanup_failure,
+                                now,
+                            );
+                        }
+                    }
+                }
                 let received = match client.poll_recv(cx) {
                     Poll::Pending => false,
                     Poll::Ready(Ok(events)) => {
@@ -679,29 +736,8 @@ impl ManagedClientTask {
                 }
                 if client.is_peer_closed() {
                     self.targets[index].counters.packets_sent = client.packets_sent();
-                    self.finish_target(index, primary_end, cleanup_failure);
+                    self.finish_target(index, ManagedTargetEndReason::PeerClosed, cleanup_failure);
                     return false;
-                }
-                if client
-                    .next_probe_timeout_deadline()
-                    .is_some_and(|timeout| timeout <= now)
-                {
-                    match client.poll_timeouts_at(now) {
-                        Ok(events) => self.publish_client_events(index, events),
-                        Err(error) => {
-                            self.targets[index].counters.packets_sent = client.packets_sent();
-                            cleanup_failure.get_or_insert_with(|| {
-                                classify_client_error(ManagedTargetFailurePhase::Timing, &error)
-                            });
-                            return self.begin_close(
-                                index,
-                                client,
-                                primary_end,
-                                cleanup_failure,
-                                now,
-                            );
-                        }
-                    }
                 }
                 if now >= deadline {
                     if received && post_deadline_receives_remaining > 1 {
@@ -798,12 +834,8 @@ impl ManagedClientTask {
             .unwrap_or(now)
             .max(now);
         let Some(deadline) = latest.checked_add(self.config.final_drain) else {
-            self.fail_target(
-                index,
-                ManagedTargetFailurePhase::Timing,
-                ClientError::DurationOverflow,
-            );
-            return false;
+            let cleanup_failure = Some(duration_overflow_failure());
+            return self.begin_close(index, client, primary_end, cleanup_failure, now);
         };
         self.install_target_state(
             index,
@@ -823,10 +855,13 @@ impl ManagedClientTask {
         index: usize,
         client: AsyncClient,
         primary_end: ManagedTargetEndReason,
-        cleanup_failure: Option<ManagedTargetFailure>,
+        mut cleanup_failure: Option<ManagedTargetFailure>,
         now: Instant,
     ) -> bool {
-        let deadline = now.checked_add(self.config.final_drain).unwrap_or(now);
+        let deadline = now.checked_add(self.config.final_drain).unwrap_or_else(|| {
+            cleanup_failure.get_or_insert_with(duration_overflow_failure);
+            now
+        });
         self.install_target_state(
             index,
             TargetState::Closing {
@@ -860,10 +895,7 @@ impl ManagedClientTask {
     }
 
     fn active_count(&self) -> usize {
-        self.targets
-            .iter()
-            .filter(|target| matches!(target.state, TargetState::Active { .. }))
-            .count()
+        self.targets.iter().filter(|target| target.active).count()
     }
 
     fn active_stagger_spacing(&self) -> Option<(usize, Duration)> {
@@ -880,6 +912,14 @@ impl ManagedClientTask {
             minimum = minimum.into_iter().chain(Some(interval)).min();
         }
         minimum.map(|interval| (active, stagger_spacing(interval, active)))
+    }
+
+    fn recompute_stagger_gate(&mut self, now: Instant) {
+        self.send_gate = self
+            .last_stagger_send
+            .zip(self.active_stagger_spacing())
+            .and_then(|(last, (_, spacing))| last.checked_add(spacing))
+            .filter(|gate| *gate > now);
     }
 
     fn poll_one_send(&mut self, index: usize, cx: &mut Context<'_>, now: Instant) -> SendResult {
@@ -952,6 +992,7 @@ impl ManagedClientTask {
             if !matches!(self.targets[index].state, TargetState::Active { .. }) {
                 continue;
             }
+            #[cfg(test)]
             let stagger_spacing = self.active_stagger_spacing();
             let result = self.poll_one_send(index, cx, now);
             if result == SendResult::NotAttempted {
@@ -959,13 +1000,15 @@ impl ManagedClientTask {
             }
             self.stagger_remaining = 0;
             if result.accepted() {
+                #[cfg(test)]
                 if let Some((_active, spacing)) = stagger_spacing {
-                    #[cfg(test)]
                     if let Some(observations) = &self.stagger_observations {
                         observations.lock().unwrap().push((_active, spacing));
                     }
-                    self.send_gate = Instant::now().checked_add(spacing);
                 }
+                let accepted_at = Instant::now();
+                self.last_stagger_send = Some(accepted_at);
+                self.recompute_stagger_gate(accepted_at);
             }
             return matches!(result, SendResult::Ready { .. } | SendResult::Failed { .. });
         }
@@ -1231,6 +1274,11 @@ fn build_task(
     if config.max_live_target_generations == 0 {
         return Err(ManagedConfigError::ZeroLiveGenerationLimit);
     }
+    if Instant::now().checked_add(config.final_drain).is_none() {
+        return Err(ManagedConfigError::UnschedulableFinalDrain {
+            duration: config.final_drain,
+        });
+    }
     if targets.len() > config.max_live_target_generations {
         return Err(ManagedConfigError::TooManyTargets {
             configured: targets.len(),
@@ -1273,6 +1321,7 @@ fn build_task(
             counters: TargetCounters::default(),
             latest_committed_timeout: None,
             send_waiting: false,
+            active: false,
             state: TargetState::Pending { client_config },
         });
     }
@@ -1337,6 +1386,7 @@ fn build_task(
         burst_remaining: 0,
         stagger_remaining: 0,
         send_gate: None,
+        last_stagger_send: None,
         stop_observed: false,
         final_outcome: None,
         _next_generation: next_generation,
@@ -1375,6 +1425,13 @@ fn stagger_spacing(interval: Duration, active_targets: usize) -> Duration {
     let seconds = u64::try_from(nanos / 1_000_000_000).unwrap_or(u64::MAX);
     let subsec = u32::try_from(nanos % 1_000_000_000).unwrap_or(999_999_999);
     Duration::new(seconds, subsec)
+}
+
+fn duration_overflow_failure() -> ManagedTargetFailure {
+    classify_client_error(
+        ManagedTargetFailurePhase::Timing,
+        &ClientError::DurationOverflow,
+    )
 }
 
 fn close_timeout_failure() -> ManagedTargetFailure {
