@@ -35,6 +35,7 @@ use super::{
 };
 
 const TARGET_WORK_BUDGET: usize = 128;
+const POST_DEADLINE_RECEIVE_BUDGET: usize = TARGET_WORK_BUDGET;
 
 /// Entry point for constructing a unified Tokio managed task.
 #[derive(Debug, Default)]
@@ -144,6 +145,8 @@ type ConnectFuture =
 type WakeFuture = Pin<Box<dyn Future<Output = Option<watch::Receiver<()>>> + Send + 'static>>;
 #[cfg(test)]
 type EventObservations = Arc<std::sync::Mutex<Vec<(ManagedEvent, Arc<ManagedStatus>)>>>;
+#[cfg(test)]
+type StaggerObservations = Arc<std::sync::Mutex<Vec<(usize, Duration)>>>;
 
 fn arm_wake(mut receiver: watch::Receiver<()>) -> WakeFuture {
     Box::pin(async move {
@@ -170,11 +173,14 @@ enum TargetState {
         client: AsyncClient,
         deadline: Instant,
         primary_end: ManagedTargetEndReason,
+        cleanup_failure: Option<ManagedTargetFailure>,
+        post_deadline_receives_remaining: usize,
     },
     Closing {
         client: AsyncClient,
         deadline: Instant,
         primary_end: ManagedTargetEndReason,
+        cleanup_failure: Option<ManagedTargetFailure>,
     },
     Terminal,
 }
@@ -317,6 +323,18 @@ pub struct ManagedClientTask {
     _next_generation: u64,
     #[cfg(test)]
     event_observations: Option<EventObservations>,
+    #[cfg(test)]
+    stagger_observations: Option<StaggerObservations>,
+    #[cfg(test)]
+    drain_test_hook: DrainTestHook,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct DrainTestHook {
+    defer_work_until_deadline: bool,
+    fail_receive: bool,
+    fail_close: bool,
 }
 
 impl ManagedClientTask {
@@ -616,7 +634,28 @@ impl ManagedClientTask {
                 mut client,
                 deadline,
                 primary_end,
+                mut cleanup_failure,
+                mut post_deadline_receives_remaining,
             } => {
+                #[cfg(test)]
+                let defer_work = self.drain_test_hook.defer_work_until_deadline && now < deadline;
+                #[cfg(not(test))]
+                let defer_work = false;
+                if defer_work {
+                    self.targets[index].state = TargetState::Draining {
+                        client,
+                        deadline,
+                        primary_end,
+                        cleanup_failure,
+                        post_deadline_receives_remaining,
+                    };
+                    return false;
+                }
+
+                #[cfg(test)]
+                let injected_receive_failure = self.take_drain_receive_failure();
+                #[cfg(not(test))]
+                let injected_receive_failure = None;
                 let received = match client.poll_recv(cx) {
                     Poll::Pending => false,
                     Poll::Ready(Ok(events)) => {
@@ -625,13 +664,22 @@ impl ManagedClientTask {
                     }
                     Poll::Ready(Err(error)) => {
                         self.targets[index].counters.packets_sent = client.packets_sent();
-                        self.fail_target(index, ManagedTargetFailurePhase::Receiving, error);
-                        return false;
+                        cleanup_failure.get_or_insert_with(|| {
+                            classify_client_error(ManagedTargetFailurePhase::Receiving, &error)
+                        });
+                        return self.begin_close(index, client, primary_end, cleanup_failure, now);
                     }
                 };
+                if let Some(error) = injected_receive_failure {
+                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    cleanup_failure.get_or_insert_with(|| {
+                        classify_client_error(ManagedTargetFailurePhase::Receiving, &error)
+                    });
+                    return self.begin_close(index, client, primary_end, cleanup_failure, now);
+                }
                 if client.is_peer_closed() {
                     self.targets[index].counters.packets_sent = client.packets_sent();
-                    self.finish_target(index, ManagedTargetEndReason::PeerClosed, None);
+                    self.finish_target(index, primary_end, cleanup_failure);
                     return false;
                 }
                 if client
@@ -642,27 +690,40 @@ impl ManagedClientTask {
                         Ok(events) => self.publish_client_events(index, events),
                         Err(error) => {
                             self.targets[index].counters.packets_sent = client.packets_sent();
-                            self.fail_target(index, ManagedTargetFailurePhase::Timing, error);
-                            return false;
+                            cleanup_failure.get_or_insert_with(|| {
+                                classify_client_error(ManagedTargetFailurePhase::Timing, &error)
+                            });
+                            return self.begin_close(
+                                index,
+                                client,
+                                primary_end,
+                                cleanup_failure,
+                                now,
+                            );
                         }
                     }
                 }
                 if now >= deadline {
-                    let close_deadline = now.checked_add(self.config.final_drain).unwrap_or(now);
-                    self.install_target_state(
-                        index,
-                        TargetState::Closing {
+                    if received && post_deadline_receives_remaining > 1 {
+                        post_deadline_receives_remaining -= 1;
+                        self.targets[index].state = TargetState::Draining {
                             client,
-                            deadline: close_deadline,
+                            deadline,
                             primary_end,
-                        },
-                    );
-                    true
+                            cleanup_failure,
+                            post_deadline_receives_remaining,
+                        };
+                        true
+                    } else {
+                        self.begin_close(index, client, primary_end, cleanup_failure, now)
+                    }
                 } else {
                     self.targets[index].state = TargetState::Draining {
                         client,
                         deadline,
                         primary_end,
+                        cleanup_failure,
+                        post_deadline_receives_remaining,
                     };
                     received
                 }
@@ -671,17 +732,23 @@ impl ManagedClientTask {
                 mut client,
                 deadline,
                 primary_end,
+                cleanup_failure,
             } => match client.poll_close(cx) {
                 Poll::Pending => {
                     if now >= deadline {
                         self.targets[index].counters.packets_sent = client.packets_sent();
-                        self.finish_target(index, primary_end, Some(close_timeout_failure()));
+                        self.finish_target(
+                            index,
+                            primary_end,
+                            cleanup_failure.or_else(|| Some(close_timeout_failure())),
+                        );
                         false
                     } else {
                         self.targets[index].state = TargetState::Closing {
                             client,
                             deadline,
                             primary_end,
+                            cleanup_failure,
                         };
                         false
                     }
@@ -689,13 +756,23 @@ impl ManagedClientTask {
                 Poll::Ready(Ok(events)) => {
                     self.targets[index].counters.packets_sent = client.packets_sent();
                     self.publish_client_events(index, events);
-                    self.finish_target(index, primary_end, None);
+                    #[cfg(test)]
+                    let injected_close_failure = self.take_drain_close_failure().map(|error| {
+                        classify_client_error(ManagedTargetFailurePhase::Closing, &error)
+                    });
+                    #[cfg(not(test))]
+                    let injected_close_failure = None;
+                    self.finish_target(
+                        index,
+                        primary_end,
+                        cleanup_failure.or(injected_close_failure),
+                    );
                     false
                 }
                 Poll::Ready(Err(error)) => {
                     self.targets[index].counters.packets_sent = client.packets_sent();
                     let cleanup = classify_client_error(ManagedTargetFailurePhase::Closing, &error);
-                    self.finish_target(index, primary_end, Some(cleanup));
+                    self.finish_target(index, primary_end, cleanup_failure.or(Some(cleanup)));
                     false
                 }
             },
@@ -734,9 +811,52 @@ impl ManagedClientTask {
                 client,
                 deadline,
                 primary_end,
+                cleanup_failure: None,
+                post_deadline_receives_remaining: POST_DEADLINE_RECEIVE_BUDGET,
             },
         );
         true
+    }
+
+    fn begin_close(
+        &mut self,
+        index: usize,
+        client: AsyncClient,
+        primary_end: ManagedTargetEndReason,
+        cleanup_failure: Option<ManagedTargetFailure>,
+        now: Instant,
+    ) -> bool {
+        let deadline = now.checked_add(self.config.final_drain).unwrap_or(now);
+        self.install_target_state(
+            index,
+            TargetState::Closing {
+                client,
+                deadline,
+                primary_end,
+                cleanup_failure,
+            },
+        );
+        true
+    }
+
+    #[cfg(test)]
+    fn take_drain_receive_failure(&mut self) -> Option<ClientError> {
+        if !mem::take(&mut self.drain_test_hook.fail_receive) {
+            return None;
+        }
+        Some(ClientError::Socket(std::io::Error::other(
+            "injected drain receive failure",
+        )))
+    }
+
+    #[cfg(test)]
+    fn take_drain_close_failure(&mut self) -> Option<ClientError> {
+        if !mem::take(&mut self.drain_test_hook.fail_close) {
+            return None;
+        }
+        Some(ClientError::Socket(std::io::Error::other(
+            "injected drain close failure",
+        )))
     }
 
     fn active_count(&self) -> usize {
@@ -744,6 +864,22 @@ impl ManagedClientTask {
             .iter()
             .filter(|target| matches!(target.state, TargetState::Active { .. }))
             .count()
+    }
+
+    fn active_stagger_spacing(&self) -> Option<(usize, Duration)> {
+        let mut active = 0;
+        let mut minimum: Option<Duration> = None;
+        for target in &self.targets {
+            let TargetState::Active { client } = &target.state else {
+                continue;
+            };
+            active += 1;
+            let interval = client
+                .probe_interval()
+                .expect("active managed targets have a committed probe schedule");
+            minimum = minimum.into_iter().chain(Some(interval)).min();
+        }
+        minimum.map(|interval| (active, stagger_spacing(interval, active)))
     }
 
     fn poll_one_send(&mut self, index: usize, cx: &mut Context<'_>, now: Instant) -> SendResult {
@@ -802,8 +938,7 @@ impl ManagedClientTask {
     }
 
     fn poll_staggered_send(&mut self, cx: &mut Context<'_>, now: Instant) -> bool {
-        let active = self.active_count();
-        if active == 0 || self.send_gate.is_some_and(|gate| gate > now) {
+        if self.active_count() == 0 || self.send_gate.is_some_and(|gate| gate > now) {
             return false;
         }
         if self.stagger_remaining == 0 {
@@ -817,14 +952,20 @@ impl ManagedClientTask {
             if !matches!(self.targets[index].state, TargetState::Active { .. }) {
                 continue;
             }
+            let stagger_spacing = self.active_stagger_spacing();
             let result = self.poll_one_send(index, cx, now);
             if result == SendResult::NotAttempted {
                 continue;
             }
             self.stagger_remaining = 0;
             if result.accepted() {
-                self.send_gate = Instant::now()
-                    .checked_add(stagger_spacing(self.config.client.interval, active));
+                if let Some((_active, spacing)) = stagger_spacing {
+                    #[cfg(test)]
+                    if let Some(observations) = &self.stagger_observations {
+                        observations.lock().unwrap().push((_active, spacing));
+                    }
+                    self.send_gate = Instant::now().checked_add(spacing);
+                }
             }
             return matches!(result, SendResult::Ready { .. } | SendResult::Failed { .. });
         }
@@ -894,9 +1035,17 @@ impl ManagedClientTask {
                 TargetState::Draining {
                     client, deadline, ..
                 } => {
+                    #[cfg(test)]
+                    let defer_work = self.drain_test_hook.defer_work_until_deadline;
+                    #[cfg(not(test))]
+                    let defer_work = false;
                     non_send_deadline = non_send_deadline
                         .into_iter()
-                        .chain(client.next_probe_timeout_deadline())
+                        .chain(
+                            (!defer_work)
+                                .then(|| client.next_probe_timeout_deadline())
+                                .flatten(),
+                        )
                         .chain(Some(*deadline))
                         .min();
                 }
@@ -1193,6 +1342,10 @@ fn build_task(
         _next_generation: next_generation,
         #[cfg(test)]
         event_observations: None,
+        #[cfg(test)]
+        stagger_observations: None,
+        #[cfg(test)]
+        drain_test_hook: DrainTestHook::default(),
     };
     let handle = ManagedClientHandle {
         stop,

@@ -15,7 +15,7 @@ use irtt_proto::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::*;
-use crate::{socket::resolution_call_counts, ClientAuthConfig, RunMode};
+use crate::{socket::resolution_call_counts, ClientAuthConfig, NegotiationPolicy, RunMode};
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -25,6 +25,7 @@ enum ServerBehavior {
     NoTest,
     PeerClose,
     DelayedEcho(Duration),
+    DeferredBurst(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -55,6 +56,14 @@ impl TestServer {
 }
 
 fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
+    start_server_negotiating(behavior, key, None)
+}
+
+fn start_server_negotiating(
+    behavior: ServerBehavior,
+    key: Option<Vec<u8>>,
+    interval: Option<Duration>,
+) -> TestServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
         .set_read_timeout(Some(Duration::from_secs(3)))
@@ -72,6 +81,10 @@ fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
             at: Instant::now(),
         });
         let request = decode_open_request(&buffer[..open_len], key.as_deref()).unwrap();
+        let mut negotiated = request.params.clone();
+        if let Some(interval) = interval {
+            negotiated.interval_ns = i64::try_from(interval.as_nanos()).unwrap();
+        }
         let no_test = matches!(behavior, ServerBehavior::NoTest);
         let open_reply = encode_open_reply(
             &OpenReply {
@@ -79,7 +92,7 @@ fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
                     | flags::FLAG_REPLY
                     | if no_test { flags::FLAG_CLOSE } else { 0 },
                 token: if no_test { 0 } else { TOKEN },
-                params: request.params.clone(),
+                params: negotiated.clone(),
             },
             key.as_deref(),
         )
@@ -89,12 +102,13 @@ fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
             return;
         }
 
+        let mut deferred_burst_sent = false;
         loop {
             let Ok((len, packet_peer)) = socket.recv_from(&mut buffer) else {
                 return;
             };
             let packet = &buffer[..len];
-            if let Ok(probe) = decode_echo_request(packet, &request.params, key.as_deref()) {
+            if let Ok(probe) = decode_echo_request(packet, &negotiated, key.as_deref()) {
                 thread_records.lock().unwrap().push(PacketRecord {
                     kind: PacketKind::Probe,
                     at: Instant::now(),
@@ -104,6 +118,35 @@ fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
                 ready.notify_all();
                 if let ServerBehavior::DelayedEcho(delay) = behavior {
                     thread::sleep(delay);
+                }
+                if let ServerBehavior::DeferredBurst(count) = behavior {
+                    if deferred_burst_sent {
+                        continue;
+                    }
+                    deferred_burst_sent = true;
+                    thread::sleep(Duration::from_millis(30));
+                    for reply_index in 0..count {
+                        let reply = encode_echo_reply(
+                            &EchoReply {
+                                flags: flags::FLAG_REPLY,
+                                token: TOKEN,
+                                sequence: if reply_index < 2 {
+                                    probe.sequence
+                                } else {
+                                    u32::MAX
+                                },
+                                recv_count: None,
+                                recv_window: None,
+                                timestamps: TimestampFields::default(),
+                                payload: Vec::new(),
+                            },
+                            &negotiated,
+                            key.as_deref(),
+                        )
+                        .unwrap();
+                        socket.send_to(&reply, packet_peer).unwrap();
+                    }
+                    continue;
                 }
                 let peer_close = matches!(behavior, ServerBehavior::PeerClose);
                 let reply = encode_echo_reply(
@@ -116,7 +159,7 @@ fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
                         timestamps: TimestampFields::default(),
                         payload: Vec::new(),
                     },
-                    &request.params,
+                    &negotiated,
                     key.as_deref(),
                 )
                 .unwrap();
@@ -221,6 +264,75 @@ fn assert_rotated_without_catchup(sends: &[(TargetInstance, u32, Instant, Instan
         assert!(target_sends.len() >= 2);
         assert!(target_sends[1].2 > target_sends[0].3);
     }
+}
+
+fn run_negotiated_stagger_case(
+    requested: Duration,
+    negotiated: &[Duration],
+) -> (Vec<(usize, Duration)>, Vec<u64>) {
+    let servers = negotiated
+        .iter()
+        .map(|interval| start_server_negotiating(ServerBehavior::Echo, None, Some(*interval)))
+        .collect::<Vec<_>>();
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.client.duration = Some(Duration::from_millis(190));
+    managed.client.interval = requested;
+    managed.client.negotiation_policy = NegotiationPolicy::Loose;
+    let targets = servers
+        .iter()
+        .enumerate()
+        .map(|(index, server)| target(&format!("target-{index}"), server.addr))
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.stagger_observations = Some(Arc::clone(&observations));
+    let outcome = runtime().block_on(task);
+    let packets_sent = (0..servers.len())
+        .map(|index| {
+            outcome
+                .recent_target_outcomes
+                .iter()
+                .find(|target| target.target.id.as_ref() == format!("target-{index}"))
+                .unwrap()
+                .packets_sent
+        })
+        .collect();
+    for server in servers {
+        server.finish();
+    }
+    let spacings = observations.lock().unwrap().clone();
+    (spacings, packets_sent)
+}
+
+fn run_deferred_drain_burst(packet_count: usize) -> ManagedOutcome {
+    let server = start_server(ServerBehavior::DeferredBurst(packet_count), None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.interval = Duration::from_millis(100);
+    managed.client.probe_timeout = Duration::from_millis(60);
+    managed.final_drain = Duration::from_millis(20);
+    let (mut task, handle) =
+        ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    task.drain_test_hook.defer_work_until_deadline = true;
+    let seen = Arc::clone(&server.probe_seen);
+    let stopper = thread::spawn(move || {
+        let (flag, ready) = &*seen;
+        let guard = flag.lock().unwrap();
+        let (guard, timeout) = ready
+            .wait_timeout_while(guard, Duration::from_secs(2), |seen| !*seen)
+            .unwrap();
+        assert!(*guard && !timeout.timed_out());
+        drop(handle.stop());
+    });
+    let outcome = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+    });
+    stopper.join().unwrap();
+    server.finish();
+    outcome
 }
 
 #[test]
@@ -447,6 +559,45 @@ fn staggered_pacing_fairness() {
 }
 
 #[test]
+fn staggered_pacing_uses_all_active_negotiated_intervals() {
+    let requested = Duration::from_millis(120);
+
+    let (single, single_packets) =
+        run_negotiated_stagger_case(requested, &[Duration::from_millis(40)]);
+    assert!(single
+        .iter()
+        .all(|entry| *entry == (1, Duration::from_millis(40))));
+    assert!(single_packets[0] >= 4);
+
+    let (different, different_packets) = run_negotiated_stagger_case(
+        requested,
+        &[Duration::from_millis(30), Duration::from_millis(90)],
+    );
+    let while_both_active = different
+        .iter()
+        .filter(|(active, _)| *active == 2)
+        .collect::<Vec<_>>();
+    assert!(!while_both_active.is_empty());
+    assert!(while_both_active
+        .iter()
+        .all(|(_, spacing)| *spacing == Duration::from_millis(15)));
+    assert!(different_packets[0] > different_packets[1]);
+
+    let (equal, _) = run_negotiated_stagger_case(
+        requested,
+        &[Duration::from_millis(60), Duration::from_millis(60)],
+    );
+    let while_both_active = equal
+        .iter()
+        .filter(|(active, _)| *active == 2)
+        .collect::<Vec<_>>();
+    assert!(!while_both_active.is_empty());
+    assert!(while_both_active
+        .iter()
+        .all(|(_, spacing)| *spacing == Duration::from_millis(30)));
+}
+
+#[test]
 fn committed_probe_graceful_drain() {
     let server = start_server(ServerBehavior::DelayedEcho(Duration::from_millis(25)), None);
     let mut config = config(ManagedPacing::Staggered);
@@ -478,6 +629,94 @@ fn committed_probe_graceful_drain() {
     assert_eq!(target.packets_sent, 1);
     assert_eq!(target.replies_received, 1);
     assert_eq!(probes(&records).len(), 1);
+}
+
+#[test]
+fn drain_failures_preserve_primary_outcome_and_first_cleanup_failure() {
+    let completed_server = start_server(ServerBehavior::Echo, None);
+    let (mut completed_task, _) = ManagedClient::task(
+        config(ManagedPacing::Staggered),
+        vec![target("completed", completed_server.addr)],
+    )
+    .unwrap();
+    completed_task.drain_test_hook.fail_receive = true;
+    completed_task.drain_test_hook.fail_close = true;
+    let completed = runtime().block_on(completed_task);
+    let completed_target = &completed.recent_target_outcomes[0];
+    assert!(matches!(
+        completed_target.end_reason,
+        ManagedTargetEndReason::TestComplete
+    ));
+    assert_eq!(completed.failed_target_outcomes, 0);
+    assert!(matches!(
+        completed_target.cleanup_failure,
+        Some(ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Receiving,
+            kind: ManagedTargetFailureKind::Socket,
+            ..
+        })
+    ));
+    completed_server.finish();
+
+    let stopped_server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (mut stopped_task, handle) =
+        ManagedClient::task(managed, vec![target("stopped", stopped_server.addr)]).unwrap();
+    stopped_task.drain_test_hook.fail_receive = true;
+    let seen = Arc::clone(&stopped_server.probe_seen);
+    let stopper = thread::spawn(move || {
+        let (flag, ready) = &*seen;
+        let guard = flag.lock().unwrap();
+        let (guard, timeout) = ready
+            .wait_timeout_while(guard, Duration::from_secs(2), |seen| !*seen)
+            .unwrap();
+        assert!(*guard && !timeout.timed_out());
+        drop(handle.stop());
+    });
+    let stopped = runtime().block_on(stopped_task);
+    stopper.join().unwrap();
+    let stopped_target = &stopped.recent_target_outcomes[0];
+    assert!(matches!(
+        stopped_target.end_reason,
+        ManagedTargetEndReason::Stopped
+    ));
+    assert_eq!(stopped.failed_target_outcomes, 0);
+    assert!(matches!(
+        stopped_target.cleanup_failure,
+        Some(ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Receiving,
+            kind: ManagedTargetFailureKind::Socket,
+            ..
+        })
+    ));
+    stopped_server.finish();
+}
+
+#[test]
+fn post_deadline_receive_sweep_drains_queued_packets_and_is_bounded() {
+    let drained = run_deferred_drain_burst(3);
+    let drained_target = &drained.recent_target_outcomes[0];
+    assert!(matches!(
+        drained_target.end_reason,
+        ManagedTargetEndReason::Stopped
+    ));
+    assert_eq!(drained_target.replies_received, 1);
+    assert_eq!(drained_target.duplicates, 1);
+    assert_eq!(drained_target.late, 1);
+
+    let bounded = run_deferred_drain_burst(POST_DEADLINE_RECEIVE_BUDGET + 64);
+    let bounded_target = &bounded.recent_target_outcomes[0];
+    assert!(matches!(
+        bounded_target.end_reason,
+        ManagedTargetEndReason::Stopped
+    ));
+    assert_eq!(
+        bounded_target.replies_received + bounded_target.duplicates + bounded_target.late,
+        u64::try_from(POST_DEADLINE_RECEIVE_BUDGET).unwrap()
+    );
+    assert_eq!(bounded.failed_target_outcomes, 0);
 }
 
 #[test]

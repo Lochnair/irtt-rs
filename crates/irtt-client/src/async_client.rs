@@ -663,6 +663,13 @@ impl AsyncClient {
         self.schedule.as_ref()?.next_send_deadline()
     }
 
+    pub(crate) fn probe_interval(&self) -> Option<Duration> {
+        if !self.machine.is_open() {
+            return None;
+        }
+        self.schedule.as_ref().map(ProbeSchedule::interval)
+    }
+
     /// Return the configured local probe timeout.
     pub fn probe_timeout(&self) -> Duration {
         self.machine.probe_timeout()
