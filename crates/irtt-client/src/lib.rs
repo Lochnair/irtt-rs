@@ -51,6 +51,8 @@
 )]
 #![cfg_attr(all(target_os = "linux", feature = "ancillary"), deny(unsafe_code))]
 
+#[cfg(feature = "tokio")]
+mod async_client;
 mod client;
 mod config;
 mod error;
@@ -64,6 +66,8 @@ mod socket;
 mod socket_options;
 mod timing;
 
+#[cfg(feature = "tokio")]
+pub use async_client::AsyncClient;
 pub use client::Client;
 pub use config::{
     ClientAuthConfig, ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig,
