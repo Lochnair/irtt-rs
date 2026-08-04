@@ -446,15 +446,6 @@ impl SessionMachine {
         commit.event
     }
 
-    pub(crate) fn close_with<F>(&mut self, send: F) -> Result<Vec<ClientEvent>, ClientError>
-    where
-        F: FnOnce(&[u8]) -> Result<(), ClientError>,
-    {
-        let prepared = self.prepare_close()?;
-        send(prepared.bytes)?;
-        Ok(vec![self.commit_local_close(prepared.commit)])
-    }
-
     pub(crate) fn pending_is_empty(&self) -> bool {
         match &self.state {
             MachineState::Open(session) => session.pending.len() == 0,
