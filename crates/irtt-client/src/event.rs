@@ -94,11 +94,13 @@ pub enum ClientEvent {
         remote: SocketAddr,
         /// Monotonic deadline at which the probe was scheduled to be sent.
         scheduled_at: Instant,
-        /// Client wall/monotonic timestamp captured for the send.
+        /// Client wall/monotonic timestamp captured after probe preparation,
+        /// immediately before timeout finalization and the socket send.
         sent_at: ClientTimestamp,
         /// Number of bytes passed to the UDP socket.
         bytes: usize,
-        /// Elapsed time spent in the socket send call.
+        /// Elapsed time spent in the socket send call, excluding protocol and
+        /// scheduler commit work.
         send_call: Duration,
         /// Absolute difference between the scheduled send time and actual send
         /// timestamp.

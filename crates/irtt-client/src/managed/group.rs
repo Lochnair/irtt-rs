@@ -14,7 +14,7 @@ use std::{
 use crate::{
     client::{
         echo_sent_event,
-        schedule::{advance_cadence, ProbeSchedule},
+        schedule::{advance_cadence, instant_abs_diff, ProbeSchedule},
         validate_datagram_length,
     },
     config::{ClientAuthConfig, ClientConfig},
@@ -27,6 +27,9 @@ use crate::{
     socket_options::apply_dscp_to_socket,
     timing::ClientTimestamp,
 };
+
+#[cfg(test)]
+use crate::client::ProbeSendTimestamps;
 
 use super::{
     cancellation::CancellationToken,
@@ -641,6 +644,8 @@ struct TargetState {
     probe_reported_len: Option<usize>,
     #[cfg(test)]
     probe_send_error: bool,
+    #[cfg(test)]
+    probe_send_timestamps: Option<ProbeSendTimestamps>,
 }
 
 type ScheduledTarget = (Arc<Mutex<TargetState>>, Instant);
@@ -739,6 +744,8 @@ impl TargetState {
             probe_reported_len: None,
             #[cfg(test)]
             probe_send_error: false,
+            #[cfg(test)]
+            probe_send_timestamps: None,
         })
     }
 
@@ -1344,17 +1351,29 @@ fn send_echo_to_locked_target(
     target: &mut TargetState,
     scheduled_at: Instant,
 ) -> Result<Vec<ClientEvent>, ClientError> {
-    send_echo_to_locked_target_at(socket, target, scheduled_at, ClientTimestamp::now())
+    send_echo_to_locked_target_inner(socket, target, scheduled_at)
 }
 
+#[cfg(test)]
 fn send_echo_to_locked_target_at(
     socket: &UdpSocket,
     target: &mut TargetState,
     scheduled_at: Instant,
-    sent_at: ClientTimestamp,
+    timestamps: ProbeSendTimestamps,
+) -> Result<Vec<ClientEvent>, ClientError> {
+    target.probe_send_timestamps = Some(timestamps);
+    send_echo_to_locked_target_inner(socket, target, scheduled_at)
+}
+
+fn send_echo_to_locked_target_inner(
+    socket: &UdpSocket,
+    target: &mut TargetState,
+    scheduled_at: Instant,
 ) -> Result<Vec<ClientEvent>, ClientError> {
     target.runtime.ensure_open()?;
     let remote = target.remote;
+    #[cfg(test)]
+    let test_timestamps = target.probe_send_timestamps.take();
     #[cfg(test)]
     let reported_bytes = target.probe_reported_len.take();
     #[cfg(test)]
@@ -1365,15 +1384,21 @@ fn send_echo_to_locked_target_at(
     let schedule = schedule
         .as_mut()
         .expect("active targets always have a probe schedule");
-    if !schedule.permit_probe_at(sent_at.mono) {
+    #[cfg(not(test))]
+    let permission_at = Instant::now();
+    #[cfg(test)]
+    let permission_at = test_timestamps
+        .map(|timestamps| timestamps.permission_at)
+        .unwrap_or_else(Instant::now);
+    if !schedule.permit_probe_at(permission_at) {
         return Ok(Vec::new());
     }
 
     let Some(prepared) = runtime.prepare_probe()? else {
         return Ok(Vec::new());
     };
-    let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at)?;
-    let schedule_commit = schedule.preflight_managed_commit(scheduled_at, sent_at.mono)?;
+    let machine_preflight = runtime.preflight_probe_commit(&prepared)?;
+    let schedule_commit = schedule.preflight_managed_commit(scheduled_at, permission_at)?;
     let mut events = Vec::new();
     events
         .try_reserve(1)
@@ -1384,19 +1409,37 @@ fn send_echo_to_locked_target_at(
 
     let expected_bytes = prepared.bytes.len();
     let event_scheduled_at = schedule_commit.scheduled_at;
-    let timer_error = schedule_commit.timer_error;
+    #[cfg(not(test))]
+    let sent_at = ClientTimestamp::now();
+    #[cfg(test)]
+    let sent_at = test_timestamps
+        .map(|timestamps| timestamps.sent_at)
+        .unwrap_or_else(ClientTimestamp::now);
+    let machine_commit = runtime.finalize_probe_commit(machine_preflight, sent_at)?;
+    #[cfg(not(test))]
+    let send_call_start = Instant::now();
+    #[cfg(test)]
+    let send_call_start = test_timestamps
+        .map(|timestamps| timestamps.send_call_start)
+        .unwrap_or_else(Instant::now);
     #[cfg(test)]
     if fail_send {
         return Err(ClientError::Socket(std::io::Error::other(
             "injected managed probe send failure",
         )));
     }
-    let send_call_start = Instant::now();
     let bytes = socket.send_to(&prepared.bytes, remote)?;
+    #[cfg(not(test))]
+    let send_finished_at = Instant::now();
+    #[cfg(test)]
+    let send_finished_at = test_timestamps
+        .map(|timestamps| timestamps.send_finished_at)
+        .unwrap_or_else(Instant::now);
     let sent = runtime.commit_probe_sent(machine_commit, bytes);
     schedule.commit(schedule_commit);
 
-    let send_call = send_call_start.elapsed();
+    let send_call = send_finished_at.saturating_duration_since(send_call_start);
+    let timer_error = instant_abs_diff(sent_at.mono, event_scheduled_at);
     #[cfg(test)]
     let bytes = reported_bytes.unwrap_or(bytes);
     validate_datagram_length(expected_bytes, bytes)?;
@@ -1812,6 +1855,15 @@ mod tests {
 
     const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
+    fn probe_timestamps(permission_at: Instant, sent_at: ClientTimestamp) -> ProbeSendTimestamps {
+        ProbeSendTimestamps {
+            permission_at,
+            sent_at,
+            send_call_start: sent_at.mono,
+            send_finished_at: sent_at.mono,
+        }
+    }
+
     #[derive(Debug)]
     struct FakeServer {
         addr: SocketAddr,
@@ -1922,14 +1974,17 @@ mod tests {
             let schedule = schedule.as_mut().unwrap();
             assert!(schedule.permit_probe_at(sent_at.mono));
             let prepared = runtime.prepare_probe().unwrap().unwrap();
-            let machine_commit = runtime.preflight_probe_commit(&prepared, sent_at).unwrap();
+            let machine_preflight = runtime.preflight_probe_commit(&prepared).unwrap();
             let schedule_commit = schedule
                 .preflight_managed_commit(scheduled_at, sent_at.mono)
                 .unwrap();
             let event_scheduled_at = schedule_commit.scheduled_at;
-            let timer_error = schedule_commit.timer_error;
+            let machine_commit = runtime
+                .finalize_probe_commit(machine_preflight, sent_at)
+                .unwrap();
             let sent = runtime.commit_probe_sent(machine_commit, prepared.bytes.len());
             schedule.commit(schedule_commit);
+            let timer_error = instant_abs_diff(sent_at.mono, event_scheduled_at);
             vec![echo_sent_event(
                 remote,
                 sent,
@@ -2975,7 +3030,7 @@ mod tests {
     }
 
     #[test]
-    fn group_probe_uses_one_timestamp_for_permission_and_schedule_commit() {
+    fn group_probe_separates_permission_committed_send_and_send_call_timing() {
         let duration = Duration::from_secs(1);
         let interval = Duration::from_millis(100);
         let params = test_params(Some(duration), interval);
@@ -2990,25 +3045,34 @@ mod tests {
             mono: opened_mono,
         };
         let mut target = active_probe_target(&config, &params, remote, opened_at);
+        let permission_at = opened_mono + Duration::from_millis(500);
         let sent_at = ClientTimestamp {
             wall: std::time::SystemTime::now(),
-            mono: opened_mono + Duration::from_millis(500),
+            mono: opened_mono + Duration::from_millis(525),
+        };
+        let timestamps = ProbeSendTimestamps {
+            permission_at,
+            sent_at,
+            send_call_start: opened_mono + Duration::from_millis(526),
+            send_finished_at: opened_mono + Duration::from_millis(533),
         };
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
 
         let events =
-            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at).unwrap();
+            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, timestamps).unwrap();
 
         assert!(matches!(
             events.as_slice(),
             [ClientEvent::EchoSent {
                 scheduled_at,
                 sent_at: event_sent_at,
+                send_call,
                 timer_error,
                 ..
-            }] if *scheduled_at == sent_at.mono
+            }] if *scheduled_at == permission_at
                 && *event_sent_at == sent_at
-                && *timer_error == Duration::ZERO
+                && *send_call == Duration::from_millis(7)
+                && *timer_error == Duration::from_millis(25)
         ));
         assert_eq!(
             target
@@ -3018,6 +3082,19 @@ mod tests {
             Some(opened_mono + Duration::from_millis(600))
         );
         assert_eq!(target.runtime.packets_sent(), 1);
+        let timeout_at = sent_at.mono + target.runtime.probe_timeout();
+        assert!(target
+            .runtime
+            .poll_timeouts_at(timeout_at - Duration::from_nanos(1))
+            .unwrap()
+            .is_empty());
+        assert!(matches!(
+            target.runtime.poll_timeouts_at(timeout_at).unwrap().as_slice(),
+            [ClientEvent::EchoLoss {
+                sent_at: loss_sent_at,
+                ..
+            }] if *loss_sent_at == sent_at
+        ));
     }
 
     #[test]
@@ -3044,7 +3121,12 @@ mod tests {
         target.probe_send_error = true;
 
         assert!(matches!(
-            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at),
+            send_echo_to_locked_target_at(
+                &socket,
+                &mut target,
+                opened_mono,
+                probe_timestamps(sent_at.mono, sent_at),
+            ),
             Err(ClientError::Socket(_))
         ));
         assert_eq!(target.runtime.packets_sent(), 0);
@@ -3057,9 +3139,14 @@ mod tests {
         );
 
         assert!(matches!(
-            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at)
-                .unwrap()
-                .as_slice(),
+            send_echo_to_locked_target_at(
+                &socket,
+                &mut target,
+                opened_mono,
+                probe_timestamps(sent_at.mono, sent_at),
+            )
+            .unwrap()
+            .as_slice(),
             [ClientEvent::EchoSent { seq: 0, .. }]
         ));
     }
@@ -3089,7 +3176,12 @@ mod tests {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
 
         assert!(matches!(
-            send_echo_to_locked_target_at(&socket, &mut target, opened_mono, sent_at),
+            send_echo_to_locked_target_at(
+                &socket,
+                &mut target,
+                opened_mono,
+                probe_timestamps(sent_at.mono, sent_at),
+            ),
             Err(ClientError::DatagramLengthMismatch {
                 expected: error_expected,
                 actual,

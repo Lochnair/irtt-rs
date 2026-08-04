@@ -68,10 +68,17 @@ pub(crate) struct PreparedProbe {
 }
 
 #[derive(Debug)]
+pub(crate) struct ProbeCommitPreflight {
+    seq: u32,
+    next_wire_seq: u32,
+    pub(crate) next_packets_sent: u64,
+}
+
+#[derive(Debug)]
 pub(crate) struct ProbeCommit {
     pending: PendingProbe,
     next_wire_seq: u32,
-    pub(crate) next_packets_sent: u64,
+    next_packets_sent: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -193,9 +200,7 @@ impl SessionMachine {
     pub(crate) fn preflight_probe_commit(
         &mut self,
         prepared: &PreparedProbe,
-        sent_at: ClientTimestamp,
-    ) -> Result<ProbeCommit, ClientError> {
-        let probe_timeout = self.config.probe_timeout;
+    ) -> Result<ProbeCommitPreflight, ClientError> {
         let session = self.open_session_mut()?;
         if prepared.seq != session.next_wire_seq {
             return Err(ClientError::StalePreparedProbe {
@@ -211,19 +216,31 @@ impl SessionMachine {
                 .ok_or(ClientError::CounterOverflow {
                     counter: "packets_sent",
                 })?;
+        Ok(ProbeCommitPreflight {
+            seq: prepared.seq,
+            next_wire_seq: prepared.seq.wrapping_add(1),
+            next_packets_sent,
+        })
+    }
+
+    pub(crate) fn finalize_probe_commit(
+        &self,
+        preflight: ProbeCommitPreflight,
+        sent_at: ClientTimestamp,
+    ) -> Result<ProbeCommit, ClientError> {
         let timeout_at = sent_at
             .mono
-            .checked_add(probe_timeout)
+            .checked_add(self.config.probe_timeout)
             .ok_or(ClientError::DurationOverflow)?;
 
         Ok(ProbeCommit {
             pending: PendingProbe {
-                wire_seq: prepared.seq,
+                wire_seq: preflight.seq,
                 sent_at,
                 timeout_at,
             },
-            next_wire_seq: prepared.seq.wrapping_add(1),
-            next_packets_sent,
+            next_wire_seq: preflight.next_wire_seq,
+            next_packets_sent: preflight.next_packets_sent,
         })
     }
 
@@ -813,6 +830,22 @@ fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientE
 }
 
 #[cfg(test)]
+impl SessionMachine {
+    pub(crate) fn seed_wrapped_probe_history_for_test(&mut self, now: ClientTimestamp) {
+        let session = self
+            .open_session_mut()
+            .expect("wrapped probe history requires an open session");
+        session.next_wire_seq = 0;
+        session.timed_out.insert(PendingProbe {
+            wire_seq: 0,
+            sent_at: now,
+            timeout_at: now.mono,
+        });
+        session.completed.insert(0);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::client::{schedule::ProbeSchedule, validate_datagram_length};
@@ -880,10 +913,9 @@ mod tests {
     fn repeated_uncommitted_preflight_changes_no_logical_state() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let prepared = machine.prepare_probe().unwrap().unwrap();
-        let sent_at = timestamp(Instant::now());
 
-        let _first_preflight = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
-        let _second_preflight = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        let _first_preflight = machine.preflight_probe_commit(&prepared).unwrap();
+        let _second_preflight = machine.preflight_probe_commit(&prepared).unwrap();
 
         let session = active(&machine);
         assert_eq!(session.next_wire_seq, 0);
@@ -897,12 +929,13 @@ mod tests {
         let stale = machine.prepare_probe().unwrap().unwrap();
         let accepted = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(Instant::now());
-        let commit = machine.preflight_probe_commit(&accepted, sent_at).unwrap();
+        let preflight = machine.preflight_probe_commit(&accepted).unwrap();
+        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         machine.commit_probe_sent(commit, accepted.bytes.len());
 
         let capacity = active(&machine).pending.capacity();
         assert!(matches!(
-            machine.preflight_probe_commit(&stale, sent_at),
+            machine.preflight_probe_commit(&stale),
             Err(ClientError::StalePreparedProbe {
                 prepared_seq: 0,
                 next_wire_seq: 1,
@@ -924,9 +957,12 @@ mod tests {
         assert!(schedule.permit_probe_at(start));
         let prepared = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(start);
-        let machine_commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        let machine_preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let schedule_commit = schedule
-            .preflight_caller_commit(sent_at.mono, machine_commit.next_packets_sent)
+            .preflight_caller_commit(machine_preflight.next_packets_sent)
+            .unwrap();
+        let machine_commit = machine
+            .finalize_probe_commit(machine_preflight, sent_at)
             .unwrap();
 
         let _uncommitted_machine = machine_commit;
@@ -946,8 +982,9 @@ mod tests {
         let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
         assert!(schedule.permit_probe_at(start));
         let prepared = machine.prepare_probe().unwrap().unwrap();
+        let machine_preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let machine_commit = machine
-            .preflight_probe_commit(&prepared, timestamp(start))
+            .finalize_probe_commit(machine_preflight, timestamp(start))
             .unwrap();
         let schedule_commit = schedule.preflight_managed_commit(start, start).unwrap();
         let expected = prepared.bytes.len();
@@ -979,9 +1016,11 @@ mod tests {
         let sent_at = timestamp(Instant::now());
 
         for _ in 0..3 {
-            let _would_block_commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+            let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+            let _would_block_commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         }
-        let commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         let sent = machine.commit_probe_sent(commit, prepared.bytes.len());
 
         assert_eq!(sent.seq, 0);
@@ -996,7 +1035,13 @@ mod tests {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let prepared = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(Instant::now());
-        let commit = machine.preflight_probe_commit(&prepared, sent_at).unwrap();
+        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
+        assert_eq!(commit.pending.sent_at, sent_at);
+        assert_eq!(
+            commit.pending.timeout_at,
+            sent_at.mono + Duration::from_secs(1)
+        );
 
         let sent = machine.commit_probe_sent(commit, prepared.bytes.len());
 
@@ -1006,14 +1051,36 @@ mod tests {
     }
 
     #[test]
+    fn dropping_preflight_or_finalized_commit_changes_no_authoritative_state() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        {
+            let _preflight = machine.preflight_probe_commit(&prepared).unwrap();
+        }
+        {
+            let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+            let _commit = machine
+                .finalize_probe_commit(preflight, timestamp(Instant::now()))
+                .unwrap();
+        }
+
+        let session = active(&machine);
+        assert_eq!(session.next_wire_seq, 0);
+        assert_eq!(session.packets_sent, 0);
+        assert_eq!(session.pending.len(), 0);
+    }
+
+    #[test]
     fn commit_uses_reserved_capacity_and_prevalidated_counter() {
         let mut machine = open_machine(2, Duration::from_secs(1));
         active_mut(&mut machine).packets_sent = u64::MAX - 1;
         let prepared = machine.prepare_probe().unwrap().unwrap();
-        let commit = machine
-            .preflight_probe_commit(&prepared, timestamp(Instant::now()))
-            .unwrap();
+        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let reserved_capacity = active(&machine).pending.capacity();
+        assert_eq!(preflight.next_packets_sent, u64::MAX);
+        let commit = machine
+            .finalize_probe_commit(preflight, timestamp(Instant::now()))
+            .unwrap();
 
         machine.commit_probe_sent(commit, prepared.bytes.len());
 
@@ -1029,12 +1096,13 @@ mod tests {
         let mut machine = open_machine(1, Duration::from_secs(1));
         let first = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(Instant::now());
-        let commit = machine.preflight_probe_commit(&first, sent_at).unwrap();
+        let preflight = machine.preflight_probe_commit(&first).unwrap();
+        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         machine.commit_probe_sent(commit, first.bytes.len());
 
         let second = machine.prepare_probe().unwrap().unwrap();
         assert!(matches!(
-            machine.preflight_probe_commit(&second, sent_at),
+            machine.preflight_probe_commit(&second),
             Err(ClientError::PendingLimitExceeded { limit: 1 })
         ));
         assert_eq!(active(&machine).packets_sent, 1);
@@ -1045,13 +1113,14 @@ mod tests {
         let mut machine = open_machine(2, Duration::from_secs(1));
         let first = machine.prepare_probe().unwrap().unwrap();
         let sent_at = timestamp(Instant::now());
-        let commit = machine.preflight_probe_commit(&first, sent_at).unwrap();
+        let preflight = machine.preflight_probe_commit(&first).unwrap();
+        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         machine.commit_probe_sent(commit, first.bytes.len());
         active_mut(&mut machine).next_wire_seq = 0;
 
         let reused = machine.prepare_probe().unwrap().unwrap();
         assert!(matches!(
-            machine.preflight_probe_commit(&reused, sent_at),
+            machine.preflight_probe_commit(&reused),
             Err(ClientError::PendingSequenceCollision { seq: 0 })
         ));
         assert_eq!(active(&machine).packets_sent, 1);
@@ -1064,7 +1133,7 @@ mod tests {
         let prepared = machine.prepare_probe().unwrap().unwrap();
 
         assert!(matches!(
-            machine.preflight_probe_commit(&prepared, timestamp(Instant::now())),
+            machine.preflight_probe_commit(&prepared),
             Err(ClientError::CounterOverflow {
                 counter: "packets_sent"
             })
@@ -1076,9 +1145,10 @@ mod tests {
     fn timeout_overflow_is_detected_before_commit() {
         let mut machine = open_machine(2, Duration::MAX);
         let prepared = machine.prepare_probe().unwrap().unwrap();
+        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
 
         assert!(matches!(
-            machine.preflight_probe_commit(&prepared, timestamp(Instant::now())),
+            machine.finalize_probe_commit(preflight, timestamp(Instant::now())),
             Err(ClientError::DurationOverflow)
         ));
         assert_eq!(active(&machine).pending.len(), 0);
@@ -1089,8 +1159,9 @@ mod tests {
         let mut machine = open_machine(2, Duration::from_secs(1));
         active_mut(&mut machine).next_wire_seq = u32::MAX;
         let prepared = machine.prepare_probe().unwrap().unwrap();
+        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine
-            .preflight_probe_commit(&prepared, timestamp(Instant::now()))
+            .finalize_probe_commit(preflight, timestamp(Instant::now()))
             .unwrap();
         machine.commit_probe_sent(commit, prepared.bytes.len());
 
@@ -1113,8 +1184,9 @@ mod tests {
         session.completed.insert(0);
 
         let prepared = machine.prepare_probe().unwrap().unwrap();
+        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine
-            .preflight_probe_commit(&prepared, timestamp(now))
+            .finalize_probe_commit(preflight, timestamp(now))
             .unwrap();
         assert!(active(&machine).timed_out.contains(0));
         assert!(active(&machine).completed.contains(0));

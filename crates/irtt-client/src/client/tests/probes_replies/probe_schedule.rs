@@ -1,5 +1,14 @@
 use super::*;
 
+fn probe_timestamps(permission_at: Instant, sent_at: ClientTimestamp) -> ProbeSendTimestamps {
+    ProbeSendTimestamps {
+        permission_at,
+        sent_at,
+        send_call_start: sent_at.mono,
+        send_finished_at: sent_at.mono,
+    }
+}
+
 #[test]
 fn send_probe_fails_before_open() {
     let server = start_fake_server(|_socket, _tx| {});
@@ -103,7 +112,40 @@ fn blocking_failed_probe_send_preserves_machine_and_schedule() {
 }
 
 #[test]
-fn blocking_probe_uses_one_timestamp_for_permission_and_schedule_commit() {
+fn blocking_timeout_finalization_overflow_does_not_send_or_commit() {
+    let params = default_params();
+    let server = silent_open_server(params);
+    let config = ClientConfig {
+        probe_timeout: Duration::MAX,
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let initial_deadline = client.next_send_deadline().unwrap();
+    let sent_at = ClientTimestamp {
+        mono: Instant::now(),
+        wall: SystemTime::now(),
+    };
+
+    assert!(matches!(
+        client.send_probe_at(probe_timestamps(initial_deadline, sent_at)),
+        Err(ClientError::DurationOverflow)
+    ));
+    assert_eq!(client.runtime.packets_sent(), 0);
+    assert_eq!(client.next_send_deadline(), Some(initial_deadline));
+    thread::sleep(Duration::from_millis(30));
+    assert!(server
+        .rx
+        .try_iter()
+        .all(|packet| packet.len() >= 4 && packet[3] & FLAG_OPEN != 0));
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
+fn blocking_probe_separates_permission_committed_send_and_send_call_timing() {
     let duration = Duration::from_secs(1);
     let interval = Duration::from_millis(100);
     let params = Params {
@@ -133,26 +175,83 @@ fn blocking_probe_uses_one_timestamp_for_permission_and_schedule_commit() {
         )
         .unwrap(),
     );
+    let permission_at = opened_mono + Duration::from_millis(500);
     let sent_at = ClientTimestamp {
         wall: SystemTime::now(),
-        mono: opened_mono + Duration::from_millis(500),
+        mono: opened_mono + Duration::from_millis(525),
+    };
+    let timestamps = ProbeSendTimestamps {
+        permission_at,
+        sent_at,
+        send_call_start: opened_mono + Duration::from_millis(526),
+        send_finished_at: opened_mono + Duration::from_millis(533),
     };
 
-    let events = client.send_probe_at(sent_at).unwrap();
+    let events = client.send_probe_at(timestamps).unwrap();
 
     assert!(matches!(
         events.as_slice(),
         [ClientEvent::EchoSent {
             scheduled_at,
             sent_at: event_sent_at,
+            send_call,
             timer_error,
             ..
         }] if *scheduled_at == opened_mono
             && *event_sent_at == sent_at
-            && *timer_error == Duration::from_millis(500)
+            && *send_call == Duration::from_millis(7)
+            && *timer_error == Duration::from_millis(525)
     ));
     assert_eq!(client.next_send_deadline(), Some(opened_mono + interval));
     assert_eq!(client.runtime.packets_sent(), 1);
+    let timeout_at = sent_at.mono + client.probe_timeout();
+    assert!(client
+        .poll_timeouts_at(timeout_at - Duration::from_nanos(1))
+        .unwrap()
+        .is_empty());
+    assert!(matches!(
+        client.poll_timeouts_at(timeout_at).unwrap().as_slice(),
+        [ClientEvent::EchoLoss {
+            sent_at: loss_sent_at,
+            ..
+        }] if *loss_sent_at == sent_at
+    ));
+
+    client.close().unwrap();
+    server.join();
+}
+
+#[test]
+fn blocking_send_call_excludes_wrapped_history_cleanup() {
+    let params = default_params();
+    let server = silent_open_server(params);
+    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    assert_open_started(client.open().unwrap());
+
+    let scheduled_at = client.next_send_deadline().unwrap();
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::now(),
+        mono: scheduled_at + Duration::from_millis(5),
+    };
+    client.runtime.seed_wrapped_probe_history_for_test(sent_at);
+    let timestamps = ProbeSendTimestamps {
+        permission_at: scheduled_at,
+        sent_at,
+        send_call_start: scheduled_at + Duration::from_millis(6),
+        send_finished_at: scheduled_at + Duration::from_millis(13),
+    };
+
+    let events = client.send_probe_at(timestamps).unwrap();
+
+    assert!(matches!(
+        events.as_slice(),
+        [ClientEvent::EchoSent {
+            seq: 0,
+            send_call,
+            ..
+        }] if *send_call == Duration::from_millis(7)
+    ));
+    assert!(!client.runtime.has_timed_out_metadata());
 
     client.close().unwrap();
     server.join();
@@ -189,19 +288,25 @@ fn send_probe_respects_finite_duration_exclusive_end() {
         mono: start,
         wall: SystemTime::now(),
     };
-    assert!(client.send_probe_at(now0).is_ok());
+    assert!(client
+        .send_probe_at(probe_timestamps(now0.mono, now0))
+        .is_ok());
 
     let now1 = ClientTimestamp {
         mono: start + interval,
         wall: SystemTime::now(),
     };
-    assert!(client.send_probe_at(now1).is_ok());
+    assert!(client
+        .send_probe_at(probe_timestamps(now1.mono, now1))
+        .is_ok());
 
     let now2 = ClientTimestamp {
         mono: start + Duration::from_secs(1),
         wall: SystemTime::now(),
     };
-    let events = client.send_probe_at(now2).unwrap();
+    let events = client
+        .send_probe_at(probe_timestamps(now2.mono, now2))
+        .unwrap();
     assert!(events.is_empty());
     assert!(client.next_send_deadline().is_none());
 
@@ -231,12 +336,19 @@ fn managed_probe_skips_missed_schedule_slots() {
     assert_open_started(client.open().unwrap());
 
     let first_deadline = client.next_send_deadline().unwrap();
+    let permission_at = first_deadline + Duration::from_millis(45);
     let delayed_send = ClientTimestamp {
-        mono: first_deadline + Duration::from_millis(45),
+        mono: first_deadline + Duration::from_millis(48),
         wall: SystemTime::now(),
     };
+    let timestamps = ProbeSendTimestamps {
+        permission_at,
+        sent_at: delayed_send,
+        send_call_start: first_deadline + Duration::from_millis(49),
+        send_finished_at: first_deadline + Duration::from_millis(55),
+    };
     let events = client
-        .send_managed_probe_at(first_deadline, delayed_send)
+        .send_managed_probe_at(first_deadline, timestamps)
         .unwrap();
 
     assert_eq!(events.len(), 1);
@@ -246,9 +358,13 @@ fn managed_probe_skips_missed_schedule_slots() {
             seq: 0,
             scheduled_at,
             sent_at,
+            send_call,
+            timer_error,
             ..
         } if scheduled_at == first_deadline + Duration::from_millis(40)
             && sent_at == delayed_send
+            && send_call == Duration::from_millis(6)
+            && timer_error == Duration::from_millis(8)
     ));
     assert_eq!(
         client.next_send_deadline(),
@@ -287,15 +403,19 @@ fn managed_probe_skip_preserves_finite_run_end() {
         wall: SystemTime::now(),
     };
     let first = client
-        .send_managed_probe_at(first_deadline, delayed_send)
+        .send_managed_probe_at(
+            first_deadline,
+            probe_timestamps(delayed_send.mono, delayed_send),
+        )
         .unwrap();
+    let second_sent_at = ClientTimestamp {
+        mono: first_deadline + Duration::from_millis(46),
+        wall: SystemTime::now(),
+    };
     let second = client
         .send_managed_probe_at(
             first_deadline + duration,
-            ClientTimestamp {
-                mono: first_deadline + Duration::from_millis(46),
-                wall: SystemTime::now(),
-            },
+            probe_timestamps(second_sent_at.mono, second_sent_at),
         )
         .unwrap();
 
