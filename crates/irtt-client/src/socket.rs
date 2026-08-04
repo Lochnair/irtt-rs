@@ -28,16 +28,55 @@ pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), Client
 }
 
 pub(crate) fn resolve_remote(config: &ClientConfig) -> Result<SocketAddr, ClientError> {
+    #[cfg(all(test, feature = "tokio"))]
+    SYNC_RESOLVER_CALLS.with(|calls| calls.set(calls.get() + 1));
+
     let addr = normalize_server_addr(&config.server_addr);
     let mut addrs = addr
         .to_socket_addrs()
         .map_err(|_| ClientError::Resolve { addr: addr.clone() })?;
     addrs
-        .find(|addr| {
-            (!config.socket_config.ipv4_only || addr.is_ipv4())
-                && (!config.socket_config.ipv6_only || addr.is_ipv6())
-        })
+        .find(|addr| address_family_allowed(config, *addr))
         .ok_or(ClientError::Resolve { addr })
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) async fn resolve_remote_tokio(config: &ClientConfig) -> Result<SocketAddr, ClientError> {
+    let addr = normalize_server_addr(&config.server_addr);
+    if let Ok(remote) = addr.parse::<SocketAddr>() {
+        return address_family_allowed(config, remote)
+            .then_some(remote)
+            .ok_or(ClientError::Resolve { addr });
+    }
+
+    #[cfg(all(test, feature = "tokio"))]
+    TOKIO_DNS_LOOKUPS.with(|calls| calls.set(calls.get() + 1));
+
+    let mut addrs = tokio::net::lookup_host(&addr)
+        .await
+        .map_err(|_| ClientError::Resolve { addr: addr.clone() })?;
+    addrs
+        .find(|remote| address_family_allowed(config, *remote))
+        .ok_or_else(|| ClientError::Resolve { addr: addr.clone() })
+}
+
+fn address_family_allowed(config: &ClientConfig, remote: SocketAddr) -> bool {
+    (!config.socket_config.ipv4_only || remote.is_ipv4())
+        && (!config.socket_config.ipv6_only || remote.is_ipv6())
+}
+
+#[cfg(all(test, feature = "tokio"))]
+std::thread_local! {
+    static SYNC_RESOLVER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static TOKIO_DNS_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) fn resolution_call_counts() -> (usize, usize) {
+    (
+        SYNC_RESOLVER_CALLS.with(std::cell::Cell::get),
+        TOKIO_DNS_LOOKUPS.with(std::cell::Cell::get),
+    )
 }
 
 pub(crate) fn normalize_server_addr(addr: &str) -> String {
@@ -66,16 +105,16 @@ pub(crate) fn connect_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
 ) -> Result<UdpSocket, ClientError> {
-    let domain = if remote.is_ipv4() {
-        Domain::IPV4
-    } else {
-        Domain::IPV6
-    };
-    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+    let socket = create_connected_udp_socket(config, remote)?;
+    socket.set_read_timeout(config.recv_timeout)?;
+    Ok(socket)
+}
 
-    if config.ipv6_only && remote.is_ipv6() {
-        socket.set_only_v6(true)?;
-    }
+fn create_connected_udp_socket(
+    config: &SocketConfig,
+    remote: SocketAddr,
+) -> Result<UdpSocket, ClientError> {
+    let socket = create_prebind_udp_socket(config, remote)?;
     let bind_addr = config.bind_addr.unwrap_or_else(|| {
         if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))
@@ -95,8 +134,34 @@ pub(crate) fn connect_udp_socket(
     if let Some(ttl) = config.ttl {
         apply_ttl_to_socket(&socket, remote, ttl)?;
     }
-    socket.set_read_timeout(config.recv_timeout)?;
     Ok(socket)
+}
+
+fn create_prebind_udp_socket(
+    config: &SocketConfig,
+    remote: SocketAddr,
+) -> Result<Socket, ClientError> {
+    let domain = if remote.is_ipv4() {
+        Domain::IPV4
+    } else {
+        Domain::IPV6
+    };
+    let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
+
+    if config.ipv6_only && remote.is_ipv6() {
+        socket.set_only_v6(true)?;
+    }
+    Ok(socket)
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) fn connect_tokio_udp_socket(
+    config: &SocketConfig,
+    remote: SocketAddr,
+) -> Result<tokio::net::UdpSocket, ClientError> {
+    let socket = create_connected_udp_socket(config, remote)?;
+    socket.set_nonblocking(true)?;
+    Ok(tokio::net::UdpSocket::from_std(socket)?)
 }
 
 pub(crate) fn bind_unconnected_udp_socket(
@@ -150,5 +215,193 @@ mod tests {
         assert_eq!(normalize_server_addr("::1"), "[::1]:2112");
         assert_eq!(normalize_server_addr("[::1]"), "[::1]:2112");
         assert_eq!(normalize_server_addr("[::1]:1234"), "[::1]:1234");
+    }
+
+    #[test]
+    fn address_family_filtering_remains_unchanged() {
+        let ipv4 = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT));
+        let ipv6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], DEFAULT_PORT));
+        let mut config = ClientConfig::default();
+
+        assert!(address_family_allowed(&config, ipv4));
+        assert!(address_family_allowed(&config, ipv6));
+
+        config.socket_config.ipv4_only = true;
+        assert!(address_family_allowed(&config, ipv4));
+        assert!(!address_family_allowed(&config, ipv6));
+
+        config.socket_config.ipv4_only = false;
+        config.socket_config.ipv6_only = true;
+        assert!(!address_family_allowed(&config, ipv4));
+        assert!(address_family_allowed(&config, ipv6));
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_ipv6_only_is_applied_before_bind() {
+        let config = SocketConfig {
+            ipv6_only: true,
+            ..SocketConfig::default()
+        };
+        let remote = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], DEFAULT_PORT));
+
+        let socket = create_prebind_udp_socket(&config, remote).unwrap();
+
+        assert!(socket.only_v6().unwrap());
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_ipv6_socket_preserves_v6only_and_explicit_bind() {
+        let bind_addr = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0));
+        let peer = match UdpSocket::bind(bind_addr) {
+            Ok(peer) => peer,
+            Err(error) if ipv6_loopback_unavailable(&error) => {
+                eprintln!("skipping IPv6 Tokio socket test: IPv6 loopback unavailable: {error}");
+                return;
+            }
+            Err(error) => panic!("{error}"),
+        };
+        let remote = peer.local_addr().unwrap();
+        let config = SocketConfig {
+            bind_addr: Some(bind_addr),
+            ipv6_only: true,
+            ..SocketConfig::default()
+        };
+
+        tokio_runtime().block_on(async {
+            let socket = connect_tokio_udp_socket(&config, remote).unwrap();
+
+            assert!(socket2::SockRef::from(&socket).only_v6().unwrap());
+            assert!(socket.local_addr().unwrap().is_ipv6());
+            assert_eq!(socket.local_addr().unwrap().ip(), bind_addr.ip());
+            assert_eq!(socket.peer_addr().unwrap(), remote);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_ipv4_socket_preserves_family_bind_peer_and_ttl() {
+        let peer = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+        let remote = peer.local_addr().unwrap();
+        let bind_addr = SocketAddr::from(([127, 0, 0, 1], 0));
+        let config = SocketConfig {
+            bind_addr: Some(bind_addr),
+            ttl: Some(64),
+            ..SocketConfig::default()
+        };
+
+        tokio_runtime().block_on(async {
+            let socket = connect_tokio_udp_socket(&config, remote).unwrap();
+
+            assert!(socket.local_addr().unwrap().is_ipv4());
+            assert_eq!(socket.local_addr().unwrap().ip(), bind_addr.ip());
+            assert_eq!(socket.peer_addr().unwrap(), remote);
+            assert_eq!(socket2::SockRef::from(&socket).ttl_v4().unwrap(), 64);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_resolver_filters_families_without_using_blocking_resolution() {
+        let mut config = ClientConfig {
+            server_addr: "localhost:2112".to_owned(),
+            ..ClientConfig::default()
+        };
+        config.socket_config.ipv4_only = true;
+
+        tokio_runtime().block_on(async {
+            let before = resolution_call_counts();
+            let remote = resolve_remote_tokio(&config).await.unwrap();
+            let after = resolution_call_counts();
+
+            assert!(remote.is_ipv4());
+            assert_eq!(after.0, before.0);
+            assert_eq!(after.1, before.1 + 1);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_resolver_selects_ipv6_for_ipv6_only_hostname() {
+        let mut config = ClientConfig {
+            server_addr: "localhost:2112".to_owned(),
+            ..ClientConfig::default()
+        };
+        config.socket_config.ipv6_only = true;
+
+        tokio_runtime().block_on(async {
+            let remote = resolve_remote_tokio(&config).await.unwrap();
+            assert!(remote.is_ipv6());
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_resolver_literal_path_bypasses_all_name_resolution() {
+        let config = ClientConfig {
+            server_addr: "127.0.0.1:2112".to_owned(),
+            ..ClientConfig::default()
+        };
+
+        tokio_runtime().block_on(async {
+            let before = resolution_call_counts();
+            let remote = resolve_remote_tokio(&config).await.unwrap();
+            let after = resolution_call_counts();
+
+            assert_eq!(remote, SocketAddr::from(([127, 0, 0, 1], 2112)));
+            assert_eq!(after, before);
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_resolver_rejects_disallowed_literal_family() {
+        let mut config = ClientConfig {
+            server_addr: "127.0.0.1:2112".to_owned(),
+            ..ClientConfig::default()
+        };
+        config.socket_config.ipv6_only = true;
+
+        tokio_runtime().block_on(async {
+            assert!(matches!(
+                resolve_remote_tokio(&config).await,
+                Err(ClientError::Resolve { .. })
+            ));
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_resolver_rejects_mixed_family_restrictions() {
+        let mut config = ClientConfig {
+            server_addr: "127.0.0.1:2112".to_owned(),
+            ..ClientConfig::default()
+        };
+        config.socket_config.ipv4_only = true;
+        config.socket_config.ipv6_only = true;
+
+        tokio_runtime().block_on(async {
+            assert!(matches!(
+                resolve_remote_tokio(&config).await,
+                Err(ClientError::Resolve { .. })
+            ));
+        });
+    }
+
+    #[cfg(feature = "tokio")]
+    fn tokio_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap()
+    }
+
+    #[cfg(feature = "tokio")]
+    fn ipv6_loopback_unavailable(error: &std::io::Error) -> bool {
+        matches!(
+            error.kind(),
+            std::io::ErrorKind::AddrNotAvailable | std::io::ErrorKind::Unsupported
+        )
     }
 }

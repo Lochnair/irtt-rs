@@ -3,6 +3,8 @@ use std::{
     net::{SocketAddr, UdpSocket},
 };
 
+use socket2::SockRef;
+
 use crate::{
     config::{MAX_DSCP_CODEPOINT, MAX_TTL},
     error::ClientError,
@@ -31,6 +33,24 @@ pub(crate) fn clear_dscp_on_socket(
     remote: SocketAddr,
 ) -> Result<(), ClientError> {
     set_socket_traffic_class(socket, remote, 0, "clear DSCP before close")
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) fn apply_dscp_to_tokio_socket(
+    socket: &tokio::net::UdpSocket,
+    remote: SocketAddr,
+    dscp_codepoint: u8,
+) -> Result<(), ClientError> {
+    let traffic_class = dscp_codepoint_to_traffic_class(dscp_codepoint)?;
+    set_tokio_socket_traffic_class(socket, remote, traffic_class, "set negotiated DSCP")
+}
+
+#[cfg(feature = "tokio")]
+pub(crate) fn clear_dscp_on_tokio_socket(
+    socket: &tokio::net::UdpSocket,
+    remote: SocketAddr,
+) -> Result<(), ClientError> {
+    set_tokio_socket_traffic_class(socket, remote, 0, "clear DSCP before close")
 }
 
 pub(crate) fn validate_ttl(ttl: u32) -> Result<(), ClientError> {
@@ -67,6 +87,20 @@ pub(crate) fn socket_traffic_class(
     })
 }
 
+#[cfg(all(test, feature = "tokio"))]
+pub(crate) fn tokio_socket_traffic_class(
+    socket: &tokio::net::UdpSocket,
+    remote: SocketAddr,
+) -> Result<u32, ClientError> {
+    get_socket_traffic_class_ref(SockRef::from(socket), remote).map_err(|source| {
+        ClientError::SocketOption {
+            operation: "read DSCP socket option",
+            remote,
+            source,
+        }
+    })
+}
+
 #[cfg(test)]
 pub(crate) fn socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> Result<u32, ClientError> {
     get_socket_ttl(socket, remote).map_err(|source| ClientError::SocketOption {
@@ -77,19 +111,24 @@ pub(crate) fn socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> Result<u32, 
 }
 
 fn set_socket_ttl(socket: &UdpSocket, remote: SocketAddr, ttl: u32) -> io::Result<()> {
+    set_socket_ttl_ref(SockRef::from(socket), remote, ttl)
+}
+
+fn set_socket_ttl_ref(socket: SockRef<'_>, remote: SocketAddr, ttl: u32) -> io::Result<()> {
     if remote.is_ipv4() {
-        socket2::SockRef::from(socket).set_ttl_v4(ttl)
+        socket.set_ttl_v4(ttl)
     } else {
-        socket2::SockRef::from(socket).set_unicast_hops_v6(ttl)
+        socket.set_unicast_hops_v6(ttl)
     }
 }
 
 #[cfg(test)]
 fn get_socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> io::Result<u32> {
+    let socket = SockRef::from(socket);
     if remote.is_ipv4() {
-        socket2::SockRef::from(socket).ttl_v4()
+        socket.ttl_v4()
     } else {
-        socket2::SockRef::from(socket).unicast_hops_v6()
+        socket.unicast_hops_v6()
     }
 }
 
@@ -113,6 +152,30 @@ fn set_socket_traffic_class_io(
     remote: SocketAddr,
     traffic_class: u32,
 ) -> io::Result<()> {
+    set_socket_traffic_class_ref(SockRef::from(socket), remote, traffic_class)
+}
+
+#[cfg(feature = "tokio")]
+fn set_tokio_socket_traffic_class(
+    socket: &tokio::net::UdpSocket,
+    remote: SocketAddr,
+    traffic_class: u32,
+    operation: &'static str,
+) -> Result<(), ClientError> {
+    set_socket_traffic_class_ref(SockRef::from(socket), remote, traffic_class).map_err(|source| {
+        ClientError::SocketOption {
+            operation,
+            remote,
+            source,
+        }
+    })
+}
+
+fn set_socket_traffic_class_ref(
+    socket: SockRef<'_>,
+    remote: SocketAddr,
+    traffic_class: u32,
+) -> io::Result<()> {
     if remote.is_ipv4() {
         set_ipv4_traffic_class(socket, traffic_class)
     } else {
@@ -127,8 +190,8 @@ fn set_socket_traffic_class_io(
     target_os = "illumos",
     target_os = "haiku",
 )))]
-fn set_ipv4_traffic_class(socket: &UdpSocket, traffic_class: u32) -> io::Result<()> {
-    socket2::SockRef::from(socket).set_tos_v4(traffic_class)
+fn set_ipv4_traffic_class(socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
+    socket.set_tos_v4(traffic_class)
 }
 
 #[cfg(any(
@@ -138,7 +201,7 @@ fn set_ipv4_traffic_class(socket: &UdpSocket, traffic_class: u32) -> io::Result<
     target_os = "illumos",
     target_os = "haiku",
 ))]
-fn set_ipv4_traffic_class(_socket: &UdpSocket, traffic_class: u32) -> io::Result<()> {
+fn set_ipv4_traffic_class(_socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
     unsupported_traffic_class(traffic_class, "IPv4 DSCP socket options")
 }
 
@@ -153,8 +216,8 @@ fn set_ipv4_traffic_class(_socket: &UdpSocket, traffic_class: u32) -> io::Result
     target_os = "openbsd",
     target_os = "cygwin",
 ))]
-fn set_ipv6_traffic_class(socket: &UdpSocket, traffic_class: u32) -> io::Result<()> {
-    socket2::SockRef::from(socket).set_tclass_v6(traffic_class)
+fn set_ipv6_traffic_class(socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
+    socket.set_tclass_v6(traffic_class)
 }
 
 #[cfg(not(any(
@@ -168,7 +231,7 @@ fn set_ipv6_traffic_class(socket: &UdpSocket, traffic_class: u32) -> io::Result<
     target_os = "openbsd",
     target_os = "cygwin",
 )))]
-fn set_ipv6_traffic_class(_socket: &UdpSocket, traffic_class: u32) -> io::Result<()> {
+fn set_ipv6_traffic_class(_socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
     unsupported_traffic_class(traffic_class, "IPv6 DSCP socket options")
 }
 
@@ -211,8 +274,8 @@ fn unsupported_traffic_class(traffic_class: u32, feature: &'static str) -> io::R
         target_os = "haiku",
     ))
 ))]
-fn get_ipv4_traffic_class(socket: &UdpSocket) -> io::Result<u32> {
-    socket2::SockRef::from(socket).tos_v4()
+fn get_ipv4_traffic_class(socket: SockRef<'_>) -> io::Result<u32> {
+    socket.tos_v4()
 }
 
 #[cfg(all(
@@ -225,7 +288,7 @@ fn get_ipv4_traffic_class(socket: &UdpSocket) -> io::Result<u32> {
         target_os = "haiku",
     )
 ))]
-fn get_ipv4_traffic_class(_socket: &UdpSocket) -> io::Result<u32> {
+fn get_ipv4_traffic_class(_socket: SockRef<'_>) -> io::Result<u32> {
     unsupported_readback("IPv4 DSCP socket option readback")
 }
 
@@ -243,8 +306,8 @@ fn get_ipv4_traffic_class(_socket: &UdpSocket) -> io::Result<u32> {
         target_os = "cygwin",
     )
 ))]
-fn get_ipv6_traffic_class(socket: &UdpSocket) -> io::Result<u32> {
-    socket2::SockRef::from(socket).tclass_v6()
+fn get_ipv6_traffic_class(socket: SockRef<'_>) -> io::Result<u32> {
+    socket.tclass_v6()
 }
 
 #[cfg(all(
@@ -261,12 +324,17 @@ fn get_ipv6_traffic_class(socket: &UdpSocket) -> io::Result<u32> {
         target_os = "cygwin",
     ))
 ))]
-fn get_ipv6_traffic_class(_socket: &UdpSocket) -> io::Result<u32> {
+fn get_ipv6_traffic_class(_socket: SockRef<'_>) -> io::Result<u32> {
     unsupported_readback("IPv6 DSCP socket option readback")
 }
 
 #[cfg(test)]
 fn get_socket_traffic_class(socket: &UdpSocket, remote: SocketAddr) -> io::Result<u32> {
+    get_socket_traffic_class_ref(SockRef::from(socket), remote)
+}
+
+#[cfg(test)]
+fn get_socket_traffic_class_ref(socket: SockRef<'_>, remote: SocketAddr) -> io::Result<u32> {
     if remote.is_ipv4() {
         get_ipv4_traffic_class(socket)
     } else {
@@ -393,6 +461,40 @@ mod tests {
 
         clear_dscp_on_socket(&socket, remote).unwrap();
         assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 0);
+    }
+
+    #[cfg(all(
+        feature = "tokio",
+        not(any(
+            target_os = "fuchsia",
+            target_os = "redox",
+            target_os = "solaris",
+            target_os = "illumos",
+            target_os = "haiku",
+        ))
+    ))]
+    #[test]
+    fn tokio_ipv4_socket_option_sets_and_clears_traffic_class() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let remote = SocketAddr::from(([127, 0, 0, 1], 9));
+            let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
+            socket.connect(remote).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
+
+            apply_dscp_to_tokio_socket(&socket, remote, 46).unwrap();
+            let traffic_class = tokio_socket_traffic_class(&socket, remote).unwrap();
+            assert_eq!(traffic_class & 0xfc, 184);
+            assert_eq!(traffic_class & 0b11, 0);
+
+            clear_dscp_on_tokio_socket(&socket, remote).unwrap();
+            assert_eq!(tokio_socket_traffic_class(&socket, remote).unwrap(), 0);
+        });
     }
 
     #[test]

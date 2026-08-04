@@ -62,6 +62,32 @@ pub(crate) fn recv_datagram(
     linux::recv_datagram(socket, buf)
 }
 
+#[cfg(all(
+    feature = "tokio",
+    not(all(target_os = "linux", feature = "ancillary"))
+))]
+pub(crate) fn try_recv_tokio_datagram(
+    socket: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagram, io::Error> {
+    let len = socket.try_recv(buf)?;
+    let received_at = ClientTimestamp::now();
+
+    Ok(ReceivedDatagram {
+        len,
+        received_at,
+        meta: ReceiveMeta::default(),
+    })
+}
+
+#[cfg(all(feature = "tokio", target_os = "linux", feature = "ancillary"))]
+pub(crate) fn try_recv_tokio_datagram(
+    socket: &tokio::net::UdpSocket,
+    buf: &mut [u8],
+) -> Result<ReceivedDatagram, io::Error> {
+    linux::try_recv_tokio_datagram(socket, buf)
+}
+
 #[cfg(all(target_os = "linux", feature = "ancillary"))]
 pub(crate) fn recv_datagram_from(
     socket: &UdpSocket,
@@ -132,5 +158,30 @@ mod tests {
 
         assert!(datagram.received_at.mono >= before.mono);
         assert!(datagram.received_at.mono <= after.mono);
+    }
+
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn tokio_try_receive_preserves_fallback_metadata_and_would_block() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async {
+            let (sender, receiver) = connected_loopback_pair();
+            receiver.set_nonblocking(true).unwrap();
+            let receiver = tokio::net::UdpSocket::from_std(receiver).unwrap();
+            sender.send(b"tokio").unwrap();
+            receiver.readable().await.unwrap();
+
+            let mut buf = [0_u8; 16];
+            let datagram = super::try_recv_tokio_datagram(&receiver, &mut buf).unwrap();
+            assert_eq!(&buf[..datagram.len], b"tokio");
+            assert_eq!(datagram.meta, ReceiveMeta::default());
+
+            let error = super::try_recv_tokio_datagram(&receiver, &mut buf).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+        });
     }
 }
