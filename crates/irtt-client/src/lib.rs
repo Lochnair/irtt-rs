@@ -3,6 +3,8 @@
 //! `irtt-client` opens IRTT-compatible sessions, sends echo probes, receives
 //! replies, classifies loss/late/duplicate packets, and emits [`ClientEvent`]
 //! values for callers to consume directly or aggregate with `irtt-stats`.
+//! With the `tokio` feature enabled, `AsyncClient` provides the same low-level
+//! lifecycle for callers that own a Tokio runtime and drive readiness directly.
 //!
 //! Timing values intentionally preserve signed measurement semantics. When
 //! server timing is available, [`RttSample::effective`] is adjusted for server
@@ -51,6 +53,8 @@
 )]
 #![cfg_attr(all(target_os = "linux", feature = "ancillary"), deny(unsafe_code))]
 
+#[cfg(feature = "tokio")]
+mod async_client;
 mod client;
 mod config;
 mod error;
@@ -64,6 +68,8 @@ mod socket;
 mod socket_options;
 mod timing;
 
+#[cfg(feature = "tokio")]
+pub use async_client::AsyncClient;
 pub use client::Client;
 pub use config::{
     ClientAuthConfig, ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig,
