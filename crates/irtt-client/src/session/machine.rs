@@ -488,6 +488,7 @@ impl SessionMachine {
         )
     }
 
+    #[cfg(any(feature = "tokio", test))]
     pub(crate) fn packets_sent(&self) -> u64 {
         match &self.state {
             MachineState::Open(session) => session.packets_sent,
