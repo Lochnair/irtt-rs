@@ -414,7 +414,9 @@ impl SessionMachine {
         &mut self,
         now: Instant,
     ) -> Result<Vec<ClientEvent>, ClientError> {
-        Ok(self.poll_timeouts_bounded_at(now, usize::MAX)?.events)
+        let batch = self.poll_timeouts_bounded_at(now, usize::MAX)?;
+        debug_assert!(!batch.more_due);
+        Ok(batch.events)
     }
 
     pub(crate) fn poll_timeouts_bounded_at(
@@ -1033,6 +1035,18 @@ impl SessionMachine {
             timeout_at: now.mono,
         });
         session.completed.insert(0);
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+impl SessionMachine {
+    pub(crate) fn replace_pending_for_test(&mut self, probe: PendingProbe) {
+        let session = self
+            .open_session_mut()
+            .expect("test pending probes require an open session");
+        session.pending.remove(probe.wire_seq);
+        session.pending.preflight_insert(probe.wire_seq).unwrap();
+        session.pending.commit_insert(probe);
     }
 }
 

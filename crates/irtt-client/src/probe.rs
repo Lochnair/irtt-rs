@@ -116,10 +116,12 @@ impl PendingMap {
         self.map.len()
     }
 
+    #[cfg(any(feature = "tokio", test))]
     pub fn next_timeout_deadline(&self) -> Option<Instant> {
         self.deadlines.first().map(|key| key.timeout_at)
     }
 
+    #[cfg(any(feature = "tokio", test))]
     pub fn latest_timeout_deadline(&self) -> Option<Instant> {
         self.deadlines.last().map(|key| key.timeout_at)
     }

@@ -773,6 +773,11 @@ impl AsyncClient {
         self.socket.poll_recv_ready(cx)
     }
 
+    #[cfg(test)]
+    pub(crate) fn replace_pending_for_test(&mut self, probe: crate::probe::PendingProbe) {
+        self.machine.replace_pending_for_test(probe);
+    }
+
     pub(crate) fn skip_missed_probe_slots_at(&mut self, now: Instant) -> Result<(), ClientError> {
         let Some(schedule) = self.schedule.as_mut() else {
             return Ok(());
