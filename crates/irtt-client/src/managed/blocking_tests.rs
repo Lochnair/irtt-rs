@@ -1,8 +1,8 @@
 use std::{
     net::{SocketAddr, UdpSocket},
-    sync::{Arc, Condvar, Mutex},
+    sync::{mpsc::sync_channel, Arc, Condvar, Mutex},
     thread::{self, JoinHandle},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use irtt_proto::{
@@ -12,11 +12,11 @@ use irtt_proto::{
 use tokio::{runtime::Builder, time::timeout};
 
 use super::{
-    blocking::join_worker, BlockingManagedClient, BlockingManagedJoinError, ManagedClientConfig,
-    ManagedCompletionPolicy, ManagedEndReason, ManagedLifecycle, ManagedPacing,
-    ManagedTargetConfig, ManagedTargetEndReason,
+    blocking::{join_worker, WorkerRuntime},
+    BlockingManagedClient, BlockingManagedJoinError, ManagedClientConfig, ManagedCompletionPolicy,
+    ManagedEndReason, ManagedLifecycle, ManagedPacing, ManagedTargetConfig, ManagedTargetEndReason,
 };
-use crate::{ClientConfig, ClientEvent};
+use crate::ClientConfig;
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -285,6 +285,44 @@ fn worker_panic_is_a_join_error() {
 }
 
 #[test]
+fn dropping_worker_runtime_inside_async_context_does_not_panic() {
+    test_runtime().block_on(async {
+        let runtime = Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        drop(WorkerRuntime::new(runtime));
+    });
+}
+
+#[test]
+fn worker_runtime_shutdown_is_bounded_with_blocking_work() {
+    let runtime = Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .unwrap();
+    let (started_send, started_receive) = sync_channel(0);
+    let (release_send, release_receive) = sync_channel(0);
+
+    runtime.block_on(async move {
+        tokio::task::spawn_blocking(move || {
+            started_send.send(()).unwrap();
+            release_receive.recv().unwrap();
+        });
+    });
+    started_receive
+        .recv_timeout(Duration::from_secs(2))
+        .unwrap();
+
+    let started = Instant::now();
+    WorkerRuntime::new(runtime).shutdown();
+    assert!(started.elapsed() < Duration::from_secs(2));
+    release_send.send(()).unwrap();
+}
+
+#[test]
 fn drop_after_natural_completion_preserves_outcome() {
     let server = EchoServer::start();
     let owner = BlockingManagedClient::start(
@@ -293,34 +331,21 @@ fn drop_after_natural_completion_preserves_outcome() {
     )
     .unwrap();
     let handle = owner.handle();
-    let mut events = handle.subscribe().unwrap();
-
-    test_runtime().block_on(async {
-        loop {
-            if let super::ManagedEvent::Client {
-                event: ClientEvent::EchoSent { .. },
-                ..
-            } = timeout(Duration::from_secs(2), events.recv())
-                .await
-                .unwrap()
-                .unwrap()
-            {
-                break;
-            }
-        }
-        loop {
-            if let super::ManagedEvent::Completed { outcome } =
-                timeout(Duration::from_secs(2), events.recv())
-                    .await
-                    .unwrap()
-                    .unwrap()
-            {
-                assert_eq!(outcome.end_reason, ManagedEndReason::TargetsComplete);
-                break;
-            }
-        }
-    });
+    server.wait_probe();
     server.wait_close();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let status = loop {
+        let status = handle.status();
+        if status.lifecycle == ManagedLifecycle::Completed && status.final_outcome.is_some() {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "managed worker did not complete");
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        status.final_outcome.as_ref().unwrap().end_reason,
+        ManagedEndReason::TargetsComplete
+    );
     drop(owner);
     assert_eq!(
         handle.status().final_outcome.as_ref().unwrap().end_reason,

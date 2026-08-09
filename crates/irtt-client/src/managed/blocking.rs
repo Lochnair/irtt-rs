@@ -1,12 +1,53 @@
-use std::thread::{self, JoinHandle};
+use std::{
+    thread::{self, JoinHandle},
+    time::Duration,
+};
 
 use thiserror::Error;
-use tokio::runtime::Builder;
+use tokio::runtime::{Builder, Runtime};
 
 use super::{
     ManagedClient, ManagedClientConfig, ManagedClientHandle, ManagedConfigError, ManagedOutcome,
     ManagedTargetConfig,
 };
+
+const BLOCKING_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Owns the runtime used exclusively by the blocking managed worker.
+pub(super) struct WorkerRuntime {
+    runtime: Option<Runtime>,
+}
+
+impl WorkerRuntime {
+    pub(super) fn new(runtime: Runtime) -> Self {
+        Self {
+            runtime: Some(runtime),
+        }
+    }
+
+    fn block_on<F: std::future::Future>(&self, task: F) -> F::Output {
+        self.runtime
+            .as_ref()
+            .expect("worker runtime is available until shutdown")
+            .block_on(task)
+    }
+
+    /// Shut down residual runtime work without delaying managed completion indefinitely.
+    pub(super) fn shutdown(mut self) {
+        self.runtime
+            .take()
+            .expect("worker runtime is available until shutdown")
+            .shutdown_timeout(BLOCKING_RUNTIME_SHUTDOWN_TIMEOUT);
+    }
+}
+
+impl Drop for WorkerRuntime {
+    fn drop(&mut self) {
+        if let Some(runtime) = self.runtime.take() {
+            runtime.shutdown_background();
+        }
+    }
+}
 
 /// Failure to start a blocking managed client owner.
 #[derive(Debug, Error)]
@@ -62,9 +103,14 @@ impl BlockingManagedClient {
             .enable_time()
             .build()
             .map_err(|source| BlockingManagedStartError::Runtime { source })?;
+        let runtime = WorkerRuntime::new(runtime);
         let worker = thread::Builder::new()
             .name("irtt-managed".to_owned())
-            .spawn(move || runtime.block_on(task))
+            .spawn(move || {
+                let outcome = runtime.block_on(task);
+                runtime.shutdown();
+                outcome
+            })
             .map_err(|source| BlockingManagedStartError::ThreadSpawn { source })?;
 
         Ok(Self {
