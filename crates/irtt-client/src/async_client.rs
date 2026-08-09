@@ -34,6 +34,13 @@ use crate::{
     timing::ClientTimestamp,
 };
 
+/// Maximum amount of immediately available opening work performed by one poll.
+///
+/// Opening may consume ignored UDP datagrams, roll over an expired attempt, or
+/// encounter readiness false positives without ever awaiting.  Bound that work
+/// so one managed target cannot retain the current-thread runtime.
+const OPEN_POLL_WORK_BUDGET: usize = 64;
+
 #[cfg(test)]
 use crate::client::ProbeSendTimestamps;
 
@@ -315,7 +322,7 @@ impl AsyncClient {
             unreachable!("connected async clients retain an open request");
         }
 
-        loop {
+        for _ in 0..OPEN_POLL_WORK_BUDGET {
             if state.cleanup.is_some() {
                 return self.poll_open_cleanup(state, cx);
             }
@@ -430,6 +437,11 @@ impl AsyncClient {
             };
             return Poll::Ready(Ok(self.commit_async_open(prepared)));
         }
+
+        // We deliberately truncated known immediate opening work.  Arrange for
+        // another poll even if no new socket-readiness edge occurs.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     pub(crate) fn poll_send_probe(
@@ -855,49 +867,48 @@ impl AsyncClient {
         state: &mut AsyncOpenState,
         cx: &mut Context<'_>,
     ) -> Poll<Result<OpenOutcome, ClientError>> {
-        loop {
-            let Some(packet) = state
-                .cleanup
-                .as_ref()
-                .expect("cleanup polling requires a retained primary error")
-                .packet()
-            else {
-                return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
-            };
+        let Some(packet) = state
+            .cleanup
+            .as_ref()
+            .expect("cleanup polling requires a retained primary error")
+            .packet()
+        else {
+            return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
+        };
 
-            #[cfg(test)]
-            if self
-                .test_hooks
-                .pause_open_cleanup_before_send
-                .replace(false)
-            {
-                return Poll::Pending;
-            }
+        #[cfg(test)]
+        if self
+            .test_hooks
+            .pause_open_cleanup_before_send
+            .replace(false)
+        {
+            return Poll::Pending;
+        }
 
-            #[cfg(test)]
-            if self.test_hooks.fail_cleanup_send.replace(false) {
-                return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
-            }
-            #[cfg(test)]
-            let send_result = self.test_hooks.try_send(&self.socket, packet);
-            #[cfg(not(test))]
-            let send_result = self.socket.try_send(packet);
-            match send_result {
-                Ok(_) => {
-                    return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(_) => {
-                    return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
-                }
-            }
+        #[cfg(test)]
+        if self.test_hooks.fail_cleanup_send.replace(false) {
+            return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
+        }
+        #[cfg(test)]
+        let send_result = self.test_hooks.try_send(&self.socket, packet);
+        #[cfg(not(test))]
+        let send_result = self.socket.try_send(packet);
+        match send_result {
+            Ok(_) => return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary())),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            Err(_) => return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary())),
+        }
 
-            match poll_writable_until(&self.socket, state.deadline_timer(), cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(true)) => {}
-                Poll::Ready(Ok(false) | Err(_)) => {
-                    return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
-                }
+        match poll_writable_until(&self.socket, state.deadline_timer(), cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(true)) => {
+                // Retain cleanup state and resume the send in a fresh poll.  A
+                // writable readiness false positive must not spin this future.
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Poll::Ready(Ok(false) | Err(_)) => {
+                Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()))
             }
         }
     }
