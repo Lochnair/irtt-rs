@@ -465,27 +465,428 @@ fn explicit_empty_waits_for_stop() {
 }
 
 #[test]
-fn duplicate_and_limit_rejections_are_transactional() {
-    let mut limited = config(ManagedPacing::Staggered);
-    limited.max_live_target_generations = 1;
+fn dynamic_addition_opens_and_operates() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(managed, vec![]).unwrap();
+    let receipt = handle
+        .update_targets(vec![target("added", server.addr)])
+        .unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent != 0
+    });
+    let acknowledgement = runtime.block_on(receipt).unwrap();
+    assert_eq!(acknowledgement.sequence, 1);
+    assert_eq!(acknowledgement.status.targets[0].target.generation, 1);
+    assert!(acknowledgement.status.targets[0].desired);
+    let stop = handle.stop();
+    let outcome = runtime.block_on(task);
+    runtime.block_on(stop);
+    assert_eq!(outcome.applied_command_sequence, 1);
+    assert!(!probes(&server.finish()).is_empty());
+}
+
+#[test]
+fn dynamic_identical_open_target_preserves_session_without_pending_event() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let configured = target("same", server.addr);
+    let (mut task, handle) = ManagedClient::task(managed, vec![configured.clone()]).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent >= 2
+    });
+    let instance = task.targets[0].instance.clone();
+    let sent = task.targets[0].counters.packets_sent;
+    let receipt = handle.update_targets(vec![configured]).unwrap();
+    drive_task_until(&runtime, &mut task, |task| {
+        task.applied_command_sequence == 1
+    });
+    let acknowledgement = runtime.block_on(receipt).unwrap();
+    assert_eq!(acknowledgement.status.targets[0].target, instance);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent > sent
+    });
+    assert!(!observations.lock().unwrap().iter().any(|(event, _)| {
+        matches!(event, ManagedEvent::TargetStateChanged { target, lifecycle: ManagedTargetLifecycle::Pending } if *target == instance)
+    }));
+    let stop = handle.stop();
+    runtime.block_on(task);
+    runtime.block_on(stop);
+    assert_eq!(
+        server
+            .finish()
+            .iter()
+            .filter(|record| matches!(record.kind, PacketKind::Open))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn dynamic_retiring_active_is_ineligible_before_target_cleanup() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(managed, vec![target("old", server.addr)]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent != 0
+    });
+    let old = task.targets[0].instance.clone();
+    let sent = task.targets[0].counters.packets_sent;
+    let acknowledgement = task
+        .as_mut()
+        .get_mut()
+        .apply_targets(vec![ManagedTargetConfig::new("old", "127.0.0.1:9")])
+        .unwrap();
+    assert!(acknowledgement
+        .status
+        .targets
+        .iter()
+        .any(|target| target.target == old && !target.desired));
+    assert!(matches!(task.targets[0].state, TargetState::Active { .. }));
+    assert_eq!(
+        task.targets[0].retirement,
+        Some(ManagedTargetEndReason::Replaced)
+    );
+    let result = runtime.block_on(poll_fn(|cx| {
+        Poll::Ready(
+            task.as_mut()
+                .get_mut()
+                .poll_one_send(0, cx, Instant::now(), None),
+        )
+    }));
+    assert!(matches!(result, SendResult::NotAttempted));
+    assert_eq!(task.targets[0].counters.packets_sent, sent);
+    let stop = handle.stop();
+    runtime.block_on(task);
+    runtime.block_on(stop);
+    server.finish();
+}
+
+#[test]
+fn dynamic_replacement_counts_sync_and_async_live_generations() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.max_live_target_generations = 1;
+    let (mut pending, _) = ManagedClient::task(
+        managed.clone(),
+        vec![ManagedTargetConfig::new("same", "127.0.0.1:9")],
+    )
+    .unwrap();
+    let acknowledgement = pending
+        .apply_targets(vec![ManagedTargetConfig::new("same", "127.0.0.1:10")])
+        .unwrap();
+    assert_eq!(acknowledgement.status.targets.len(), 1);
+    assert_eq!(acknowledgement.status.targets[0].target.generation, 2);
     assert!(matches!(
-        ManagedClient::task(
-            limited,
-            vec![
-                target("a", "127.0.0.1:1".parse().unwrap()),
-                target("b", "127.0.0.1:2".parse().unwrap())
-            ]
-        ),
-        Err(ManagedConfigError::TooManyTargets { .. })
+        acknowledgement.status.recent_target_outcomes[0].end_reason,
+        ManagedTargetEndReason::Replaced
     ));
+
+    let server = start_server(ServerBehavior::Echo, None);
+    let replacement = start_server(ServerBehavior::Echo, None);
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(managed, vec![target("same", server.addr)]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent != 0
+    });
+    let before = task.targets[0].instance.clone();
+    let before_status = task.snapshot();
+    let before_generation = task.next_generation;
+    let before_sequence = task.applied_command_sequence;
+    assert!(matches!(
+        task.as_mut()
+            .get_mut()
+            .apply_targets(vec![target("same", replacement.addr)]),
+        Err(ManagedCommandApplyError::LiveGenerationLimitExceeded {
+            required: 2,
+            limit: 1
+        })
+    ));
+    assert_eq!(task.snapshot(), before_status);
+    assert_eq!(task.next_generation, before_generation);
+    assert_eq!(task.applied_command_sequence, before_sequence);
+    assert_eq!(task.targets.len(), 1);
+    task.config.max_live_target_generations = 2;
+    let acknowledgement = task
+        .as_mut()
+        .get_mut()
+        .apply_targets(vec![target("same", replacement.addr)])
+        .unwrap();
+    assert!(acknowledgement
+        .status
+        .targets
+        .iter()
+        .any(|target| target.target == before && !target.desired));
+    assert_eq!(acknowledgement.status.targets.len(), 2);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets
+            .iter()
+            .any(|target| target.desired && target.counters.packets_sent != 0)
+    });
+    let stop = handle.stop();
+    let outcome = runtime.block_on(task);
+    runtime.block_on(stop);
+    assert!(outcome.recent_target_outcomes.iter().any(|outcome| {
+        outcome.target == before && matches!(outcome.end_reason, ManagedTargetEndReason::Replaced)
+    }));
+    server.finish();
+    replacement.finish();
+}
+
+#[test]
+fn terminal_targets_count_toward_retained_generation_limit() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.max_live_target_generations = 1;
+
+    let (mut task, _) = ManagedClient::task(
+        managed.clone(),
+        vec![ManagedTargetConfig::new("same", "127.0.0.1:9")],
+    )
+    .unwrap();
+    task.targets[0].state = TargetState::Terminal;
+    assert!(matches!(
+        task.apply_targets(vec![
+            ManagedTargetConfig::new("same", "127.0.0.1:9"),
+            ManagedTargetConfig::new("other", "127.0.0.1:10"),
+        ]),
+        Err(ManagedCommandApplyError::LiveGenerationLimitExceeded {
+            required: 2,
+            limit: 1,
+        })
+    ));
+
+    let (mut task, _) = ManagedClient::task(
+        managed.clone(),
+        vec![ManagedTargetConfig::new("same", "127.0.0.1:9")],
+    )
+    .unwrap();
+    task.targets[0].state = TargetState::Terminal;
+    let acknowledgement = task
+        .apply_targets(vec![ManagedTargetConfig::new("same", "127.0.0.1:10")])
+        .unwrap();
+    assert_eq!(task.targets.len(), 1);
+    assert_eq!(acknowledgement.status.targets.len(), 1);
+    assert_eq!(acknowledgement.status.targets[0].target.generation, 2);
+
+    let (mut task, _) = ManagedClient::task(
+        managed,
+        vec![ManagedTargetConfig::new("same", "127.0.0.1:9")],
+    )
+    .unwrap();
+    task.targets[0].state = TargetState::Terminal;
+    task.apply_targets(Vec::new()).unwrap();
+    assert!(task.targets.is_empty());
+    assert!(task.snapshot().targets.is_empty());
+}
+
+#[test]
+fn pruning_preserves_target_cursor_progress() {
+    let (mut task, _) = ManagedClient::task(
+        config(ManagedPacing::Staggered),
+        vec![
+            ManagedTargetConfig::new("one", "127.0.0.1:9"),
+            ManagedTargetConfig::new("two", "127.0.0.1:10"),
+            ManagedTargetConfig::new("three", "127.0.0.1:11"),
+        ],
+    )
+    .unwrap();
+    task.cursor = 5;
+    task.send_cursor = 5;
+    task.scan_remaining = 3;
+    task.burst_remaining = 3;
+    task.stagger_remaining = 3;
+    task.targets.truncate(2);
+    task.rebase_target_cursors();
+    assert_eq!(task.cursor, 1);
+    assert_eq!(task.send_cursor, 1);
+    assert_eq!(task.scan_remaining, 2);
+    assert_eq!(task.burst_remaining, 2);
+    assert_eq!(task.stagger_remaining, 2);
+
+    task.targets.clear();
+    task.rebase_target_cursors();
+    assert_eq!(task.cursor, 0);
+    assert_eq!(task.send_cursor, 0);
+    assert_eq!(task.scan_remaining, 0);
+    assert_eq!(task.burst_remaining, 0);
+    assert_eq!(task.stagger_remaining, 0);
+}
+
+#[test]
+fn dynamic_rejections_leave_transaction_state_unchanged() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    let (mut task, _) = ManagedClient::task(
+        managed,
+        vec![ManagedTargetConfig::new("same", "127.0.0.1:9")],
+    )
+    .unwrap();
+    let status = task.snapshot();
+    let generation = task.next_generation;
+    let sequence = task.applied_command_sequence;
+    let instances = task
+        .targets
+        .iter()
+        .map(|target| (target.instance.clone(), target.desired))
+        .collect::<Vec<_>>();
     let duplicate = vec![
-        target("same", "127.0.0.1:1".parse().unwrap()),
-        target("same", "127.0.0.1:2".parse().unwrap()),
+        ManagedTargetConfig::new("same", "127.0.0.1:10"),
+        ManagedTargetConfig::new("same", "127.0.0.1:11"),
     ];
+    assert!(task.apply_targets(duplicate).is_err());
+    task.config.client.open_timeouts.clear();
+    assert!(task
+        .apply_targets(vec![ManagedTargetConfig::new("same", "127.0.0.1:10")])
+        .is_err());
+    assert_eq!(task.next_generation, generation);
+    assert_eq!(task.applied_command_sequence, sequence);
+    assert_eq!(task.snapshot(), status);
+    assert_eq!(
+        task.targets
+            .iter()
+            .map(|target| (target.instance.clone(), target.desired))
+            .collect::<Vec<_>>(),
+        instances
+    );
+}
+
+#[test]
+fn dynamic_empty_update_orders_stopping_before_acknowledgement() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.command_capacity = 2;
+    let (mut task, handle) = ManagedClient::task(
+        managed,
+        vec![ManagedTargetConfig::new("gone", "127.0.0.1:9")],
+    )
+    .unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let removal = handle.update_targets(vec![]).unwrap();
+    let later = handle
+        .update_targets(vec![ManagedTargetConfig::new("later", "127.0.0.1:9")])
+        .unwrap();
+    let outcome = runtime().block_on(task);
+    let acknowledgement = runtime().block_on(removal).unwrap();
+    assert_eq!(acknowledgement.status.lifecycle, ManagedLifecycle::Stopping);
+    assert_eq!(acknowledgement.status.desired_target_count, 0);
     assert!(matches!(
-        ManagedClient::task(config(ManagedPacing::Staggered), duplicate),
-        Err(ManagedConfigError::DuplicateTargetId { .. })
+        runtime().block_on(later),
+        Err(ManagedCommandApplyError::Stopping)
     ));
+    assert_eq!(outcome.end_reason, ManagedEndReason::TargetsComplete);
+    let events = observations.lock().unwrap();
+    let stopping = events
+        .iter()
+        .position(|(event, _)| matches!(event, ManagedEvent::Stopping))
+        .unwrap();
+    let finished = events
+        .iter()
+        .position(|(event, _)| matches!(event, ManagedEvent::TargetFinished { .. }))
+        .unwrap();
+    assert!(stopping < finished);
+    assert_eq!(events[stopping].1.lifecycle, ManagedLifecycle::Stopping);
+    assert!(Arc::ptr_eq(&acknowledgement.status, &events[stopping].1));
+}
+
+#[test]
+fn dynamic_explicit_remove_and_readd_uses_new_generation() {
+    let first = start_server(ServerBehavior::Echo, None);
+    let second = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(managed, vec![target("same", first.addr)]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| task.active_count() == 1);
+    let first_instance = task.targets[0].instance.clone();
+    let removal = handle.update_targets(vec![]).unwrap();
+    drive_task_until(&runtime, &mut task, |task| task.targets.is_empty());
+    let acknowledgement = runtime.block_on(removal).unwrap();
+    assert_eq!(acknowledgement.status.lifecycle, ManagedLifecycle::Running);
+    assert!(acknowledgement
+        .status
+        .targets
+        .iter()
+        .any(|target| target.target == first_instance && !target.desired));
+    assert!(matches!(
+        task.history.recent.back().unwrap().end_reason,
+        ManagedTargetEndReason::Removed
+    ));
+    let addition = handle
+        .update_targets(vec![target("same", second.addr)])
+        .unwrap();
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent != 0
+    });
+    let acknowledgement = runtime.block_on(addition).unwrap();
+    assert!(acknowledgement.status.targets[0].target.generation > first_instance.generation);
+    let stop = handle.stop();
+    runtime.block_on(task);
+    runtime.block_on(stop);
+    assert!(has_close(&first.finish()));
+    second.finish();
+}
+
+#[test]
+fn dynamic_queue_stop_and_dropped_receipt_are_linearized() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.command_capacity = 1;
+    let (task, handle) = ManagedClient::task(managed.clone(), vec![]).unwrap();
+    let receipt = handle
+        .update_targets(vec![ManagedTargetConfig::new("queued", "127.0.0.1:9")])
+        .unwrap();
+    assert!(matches!(
+        handle.update_targets(vec![]),
+        Err(ManagedCommandError::QueueFull)
+    ));
+    let stop = handle.stop();
+    let outcome = runtime().block_on(task);
+    runtime().block_on(stop);
+    assert_eq!(outcome.applied_command_sequence, 0);
+    assert!(matches!(
+        runtime().block_on(receipt),
+        Err(ManagedCommandApplyError::Stopping)
+    ));
+
+    let server = start_server(ServerBehavior::Echo, None);
+    managed.command_capacity = 2;
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(managed, vec![]).unwrap();
+    drop(
+        handle
+            .update_targets(vec![target("dropped", server.addr)])
+            .unwrap(),
+    );
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent != 0
+    });
+    assert_eq!(handle.status().applied_command_sequence, 1);
+    assert_eq!(handle.status().targets[0].target.generation, 1);
+    let stop = handle.stop();
+    runtime.block_on(task);
+    runtime.block_on(stop);
+    assert!(!probes(&server.finish()).is_empty());
 }
 
 #[test]
