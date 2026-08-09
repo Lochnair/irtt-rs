@@ -10,6 +10,6 @@ pub use args::{
 pub use config::{expected_probe_count, DEFAULT_RECV_TIMEOUT};
 pub use session::is_shutdown_requested;
 pub use targets::{
-    parse_labelled_target, resolved_managed_targets, target_specs, GroupPacingArg,
-    LabelledTargetArg, ResolvedTarget, TargetSpec,
+    parse_labelled_target, prepare_managed_targets, target_specs, GroupPacingArg,
+    LabelledTargetArg, PreparedTarget, TargetSpec,
 };

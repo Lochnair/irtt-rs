@@ -13,39 +13,10 @@
 //! also signed when the required wall-clock timestamps are available; negative
 //! values usually indicate client/server clock skew.
 //!
-//! A managed session can drive the socket loop on a worker thread and publish
-//! events through a subscription:
-//!
-//! ```no_run
-//! use std::time::Duration;
-//!
-//! use irtt_client::{ClientConfig, ClientEvent, ManagedClient, SubscriberConfig};
-//!
-//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! let config = ClientConfig {
-//!     server_addr: "127.0.0.1:2112".to_owned(),
-//!     duration: Some(Duration::from_secs(10)),
-//!     interval: Duration::from_secs(1),
-//!     ..ClientConfig::default()
-//! };
-//!
-//! let (session, events) =
-//!     ManagedClient::start_with_subscription(config, SubscriberConfig::default())?;
-//!
-//! while let Ok(event) = events.recv() {
-//!     match event {
-//!         ClientEvent::EchoReply { seq, rtt, .. } => {
-//!             println!("seq={seq} effective_rtt_us={}", rtt.effective.as_micros());
-//!         }
-//!         ClientEvent::SessionClosed { .. } => break,
-//!         _ => {}
-//!     }
-//! }
-//!
-//! let _outcome = session.join()?;
-//! # Ok(())
-//! # }
-//! ```
+//! [`Client`] is the runtime-free low-level blocking adapter. With the
+//! `tokio` feature, `AsyncClient` provides the corresponding Tokio adapter;
+//! [`managed`] contains the unified managed task/handle implementation,
+//! including the dedicated-runtime blocking frontend for synchronous callers.
 //!
 #![cfg_attr(
     not(all(target_os = "linux", feature = "ancillary")),
@@ -75,20 +46,10 @@ pub use config::{
     ClientAuthConfig, ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig,
     MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
 };
-pub use error::{ClientError, EventSubscriptionError};
+pub use error::ClientError;
 pub use event::{
     ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
     ServerTiming, SignedDuration, WarningKind,
 };
-pub use managed::legacy::{
-    CancellationToken, EventHub, EventSubscription, ManagedClient, ManagedClientGroup,
-    ManagedClientGroupConfig, ManagedClientGroupSession, ManagedClientSession,
-    ManagedGroupCompletionPolicy, ManagedGroupEndReason, ManagedGroupEvent, ManagedGroupOutcome,
-    ManagedGroupPacing, ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure,
-    ManagedTargetFailureKind, ManagedTargetOutcome, SessionEndReason, SessionOutcome,
-    SubscriberConfig, SubscriberOverflow, TargetEvent, TargetEventSubscription,
-    MANAGED_GROUP_OUTCOME_HISTORY_LIMIT,
-};
-pub use managed::TargetId;
 pub use session::{NegotiatedParams, NegotiationRestriction};
 pub use timing::ClientTimestamp;

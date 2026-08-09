@@ -323,7 +323,10 @@ fn continuous_single_target_interruption_drains_final_events_and_succeeds() {
     assert!(stdout
         .lines()
         .any(|line| line.starts_with("session_closed,")));
-    assert!(stderr.contains("interrupted, closing session"), "{stderr}");
+    assert!(
+        stderr.contains("interrupted, closing managed run"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("peer closure"), "{stderr}");
 }
 
@@ -643,7 +646,10 @@ fn explicit_group_interruption_succeeds_without_peer_close_error() {
         stdout.lines().any(|line| line.starts_with("b,")),
         "{stdout}"
     );
-    assert!(stderr.contains("interrupted, closing group"), "{stderr}");
+    assert!(
+        stderr.contains("interrupted, closing managed run"),
+        "{stderr}"
+    );
     assert!(!stderr.contains("peer closure"), "{stderr}");
 }
 

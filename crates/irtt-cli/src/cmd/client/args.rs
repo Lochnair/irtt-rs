@@ -4,8 +4,8 @@ use clap::{Parser, ValueEnum};
 use irtt_client::ClientConfig;
 
 use crate::shared::client::{
-    parse_labelled_target, parse_test_duration, resolved_managed_targets, target_specs,
-    CommonClientArgs, GroupPacingArg, LabelledTargetArg, ResolvedTarget, TargetSpec, TimestampArg,
+    parse_labelled_target, parse_test_duration, prepare_managed_targets, target_specs,
+    CommonClientArgs, GroupPacingArg, LabelledTargetArg, PreparedTarget, TargetSpec, TimestampArg,
 };
 
 pub const DEFAULT_CLIENT_DURATION: Duration = Duration::from_secs(10);
@@ -111,10 +111,8 @@ impl ClientArgs {
         target_specs(&self.targets, &self.labelled_targets)
     }
 
-    pub fn resolved_managed_targets(&self) -> Result<Vec<ResolvedCliTarget>, String> {
-        let specs = self.target_specs()?;
-        let config = self.to_client_config();
-        resolved_managed_targets(specs, &config)
+    pub fn managed_targets(&self) -> Result<Vec<CliManagedTarget>, String> {
+        prepare_managed_targets(self.target_specs()?)
     }
 
     fn primary_target_addr(&self) -> Option<&str> {
@@ -147,7 +145,7 @@ pub enum OutputFormat {
 }
 
 pub type CliTargetSpec = TargetSpec;
-pub type ResolvedCliTarget = ResolvedTarget;
+pub type CliManagedTarget = PreparedTarget;
 
 impl OutputFormat {
     pub fn prints_summary(self) -> bool {
@@ -262,11 +260,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_resolved_target_addresses_are_rejected() {
+    fn duplicate_target_endpoints_are_allowed() {
         let args = parse(&["127.0.0.1:2112", "127.0.0.1"]).unwrap();
-        let err = args.resolved_managed_targets().unwrap_err();
-
-        assert!(err.contains("duplicate resolved target address 127.0.0.1:2112"));
+        assert_eq!(args.managed_targets().unwrap().len(), 2);
     }
 
     #[test]

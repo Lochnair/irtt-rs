@@ -5,20 +5,20 @@ use std::{
     io::{self, Write},
     sync::atomic::AtomicBool,
     thread,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use irtt_client::{
-    ClientEvent, EventSubscriptionError, ManagedClient, ManagedClientGroup,
-    ManagedClientGroupConfig, ManagedGroupCompletionPolicy, ManagedGroupEndReason,
-    ManagedGroupEvent, ManagedTargetOutcome, SessionEndReason, SubscriberConfig,
-    SubscriberOverflow, TargetEvent,
+    managed::{
+        BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy, ManagedEndReason,
+        ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError, ManagedTargetEndReason,
+        ManagedTargetOutcome, TargetInstance,
+    },
+    ClientEvent,
 };
-#[cfg(all(test, feature = "stats"))]
-use irtt_client::{ClientTimestamp, PacketMeta, RttSample, SignedDuration};
 
 use super::{
-    args::{ClientArgs, ResolvedCliTarget},
+    args::ClientArgs,
     output::{EventRenderStats, OutputConfig},
 };
 #[cfg(feature = "stats")]
@@ -26,11 +26,10 @@ use crate::shared::client::expected_probe_count;
 use crate::shared::client::{
     is_shutdown_requested,
     session::{
-        peer_close_run_error, request_group_stop_for_peer_close, request_group_stop_once,
-        should_print_final_summary,
+        drain_managed_events, peer_close_run_error, request_managed_stop_for_peer_close,
+        request_managed_stop_once, should_print_final_summary, ManagedDrainState,
     },
 };
-
 #[cfg(feature = "stats")]
 use irtt_stats::{StatsCollector, StatsConfig};
 
@@ -46,9 +45,6 @@ const FINITE_STATS_MEMORY_WARNING_BYTES: u64 = 128 * MIB;
 const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
 #[cfg(feature = "stats")]
 const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
-
-const GROUP_IDLE_SLEEP: Duration = Duration::from_millis(5);
-const GROUP_COMPLETION_GRACE: Duration = Duration::from_secs(1);
 const MANAGED_EVENT_WAIT_SLICE: Duration = Duration::from_millis(20);
 const MANAGED_EVENT_CAPACITY: usize = 16_384;
 
@@ -60,39 +56,45 @@ pub fn run_stream(
         print!("{}", OutputConfig::list_columns());
         return Ok(());
     }
+    let targets = args
+        .managed_targets()
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let multi_target = targets.len() > 1;
     let output_config = OutputConfig::new(
         args.format,
         args.columns.as_deref(),
         args.header,
         args.verbose,
-        args.target_specs()
-            .map(|targets| targets.len() > 1)
-            .unwrap_or(false),
+        multi_target,
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-
-    let targets = args
-        .resolved_managed_targets()
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let multi_target = targets.len() > 1;
-
     let continuous = args.is_continuous();
     #[cfg(feature = "stats")]
     if let Some(warning) = finite_stats_memory_warning(&args) {
         eprintln!("{warning}");
     }
-
-    if multi_target {
-        return run_group_stream(args, targets, output_config, continuous, shutdown_requested);
+    if is_shutdown_requested(shutdown_requested) {
+        return Ok(());
     }
-
-    let target_label = targets
-        .first()
-        .map(|target| target.label.as_str())
-        .expect("at least one target was validated");
+    let target_count = targets.len();
+    let config = ManagedClientConfig {
+        client: args.to_client_config(),
+        pacing: args.pacing.into(),
+        completion: ManagedCompletionPolicy::FinishWhenQuiescent,
+        event_capacity: MANAGED_EVENT_CAPACITY,
+        outcome_history_limit: target_count,
+        max_live_target_generations: target_count,
+        ..ManagedClientConfig::default()
+    };
+    let (owner, mut events) = BlockingManagedClient::start_with_subscription(
+        config,
+        targets
+            .iter()
+            .map(|target| target.managed.clone())
+            .collect(),
+    )?;
+    let handle = owner.handle();
     let mut stdout = io::LineWriter::new(io::stdout().lock());
-    #[cfg(feature = "stats")]
-    let mut stats = StatsCollector::new(stats_config(continuous));
     let mut stream_output = StreamOutput {
         config: output_config,
         header_printed: false,
@@ -100,270 +102,6 @@ pub fn run_stream(
         show_running_only_summary_note: false,
         out: &mut stdout,
     };
-
-    if is_shutdown_requested(shutdown_requested) {
-        return Ok(());
-    }
-
-    let (session, events) = ManagedClient::start_with_subscription(
-        args.to_client_config(),
-        managed_event_subscriber_config(),
-    )?;
-    let mut interrupted = false;
-    loop {
-        if is_shutdown_requested(shutdown_requested) {
-            interrupted = true;
-            session.stop();
-            break;
-        }
-
-        match events.recv_timeout(MANAGED_EVENT_WAIT_SLICE) {
-            Ok(Some(event)) => {
-                #[cfg(feature = "stats")]
-                print_events_with_stats(
-                    &mut stream_output,
-                    std::slice::from_ref(&event),
-                    Some(target_label),
-                    &mut stats,
-                )?;
-                #[cfg(not(feature = "stats"))]
-                print_events_with_stats(
-                    &mut stream_output,
-                    std::slice::from_ref(&event),
-                    Some(target_label),
-                )?;
-            }
-            Ok(None) => {}
-            Err(EventSubscriptionError::Disconnected) => break,
-        }
-    }
-    interrupted |= is_shutdown_requested(shutdown_requested);
-
-    if interrupted {
-        eprintln!("interrupted, closing session...");
-        drain_single_client_events(
-            &events,
-            &mut stream_output,
-            target_label,
-            #[cfg(feature = "stats")]
-            &mut stats,
-        )?;
-    }
-
-    let outcome = session.join();
-    drain_single_client_events(
-        &events,
-        &mut stream_output,
-        target_label,
-        #[cfg(feature = "stats")]
-        &mut stats,
-    )?;
-    if let Some(warning) = dropped_event_warning(events.dropped_events(), "managed client") {
-        eprintln!("{warning}");
-    }
-
-    interrupted |= is_shutdown_requested(shutdown_requested);
-    let peer_close_error = outcome.as_ref().ok().and_then(|outcome| {
-        peer_close_run_error(
-            continuous,
-            interrupted,
-            u64::from(outcome.end_reason == SessionEndReason::PeerClosed),
-        )
-    });
-    let print_final_summary = should_print_final_summary(continuous, interrupted);
-    stream_output.print_final_summary = print_final_summary;
-    stream_output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
-    #[cfg(feature = "stats")]
-    stream_output.print_summary(&stats)?;
-    #[cfg(not(feature = "stats"))]
-    stream_output.print_summary()?;
-    stream_output.out.flush()?;
-    if let Err(error) = outcome {
-        return Err(error.into());
-    }
-    if let Some(error) = peer_close_error {
-        return Err(error.into());
-    }
-    Ok(())
-}
-
-fn managed_event_subscriber_config() -> SubscriberConfig {
-    SubscriberConfig {
-        capacity: MANAGED_EVENT_CAPACITY,
-        // CLI output is best-effort under sustained backpressure. Dropping
-        // stale rows keeps the managed worker independent from output speed,
-        // while dropped_events() makes incomplete output visible.
-        overflow: SubscriberOverflow::DropOldest,
-    }
-}
-
-#[cfg(feature = "stats")]
-fn drain_single_client_events<W: Write>(
-    events: &irtt_client::EventSubscription,
-    stream_output: &mut StreamOutput<'_, W>,
-    target_label: &str,
-    stats: &mut StatsCollector,
-) -> io::Result<()> {
-    while let Ok(Some(event)) = events.try_recv() {
-        print_events_with_stats(
-            stream_output,
-            std::slice::from_ref(&event),
-            Some(target_label),
-            stats,
-        )?;
-    }
-    Ok(())
-}
-
-#[cfg(not(feature = "stats"))]
-fn drain_single_client_events<W: Write>(
-    events: &irtt_client::EventSubscription,
-    stream_output: &mut StreamOutput<'_, W>,
-    target_label: &str,
-) -> io::Result<()> {
-    while let Ok(Some(event)) = events.try_recv() {
-        print_events_with_stats(
-            stream_output,
-            std::slice::from_ref(&event),
-            Some(target_label),
-        )?;
-    }
-    Ok(())
-}
-
-struct StreamOutput<'a, W: Write> {
-    config: OutputConfig,
-    header_printed: bool,
-    print_final_summary: bool,
-    show_running_only_summary_note: bool,
-    out: &'a mut W,
-}
-
-impl<W: Write> StreamOutput<'_, W> {
-    fn print_events(
-        &mut self,
-        events: &[ClientEvent],
-        target: Option<&str>,
-        stats_updates: &[EventRenderStats],
-    ) -> io::Result<()> {
-        self.print_header()?;
-        for (event, stats_update) in events.iter().zip(stats_updates) {
-            self.print_event(event, target, stats_update)?;
-        }
-        Ok(())
-    }
-
-    fn print_event(
-        &mut self,
-        event: &ClientEvent,
-        target: Option<&str>,
-        stats_update: &EventRenderStats,
-    ) -> io::Result<()> {
-        if let Some(line) = self.config.render_event(event, target, Some(stats_update)) {
-            writeln!(self.out, "{line}")?;
-        }
-        Ok(())
-    }
-
-    fn print_header(&mut self) -> io::Result<()> {
-        if self.header_printed {
-            return Ok(());
-        }
-        self.header_printed = true;
-        if let Some(header) = self.config.render_header() {
-            writeln!(self.out, "{header}")?;
-        }
-        Ok(())
-    }
-
-    #[cfg(feature = "stats")]
-    fn print_summary(&mut self, stats: &StatsCollector) -> io::Result<()> {
-        if !self.print_final_summary || !self.config.prints_summary() {
-            return Ok(());
-        }
-
-        write!(
-            self.out,
-            "{}",
-            crate::cmd::client::summary::format_summary_with_options(
-                &stats.snapshot(),
-                crate::cmd::client::summary::SummaryFormatOptions {
-                    verbose: self.config.summary_verbose(),
-                    show_running_only_note: self.show_running_only_summary_note,
-                },
-            )
-        )?;
-
-        Ok(())
-    }
-
-    #[cfg(not(feature = "stats"))]
-    fn print_summary(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(feature = "stats")]
-fn print_events_with_stats<W: Write>(
-    stream_output: &mut StreamOutput<'_, W>,
-    events: &[ClientEvent],
-    target: Option<&str>,
-    stats: &mut StatsCollector,
-) -> io::Result<()> {
-    let stats_updates = events
-        .iter()
-        .map(|event| EventRenderStats::from(stats.process(event)))
-        .collect::<Vec<_>>();
-    stream_output.print_events(events, target, &stats_updates)
-}
-
-#[cfg(not(feature = "stats"))]
-fn print_events_with_stats<W: Write>(
-    stream_output: &mut StreamOutput<'_, W>,
-    events: &[ClientEvent],
-    target: Option<&str>,
-) -> io::Result<()> {
-    let stats_updates = vec![EventRenderStats::default(); events.len()];
-    stream_output.print_events(events, target, &stats_updates)
-}
-
-fn run_group_stream(
-    args: ClientArgs,
-    targets: Vec<ResolvedCliTarget>,
-    output_config: OutputConfig,
-    continuous: bool,
-    shutdown_requested: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = args.to_client_config();
-    let managed_targets = targets
-        .iter()
-        .map(|target| target.managed.clone())
-        .collect::<Vec<_>>();
-    let expected_target_count = managed_targets.len();
-    if let Some(first) = managed_targets.first() {
-        config.server_addr = first.remote.to_string();
-    }
-
-    let group_config = ManagedClientGroupConfig {
-        client: config,
-        pacing: args.pacing.into(),
-        completion: ManagedGroupCompletionPolicy::AllTargetsComplete,
-    };
-
-    let (session, events) = ManagedClientGroup::start_with_subscription(
-        group_config,
-        managed_targets,
-        SubscriberConfig {
-            capacity: MANAGED_EVENT_CAPACITY,
-            // CLI output is best-effort under sustained backpressure. Dropping
-            // stale rows keeps continuous runs attached to the running group
-            // instead of turning a full output queue into a disconnected
-            // subscriber and a potentially blocking join.
-            overflow: SubscriberOverflow::DropOldest,
-        },
-    )?;
-
-    let mut stdout = io::LineWriter::new(io::stdout().lock());
     #[cfg(feature = "stats")]
     let mut stats = targets
         .iter()
@@ -374,173 +112,103 @@ fn run_group_stream(
             )
         })
         .collect::<BTreeMap<_, _>>();
-    let mut stream_output = StreamOutput {
-        config: output_config,
-        header_printed: false,
-        print_final_summary: false,
-        show_running_only_summary_note: false,
-        out: &mut stdout,
-    };
-
+    let mut terminal_targets = HashSet::new();
+    let mut dropped_events = 0_u64;
     let mut interrupted = false;
     let mut stop_requested = false;
-    let mut peer_close_requested_stop = false;
-    let mut terminal_targets = HashSet::new();
-    let mut last_event_at = Instant::now();
-    let mut saw_target_event = false;
-
+    let mut subscription_closed = false;
     loop {
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
-            if request_group_stop_once(&mut stop_requested) {
-                session.stop();
+            if request_managed_stop_once(&mut stop_requested) {
+                drop(handle.stop());
             }
         }
-        if request_group_stop_for_peer_close(
+        if request_managed_stop_for_peer_close(
             continuous,
             interrupted,
-            session.peer_closed_target_count(),
-            &mut peer_close_requested_stop,
+            handle.status().peer_closed_target_outcomes,
             &mut stop_requested,
         ) {
-            session.stop();
+            drop(handle.stop());
         }
-
-        match events.try_recv() {
-            Ok(Some(group_event)) => {
-                last_event_at = Instant::now();
-                saw_target_event = true;
-                match group_event {
-                    ManagedGroupEvent::Client(target_event) => {
-                        #[cfg(feature = "stats")]
-                        {
-                            let label = target_event.target.as_str();
-                            let stats = stats
-                                .entry(label.to_owned())
-                                .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
-                            print_target_event_with_stats(
-                                &mut stream_output,
-                                &target_event,
-                                stats,
-                            )?;
-                        }
-                        #[cfg(not(feature = "stats"))]
-                        {
-                            print_target_event_with_stats(&mut stream_output, &target_event)?;
-                        }
-                    }
-                    ManagedGroupEvent::TargetFinished(target) => {
-                        report_target_failure(&target);
-                        terminal_targets.insert(target.id.as_str().to_owned());
-                        if request_group_stop_for_peer_close(
-                            continuous,
-                            interrupted,
-                            u64::from(matches!(
-                                &target.end_reason,
-                                irtt_client::ManagedTargetEndReason::PeerClosed
-                            )),
-                            &mut peer_close_requested_stop,
-                            &mut stop_requested,
-                        ) {
-                            session.stop();
-                        }
-                    }
-                }
-            }
-            Ok(None) => {
-                if interrupted {
-                    break;
-                }
-                if terminal_targets.len() >= expected_target_count {
-                    break;
-                }
-                if should_join_group_after_idle(&args, continuous, saw_target_event, last_event_at)
-                {
-                    break;
-                }
-                thread::sleep(GROUP_IDLE_SLEEP);
-            }
-            Err(EventSubscriptionError::Disconnected) => break,
+        let drain_state = drain_events(
+            &mut events,
+            &mut stream_output,
+            #[cfg(feature = "stats")]
+            &mut stats,
+            &mut terminal_targets,
+            &mut dropped_events,
+        )?;
+        match drain_state {
+            ManagedDrainState::Empty => thread::sleep(MANAGED_EVENT_WAIT_SLICE),
+            ManagedDrainState::Closed => subscription_closed = true,
+            ManagedDrainState::BudgetExhausted => {}
+        }
+        if handle.status().final_outcome.is_some() || subscription_closed {
+            break;
         }
     }
-
     if interrupted {
-        eprintln!("interrupted, closing group...");
+        eprintln!("interrupted, closing managed run...");
     }
-
-    let outcome = session.join()?;
-    while let Ok(Some(group_event)) = events.try_recv() {
-        match group_event {
-            ManagedGroupEvent::Client(target_event) => {
-                #[cfg(feature = "stats")]
-                {
-                    let label = target_event.target.as_str();
-                    let stats = stats
-                        .entry(label.to_owned())
-                        .or_insert_with(|| StatsCollector::new(stats_config(continuous)));
-                    print_target_event_with_stats(&mut stream_output, &target_event, stats)?;
-                }
-                #[cfg(not(feature = "stats"))]
-                {
-                    print_target_event_with_stats(&mut stream_output, &target_event)?;
-                }
-            }
-            ManagedGroupEvent::TargetFinished(target) => {
-                if terminal_targets.insert(target.id.as_str().to_owned()) {
-                    report_target_failure(&target);
-                }
-            }
-        }
-    }
-    if let Some(warning) = dropped_event_warning(events.dropped_events(), "managed group") {
+    let outcome = owner.join()?;
+    drain_final_events(
+        &mut events,
+        &mut stream_output,
+        #[cfg(feature = "stats")]
+        &mut stats,
+        &mut terminal_targets,
+        &mut dropped_events,
+    )?;
+    if let Some(warning) = dropped_event_warning(dropped_events) {
         eprintln!("{warning}");
     }
-
-    interrupted |= is_shutdown_requested(shutdown_requested);
-    for target in &outcome.targets {
-        if terminal_targets.insert(target.id.as_str().to_owned()) {
+    if outcome.discarded_target_outcomes != 0 {
+        eprintln!(
+            "irtt-rs: warning: {} final target outcomes were discarded",
+            outcome.discarded_target_outcomes
+        );
+    }
+    for target in outcome.recent_target_outcomes.iter() {
+        if terminal_targets.insert(target.target.clone()) {
             report_target_failure(target);
         }
     }
-    let successful_targets = outcome.successful_target_outcomes;
-    let failed_targets = outcome.failed_target_outcomes;
-    let peer_closed_target_outcomes = outcome
-        .peer_closed_target_outcomes
-        .max(u64::from(peer_close_requested_stop));
-    let terminal_error = if let Some(error) =
-        peer_close_run_error(continuous, interrupted, peer_closed_target_outcomes)
-    {
-        Some(error)
-    } else if outcome.end_reason == ManagedGroupEndReason::Cancelled
-        && !interrupted
-        && !peer_close_requested_stop
-    {
-        Some("managed client group was cancelled".to_owned())
-    } else if !interrupted && successful_targets == 0 && failed_targets > 0 {
-        Some(format!(
-            "no managed target completed successfully ({failed_targets} failed)"
-        ))
-    } else {
-        None
-    };
-
-    let print_final_summary = should_print_final_summary(continuous, interrupted);
-    stream_output.print_final_summary = print_final_summary;
-    stream_output.show_running_only_summary_note = continuous && interrupted && print_final_summary;
-    #[cfg(feature = "stats")]
-    {
-        for (label, stats) in &stats {
-            if stream_output.print_final_summary && stream_output.config.prints_summary() {
-                writeln!(stream_output.out)?;
-                writeln!(stream_output.out, "target: {label}")?;
-            }
-            stream_output.print_summary(stats)?;
+    interrupted |= is_shutdown_requested(shutdown_requested);
+    let terminal_error = match &outcome.end_reason {
+        ManagedEndReason::DriverFailed(failure) => {
+            Some(format!("managed driver failed: {failure}"))
         }
+        _ => peer_close_run_error(continuous, interrupted, outcome.peer_closed_target_outcomes)
+            .or_else(|| {
+                (!interrupted
+                    && outcome.successful_target_outcomes == 0
+                    && outcome.failed_target_outcomes > 0)
+                    .then(|| {
+                        format!(
+                            "no managed target completed successfully ({} failed)",
+                            outcome.failed_target_outcomes
+                        )
+                    })
+            }),
+    };
+    stream_output.print_final_summary = should_print_final_summary(continuous, interrupted);
+    stream_output.show_running_only_summary_note =
+        continuous && interrupted && stream_output.print_final_summary;
+    #[cfg(feature = "stats")]
+    for (label, stats) in &stats {
+        if multi_target
+            && stream_output.print_final_summary
+            && stream_output.config.prints_summary()
+        {
+            writeln!(stream_output.out)?;
+            writeln!(stream_output.out, "target: {label}")?;
+        }
+        stream_output.print_summary(stats)?;
     }
     #[cfg(not(feature = "stats"))]
-    {
-        stream_output.print_summary()?;
-    }
+    stream_output.print_summary()?;
     stream_output.out.flush()?;
     if let Some(error) = terminal_error {
         return Err(error.into());
@@ -548,73 +216,190 @@ fn run_group_stream(
     Ok(())
 }
 
-fn report_target_failure(target: &ManagedTargetOutcome) {
-    if let Some(failure) = target.end_reason.failure() {
-        eprintln!(
-            "irtt-rs: target {} failed ({}): {}",
-            target.id, failure.kind, failure.message
-        );
+fn process_event<W: Write>(
+    event: ManagedEvent,
+    stream_output: &mut StreamOutput<'_, W>,
+    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
+    terminal_targets: &mut HashSet<TargetInstance>,
+) -> io::Result<()> {
+    match event {
+        ManagedEvent::Client { target, event } => {
+            #[cfg(feature = "stats")]
+            {
+                let collector = stats
+                    .entry(target.id.as_str().to_owned())
+                    .or_insert_with(|| StatsCollector::new(stats_config(false)));
+                print_events_with_stats(
+                    stream_output,
+                    std::slice::from_ref(&event),
+                    Some(target.id.as_str()),
+                    collector,
+                )?;
+            }
+            #[cfg(not(feature = "stats"))]
+            print_events_with_stats(
+                stream_output,
+                std::slice::from_ref(&event),
+                Some(target.id.as_str()),
+            )?;
+        }
+        ManagedEvent::TargetFinished { outcome } => {
+            terminal_targets.insert(outcome.target.clone());
+            report_target_failure(&outcome);
+        }
+        _ => {}
     }
+    Ok(())
 }
 
-fn dropped_event_warning(dropped_events: u64, source: &str) -> Option<String> {
-    (dropped_events > 0).then(|| {
-        let event_word = if dropped_events == 1 {
-            "event"
-        } else {
-            "events"
-        };
-        format!(
-            "irtt-rs: warning: dropped {dropped_events} {source} {event_word}; output and statistics may be incomplete"
+fn drain_events<W: Write>(
+    events: &mut ManagedEventSubscription,
+    stream_output: &mut StreamOutput<'_, W>,
+    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
+    terminal_targets: &mut HashSet<TargetInstance>,
+    dropped_events: &mut u64,
+) -> io::Result<ManagedDrainState> {
+    drain_managed_events(events, dropped_events, |event| {
+        process_event(
+            event,
+            stream_output,
+            #[cfg(feature = "stats")]
+            stats,
+            terminal_targets,
         )
     })
 }
 
-fn estimated_group_completion_grace(args: &ClientArgs) -> Duration {
-    let open_timeout: Duration = args.to_client_config().open_timeouts.iter().sum();
-    open_timeout
-        .saturating_add(args.duration)
-        .saturating_add(GROUP_COMPLETION_GRACE)
-}
-
-fn should_join_group_after_idle(
-    args: &ClientArgs,
-    continuous: bool,
-    saw_target_event: bool,
-    last_event_at: Instant,
-) -> bool {
-    if continuous && saw_target_event {
-        return false;
-    }
-    last_event_at.elapsed() > estimated_group_completion_grace(args)
-}
-
-#[cfg(feature = "stats")]
-fn print_target_event_with_stats<W: Write>(
+fn drain_final_events<W: Write>(
+    events: &mut ManagedEventSubscription,
     stream_output: &mut StreamOutput<'_, W>,
-    target_event: &TargetEvent,
+    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
+    terminal_targets: &mut HashSet<TargetInstance>,
+    dropped_events: &mut u64,
+) -> io::Result<()> {
+    loop {
+        match events.try_recv() {
+            Ok(event) => process_event(
+                event,
+                stream_output,
+                #[cfg(feature = "stats")]
+                stats,
+                terminal_targets,
+            )?,
+            Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
+            Err(ManagedEventTryRecvError::Lagged(count)) => {
+                *dropped_events = dropped_events.saturating_add(count);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn report_target_failure(target: &ManagedTargetOutcome) {
+    for message in target_failure_messages(target) {
+        eprintln!("{message}");
+    }
+}
+
+fn target_failure_messages(target: &ManagedTargetOutcome) -> Vec<String> {
+    let mut messages = Vec::with_capacity(2);
+    if let ManagedTargetEndReason::Failed(failure) = &target.end_reason {
+        messages.push(format!(
+            "irtt-rs: target {} failed ({:?} {:?}): {}",
+            target.target.id, failure.phase, failure.kind, failure.message
+        ));
+    }
+    if let Some(failure) = &target.cleanup_failure {
+        messages.push(format!(
+            "irtt-rs: target {} cleanup failed ({:?} {:?}): {}",
+            target.target.id, failure.phase, failure.kind, failure.message
+        ));
+    }
+    messages
+}
+fn dropped_event_warning(dropped_events: u64) -> Option<String> {
+    (dropped_events > 0).then(|| format!("irtt-rs: warning: dropped {dropped_events} managed run event{}; output and statistics may be incomplete", if dropped_events == 1 { "" } else { "s" }))
+}
+
+struct StreamOutput<'a, W: Write> {
+    config: OutputConfig,
+    header_printed: bool,
+    print_final_summary: bool,
+    show_running_only_summary_note: bool,
+    out: &'a mut W,
+}
+impl<W: Write> StreamOutput<'_, W> {
+    fn print_events(
+        &mut self,
+        events: &[ClientEvent],
+        target: Option<&str>,
+        stats_updates: &[EventRenderStats],
+    ) -> io::Result<()> {
+        self.print_header()?;
+        for (event, stats_update) in events.iter().zip(stats_updates) {
+            if let Some(line) = self.config.render_event(event, target, Some(stats_update)) {
+                writeln!(self.out, "{line}")?;
+            }
+        }
+        Ok(())
+    }
+    fn print_header(&mut self) -> io::Result<()> {
+        if self.header_printed {
+            return Ok(());
+        }
+        self.header_printed = true;
+        if let Some(header) = self.config.render_header() {
+            writeln!(self.out, "{header}")?;
+        }
+        Ok(())
+    }
+    #[cfg(feature = "stats")]
+    fn print_summary(&mut self, stats: &StatsCollector) -> io::Result<()> {
+        if self.print_final_summary && self.config.prints_summary() {
+            write!(
+                self.out,
+                "{}",
+                crate::cmd::client::summary::format_summary_with_options(
+                    &stats.snapshot(),
+                    crate::cmd::client::summary::SummaryFormatOptions {
+                        verbose: self.config.summary_verbose(),
+                        show_running_only_note: self.show_running_only_summary_note
+                    }
+                )
+            )?;
+        }
+        Ok(())
+    }
+    #[cfg(not(feature = "stats"))]
+    fn print_summary(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+#[cfg(feature = "stats")]
+fn print_events_with_stats<W: Write>(
+    stream_output: &mut StreamOutput<'_, W>,
+    events: &[ClientEvent],
+    target: Option<&str>,
     stats: &mut StatsCollector,
 ) -> io::Result<()> {
-    print_events_with_stats(
-        stream_output,
-        std::slice::from_ref(&target_event.event),
-        Some(target_event.target.as_str()),
-        stats,
-    )
+    let updates = events
+        .iter()
+        .map(|event| EventRenderStats::from(stats.process(event)))
+        .collect::<Vec<_>>();
+    stream_output.print_events(events, target, &updates)
 }
-
 #[cfg(not(feature = "stats"))]
-fn print_target_event_with_stats<W: Write>(
+fn print_events_with_stats<W: Write>(
     stream_output: &mut StreamOutput<'_, W>,
-    target_event: &TargetEvent,
+    events: &[ClientEvent],
+    target: Option<&str>,
 ) -> io::Result<()> {
-    print_events_with_stats(
-        stream_output,
-        std::slice::from_ref(&target_event.event),
-        Some(target_event.target.as_str()),
+    stream_output.print_events(
+        events,
+        target,
+        &vec![EventRenderStats::default(); events.len()],
     )
 }
-
 #[cfg(feature = "stats")]
 fn stats_config(continuous: bool) -> StatsConfig {
     if continuous {
@@ -623,25 +408,21 @@ fn stats_config(continuous: bool) -> StatsConfig {
         StatsConfig::finite()
     }
 }
-
-#[cfg(feature = "stats")]
-fn estimate_finite_stats_memory_bytes(expected_probes: u64) -> u64 {
-    expected_probes.saturating_mul(FINITE_STATS_BYTES_PER_PROBE)
-}
-
 #[cfg(feature = "stats")]
 fn finite_stats_memory_warning(args: &ClientArgs) -> Option<String> {
     if args.is_continuous() || args.duration.is_zero() {
         return None;
     }
-
-    let expected_probes = expected_probe_count(args.duration, args.interval);
-    let estimated_bytes = estimate_finite_stats_memory_bytes(expected_probes);
+    let estimated_bytes = expected_probe_count(args.duration, args.interval)
+        .saturating_mul(FINITE_STATS_BYTES_PER_PROBE);
     if estimated_bytes < FINITE_STATS_MEMORY_WARNING_BYTES {
         return None;
     }
-
-    let formatted = format_bytes_for_warning(estimated_bytes);
+    let formatted = if estimated_bytes >= GIB {
+        format!("{} GiB", estimated_bytes.saturating_add(GIB / 2) / GIB)
+    } else {
+        format!("{} MiB", estimated_bytes.saturating_add(MIB / 2) / MIB)
+    };
     let guidance = if estimated_bytes >= FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES {
         "this may be unsuitable on memory-constrained systems"
     } else if estimated_bytes >= FINITE_STATS_MEMORY_STRONG_WARNING_BYTES {
@@ -649,329 +430,61 @@ fn finite_stats_memory_warning(args: &ClientArgs) -> Option<String> {
     } else {
         "use continuous mode for bounded-memory long-running tests"
     };
-
-    Some(format!(
-        "irtt-rs: warning: finite exact statistics may retain about {formatted} for this run; {guidance}"
-    ))
+    Some(format!("irtt-rs: warning: finite exact statistics may retain about {formatted} for this run; {guidance}"))
 }
 
-#[cfg(feature = "stats")]
-fn format_bytes_for_warning(bytes: u64) -> String {
-    if bytes >= GIB {
-        format!("{} GiB", bytes.saturating_add(GIB / 2) / GIB)
-    } else {
-        format!("{} MiB", bytes.saturating_add(MIB / 2) / MIB)
-    }
-}
-
-#[cfg(all(test, feature = "stats"))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        net::{IpAddr, Ipv4Addr, SocketAddr},
-        time::{Duration, Instant, UNIX_EPOCH},
+    use irtt_client::managed::{
+        ManagedTargetFailure, ManagedTargetFailureKind, ManagedTargetFailurePhase, TargetId,
     };
+    use std::sync::Arc;
 
-    fn test_timestamp(offset: Duration) -> ClientTimestamp {
-        ClientTimestamp {
-            wall: UNIX_EPOCH + offset,
-            mono: Instant::now() + offset,
-        }
+    #[test]
+    fn lagged_events_are_counted_saturatingly() {
+        let mut dropped = 0_u64;
+        dropped = dropped.saturating_add(7);
+        dropped = dropped.saturating_add(3);
+        assert_eq!(dropped, 10);
+        assert_eq!(u64::MAX.saturating_add(1), u64::MAX);
+        assert!(dropped_event_warning(dropped)
+            .unwrap()
+            .contains("dropped 10 managed run events"));
     }
 
-    fn test_remote() -> SocketAddr {
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112)
-    }
-
-    fn reply_event(seq: u32, rtt_us: u64) -> ClientEvent {
-        let sent_at = test_timestamp(Duration::from_millis(seq as u64));
-        let received_at = ClientTimestamp {
-            wall: sent_at.wall + Duration::from_micros(rtt_us),
-            mono: sent_at.mono + Duration::from_micros(rtt_us),
+    #[test]
+    fn target_failure_diagnostics_include_primary_and_cleanup_failures() {
+        let target = ManagedTargetOutcome {
+            target: TargetInstance {
+                id: TargetId::from("edge"),
+                generation: 1,
+            },
+            server_addr: Arc::from("127.0.0.1:2112"),
+            remote: None,
+            end_reason: ManagedTargetEndReason::Failed(ManagedTargetFailure {
+                phase: ManagedTargetFailurePhase::Receiving,
+                kind: ManagedTargetFailureKind::Protocol,
+                message: "primary failure".into(),
+            }),
+            packets_sent: 0,
+            replies_received: 0,
+            duplicates: 0,
+            late: 0,
+            warning_events: 0,
+            cleanup_failure: Some(ManagedTargetFailure {
+                phase: ManagedTargetFailurePhase::Closing,
+                kind: ManagedTargetFailureKind::Socket,
+                message: "cleanup failure".into(),
+            }),
         };
-        ClientEvent::EchoReply {
-            seq,
-            remote: test_remote(),
-            sent_at,
-            received_at,
-            rtt: RttSample {
-                raw: Duration::from_micros(rtt_us),
-                adjusted: None,
-                effective: SignedDuration::from_nanos(i128::from(rtt_us) * 1_000),
-            },
-            server_timing: None,
-            one_way: None,
-            received_stats: None,
-            bytes: 64,
-            packet_meta: PacketMeta::default(),
-        }
-    }
 
-    fn cli_args(args: &[&str]) -> ClientArgs {
-        let mut argv = vec!["irtt-rs"];
-        argv.extend_from_slice(args);
-        <ClientArgs as clap::Parser>::try_parse_from(argv).unwrap()
-    }
-
-    fn output_config(
-        format: crate::cmd::client::OutputFormat,
-        columns: Option<&str>,
-        header: crate::cmd::client::HeaderMode,
-        verbose: bool,
-    ) -> OutputConfig {
-        OutputConfig::new(format, columns, header, verbose, false).unwrap()
-    }
-
-    #[test]
-    fn dropped_event_warning_marks_statistics_incomplete() {
-        assert_eq!(dropped_event_warning(0, "managed client"), None);
-        let warning = dropped_event_warning(7, "managed group").unwrap();
-        assert!(warning.contains("dropped 7 managed group events"));
-        assert!(warning.contains("statistics may be incomplete"));
-    }
-
-    #[test]
-    fn single_client_drain_preserves_final_queue_and_surfaces_overflow() {
-        let hub = irtt_client::EventHub::new();
-        let events = hub
-            .subscribe(SubscriberConfig {
-                capacity: 1,
-                overflow: SubscriberOverflow::DropOldest,
-            })
-            .unwrap();
-        hub.publish(reply_event(1, 1_000));
-        hub.publish(reply_event(2, 2_000));
-        hub.disconnect_all();
-
-        let mut stats = StatsCollector::new(StatsConfig::finite());
-        let mut out = Vec::new();
-        {
-            let mut stream_output = StreamOutput {
-                config: output_config(
-                    crate::cmd::client::OutputFormat::Csv,
-                    Some("event,seq"),
-                    crate::cmd::client::HeaderMode::Never,
-                    false,
-                ),
-                header_printed: false,
-                print_final_summary: false,
-                show_running_only_summary_note: false,
-                out: &mut out,
-            };
-            drain_single_client_events(&events, &mut stream_output, "target", &mut stats).unwrap();
-        }
-
-        let rendered = String::from_utf8(out).unwrap();
-        assert_eq!(rendered.trim(), "echo_reply,2");
-        assert_eq!(events.dropped_events(), 1);
-        assert!(
-            dropped_event_warning(events.dropped_events(), "managed client")
-                .unwrap()
-                .contains("dropped 1 managed client event")
-        );
         assert_eq!(
-            events.try_recv().unwrap_err(),
-            EventSubscriptionError::Disconnected
+            target_failure_messages(&target),
+            [
+                "irtt-rs: target edge failed (Receiving Protocol): primary failure",
+                "irtt-rs: target edge cleanup failed (Closing Socket): cleanup failure",
+            ]
         );
-    }
-
-    #[test]
-    fn output_helper_streams_and_collects_events() {
-        let sent_at = test_timestamp(Duration::from_secs(1));
-        let received_at = test_timestamp(Duration::from_secs(1) + Duration::from_micros(1200));
-        let events = [
-            ClientEvent::EchoSent {
-                seq: 1,
-                remote: test_remote(),
-                scheduled_at: sent_at.mono,
-                sent_at,
-                bytes: 64,
-                send_call: Duration::from_micros(10),
-                timer_error: Duration::ZERO,
-            },
-            ClientEvent::EchoReply {
-                seq: 1,
-                remote: test_remote(),
-                sent_at,
-                received_at,
-                rtt: RttSample {
-                    raw: Duration::from_micros(1200),
-                    adjusted: None,
-                    effective: SignedDuration::from_nanos(1_200_000),
-                },
-                server_timing: None,
-                one_way: None,
-                received_stats: None,
-                bytes: 64,
-                packet_meta: PacketMeta::default(),
-            },
-        ];
-
-        let mut stats = StatsCollector::new(StatsConfig::finite());
-        let mut out = Vec::new();
-        {
-            let mut stream_output = StreamOutput {
-                config: output_config(
-                    crate::cmd::client::OutputFormat::Tsv,
-                    Some("effective_rtt_us"),
-                    crate::cmd::client::HeaderMode::Never,
-                    false,
-                ),
-                header_printed: false,
-                print_final_summary: true,
-                show_running_only_summary_note: false,
-                out: &mut out,
-            };
-            print_events_with_stats(&mut stream_output, &events, None, &mut stats).unwrap();
-            stream_output.print_summary(&stats).unwrap();
-        }
-
-        let rendered = String::from_utf8(out).unwrap();
-        let summary = stats.snapshot();
-        assert!(!rendered.is_empty());
-        assert_eq!(summary.packets.packets_sent, 1);
-        assert_eq!(summary.packets.unique_replies, 1);
-    }
-
-    #[test]
-    fn continuous_summary_prints_when_enabled_and_suppresses_when_disabled() {
-        let mut stats = StatsCollector::new(StatsConfig::continuous());
-        let mut out = Vec::new();
-        {
-            let mut stream_output = StreamOutput {
-                config: output_config(
-                    crate::cmd::client::OutputFormat::Table,
-                    None,
-                    crate::cmd::client::HeaderMode::Auto,
-                    false,
-                ),
-                header_printed: false,
-                print_final_summary: true,
-                show_running_only_summary_note: true,
-                out: &mut out,
-            };
-            print_events_with_stats(
-                &mut stream_output,
-                &[reply_event(1, 1200)],
-                None,
-                &mut stats,
-            )
-            .unwrap();
-            stream_output.print_summary(&stats).unwrap();
-        }
-
-        let rendered = String::from_utf8(out).unwrap();
-        assert!(rendered.contains("irtt-rs summary"));
-        assert!(rendered.contains("medians unavailable"));
-        assert!(rendered.contains("continuous mode"));
-        assert!(rendered.contains("packets:"));
-        assert!(rendered.contains("received=1"));
-
-        let stats = StatsCollector::new(StatsConfig::continuous());
-        let mut out = Vec::new();
-        {
-            let mut stream_output = StreamOutput {
-                config: output_config(
-                    crate::cmd::client::OutputFormat::Table,
-                    None,
-                    crate::cmd::client::HeaderMode::Auto,
-                    false,
-                ),
-                header_printed: false,
-                print_final_summary: false,
-                show_running_only_summary_note: true,
-                out: &mut out,
-            };
-            stream_output.print_summary(&stats).unwrap();
-        }
-
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn continuous_mode_uses_continuous_stats_config() {
-        let mut collector = StatsCollector::new(stats_config(true));
-        for seq in 0..5000_u32 {
-            let sent_at = test_timestamp(Duration::from_micros(seq as u64));
-            let received_at = test_timestamp(Duration::from_micros(seq as u64 + 1));
-            collector.process(&ClientEvent::EchoReply {
-                seq,
-                remote: test_remote(),
-                sent_at,
-                received_at,
-                rtt: RttSample {
-                    raw: Duration::from_micros(1),
-                    adjusted: None,
-                    effective: SignedDuration::from_nanos(1_000),
-                },
-                server_timing: None,
-                one_way: None,
-                received_stats: None,
-                bytes: 64,
-                packet_meta: PacketMeta::default(),
-            });
-        }
-
-        assert_eq!(collector.snapshot().rtt.primary.median_ns, None);
-    }
-
-    #[test]
-    fn finite_stats_memory_warning_reports_only_large_finite_runs() {
-        for args in [
-            cli_args(&["--duration", "0", "--interval", "1ms", "127.0.0.1:2112"]),
-            cli_args(&[
-                "--duration",
-                "1000ms",
-                "--interval",
-                "1ms",
-                "127.0.0.1:2112",
-            ]),
-        ] {
-            assert_eq!(finite_stats_memory_warning(&args), None);
-        }
-
-        for (threshold, size, guidance) in [
-            (
-                FINITE_STATS_MEMORY_WARNING_BYTES,
-                "about 128 MiB",
-                "bounded-memory long-running tests",
-            ),
-            (
-                FINITE_STATS_MEMORY_STRONG_WARNING_BYTES,
-                "about 512 MiB",
-                "shortening the run",
-            ),
-            (
-                FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES,
-                "about 1 GiB",
-                "memory-constrained systems",
-            ),
-        ] {
-            let expected_probes = threshold.div_ceil(FINITE_STATS_BYTES_PER_PROBE);
-            let args = cli_args(&[
-                "--duration",
-                &format!("{expected_probes}ms"),
-                "--interval",
-                "1ms",
-                "127.0.0.1:2112",
-            ]);
-
-            let warning = finite_stats_memory_warning(&args).unwrap();
-            assert!(warning.contains(size));
-            assert!(warning.contains(guidance));
-        }
-    }
-
-    #[test]
-    fn expected_probe_count_rounds_up() {
-        assert_eq!(
-            expected_probe_count(Duration::from_millis(1001), Duration::from_secs(1)),
-            2
-        );
-    }
-
-    #[test]
-    fn estimate_finite_stats_memory_bytes_saturates() {
-        assert_eq!(estimate_finite_stats_memory_bytes(u64::MAX), u64::MAX);
     }
 }

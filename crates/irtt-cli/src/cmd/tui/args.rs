@@ -6,8 +6,8 @@ use irtt_client::ClientConfig;
 #[cfg(test)]
 use crate::shared::client::TimestampArg;
 use crate::shared::client::{
-    parse_labelled_target, parse_test_duration, resolved_managed_targets, target_specs,
-    CommonClientArgs, GroupPacingArg, LabelledTargetArg, ResolvedTarget, TargetSpec,
+    parse_labelled_target, parse_test_duration, prepare_managed_targets, target_specs,
+    CommonClientArgs, GroupPacingArg, LabelledTargetArg, PreparedTarget, TargetSpec,
 };
 
 pub const DEFAULT_TUI_DURATION: Duration = Duration::ZERO;
@@ -72,10 +72,8 @@ impl TuiArgs {
         target_specs(&self.targets, &self.labelled_targets)
     }
 
-    pub fn resolved_managed_targets(&self) -> Result<Vec<ResolvedTuiTarget>, String> {
-        let specs = self.target_specs()?;
-        let config = self.to_client_config();
-        resolved_managed_targets(specs, &config)
+    pub fn managed_targets(&self) -> Result<Vec<TuiManagedTarget>, String> {
+        prepare_managed_targets(self.target_specs()?)
     }
 
     #[cfg(test)]
@@ -93,7 +91,7 @@ impl TuiArgs {
 }
 
 pub type TuiTargetSpec = TargetSpec;
-pub type ResolvedTuiTarget = ResolvedTarget;
+pub type TuiManagedTarget = PreparedTarget;
 
 impl std::ops::Deref for TuiArgs {
     type Target = CommonClientArgs;
@@ -199,11 +197,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_resolved_target_addresses_are_rejected() {
+    fn duplicate_target_endpoints_are_allowed() {
         let args = parse(&["127.0.0.1:2112", "127.0.0.1"]).unwrap();
-        let err = args.resolved_managed_targets().unwrap_err();
-
-        assert!(err.contains("duplicate resolved target address 127.0.0.1:2112"));
+        assert_eq!(args.managed_targets().unwrap().len(), 2);
     }
 
     #[test]

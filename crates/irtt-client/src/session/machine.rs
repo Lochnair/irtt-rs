@@ -480,6 +480,7 @@ impl SessionMachine {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn has_timed_out_metadata(&self) -> bool {
         matches!(
             &self.state,
@@ -487,6 +488,7 @@ impl SessionMachine {
         )
     }
 
+    #[cfg(any(feature = "tokio", test))]
     pub(crate) fn packets_sent(&self) -> u64 {
         match &self.state {
             MachineState::Open(session) => session.packets_sent,

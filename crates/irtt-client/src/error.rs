@@ -186,27 +186,4 @@ pub enum ClientError {
     /// The reported reason names a value that must be changed before retrying.
     #[error("invalid configuration: {reason}")]
     InvalidConfig { reason: String },
-    /// A managed-session worker thread panicked before producing an outcome.
-    ///
-    /// This is a runtime failure from joining the managed session, not a
-    /// protocol response from the server.
-    #[error("managed client worker thread panicked")]
-    WorkerPanicked,
-}
-
-/// Failure reported while setting up or receiving from an event subscription.
-///
-/// Zero-capacity subscriber queues are rejected when subscriptions are created.
-/// Once a subscription exists, this error type reports delivery failures observed
-/// by [`EventSubscription`](crate::EventSubscription).
-#[derive(Debug, Error, Clone, Copy, PartialEq, Eq)]
-pub enum EventSubscriptionError {
-    /// The subscription can no longer receive new events.
-    ///
-    /// Already queued events are delivered first. After the queue is drained,
-    /// `recv`, `recv_timeout`, and `try_recv` return this error when the hub
-    /// disconnects the subscriber, the hub is shut down, or the subscription is
-    /// disconnected by its overflow policy.
-    #[error("event subscription is disconnected")]
-    Disconnected,
 }

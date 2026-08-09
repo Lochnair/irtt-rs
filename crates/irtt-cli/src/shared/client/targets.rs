@@ -1,7 +1,7 @@
-use std::{collections::HashSet, net::ToSocketAddrs};
+use std::collections::HashSet;
 
 use clap::ValueEnum;
-use irtt_client::{ClientConfig, ManagedGroupPacing, ManagedTargetConfig, TargetId};
+use irtt_client::managed::{ManagedPacing, ManagedTargetConfig, TargetId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LabelledTargetArg {
@@ -16,7 +16,7 @@ pub struct TargetSpec {
 }
 
 #[derive(Debug, Clone)]
-pub struct ResolvedTarget {
+pub struct PreparedTarget {
     pub label: String,
     pub managed: ManagedTargetConfig,
 }
@@ -27,7 +27,7 @@ pub enum GroupPacingArg {
     Burst,
 }
 
-impl From<GroupPacingArg> for ManagedGroupPacing {
+impl From<GroupPacingArg> for ManagedPacing {
     fn from(value: GroupPacingArg) -> Self {
         match value {
             GroupPacingArg::Staggered => Self::Staggered,
@@ -93,117 +93,20 @@ pub fn target_specs(
     Ok(specs)
 }
 
-pub fn resolved_managed_targets(
-    specs: Vec<TargetSpec>,
-    config: &ClientConfig,
-) -> Result<Vec<ResolvedTarget>, String> {
-    let mut remotes = HashSet::new();
+pub fn prepare_managed_targets(specs: Vec<TargetSpec>) -> Result<Vec<PreparedTarget>, String> {
     let mut targets = Vec::with_capacity(specs.len());
     for spec in specs {
-        let remote = resolve_target(&spec.addr, config).map_err(|err| {
-            format!(
-                "failed to resolve target {} ({:?}): {err}",
-                spec.label, spec.addr
-            )
-        })?;
-        if !remotes.insert(remote) {
-            return Err(format!(
-                "duplicate resolved target address {remote} for label {}",
-                spec.label
-            ));
-        }
-        targets.push(ResolvedTarget {
+        targets.push(PreparedTarget {
             label: spec.label.clone(),
-            managed: ManagedTargetConfig {
-                id: TargetId::from(spec.label),
-                remote,
-                auth: None,
-            },
+            managed: ManagedTargetConfig::new(TargetId::from(spec.label), spec.addr),
         });
     }
     Ok(targets)
 }
 
-pub fn resolve_target(addr: &str, config: &ClientConfig) -> Result<std::net::SocketAddr, String> {
-    let normalized = normalize_target_addr(addr);
-    let mut addrs = normalized
-        .to_socket_addrs()
-        .map_err(|_| format!("failed to resolve address {normalized:?}"))?;
-    addrs
-        .find(|addr| {
-            (!config.socket_config.ipv4_only || addr.is_ipv4())
-                && (!config.socket_config.ipv6_only || addr.is_ipv6())
-        })
-        .ok_or_else(|| format!("failed to resolve address {normalized:?}"))
-}
-
-pub fn normalize_target_addr(addr: &str) -> String {
-    const DEFAULT_PORT: u16 = 2112;
-    if addr.parse::<std::net::SocketAddr>().is_ok() {
-        return addr.to_owned();
-    }
-    if addr.starts_with('[') && addr.ends_with(']') {
-        return format!("{addr}:{DEFAULT_PORT}");
-    }
-    if addr.starts_with('[') {
-        return addr.to_owned();
-    }
-    if addr.parse::<std::net::Ipv6Addr>().is_ok() {
-        return format!("[{addr}]:{DEFAULT_PORT}");
-    }
-    if addr
-        .rsplit_once(':')
-        .is_some_and(|(_, port)| port.parse::<u16>().is_ok())
-    {
-        return addr.to_owned();
-    }
-    format!("{addr}:{DEFAULT_PORT}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn target_normalization_matches_single_target_forms() {
-        assert_eq!(normalize_target_addr("127.0.0.1"), "127.0.0.1:2112");
-        assert_eq!(normalize_target_addr("127.0.0.1:1234"), "127.0.0.1:1234");
-        assert_eq!(normalize_target_addr("example.com"), "example.com:2112");
-        assert_eq!(
-            normalize_target_addr("example.com:1234"),
-            "example.com:1234"
-        );
-        assert_eq!(normalize_target_addr("[::1]"), "[::1]:2112");
-        assert_eq!(normalize_target_addr("[::1]:1234"), "[::1]:1234");
-        assert_eq!(normalize_target_addr("::1"), "[::1]:2112");
-    }
-
-    #[test]
-    fn target_resolution_respects_family_filters() {
-        let config = ClientConfig::default();
-        assert_eq!(
-            resolve_target("127.0.0.1", &config).unwrap(),
-            "127.0.0.1:2112".parse().unwrap()
-        );
-        assert_eq!(
-            resolve_target("[::1]", &config).unwrap(),
-            "[::1]:2112".parse().unwrap()
-        );
-        assert_eq!(
-            resolve_target("::1", &config).unwrap(),
-            "[::1]:2112".parse().unwrap()
-        );
-
-        let mut ipv4_only = ClientConfig::default();
-        ipv4_only.socket_config.ipv4_only = true;
-        assert!(resolve_target("127.0.0.1", &ipv4_only).unwrap().is_ipv4());
-        assert!(resolve_target("::1", &ipv4_only).is_err());
-
-        let mut ipv6_only = ClientConfig::default();
-        ipv6_only.socket_config.ipv6_only = true;
-        assert!(resolve_target("::1", &ipv6_only).unwrap().is_ipv6());
-        assert!(resolve_target("127.0.0.1", &ipv6_only).is_err());
-    }
 
     #[test]
     fn target_specs_suffix_repeated_positionals_and_reject_duplicate_labels() {
@@ -222,19 +125,19 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_resolved_target_addresses_are_rejected() {
+    fn target_preparation_preserves_hostname_and_allows_duplicate_endpoints() {
         let specs = vec![
             TargetSpec {
                 label: "a".to_owned(),
-                addr: "127.0.0.1:2112".to_owned(),
+                addr: "example.test".to_owned(),
             },
             TargetSpec {
                 label: "b".to_owned(),
-                addr: "127.0.0.1".to_owned(),
+                addr: "example.test".to_owned(),
             },
         ];
-        let err = resolved_managed_targets(specs, &ClientConfig::default()).unwrap_err();
-
-        assert!(err.contains("duplicate resolved target address 127.0.0.1:2112"));
+        let targets = prepare_managed_targets(specs).unwrap();
+        assert_eq!(targets[0].managed.server_addr, "example.test");
+        assert_eq!(targets[1].managed.server_addr, "example.test");
     }
 }

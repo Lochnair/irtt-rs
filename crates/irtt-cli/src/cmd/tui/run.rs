@@ -1,33 +1,30 @@
 use std::{
+    collections::HashSet,
     io,
     sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant},
 };
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
-use irtt_client::{
-    EventSubscription, EventSubscriptionError, ManagedClient, ManagedClientGroup,
-    ManagedClientGroupConfig, ManagedGroupCompletionPolicy, ManagedGroupEndReason,
-    ManagedGroupEvent, SessionEndReason, SubscriberConfig, SubscriberOverflow,
-};
-
+use super::ui::{should_render, TuiConfig, TuiState, TuiStatus, TuiTerminal};
 use crate::{
-    cmd::tui::args::{ResolvedTuiTarget, TuiArgs},
+    cmd::tui::args::TuiArgs,
     shared::client::{
         is_shutdown_requested,
         session::{
-            peer_close_run_error, request_group_stop_for_peer_close, request_group_stop_once,
+            drain_managed_events, peer_close_run_error, request_managed_stop_for_peer_close,
+            request_managed_stop_once, ManagedDrainState,
         },
     },
 };
-
-use super::ui::{should_render, TuiConfig, TuiState, TuiStatus, TuiTerminal};
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use irtt_client::managed::{
+    BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy, ManagedEndReason,
+    ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError, TargetInstance,
+};
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_WAIT_SLICE: Duration = Duration::from_millis(20);
-const IDLE_SLEEP: Duration = Duration::from_millis(5);
-const GROUP_COMPLETION_GRACE: Duration = Duration::from_secs(1);
 const MANAGED_EVENT_CAPACITY: usize = 16_384;
 
 pub fn run_tui(
@@ -35,7 +32,7 @@ pub fn run_tui(
     shutdown_requested: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let targets = args
-        .resolved_managed_targets()
+        .managed_targets()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let continuous = args.is_continuous();
     let mut terminal = TuiTerminal::enter()?;
@@ -44,329 +41,179 @@ pub fn run_tui(
         targets.iter().map(|target| target.label.clone()),
     );
     let mut next_render = Instant::now();
-
     if is_shutdown_requested(shutdown_requested) {
         return Ok(());
     }
-
     state.set_status(TuiStatus::Opening);
     render_if_due(&mut terminal, &state, &mut next_render, true)?;
-
-    if targets.len() > 1 {
-        return run_group_tui(
-            args,
-            targets,
-            &mut terminal,
-            &mut state,
-            &mut next_render,
-            shutdown_requested,
-        );
-    }
-
-    let (session, events) = match ManagedClient::start_with_subscription(
-        args.to_client_config(),
-        managed_event_subscriber_config(),
+    let target_count = targets.len();
+    let config = ManagedClientConfig {
+        client: args.to_client_config(),
+        pacing: args.pacing.into(),
+        completion: ManagedCompletionPolicy::FinishWhenQuiescent,
+        event_capacity: MANAGED_EVENT_CAPACITY,
+        outcome_history_limit: target_count,
+        max_live_target_generations: target_count,
+        ..ManagedClientConfig::default()
+    };
+    let (owner, mut events) = match BlockingManagedClient::start_with_subscription(
+        config,
+        targets
+            .iter()
+            .map(|target| target.managed.clone())
+            .collect(),
     ) {
-        Ok(session) => session,
-        Err(err) => {
-            state.set_error(err.to_string());
+        Ok(value) => value,
+        Err(error) => {
+            state.set_error(error.to_string());
             render_if_due(&mut terminal, &state, &mut next_render, true)?;
-            return Err(Box::new(err));
+            return Err(Box::new(error));
         }
     };
-
+    let handle = owner.handle();
     let mut interrupted = false;
+    let mut stop_requested = false;
+    let mut terminal_targets = HashSet::new();
+    let mut dropped_events = 0;
+    let mut subscription_closed = false;
     loop {
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
-            session.stop();
-            break;
+            if request_managed_stop_once(&mut stop_requested) {
+                drop(handle.stop());
+            }
         }
-
         if handle_input(&mut state, shutdown_requested)? {
             render_if_due(&mut terminal, &state, &mut next_render, true)?;
         }
         if state.quit_requested {
             interrupted = true;
-            session.stop();
-            break;
-        }
-
-        match events.recv_timeout(managed_tui_wait_duration(&next_render, state.paused)) {
-            Ok(Some(event)) => {
-                state.process_event(&event);
-                render_if_due(&mut terminal, &state, &mut next_render, false)?;
-            }
-            Ok(None) => {
-                render_if_due(&mut terminal, &state, &mut next_render, false)?;
-            }
-            Err(EventSubscriptionError::Disconnected) => break,
-        }
-    }
-    interrupted |= is_shutdown_requested(shutdown_requested);
-
-    if interrupted {
-        state.set_status(TuiStatus::Interrupted);
-        render_if_due(&mut terminal, &state, &mut next_render, true)?;
-    }
-
-    if interrupted {
-        state.set_status(TuiStatus::Draining);
-        drain_single_tui_events(&events, &mut state);
-        render_if_due(&mut terminal, &state, &mut next_render, true)?;
-    }
-
-    state.set_status(TuiStatus::Closing);
-    render_if_due(&mut terminal, &state, &mut next_render, true)?;
-
-    let outcome = session.join();
-    drain_single_tui_events(&events, &mut state);
-    state.mark_dropped_client_events(events.dropped_events());
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            state.set_error(err.to_string());
-            render_if_due(&mut terminal, &state, &mut next_render, true)?;
-            return Err(Box::new(err));
-        }
-    };
-
-    interrupted |= is_shutdown_requested(shutdown_requested);
-    if let Some(error) = peer_close_run_error(
-        continuous,
-        interrupted,
-        u64::from(outcome.end_reason == SessionEndReason::PeerClosed),
-    ) {
-        state.set_run_error(error.clone());
-        render_if_due(&mut terminal, &state, &mut next_render, true)?;
-        return Err(error.into());
-    }
-    state.set_status(TuiStatus::Complete);
-    render_if_due(&mut terminal, &state, &mut next_render, true)?;
-    Ok(())
-}
-
-fn run_group_tui(
-    args: TuiArgs,
-    targets: Vec<ResolvedTuiTarget>,
-    terminal: &mut TuiTerminal,
-    state: &mut TuiState,
-    next_render: &mut Instant,
-    shutdown_requested: &AtomicBool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let mut config = args.to_client_config();
-    let managed_targets = targets
-        .iter()
-        .map(|target| target.managed.clone())
-        .collect::<Vec<_>>();
-    let expected_target_count = managed_targets.len();
-    if let Some(first) = managed_targets.first() {
-        config.server_addr = first.remote.to_string();
-    }
-
-    let group_config = ManagedClientGroupConfig {
-        client: config,
-        pacing: args.pacing.into(),
-        completion: ManagedGroupCompletionPolicy::AllTargetsComplete,
-    };
-    let (session, events) = ManagedClientGroup::start_with_subscription(
-        group_config,
-        managed_targets,
-        SubscriberConfig {
-            capacity: MANAGED_EVENT_CAPACITY,
-            overflow: SubscriberOverflow::DropOldest,
-        },
-    )?;
-
-    let mut interrupted = false;
-    let mut stop_requested = false;
-    let mut peer_close_requested_stop = false;
-    let mut terminal_targets = std::collections::HashSet::new();
-    let mut saw_target_event = false;
-    let mut last_event_at = Instant::now();
-
-    let exit = loop {
-        if is_shutdown_requested(shutdown_requested) {
-            interrupted = true;
-            if request_group_stop_once(&mut stop_requested) {
-                session.stop();
+            if request_managed_stop_once(&mut stop_requested) {
+                drop(handle.stop());
             }
         }
-
-        if handle_input(state, shutdown_requested)? {
-            render_if_due(terminal, state, next_render, true)?;
-        }
-        if state.quit_requested {
-            interrupted = true;
-            if request_group_stop_once(&mut stop_requested) {
-                session.stop();
-            }
-        }
-        if request_group_stop_for_peer_close(
-            args.is_continuous(),
+        if request_managed_stop_for_peer_close(
+            continuous,
             interrupted,
-            session.peer_closed_target_count(),
-            &mut peer_close_requested_stop,
+            handle.status().peer_closed_target_outcomes,
             &mut stop_requested,
         ) {
-            session.stop();
+            drop(handle.stop());
         }
-
-        match events.try_recv() {
-            Ok(Some(group_event)) => {
-                saw_target_event = true;
-                last_event_at = Instant::now();
-                match group_event {
-                    ManagedGroupEvent::Client(target_event) => {
-                        state.process_target_event(&target_event);
-                    }
-                    ManagedGroupEvent::TargetFinished(target) => {
-                        terminal_targets.insert(target.id.as_str().to_owned());
-                        state.process_target_outcome(&target);
-                        if request_group_stop_for_peer_close(
-                            args.is_continuous(),
-                            interrupted,
-                            u64::from(matches!(
-                                &target.end_reason,
-                                irtt_client::ManagedTargetEndReason::PeerClosed
-                            )),
-                            &mut peer_close_requested_stop,
-                            &mut stop_requested,
-                        ) {
-                            session.stop();
-                        }
-                    }
-                }
-                render_if_due(terminal, state, next_render, false)?;
+        let drain_state = drain_tui_events(
+            &mut events,
+            &mut state,
+            &mut terminal_targets,
+            &mut dropped_events,
+        );
+        match drain_state {
+            ManagedDrainState::Empty => {
+                thread::sleep(managed_tui_wait_duration(&next_render, state.paused));
             }
-            Ok(None) => {
-                if interrupted {
-                    break GroupLoopExit::Interrupted;
-                }
-                if terminal_targets.len() >= expected_target_count {
-                    break GroupLoopExit::AllTargetsTerminal;
-                }
-                if should_join_group_after_idle(&args, saw_target_event, last_event_at) {
-                    break GroupLoopExit::IdleGraceElapsed;
-                }
-                wait_for_tui_activity(None, next_render, state, terminal, shutdown_requested)?;
-                thread::sleep(IDLE_SLEEP);
-            }
-            Err(EventSubscriptionError::Disconnected) => {
-                break GroupLoopExit::SubscriptionDisconnected
-            }
+            ManagedDrainState::Closed => subscription_closed = true,
+            ManagedDrainState::BudgetExhausted => {}
         }
-    };
-
-    if exit.should_stop_before_join() && request_group_stop_once(&mut stop_requested) {
-        session.stop();
+        if handle.status().final_outcome.is_some() || subscription_closed {
+            break;
+        }
+        render_if_due(&mut terminal, &state, &mut next_render, false)?;
     }
-
     if interrupted {
         state.set_status(TuiStatus::Interrupted);
-        render_if_due(terminal, state, next_render, true)?;
+        render_if_due(&mut terminal, &state, &mut next_render, true)?;
     }
-
     state.set_status(TuiStatus::Closing);
-    render_if_due(terminal, state, next_render, true)?;
-
-    let outcome = session.join()?;
-    while let Ok(Some(group_event)) = events.try_recv() {
-        match group_event {
-            ManagedGroupEvent::Client(target_event) => state.process_target_event(&target_event),
-            ManagedGroupEvent::TargetFinished(target) => {
-                if terminal_targets.insert(target.id.as_str().to_owned()) {
-                    state.process_target_outcome(&target);
-                }
-            }
-        }
+    render_if_due(&mut terminal, &state, &mut next_render, true)?;
+    let outcome = owner.join()?;
+    drain_final_tui_events(
+        &mut events,
+        &mut state,
+        &mut terminal_targets,
+        &mut dropped_events,
+    );
+    state.mark_dropped_managed_events(dropped_events);
+    if outcome.discarded_target_outcomes != 0 {
+        state.set_run_error(format!(
+            "{} final target outcomes were discarded",
+            outcome.discarded_target_outcomes
+        ));
     }
-    state.mark_dropped_group_events(events.dropped_events());
-    for target in &outcome.targets {
-        if terminal_targets.insert(target.id.as_str().to_owned()) {
+    for target in outcome.recent_target_outcomes.iter() {
+        if terminal_targets.insert(target.target.clone()) {
             state.process_target_outcome(target);
         }
     }
-
     interrupted |= is_shutdown_requested(shutdown_requested);
-    let peer_closed_target_outcomes = outcome
-        .peer_closed_target_outcomes
-        .max(u64::from(peer_close_requested_stop));
-    if let Some(error) = peer_close_run_error(
-        args.is_continuous(),
-        interrupted,
-        peer_closed_target_outcomes,
-    ) {
+    let error = match &outcome.end_reason {
+        ManagedEndReason::DriverFailed(failure) => {
+            Some(format!("managed driver failed: {failure}"))
+        }
+        _ => peer_close_run_error(continuous, interrupted, outcome.peer_closed_target_outcomes)
+            .or_else(|| {
+                (!interrupted
+                    && outcome.successful_target_outcomes == 0
+                    && outcome.failed_target_outcomes > 0)
+                    .then(|| {
+                        format!(
+                            "no managed target completed successfully ({} failed)",
+                            outcome.failed_target_outcomes
+                        )
+                    })
+            }),
+    };
+    if let Some(error) = error {
         state.set_run_error(error.clone());
-        render_if_due(terminal, state, next_render, true)?;
+        render_if_due(&mut terminal, &state, &mut next_render, true)?;
         return Err(error.into());
     }
-    if outcome.end_reason == ManagedGroupEndReason::Cancelled
-        && !interrupted
-        && !peer_close_requested_stop
-    {
-        return match exit {
-            GroupLoopExit::IdleGraceElapsed => {
-                Err("managed client group stayed idle before all targets completed".into())
-            }
-            GroupLoopExit::SubscriptionDisconnected => {
-                Err("managed client group event subscription disconnected before completion".into())
-            }
-            GroupLoopExit::Interrupted | GroupLoopExit::AllTargetsTerminal => {
-                Err("managed client group was cancelled".into())
-            }
-        };
-    }
-    let successful_targets = outcome.successful_target_outcomes;
-    let failed_targets = outcome.failed_target_outcomes;
-    if !interrupted && successful_targets == 0 && failed_targets > 0 {
-        state.set_status(TuiStatus::Error);
-        render_if_due(terminal, state, next_render, true)?;
-        return Err(
-            format!("no managed target completed successfully ({failed_targets} failed)").into(),
-        );
-    }
-
     state.set_status(TuiStatus::Complete);
-    render_if_due(terminal, state, next_render, true)?;
+    render_if_due(&mut terminal, &state, &mut next_render, true)?;
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GroupLoopExit {
-    Interrupted,
-    AllTargetsTerminal,
-    IdleGraceElapsed,
-    SubscriptionDisconnected,
-}
-
-impl GroupLoopExit {
-    fn should_stop_before_join(self) -> bool {
-        matches!(
-            self,
-            Self::Interrupted | Self::IdleGraceElapsed | Self::SubscriptionDisconnected
-        )
+fn process_tui_event(
+    event: ManagedEvent,
+    state: &mut TuiState,
+    terminal_targets: &mut HashSet<TargetInstance>,
+) {
+    match event {
+        ManagedEvent::Client { target, event } => state.process_target_event(&target, &event),
+        ManagedEvent::TargetFinished { outcome } => {
+            terminal_targets.insert(outcome.target.clone());
+            state.process_target_outcome(&outcome);
+        }
+        _ => {}
     }
 }
-
-fn estimated_group_completion_grace(args: &TuiArgs) -> Duration {
-    let open_timeout: Duration = args.to_client_config().open_timeouts.iter().sum();
-    open_timeout
-        .saturating_add(args.duration)
-        .saturating_add(GROUP_COMPLETION_GRACE)
+fn drain_tui_events(
+    events: &mut ManagedEventSubscription,
+    state: &mut TuiState,
+    terminal_targets: &mut HashSet<TargetInstance>,
+    dropped_events: &mut u64,
+) -> ManagedDrainState {
+    drain_managed_events(events, dropped_events, |event| {
+        process_tui_event(event, state, terminal_targets);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .expect("processing TUI managed events is infallible")
 }
 
-fn should_join_group_after_idle(
-    args: &TuiArgs,
-    saw_target_event: bool,
-    last_event_at: Instant,
-) -> bool {
-    if args.is_continuous() && saw_target_event {
-        return false;
+fn drain_final_tui_events(
+    events: &mut ManagedEventSubscription,
+    state: &mut TuiState,
+    terminal_targets: &mut HashSet<TargetInstance>,
+    dropped_events: &mut u64,
+) {
+    loop {
+        match events.try_recv() {
+            Ok(event) => process_tui_event(event, state, terminal_targets),
+            Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
+            Err(ManagedEventTryRecvError::Lagged(count)) => {
+                *dropped_events = dropped_events.saturating_add(count);
+            }
+        }
     }
-    last_event_at.elapsed() > estimated_group_completion_grace(args)
 }
-
 fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Result<bool> {
     let mut force_render = false;
     while event::poll(Duration::ZERO)? {
@@ -377,12 +224,10 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
             continue;
         }
         match key.code {
-            KeyCode::Char('q') => {
-                state.quit_requested = true;
-                shutdown_requested.store(true, Ordering::Relaxed);
-                force_render = true;
-            }
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            KeyCode::Char('q') | KeyCode::Char('c')
+                if key.code == KeyCode::Char('q')
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 state.quit_requested = true;
                 shutdown_requested.store(true, Ordering::Relaxed);
                 force_render = true;
@@ -444,7 +289,6 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
     }
     Ok(force_render)
 }
-
 fn render_if_due(
     terminal: &mut TuiTerminal,
     state: &TuiState,
@@ -452,27 +296,12 @@ fn render_if_due(
     force: bool,
 ) -> io::Result<()> {
     let now = Instant::now();
-    if !should_render(now, *next_render, state.paused, force) {
-        return Ok(());
+    if should_render(now, *next_render, state.paused, force) {
+        terminal.draw(state)?;
+        *next_render = now + RENDER_INTERVAL;
     }
-    terminal.draw(state)?;
-    *next_render = now + RENDER_INTERVAL;
     Ok(())
 }
-
-fn managed_event_subscriber_config() -> SubscriberConfig {
-    SubscriberConfig {
-        capacity: MANAGED_EVENT_CAPACITY,
-        overflow: SubscriberOverflow::DropOldest,
-    }
-}
-
-fn drain_single_tui_events(events: &EventSubscription, state: &mut TuiState) {
-    while let Ok(Some(event)) = events.try_recv() {
-        state.process_event(&event);
-    }
-}
-
 fn managed_tui_wait_duration(next_render: &Instant, paused: bool) -> Duration {
     let render_wait = if paused {
         TUI_WAIT_SLICE
@@ -480,153 +309,4 @@ fn managed_tui_wait_duration(next_render: &Instant, paused: bool) -> Duration {
         next_render.saturating_duration_since(Instant::now())
     };
     render_wait.min(TUI_WAIT_SLICE)
-}
-
-fn wait_for_tui_activity(
-    next_send_deadline: Option<Instant>,
-    next_render: &mut Instant,
-    state: &mut TuiState,
-    terminal: &mut TuiTerminal,
-    shutdown_requested: &AtomicBool,
-) -> io::Result<()> {
-    let wait_for = tui_wait_duration(next_send_deadline, *next_render, state.paused);
-    if wait_for.is_zero() || !event::poll(wait_for)? {
-        return Ok(());
-    }
-
-    if handle_input(state, shutdown_requested)? {
-        render_if_due(terminal, state, next_render, true)?;
-    }
-    Ok(())
-}
-
-fn tui_wait_duration(
-    next_send_deadline: Option<Instant>,
-    next_render: Instant,
-    paused: bool,
-) -> Duration {
-    let now = Instant::now();
-    let send_wait = next_send_deadline
-        .map(|deadline| deadline.saturating_duration_since(now))
-        .unwrap_or(IDLE_SLEEP);
-    let render_wait = if paused {
-        send_wait
-    } else {
-        next_render.saturating_duration_since(now)
-    };
-    send_wait.min(render_wait).min(TUI_WAIT_SLICE)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use clap::Parser;
-
-    fn parse(args: &[&str]) -> TuiArgs {
-        let mut argv = vec!["irtt-tui"];
-        argv.extend_from_slice(args);
-        TuiArgs::try_parse_from(argv).unwrap()
-    }
-
-    #[test]
-    fn continuous_multi_target_idle_does_not_stop_after_events() {
-        let args = parse(&["127.0.0.1:2112", "127.0.0.2:2112"]);
-        let old_event_at = Instant::now() - estimated_group_completion_grace(&args) - IDLE_SLEEP;
-
-        assert!(!should_join_group_after_idle(&args, true, old_event_at));
-    }
-
-    #[test]
-    fn finite_or_unopened_group_can_leave_after_idle_grace() {
-        let finite = parse(&["--duration", "1s", "127.0.0.1:2112", "127.0.0.2:2112"]);
-        let finite_old_event_at =
-            Instant::now() - estimated_group_completion_grace(&finite) - IDLE_SLEEP;
-        assert!(should_join_group_after_idle(
-            &finite,
-            true,
-            finite_old_event_at
-        ));
-
-        let continuous = parse(&["127.0.0.1:2112", "127.0.0.2:2112"]);
-        let unopened_old_event_at =
-            Instant::now() - estimated_group_completion_grace(&continuous) - IDLE_SLEEP;
-        assert!(should_join_group_after_idle(
-            &continuous,
-            false,
-            unopened_old_event_at
-        ));
-    }
-
-    #[test]
-    fn protective_group_exits_stop_before_joining() {
-        assert!(GroupLoopExit::Interrupted.should_stop_before_join());
-        assert!(GroupLoopExit::IdleGraceElapsed.should_stop_before_join());
-        assert!(GroupLoopExit::SubscriptionDisconnected.should_stop_before_join());
-        assert!(!GroupLoopExit::AllTargetsTerminal.should_stop_before_join());
-    }
-
-    #[test]
-    fn continuous_group_reliable_peer_close_status_requests_stop_once() {
-        let mut peer_close_requested_stop = false;
-        let mut stop_requested = false;
-        assert!(request_group_stop_for_peer_close(
-            true,
-            false,
-            1,
-            &mut peer_close_requested_stop,
-            &mut stop_requested,
-        ));
-        assert!(peer_close_requested_stop);
-        assert!(stop_requested);
-        assert!(!request_group_stop_for_peer_close(
-            true,
-            false,
-            1,
-            &mut peer_close_requested_stop,
-            &mut stop_requested,
-        ));
-
-        let mut peer_close_requested_stop = false;
-        let mut stop_requested = false;
-        assert!(!request_group_stop_for_peer_close(
-            false,
-            false,
-            1,
-            &mut peer_close_requested_stop,
-            &mut stop_requested,
-        ));
-        assert!(!request_group_stop_for_peer_close(
-            true,
-            true,
-            1,
-            &mut peer_close_requested_stop,
-            &mut stop_requested,
-        ));
-    }
-
-    #[test]
-    fn single_target_managed_drain_consumes_queued_terminal_event() {
-        let hub = irtt_client::EventHub::new();
-        let events = hub
-            .subscribe(SubscriberConfig {
-                capacity: 4,
-                overflow: SubscriberOverflow::DropOldest,
-            })
-            .unwrap();
-        hub.publish(irtt_client::ClientEvent::SessionClosed {
-            remote: "127.0.0.1:2112".parse().unwrap(),
-            token: 7,
-            at: irtt_client::ClientTimestamp::now(),
-        });
-        hub.disconnect_all();
-        let mut state = TuiState::new(TuiConfig::default());
-
-        drain_single_tui_events(&events, &mut state);
-
-        assert_eq!(state.status(), TuiStatus::Complete);
-        assert_eq!(
-            events.try_recv().unwrap_err(),
-            EventSubscriptionError::Disconnected
-        );
-    }
 }

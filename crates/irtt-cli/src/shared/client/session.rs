@@ -1,5 +1,40 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(feature = "client-runtime")]
+use irtt_client::managed::{ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError};
+
+#[cfg(feature = "client-runtime")]
+pub(crate) const MANAGED_EVENT_WORK_BUDGET: usize = 128;
+
+#[cfg(feature = "client-runtime")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ManagedDrainState {
+    Empty,
+    Closed,
+    BudgetExhausted,
+}
+
+/// Drain a bounded amount of lossy presentation work before returning to the
+/// frontend control loop.
+#[cfg(feature = "client-runtime")]
+pub(crate) fn drain_managed_events<E>(
+    events: &mut ManagedEventSubscription,
+    dropped_events: &mut u64,
+    mut process: impl FnMut(ManagedEvent) -> Result<(), E>,
+) -> Result<ManagedDrainState, E> {
+    for _ in 0..MANAGED_EVENT_WORK_BUDGET {
+        match events.try_recv() {
+            Ok(event) => process(event)?,
+            Err(ManagedEventTryRecvError::Lagged(count)) => {
+                *dropped_events = dropped_events.saturating_add(count);
+            }
+            Err(ManagedEventTryRecvError::Empty) => return Ok(ManagedDrainState::Empty),
+            Err(ManagedEventTryRecvError::Closed) => return Ok(ManagedDrainState::Closed),
+        }
+    }
+    Ok(ManagedDrainState::BudgetExhausted)
+}
+
 pub fn is_shutdown_requested(shutdown_requested: &AtomicBool) -> bool {
     shutdown_requested.load(Ordering::Relaxed)
 }
@@ -27,21 +62,19 @@ pub fn peer_close_run_error(
     ))
 }
 
-pub fn request_group_stop_for_peer_close(
+pub fn request_managed_stop_for_peer_close(
     continuous: bool,
     interrupted: bool,
-    peer_closed_target_count: u64,
-    peer_close_requested_stop: &mut bool,
+    peer_closed_target_outcomes: u64,
     stop_requested: &mut bool,
 ) -> bool {
-    if !continuous || interrupted || peer_closed_target_count == 0 {
+    if !continuous || interrupted || peer_closed_target_outcomes == 0 {
         return false;
     }
-    *peer_close_requested_stop = true;
-    request_group_stop_once(stop_requested)
+    request_managed_stop_once(stop_requested)
 }
 
-pub fn request_group_stop_once(stop_requested: &mut bool) -> bool {
+pub fn request_managed_stop_once(stop_requested: &mut bool) -> bool {
     if *stop_requested {
         return false;
     }
@@ -70,46 +103,38 @@ mod tests {
 
     #[test]
     fn grouped_peer_close_stop_policy_is_run_mode_and_one_shot() {
-        let mut peer_close_requested_stop = false;
         let mut stop_requested = false;
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             false,
             false,
             1,
-            &mut peer_close_requested_stop,
             &mut stop_requested,
         ));
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             true,
             true,
             1,
-            &mut peer_close_requested_stop,
             &mut stop_requested,
         ));
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             true,
             false,
             0,
-            &mut peer_close_requested_stop,
             &mut stop_requested,
         ));
-        assert!(!peer_close_requested_stop);
         assert!(!stop_requested);
 
-        assert!(request_group_stop_for_peer_close(
+        assert!(request_managed_stop_for_peer_close(
             true,
             false,
             1,
-            &mut peer_close_requested_stop,
             &mut stop_requested,
         ));
-        assert!(peer_close_requested_stop);
         assert!(stop_requested);
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             true,
             false,
             1,
-            &mut peer_close_requested_stop,
             &mut stop_requested,
         ));
     }

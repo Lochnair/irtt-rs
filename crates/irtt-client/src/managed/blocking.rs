@@ -7,8 +7,8 @@ use thiserror::Error;
 use tokio::runtime::{Builder, Runtime};
 
 use super::{
-    ManagedClient, ManagedClientConfig, ManagedClientHandle, ManagedConfigError, ManagedOutcome,
-    ManagedTargetConfig,
+    ManagedClient, ManagedClientConfig, ManagedClientHandle, ManagedClientTask, ManagedConfigError,
+    ManagedEventSubscription, ManagedOutcome, ManagedSubscribeError, ManagedTargetConfig,
 };
 
 const BLOCKING_RUNTIME_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(100);
@@ -56,6 +56,10 @@ pub enum BlockingManagedStartError {
     #[error(transparent)]
     Config(#[from] ManagedConfigError),
 
+    /// The managed event subscription could not be created before startup.
+    #[error(transparent)]
+    Subscribe(#[from] ManagedSubscribeError),
+
     /// The dedicated Tokio runtime could not be created.
     #[error("failed to create blocking managed Tokio runtime: {source}")]
     Runtime {
@@ -98,6 +102,29 @@ impl BlockingManagedClient {
         targets: Vec<ManagedTargetConfig>,
     ) -> Result<Self, BlockingManagedStartError> {
         let (task, handle) = ManagedClient::task(config, targets)?;
+        Self::start_task(task, handle)
+    }
+
+    /// Validate configuration, subscribe to presentation events, and start a
+    /// dedicated managed worker.
+    ///
+    /// The returned subscription exists before the managed task receives its
+    /// first poll, so it cannot miss startup events because of subscription
+    /// ordering.
+    pub fn start_with_subscription(
+        config: ManagedClientConfig,
+        targets: Vec<ManagedTargetConfig>,
+    ) -> Result<(Self, ManagedEventSubscription), BlockingManagedStartError> {
+        let (task, handle) = ManagedClient::task(config, targets)?;
+        let subscription = handle.subscribe()?;
+        let owner = Self::start_task(task, handle)?;
+        Ok((owner, subscription))
+    }
+
+    fn start_task(
+        task: ManagedClientTask,
+        handle: ManagedClientHandle,
+    ) -> Result<Self, BlockingManagedStartError> {
         let runtime = Builder::new_current_thread()
             .enable_io()
             .enable_time()

@@ -79,6 +79,7 @@ impl ProbeSchedule {
         Ok(self.finish_commit(scheduled_at, next_send_at))
     }
 
+    #[cfg(any(feature = "tokio", test))]
     pub(crate) fn preflight_managed_commit(
         &self,
         scheduled_at: Instant,
@@ -122,6 +123,7 @@ fn next_probe_deadline(
         .ok_or(ClientError::DurationOverflow)
 }
 
+#[cfg(any(feature = "tokio", test))]
 pub(crate) fn advance_cadence(
     deadline: Instant,
     interval: Duration,
@@ -161,6 +163,7 @@ pub(crate) fn advance_cadence(
     Ok((scheduled_at, next_at, elapsed_slots))
 }
 
+#[cfg(any(feature = "tokio", test))]
 fn duration_from_nanos(nanos: u128) -> Result<Duration, ClientError> {
     const NANOS_PER_SECOND: u128 = 1_000_000_000;
     let seconds =

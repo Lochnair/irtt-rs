@@ -14,7 +14,8 @@ use tokio::{runtime::Builder, time::timeout};
 use super::{
     blocking::{join_worker, WorkerRuntime},
     BlockingManagedClient, BlockingManagedJoinError, ManagedClientConfig, ManagedCompletionPolicy,
-    ManagedEndReason, ManagedLifecycle, ManagedPacing, ManagedTargetConfig, ManagedTargetEndReason,
+    ManagedEndReason, ManagedEvent, ManagedLifecycle, ManagedPacing, ManagedTargetConfig,
+    ManagedTargetEndReason,
 };
 use crate::ClientConfig;
 
@@ -179,6 +180,35 @@ fn starts_without_caller_runtime_and_finishes_naturally() {
         outcome.recent_target_outcomes[0].end_reason,
         ManagedTargetEndReason::TestComplete
     );
+    server.wait_close();
+    server.finish();
+}
+
+#[test]
+fn subscribed_start_captures_events_from_a_short_run() {
+    let server = EchoServer::start();
+    let (owner, mut events) = BlockingManagedClient::start_with_subscription(
+        config(ManagedCompletionPolicy::FinishWhenQuiescent),
+        vec![target(&server)],
+    )
+    .unwrap();
+
+    server.wait_probe();
+    let outcome = owner.join().unwrap();
+    assert_eq!(outcome.end_reason, ManagedEndReason::TargetsComplete);
+
+    let mut saw_started = false;
+    let mut saw_finished = false;
+    let mut saw_completed = false;
+    while let Ok(event) = events.try_recv() {
+        match event {
+            ManagedEvent::Started => saw_started = true,
+            ManagedEvent::TargetFinished { .. } => saw_finished = true,
+            ManagedEvent::Completed { .. } => saw_completed = true,
+            _ => {}
+        }
+    }
+    assert!(saw_started && saw_finished && saw_completed);
     server.wait_close();
     server.finish();
 }
