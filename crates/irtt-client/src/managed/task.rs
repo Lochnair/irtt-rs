@@ -591,6 +591,8 @@ pub struct ManagedClientTask {
     stagger_observations: Option<StaggerObservations>,
     #[cfg(test)]
     drain_test_hook: DrainTestHook,
+    #[cfg(test)]
+    timeout_inspections: usize,
 }
 
 #[cfg(test)]
@@ -1730,6 +1732,10 @@ impl ManagedClientTask {
         for _ in 0..TIMEOUT_WORK_BUDGET {
             let index = self.timeout_cursor;
             self.timeout_cursor = (self.timeout_cursor + 1) % target_len;
+            #[cfg(test)]
+            {
+                self.timeout_inspections += 1;
+            }
             if self.target_has_due_timeout(index, now) {
                 let step = self.poll_target_timeout(index, now);
                 more_due |= step.more_due;
@@ -2263,6 +2269,8 @@ fn build_task(
         stagger_observations: None,
         #[cfg(test)]
         drain_test_hook: DrainTestHook::default(),
+        #[cfg(test)]
+        timeout_inspections: 0,
     };
     let handle = ManagedClientHandle {
         stop,
