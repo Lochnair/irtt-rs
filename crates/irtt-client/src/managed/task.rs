@@ -138,6 +138,73 @@ pub struct ManagedClientHandle {
     max_live_target_generations: usize,
     status: watch::Receiver<Arc<ManagedStatus>>,
     events: broadcast::WeakSender<ManagedEvent>,
+    #[cfg(test)]
+    update_submission_hook: Option<Arc<UpdateSubmissionTestHook>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct UpdateSubmissionTestHook {
+    state: std::sync::Mutex<UpdateSubmissionTestState>,
+    arrived: std::sync::Condvar,
+    released: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct UpdateSubmissionTestState {
+    armed: bool,
+    arrived: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl UpdateSubmissionTestHook {
+    fn arm(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .armed = true;
+    }
+
+    fn pause_after_admission(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.arrived = true;
+        self.arrived.notify_all();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn wait_until_arrived(&self) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, timeout) = self
+            .arrived
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.arrived)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.arrived && !timeout.timed_out());
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        self.released.notify_all();
+    }
 }
 
 impl fmt::Debug for ManagedClientHandle {
@@ -183,6 +250,11 @@ impl ManagedClientHandle {
                 configured: targets.len(),
                 limit: self.max_live_target_generations,
             });
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.update_submission_hook {
+            hook.pause_after_admission();
         }
 
         // Submission linearizes at the successful `try_send` below.  The
@@ -2076,6 +2148,8 @@ fn build_task(
         max_live_target_generations,
         status: status_receiver,
         events: weak_events,
+        #[cfg(test)]
+        update_submission_hook: None,
     };
     Ok((task, handle))
 }
