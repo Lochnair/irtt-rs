@@ -157,6 +157,12 @@ pub(crate) struct ProbeCommit {
     next_packets_sent: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct TimeoutBatch {
+    pub events: Vec<ClientEvent>,
+    pub more_due: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProbeSent {
     pub(crate) seq: u32,
@@ -408,11 +414,19 @@ impl SessionMachine {
         &mut self,
         now: Instant,
     ) -> Result<Vec<ClientEvent>, ClientError> {
+        Ok(self.poll_timeouts_bounded_at(now, usize::MAX)?.events)
+    }
+
+    pub(crate) fn poll_timeouts_bounded_at(
+        &mut self,
+        now: Instant,
+        limit: usize,
+    ) -> Result<TimeoutBatch, ClientError> {
         let session = self.open_session_mut()?;
 
-        let expired = session.pending.drain_expired(now);
-        let mut events = Vec::with_capacity(expired.len());
-        for probe in expired {
+        let expired = session.pending.drain_expired_bounded(now, limit);
+        let mut events = Vec::with_capacity(expired.probes.len());
+        for probe in expired.probes {
             events.push(ClientEvent::EchoLoss {
                 seq: probe.wire_seq,
                 sent_at: probe.sent_at,
@@ -421,7 +435,10 @@ impl SessionMachine {
             session.timed_out.insert(probe);
         }
 
-        Ok(events)
+        Ok(TimeoutBatch {
+            events,
+            more_due: expired.more_due,
+        })
     }
 
     pub(crate) fn prepare_close(&self) -> Result<PreparedClose<'_>, ClientError> {

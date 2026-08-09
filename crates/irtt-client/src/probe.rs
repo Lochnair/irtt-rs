@@ -82,12 +82,6 @@ impl PendingMap {
         Some(probe)
     }
 
-    pub fn drain_expired(&mut self, now: Instant) -> Vec<PendingProbe> {
-        let batch = self.drain_expired_bounded(now, usize::MAX);
-        debug_assert!(!batch.more_due);
-        batch.probes
-    }
-
     pub(crate) fn drain_expired_bounded(&mut self, now: Instant, limit: usize) -> ExpiredBatch {
         let mut probes = Vec::with_capacity(limit.min(self.map.len()));
         while probes.len() < limit {
@@ -447,7 +441,8 @@ mod tests {
             }
         }
         let expected = exhaustive
-            .drain_expired(now + Duration::from_secs(4))
+            .drain_expired_bounded(now + Duration::from_secs(4), usize::MAX)
+            .probes
             .into_iter()
             .map(|probe| probe.wire_seq)
             .collect::<Vec<_>>();
@@ -465,10 +460,11 @@ mod tests {
         assert!(map.remove(7).is_some());
         insert(&mut map, pending(7, now + Duration::from_secs(1)));
 
-        assert!(map.drain_expired(now).is_empty());
+        assert!(map.drain_expired_bounded(now, usize::MAX).probes.is_empty());
         assert_eq!(map.deadline_index_len(), map.len());
         assert_eq!(
-            map.drain_expired(now + Duration::from_secs(1))
+            map.drain_expired_bounded(now + Duration::from_secs(1), usize::MAX)
+                .probes
                 .into_iter()
                 .map(|probe| probe.wire_seq)
                 .collect::<Vec<_>>(),

@@ -27,7 +27,7 @@ use crate::{
     receive::try_recv_tokio_datagram,
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
-        PreparedProbe, SessionMachine, MAX_OPEN_PACKET_SIZE,
+        PreparedProbe, SessionMachine, TimeoutBatch, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_tokio_udp_socket, resolve_remote_tokio, validate_open_timeouts},
     socket_options::{apply_dscp_to_tokio_socket, clear_dscp_on_tokio_socket},
@@ -298,6 +298,14 @@ impl AsyncClient {
     /// Poll protocol timeouts using the caller's monotonic timestamp.
     pub fn poll_timeouts_at(&mut self, now: Instant) -> Result<Vec<ClientEvent>, ClientError> {
         self.machine.poll_timeouts_at(now)
+    }
+
+    pub(crate) fn poll_timeouts_bounded_at(
+        &mut self,
+        now: Instant,
+        limit: usize,
+    ) -> Result<TimeoutBatch, ClientError> {
+        self.machine.poll_timeouts_bounded_at(now, limit)
     }
 
     /// Send the retained close packet and commit local close exactly once.
