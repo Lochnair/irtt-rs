@@ -2131,8 +2131,8 @@ mod tests {
         &state.targets[0]
     }
 
-    fn target_event(label: &str, event: ClientEvent) -> TargetEvent {
-        TargetEvent {
+    fn target_event(label: &str, event: ClientEvent) -> UiEventScope {
+        UiEventScope {
             target: TargetId::from(label),
             event,
         }

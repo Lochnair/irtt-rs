@@ -480,6 +480,7 @@ impl SessionMachine {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn has_timed_out_metadata(&self) -> bool {
         matches!(
             &self.state,

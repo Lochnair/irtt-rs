@@ -1,17 +1,13 @@
 #![allow(unsafe_code)]
 use std::{
     io, mem,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket},
+    net::{SocketAddr, UdpSocket},
     os::fd::{AsRawFd, RawFd},
     ptr,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use crate::{
-    metadata::ReceiveMeta,
-    receive::{ReceivedDatagram, ReceivedDatagramFrom},
-    timing::ClientTimestamp,
-};
+use crate::{metadata::ReceiveMeta, receive::ReceivedDatagram, timing::ClientTimestamp};
 
 const CONTROL_LEN: usize = 128;
 
@@ -109,6 +105,7 @@ fn recv_datagram_fd(
     })
 }
 
+#[cfg(any())]
 pub(crate) fn recv_datagram_from(
     socket: &UdpSocket,
     buf: &mut [u8],
@@ -185,6 +182,7 @@ unsafe fn parse_receive_meta(msg: &libc::msghdr) -> ReceiveMeta {
     meta
 }
 
+#[cfg(any())]
 unsafe fn socket_addr_from_storage(
     storage: &libc::sockaddr_storage,
     len: libc::socklen_t,

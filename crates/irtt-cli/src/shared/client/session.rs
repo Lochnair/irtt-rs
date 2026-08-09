@@ -30,11 +30,11 @@ pub fn peer_close_run_error(
 pub fn request_managed_stop_for_peer_close(
     continuous: bool,
     interrupted: bool,
-    peer_closed_target_count: u64,
+    peer_closed_target_outcomes: u64,
     peer_close_requested_stop: &mut bool,
     stop_requested: &mut bool,
 ) -> bool {
-    if !continuous || interrupted || peer_closed_target_count == 0 {
+    if !continuous || interrupted || peer_closed_target_outcomes == 0 {
         return false;
     }
     *peer_close_requested_stop = true;

@@ -80,7 +80,7 @@ pub fn run_tui(
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
             if request_managed_stop_once(&mut stop_requested) {
-                let _ = handle.stop();
+                drop(handle.stop());
             }
         }
         if handle_input(&mut state, shutdown_requested)? {
@@ -89,7 +89,7 @@ pub fn run_tui(
         if state.quit_requested {
             interrupted = true;
             if request_managed_stop_once(&mut stop_requested) {
-                let _ = handle.stop();
+                drop(handle.stop());
             }
         }
         if request_managed_stop_for_peer_close(
@@ -99,7 +99,7 @@ pub fn run_tui(
             &mut peer_close_requested_stop,
             &mut stop_requested,
         ) {
-            let _ = handle.stop();
+            drop(handle.stop());
         }
         drain_tui_events(
             &mut events,

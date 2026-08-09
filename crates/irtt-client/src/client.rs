@@ -31,7 +31,10 @@ use schedule::{instant_abs_diff, ProbeSchedule};
 #[derive(Debug, Clone, Copy)]
 enum ProbeScheduleMode {
     CallerPaced,
-    Managed { scheduled_at: Instant },
+    #[cfg(test)]
+    Managed {
+        scheduled_at: Instant,
+    },
 }
 
 #[derive(Debug)]
@@ -250,23 +253,6 @@ impl Client {
         self.recv_once_inner()
     }
 
-    pub(crate) fn recv_once_until(
-        &mut self,
-        deadline: Option<Instant>,
-        max_wait: Duration,
-    ) -> Result<Vec<ClientEvent>, ClientError> {
-        let Some(timeout) = bounded_receive_timeout(
-            deadline,
-            self.runtime.config().socket_config.recv_timeout,
-            max_wait,
-            Instant::now(),
-        ) else {
-            return Ok(Vec::new());
-        };
-        self.socket.set_read_timeout(Some(timeout))?;
-        self.recv_once_inner()
-    }
-
     fn recv_once_inner(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         let datagram = match recv_datagram(&self.socket, &mut self.recv_buffer) {
             Ok(datagram) => datagram,
@@ -353,14 +339,7 @@ impl Client {
         self.runtime.is_peer_closed()
     }
 
-    pub(crate) fn has_timed_out_metadata(&self) -> bool {
-        self.runtime.has_timed_out_metadata()
-    }
-
-    pub(crate) fn packets_sent(&self) -> u64 {
-        self.runtime.packets_sent()
-    }
-
+    #[cfg(test)]
     pub(crate) fn send_managed_probe(
         &mut self,
         scheduled_at: Instant,
@@ -400,6 +379,7 @@ impl Client {
             ProbeScheduleMode::CallerPaced => {
                 schedule.preflight_caller_commit(machine_preflight.next_packets_sent)?
             }
+            #[cfg(test)]
             ProbeScheduleMode::Managed { scheduled_at } => {
                 schedule.preflight_managed_commit(scheduled_at, permission_at)?
             }
@@ -763,6 +743,7 @@ impl Client {
     }
 }
 
+#[cfg(test)]
 fn bounded_receive_timeout(
     deadline: Option<Instant>,
     configured_timeout: Option<Duration>,

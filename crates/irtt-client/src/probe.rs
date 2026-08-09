@@ -145,6 +145,7 @@ impl TimedOutMap {
         self.insertion_order.clear();
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
     }

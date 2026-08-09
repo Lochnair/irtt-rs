@@ -122,7 +122,7 @@ pub fn run_stream(
         if is_shutdown_requested(shutdown_requested) {
             interrupted = true;
             if request_managed_stop_once(&mut stop_requested) {
-                let _ = handle.stop();
+                drop(handle.stop());
             }
         }
         if request_managed_stop_for_peer_close(
@@ -132,7 +132,7 @@ pub fn run_stream(
             &mut peer_close_requested_stop,
             &mut stop_requested,
         ) {
-            let _ = handle.stop();
+            drop(handle.stop());
         }
         drain_events(
             &mut events,
