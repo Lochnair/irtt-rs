@@ -173,6 +173,9 @@ pub enum ManagedEvent {
 /// Receiving half of the lossy managed event stream.
 pub type ManagedEventSubscription = tokio::sync::broadcast::Receiver<ManagedEvent>;
 
+/// Immediate result of attempting to receive a managed presentation event.
+pub type ManagedEventTryRecvError = tokio::sync::broadcast::error::TryRecvError;
+
 /// Final authoritative outcome returned by the task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedOutcome {
