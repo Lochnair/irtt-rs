@@ -268,8 +268,12 @@ pub enum ManagedConfigError {
     TooManyTargets { configured: usize, limit: usize },
     #[error("managed event capacity must be greater than zero")]
     ZeroEventCapacity,
+    #[error("managed event capacity {configured} exceeds Tokio's maximum {maximum}")]
+    EventCapacityTooLarge { configured: usize, maximum: usize },
     #[error("managed command capacity must be greater than zero")]
     ZeroCommandCapacity,
+    #[error("managed command capacity {configured} exceeds Tokio's maximum {maximum}")]
+    CommandCapacityTooLarge { configured: usize, maximum: usize },
     #[error("managed live-generation limit must be greater than zero")]
     ZeroLiveGenerationLimit,
     #[error("managed final drain {duration:?} cannot be scheduled from the current instant")]
@@ -289,6 +293,8 @@ pub enum ManagedConfigError {
 pub enum ManagedCommandError {
     #[error("managed target updates are no longer accepted")]
     Stopping,
+    #[error("managed target update contains {configured} targets but the limit is {limit}")]
+    TooManyTargets { configured: usize, limit: usize },
     #[error("managed command queue is full")]
     QueueFull,
     #[error("managed command receiver is closed")]

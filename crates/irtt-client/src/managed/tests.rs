@@ -27,6 +27,7 @@ enum ServerBehavior {
     PeerClose,
     DelayedEcho(Duration),
     DeferredBurst(usize),
+    NoisyOpen(usize),
 }
 
 #[derive(Clone, Debug)]
@@ -47,6 +48,7 @@ struct TestServer {
     records: Arc<Mutex<Vec<PacketRecord>>>,
     probe_seen: Arc<(Mutex<bool>, Condvar)>,
     reply_sent: Arc<(Mutex<bool>, Condvar)>,
+    open_reply_sent: Arc<(Mutex<bool>, Condvar)>,
     thread: JoinHandle<()>,
 }
 
@@ -110,6 +112,8 @@ fn start_server_with_gates(
     let thread_probe_seen = Arc::clone(&probe_seen);
     let reply_sent = Arc::new((Mutex::new(false), Condvar::new()));
     let thread_reply_sent = Arc::clone(&reply_sent);
+    let open_reply_sent = Arc::new((Mutex::new(false), Condvar::new()));
+    let thread_open_reply_sent = Arc::clone(&open_reply_sent);
     let thread = thread::spawn(move || {
         let mut buffer = [0_u8; 8192];
         let (open_len, peer) = socket.recv_from(&mut buffer).unwrap();
@@ -137,8 +141,17 @@ fn start_server_with_gates(
             key.as_deref(),
         )
         .unwrap();
+        let noisy_open = matches!(behavior, ServerBehavior::NoisyOpen(_));
+        if let ServerBehavior::NoisyOpen(count) = behavior {
+            for _ in 0..count {
+                socket.send_to(&[0_u8], peer).unwrap();
+            }
+        }
         socket.send_to(&open_reply, peer).unwrap();
-        if no_test {
+        let (sent, ready) = &*thread_open_reply_sent;
+        *sent.lock().unwrap() = true;
+        ready.notify_all();
+        if no_test || noisy_open {
             return;
         }
 
@@ -227,6 +240,7 @@ fn start_server_with_gates(
         records,
         probe_seen,
         reply_sent,
+        open_reply_sent,
         thread,
     }
 }
@@ -803,6 +817,374 @@ fn dynamic_empty_update_orders_stopping_before_acknowledgement() {
     assert!(stopping < finished);
     assert_eq!(events[stopping].1.lifecycle, ManagedLifecycle::Stopping);
     assert!(Arc::ptr_eq(&acknowledgement.status, &events[stopping].1));
+}
+
+#[test]
+fn noisy_opening_yields_before_stop_observation() {
+    let open_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::NoisyOpen(256),
+        None,
+        None,
+        Some(Arc::clone(&open_gate)),
+        None,
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(managed, vec![target("noisy", server.addr)]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+
+    drive_task_until(&runtime, &mut task, |task| {
+        matches!(task.targets[0].state, TargetState::Opening { .. })
+    });
+    drive_task_until(&runtime, &mut task, |task| {
+        matches!(
+            task.targets[0].state,
+            TargetState::Opening { ref open, .. } if open.has_in_flight_work()
+        )
+    });
+    let seen = open_gate.seen.lock().unwrap();
+    let (seen, timeout) = open_gate
+        .seen_ready
+        .wait_timeout_while(seen, Duration::from_secs(2), |seen| !*seen)
+        .unwrap();
+    assert!(*seen && !timeout.timed_out());
+    drop(seen);
+    open_gate.release();
+    wait_flag(&server.open_reply_sent);
+
+    // One managed task poll must leave a valid open reply behind the noisy
+    // queue, rather than letting this target consume all immediate work.
+    let poll = runtime.block_on(poll_fn(|cx| Poll::Ready(task.as_mut().poll(cx))));
+    assert!(poll.is_pending());
+    assert!(matches!(task.targets[0].state, TargetState::Opening { .. }));
+
+    let receipt = handle.stop();
+    let poll = runtime.block_on(poll_fn(|cx| Poll::Ready(task.as_mut().poll(cx))));
+    assert!(poll.is_pending());
+    assert!(handle.status().stop_requested);
+    assert_eq!(handle.status().lifecycle, ManagedLifecycle::Stopping);
+    let outcome = runtime.block_on(task);
+    runtime.block_on(receipt);
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+    server.finish();
+}
+
+#[test]
+fn stop_during_quiescent_stopping_is_durable_without_duplicate_event() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.client.duration = None;
+    managed.final_drain = Duration::from_millis(80);
+    let (mut task, handle) =
+        ManagedClient::task(managed, vec![target("old", server.addr)]).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| task.active_count() == 1);
+
+    let removal = handle.update_targets(vec![]).unwrap();
+    drive_task_until(&runtime, &mut task, |task| {
+        task.state == DriverState::Stopping
+            && !task.stop_observed
+            && task.targets.iter().any(|target| !target.desired)
+    });
+    let acknowledgement = runtime.block_on(removal).unwrap();
+    assert_eq!(acknowledgement.status.lifecycle, ManagedLifecycle::Stopping);
+
+    let stop = handle.stop();
+    let outcome = runtime.block_on(task);
+    runtime.block_on(stop);
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+    assert!(handle.status().stop_requested);
+    assert!(outcome
+        .recent_target_outcomes
+        .iter()
+        .any(|outcome| { matches!(outcome.end_reason, ManagedTargetEndReason::Removed) }));
+    assert_eq!(
+        observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(event, _)| matches!(event, ManagedEvent::Stopping))
+            .count(),
+        1
+    );
+    server.finish();
+}
+
+#[test]
+fn stop_before_enqueue_rejects_without_allocating_a_generation() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    let (task, handle) = ManagedClient::task(managed, vec![]).unwrap();
+    let initial = handle.status();
+    let stop = handle.stop();
+    assert!(matches!(
+        handle.update_targets(vec![ManagedTargetConfig::new("later", "127.0.0.1:9")]),
+        Err(ManagedCommandError::Stopping)
+    ));
+    assert_eq!(task.next_generation, 1);
+    assert_eq!(task.applied_command_sequence, 0);
+    assert_eq!(handle.status(), initial);
+    let outcome = runtime().block_on(task);
+    runtime().block_on(stop);
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+}
+
+#[test]
+fn paused_submission_cannot_outlive_terminal_seal() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    let (task, mut handle) = ManagedClient::task(managed, vec![]).unwrap();
+    let hook = Arc::new(UpdateSubmissionTestHook::default());
+    hook.arm();
+    handle.update_submission_hook = Some(Arc::clone(&hook));
+    let submitter = handle.clone();
+    let sender = thread::spawn(move || {
+        submitter.update_targets(vec![ManagedTargetConfig::new("late", "127.0.0.1:9")])
+    });
+    hook.wait_until_arrived();
+
+    let stop = handle.stop();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    let Poll::Ready(outcome) = runtime.block_on(poll_fn(|cx| Poll::Ready(task.as_mut().poll(cx))))
+    else {
+        panic!("empty stopped task did not seal")
+    };
+    runtime.block_on(stop);
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+
+    hook.release();
+    assert!(matches!(
+        sender.join().unwrap(),
+        Err(ManagedCommandError::DriverClosed)
+    ));
+    drop(task);
+}
+
+#[test]
+fn paused_submission_can_enqueue_during_stopping() {
+    let reply_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&reply_gate)),
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.interval = Duration::from_secs(1);
+    managed.client.probe_timeout = Duration::from_secs(1);
+    let (task, mut handle) =
+        ManagedClient::task(managed, vec![target("old", server.addr)]).unwrap();
+    let hook = Arc::new(UpdateSubmissionTestHook::default());
+    hook.arm();
+    handle.update_submission_hook = Some(Arc::clone(&hook));
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent == 1
+    });
+    wait_flag(&server.probe_seen);
+
+    let next_generation = task.next_generation;
+    let applied_command_sequence = task.applied_command_sequence;
+    let desired_membership = task
+        .targets
+        .iter()
+        .map(|target| (target.instance.clone(), target.desired))
+        .collect::<Vec<_>>();
+    let submitter = handle.clone();
+    let sender = thread::spawn(move || {
+        submitter.update_targets(vec![ManagedTargetConfig::new("new", "127.0.0.1:9")])
+    });
+    hook.wait_until_arrived();
+
+    let stop = handle.stop();
+    drive_task_until(&runtime, &mut task, |task| {
+        task.state == DriverState::Stopping
+            && task.stop_observed
+            && task.resources().stop.update_admission() == UpdateAdmission::Stopping
+            && matches!(task.targets[0].state, TargetState::Draining { .. })
+    });
+    let stopping_status = handle.status();
+    assert_eq!(stopping_status.lifecycle, ManagedLifecycle::Stopping);
+
+    hook.release();
+    let receipt = sender
+        .join()
+        .unwrap()
+        .expect("send must succeed while the receiver remains open during stopping");
+
+    runtime.block_on(poll_fn(|cx| {
+        assert!(task.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }));
+    let result = runtime.block_on(receipt);
+    assert!(!matches!(
+        &result,
+        Err(ManagedCommandApplyError::AcknowledgementDisconnected)
+    ));
+    assert!(matches!(result, Err(ManagedCommandApplyError::Stopping)));
+    assert_eq!(task.applied_command_sequence, applied_command_sequence);
+    assert_eq!(task.next_generation, next_generation);
+    assert_eq!(
+        task.targets
+            .iter()
+            .map(|target| (target.instance.clone(), target.desired))
+            .collect::<Vec<_>>(),
+        desired_membership
+    );
+    assert_eq!(handle.status(), stopping_status);
+
+    reply_gate.release();
+    wait_flag(&server.reply_sent);
+    let outcome = runtime.block_on(task);
+    runtime.block_on(stop);
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+    server.finish();
+}
+
+#[test]
+fn accepted_update_before_stop_resolves_stopping() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    let (task, handle) = ManagedClient::task(managed, vec![]).unwrap();
+    let receipt = handle
+        .update_targets(vec![ManagedTargetConfig::new("queued", "127.0.0.1:9")])
+        .unwrap();
+    let stop = handle.stop();
+    let outcome = runtime().block_on(task);
+    runtime().block_on(stop);
+    assert_eq!(outcome.applied_command_sequence, 0);
+    assert!(matches!(
+        runtime().block_on(receipt),
+        Err(ManagedCommandApplyError::Stopping)
+    ));
+}
+
+#[test]
+fn accepted_update_before_driver_failure_resolves_driver_failed() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    let (task, handle) = ManagedClient::task(managed, vec![]).unwrap();
+    let receipt = handle
+        .update_targets(vec![ManagedTargetConfig::new("queued", "127.0.0.1:9")])
+        .unwrap();
+    let mut task = Box::pin(task);
+    let Poll::Ready(outcome) = poll_once(task.as_mut()) else {
+        panic!("first poll outside Tokio did not fail")
+    };
+    assert_eq!(
+        outcome.end_reason,
+        ManagedEndReason::DriverFailed(ManagedDriverFailure::NoTokioRuntime)
+    );
+    let mut receipt = Box::pin(receipt);
+    assert!(matches!(
+        poll_once(Pin::as_mut(&mut receipt)),
+        Poll::Ready(Err(ManagedCommandApplyError::DriverFailed(
+            ManagedDriverFailure::NoTokioRuntime
+        )))
+    ));
+    assert!(matches!(
+        handle.update_targets(vec![]),
+        Err(ManagedCommandError::DriverClosed)
+    ));
+}
+
+#[test]
+fn extreme_event_capacity_is_rejected_without_panic() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.event_capacity = usize::MAX;
+    assert!(matches!(
+        ManagedClient::task(managed, vec![]),
+        Err(ManagedConfigError::EventCapacityTooLarge {
+            configured: usize::MAX,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn extreme_command_capacity_is_rejected_without_panic() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.command_capacity = usize::MAX;
+    assert!(matches!(
+        ManagedClient::task(managed, vec![]),
+        Err(ManagedConfigError::CommandCapacityTooLarge {
+            configured: usize::MAX,
+            ..
+        })
+    ));
+}
+
+#[test]
+fn oversized_desired_set_is_rejected_before_enqueue() {
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.max_live_target_generations = 1;
+    let (task, handle) = ManagedClient::task(managed, vec![]).unwrap();
+    let initial = handle.status();
+    let capacity = handle.commands.capacity();
+    assert!(matches!(
+        handle.update_targets(vec![
+            ManagedTargetConfig::new("one", "127.0.0.1:9"),
+            ManagedTargetConfig::new("two", "127.0.0.1:10"),
+        ]),
+        Err(ManagedCommandError::TooManyTargets {
+            configured: 2,
+            limit: 1
+        })
+    ));
+    assert_eq!(handle.commands.capacity(), capacity);
+    assert_eq!(task.next_generation, 1);
+    assert_eq!(task.applied_command_sequence, 0);
+    assert_eq!(handle.status(), initial);
+}
+
+#[test]
+fn legal_desired_set_can_still_fail_at_overlap_application() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.max_live_target_generations = 1;
+    let (task, handle) = ManagedClient::task(managed, vec![target("same", server.addr)]).unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| task.active_count() == 1);
+
+    let receipt = handle
+        .update_targets(vec![ManagedTargetConfig::new("same", "127.0.0.1:10")])
+        .unwrap();
+    let mut receipt = Box::pin(receipt);
+    let result = runtime.block_on(poll_fn(|cx| {
+        assert!(task.as_mut().poll(cx).is_pending());
+        match receipt.as_mut().poll(cx) {
+            Poll::Ready(result) => Poll::Ready(result),
+            Poll::Pending => Poll::Pending,
+        }
+    }));
+    assert!(matches!(
+        result,
+        Err(ManagedCommandApplyError::LiveGenerationLimitExceeded {
+            required: 2,
+            limit: 1
+        })
+    ));
+    let stop = handle.stop();
+    runtime.block_on(task);
+    runtime.block_on(stop);
+    server.finish();
 }
 
 #[test]

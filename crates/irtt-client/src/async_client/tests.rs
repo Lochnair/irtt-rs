@@ -335,6 +335,56 @@ fn ignored_open_traffic_uses_one_request_and_deadline_per_attempt() {
 }
 
 #[test]
+fn opening_poll_budget_yields_then_public_open_completes() {
+    let (queued, queue_ready) = mpsc::channel();
+    let server = start_server(move |socket, tx| {
+        let (open_packet, peer) = recv_packet(&socket, &tx);
+        let request = decode_open_request(&open_packet, None).unwrap();
+        for _ in 0..=OPEN_POLL_WORK_BUDGET {
+            socket.send_to(&[0_u8], peer).unwrap();
+        }
+        send_open_reply(
+            &socket,
+            peer,
+            request.params,
+            None,
+            flags::FLAG_OPEN | flags::FLAG_REPLY,
+            TOKEN,
+        );
+        queued.send(()).unwrap();
+    });
+
+    runtime().block_on(async {
+        let mut client = AsyncClient::connect(config(server.addr, None, 0))
+            .await
+            .unwrap();
+        client.socket.writable().await.unwrap();
+        client.test_hooks.pause_open_before_readable.set(true);
+        let mut opening = Box::pin(client.open());
+
+        // Submit the one opening request, then let the server queue all noise
+        // before performing the explicit bounded poll below.
+        assert!(matches!(
+            poll_once(Pin::as_mut(&mut opening)),
+            Poll::Pending
+        ));
+        queue_ready.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // The valid reply is behind more ignored datagrams than one opening
+        // poll may consume, so this cannot complete without the budget yield.
+        assert!(matches!(
+            poll_once(Pin::as_mut(&mut opening)),
+            Poll::Pending
+        ));
+        assert!(matches!(
+            opening.await.unwrap(),
+            OpenOutcome::Started { .. }
+        ));
+    });
+    assert_eq!(server.finish().len(), 1);
+}
+
+#[test]
 fn ignored_open_traffic_cannot_extend_the_absolute_attempt_deadline() {
     let server = start_server(move |socket, tx| {
         let (first_packet, peer) = recv_packet(&socket, &tx);

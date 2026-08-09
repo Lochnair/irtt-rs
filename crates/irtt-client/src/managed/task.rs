@@ -5,7 +5,7 @@ use std::{
     mem,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
         Arc,
     },
     task::{Context, Poll},
@@ -38,6 +38,9 @@ use super::{
 const TARGET_WORK_BUDGET: usize = 128;
 const COMMAND_WORK_BUDGET: usize = 32;
 const POST_DEADLINE_RECEIVE_BUDGET: usize = TARGET_WORK_BUDGET;
+// Tokio 1.53 broadcast asserts this exact bound before rounding capacity to a
+// power of two; Tokio does not expose it as a public constant.
+const MAX_BROADCAST_CHANNEL_CAPACITY: usize = usize::MAX >> 1;
 
 /// Entry point for constructing a unified Tokio managed task.
 #[derive(Debug, Default)]
@@ -56,25 +59,64 @@ impl ManagedClient {
 #[derive(Debug)]
 struct StopSignal {
     requested: AtomicBool,
-    updates_accepted: AtomicBool,
+    update_admission: AtomicU8,
     wake: watch::Sender<()>,
     acknowledged: AtomicBool,
     acknowledgement: watch::Sender<()>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+enum UpdateAdmission {
+    Open,
+    Stopping,
+    Closed,
+}
+
+impl UpdateAdmission {
+    fn from_raw(value: u8) -> Self {
+        match value {
+            value if value == Self::Open as u8 => Self::Open,
+            value if value == Self::Stopping as u8 => Self::Stopping,
+            value if value == Self::Closed as u8 => Self::Closed,
+            _ => unreachable!("managed update admission stores a known state"),
+        }
+    }
+}
+
 impl StopSignal {
     fn request(&self) {
-        self.updates_accepted.store(false, Ordering::Release);
+        self.begin_stopping();
         if !self.requested.swap(true, Ordering::AcqRel) {
             self.wake.send_replace(());
         }
     }
 
-    fn updates_accepted(&self) -> bool {
-        self.updates_accepted.load(Ordering::Acquire)
+    fn update_admission(&self) -> UpdateAdmission {
+        UpdateAdmission::from_raw(self.update_admission.load(Ordering::Acquire))
     }
+
+    fn begin_stopping(&self) {
+        let mut current = self.update_admission.load(Ordering::Acquire);
+        loop {
+            match UpdateAdmission::from_raw(current) {
+                UpdateAdmission::Open => match self.update_admission.compare_exchange_weak(
+                    UpdateAdmission::Open as u8,
+                    UpdateAdmission::Stopping as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                ) {
+                    Ok(_) => return,
+                    Err(observed) => current = observed,
+                },
+                UpdateAdmission::Stopping | UpdateAdmission::Closed => return,
+            }
+        }
+    }
+
     fn close_updates(&self) {
-        self.updates_accepted.store(false, Ordering::Release);
+        self.update_admission
+            .store(UpdateAdmission::Closed as u8, Ordering::Release);
     }
 
     fn is_requested(&self) -> bool {
@@ -93,8 +135,76 @@ impl StopSignal {
 pub struct ManagedClientHandle {
     stop: Arc<StopSignal>,
     commands: mpsc::Sender<ManagedCommand>,
+    max_live_target_generations: usize,
     status: watch::Receiver<Arc<ManagedStatus>>,
     events: broadcast::WeakSender<ManagedEvent>,
+    #[cfg(test)]
+    update_submission_hook: Option<Arc<UpdateSubmissionTestHook>>,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct UpdateSubmissionTestHook {
+    state: std::sync::Mutex<UpdateSubmissionTestState>,
+    arrived: std::sync::Condvar,
+    released: std::sync::Condvar,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct UpdateSubmissionTestState {
+    armed: bool,
+    arrived: bool,
+    released: bool,
+}
+
+#[cfg(test)]
+impl UpdateSubmissionTestHook {
+    fn arm(&self) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .armed = true;
+    }
+
+    fn pause_after_admission(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if !state.armed {
+            return;
+        }
+        state.arrived = true;
+        self.arrived.notify_all();
+        while !state.released {
+            state = self
+                .released
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn wait_until_arrived(&self) {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let (state, timeout) = self
+            .arrived
+            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.arrived)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(state.arrived && !timeout.timed_out());
+    }
+
+    fn release(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.released = true;
+        self.released.notify_all();
+    }
 }
 
 impl fmt::Debug for ManagedClientHandle {
@@ -130,16 +240,41 @@ impl ManagedClientHandle {
         &self,
         targets: Vec<ManagedTargetConfig>,
     ) -> Result<ManagedCommandReceipt, ManagedCommandError> {
-        if !self.stop.updates_accepted() {
-            return Err(ManagedCommandError::Stopping);
+        match self.stop.update_admission() {
+            UpdateAdmission::Open => {}
+            UpdateAdmission::Stopping => return Err(ManagedCommandError::Stopping),
+            UpdateAdmission::Closed => return Err(ManagedCommandError::DriverClosed),
         }
+        if targets.len() > self.max_live_target_generations {
+            return Err(ManagedCommandError::TooManyTargets {
+                configured: targets.len(),
+                limit: self.max_live_target_generations,
+            });
+        }
+
+        #[cfg(test)]
+        if let Some(hook) = &self.update_submission_hook {
+            hook.pause_after_admission();
+        }
+
+        // Observing `Open` only permits attempting submission. A successful
+        // `try_send` transfers command ownership to the driver. A concurrent
+        // stop may move admission to `Stopping` before this send, allowing the
+        // command to enqueue; the driver-side check immediately before
+        // `apply_targets` determines whether it applies or resolves as
+        // `Stopping`. Terminal sealing closes the receiver before draining
+        // accepted commands.
         let (acknowledgement, receiver) = oneshot::channel();
         match self.commands.try_send(ManagedCommand::UpdateTargets {
             targets,
             acknowledgement,
         }) {
             Ok(()) => Ok(ManagedCommandReceipt { receiver }),
-            Err(mpsc::error::TrySendError::Full(_)) => Err(ManagedCommandError::QueueFull),
+            Err(mpsc::error::TrySendError::Full(_)) => match self.stop.update_admission() {
+                UpdateAdmission::Open => Err(ManagedCommandError::QueueFull),
+                UpdateAdmission::Stopping => Err(ManagedCommandError::Stopping),
+                UpdateAdmission::Closed => Err(ManagedCommandError::DriverClosed),
+            },
             Err(mpsc::error::TrySendError::Closed(_)) => Err(ManagedCommandError::DriverClosed),
         }
     }
@@ -657,11 +792,15 @@ impl ManagedClientTask {
             return;
         }
         self.stop_observed = true;
-        self.resources().stop.close_updates();
+        self.resources().stop.begin_stopping();
+        let lifecycle_transition =
+            self.state != DriverState::Stopping || self.lifecycle != ManagedLifecycle::Stopping;
         self.state = DriverState::Stopping;
         self.lifecycle = ManagedLifecycle::Stopping;
         self.replace_status();
-        self.publish_event(ManagedEvent::Stopping);
+        if lifecycle_transition {
+            self.publish_event(ManagedEvent::Stopping);
+        }
         self.resources().stop.acknowledge();
         self.scan_remaining = self.targets.len();
         self.burst_remaining = 0;
@@ -683,7 +822,7 @@ impl ManagedClientTask {
                     // `apply_targets` cannot suspend, so a stop observed here wins over
                     // this command; once it passes, this command may complete atomically.
                     let result = if self.state != DriverState::Running
-                        || self.resources().stop.is_requested()
+                        || self.resources().stop.update_admission() != UpdateAdmission::Open
                     {
                         Err(ManagedCommandApplyError::Stopping)
                     } else {
@@ -767,7 +906,7 @@ impl ManagedClientTask {
         let stopping = self.targets.iter().all(|runtime| !runtime.desired)
             && self.config.completion == ManagedCompletionPolicy::FinishWhenQuiescent;
         if stopping {
-            self.resources().stop.close_updates();
+            self.resources().stop.begin_stopping();
             self.state = DriverState::Stopping;
             self.lifecycle = ManagedLifecycle::Stopping;
         }
@@ -1677,7 +1816,22 @@ impl ManagedClientTask {
         }
     }
 
-    fn seal(&mut self, end_reason: ManagedEndReason, failed: bool) -> Poll<ManagedOutcome> {
+    fn seal(&mut self, mut end_reason: ManagedEndReason, failed: bool) -> Poll<ManagedOutcome> {
+        // Sealing is the final stop-observation point.  A stop that reaches the
+        // latch before this terminal linearization becomes durable even when
+        // quiescence had already entered `Stopping`.
+        if self.resources().stop.is_requested() {
+            self.observe_stop();
+        }
+        if self.stop_observed && matches!(end_reason, ManagedEndReason::TargetsComplete) {
+            end_reason = ManagedEndReason::StopRequested;
+        }
+
+        // Closing admission before closing and draining the receiver makes every
+        // accepted command task-owned.  Tokio still permits buffered commands
+        // to be drained after `Receiver::close`, but rejects later sends.
+        self.resources().stop.close_updates();
+        self.commands.close();
         while let Ok(ManagedCommand::UpdateTargets {
             acknowledgement, ..
         }) = self.commands.try_recv()
@@ -1759,11 +1913,14 @@ impl Future for ManagedClientTask {
                 return this.fail_driver(failure);
             }
         }
-        if this.state == DriverState::Running && this.resources().stop.is_requested() {
+        if this.resources().stop.is_requested() {
             this.observe_stop();
         }
 
         let mut immediate = this.process_commands(cx);
+        if this.resources().stop.is_requested() {
+            this.observe_stop();
+        }
         let now = Instant::now();
         immediate |= this.poll_target_pass(cx, now);
         this.prune_undesired_terminal();
@@ -1772,6 +1929,10 @@ impl Future for ManagedClientTask {
                 ManagedPacing::Staggered => this.poll_staggered_send(cx, now),
                 ManagedPacing::Burst => this.poll_burst_sends(cx, now),
             };
+        }
+
+        if this.resources().stop.is_requested() {
+            this.observe_stop();
         }
 
         if this.all_targets_terminal() {
@@ -1791,7 +1952,7 @@ impl Future for ManagedClientTask {
                 {
                     this.state = DriverState::Stopping;
                     this.lifecycle = ManagedLifecycle::Stopping;
-                    this.resources().stop.close_updates();
+                    this.resources().stop.begin_stopping();
                     this.replace_status();
                     this.publish_event(ManagedEvent::Stopping);
                     return this.seal(ManagedEndReason::TargetsComplete, false);
@@ -1816,6 +1977,8 @@ impl Drop for ManagedClientTask {
         }
         self.lifecycle = ManagedLifecycle::Abandoned;
         self.final_outcome = None;
+        self.resources().stop.close_updates();
+        self.commands.close();
         self.replace_status();
         self.publish_event(ManagedEvent::Abandoned);
         self.resources().stop.acknowledge();
@@ -1833,8 +1996,20 @@ fn build_task(
     if config.event_capacity == 0 {
         return Err(ManagedConfigError::ZeroEventCapacity);
     }
+    if config.event_capacity > MAX_BROADCAST_CHANNEL_CAPACITY {
+        return Err(ManagedConfigError::EventCapacityTooLarge {
+            configured: config.event_capacity,
+            maximum: MAX_BROADCAST_CHANNEL_CAPACITY,
+        });
+    }
     if config.command_capacity == 0 {
         return Err(ManagedConfigError::ZeroCommandCapacity);
+    }
+    if config.command_capacity > tokio::sync::Semaphore::MAX_PERMITS {
+        return Err(ManagedConfigError::CommandCapacityTooLarge {
+            configured: config.command_capacity,
+            maximum: tokio::sync::Semaphore::MAX_PERMITS,
+        });
     }
     if config.max_live_target_generations == 0 {
         return Err(ManagedConfigError::ZeroLiveGenerationLimit);
@@ -1899,7 +2074,7 @@ fn build_task(
     let (acknowledgement_sender, _) = watch::channel(());
     let stop = Arc::new(StopSignal {
         requested: AtomicBool::new(false),
-        updates_accepted: AtomicBool::new(true),
+        update_admission: AtomicU8::new(UpdateAdmission::Open as u8),
         wake: wake_sender,
         acknowledged: AtomicBool::new(false),
         acknowledgement: acknowledgement_sender,
@@ -1937,6 +2112,7 @@ fn build_task(
     });
     let (status_sender, status_receiver) = watch::channel(initial);
     let (command_sender, command_receiver) = mpsc::channel(config.command_capacity);
+    let max_live_target_generations = config.max_live_target_generations;
     let resources = TaskResources {
         status: status_sender,
         events: Some(event_sender),
@@ -1973,8 +2149,11 @@ fn build_task(
     let handle = ManagedClientHandle {
         stop,
         commands: command_sender,
+        max_live_target_generations,
         status: status_receiver,
         events: weak_events,
+        #[cfg(test)]
+        update_submission_hook: None,
     };
     Ok((task, handle))
 }
