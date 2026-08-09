@@ -968,6 +968,91 @@ fn paused_submission_cannot_outlive_terminal_seal() {
 }
 
 #[test]
+fn paused_submission_can_enqueue_during_stopping() {
+    let reply_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&reply_gate)),
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.interval = Duration::from_secs(1);
+    managed.client.probe_timeout = Duration::from_secs(1);
+    let (task, mut handle) =
+        ManagedClient::task(managed, vec![target("old", server.addr)]).unwrap();
+    let hook = Arc::new(UpdateSubmissionTestHook::default());
+    hook.arm();
+    handle.update_submission_hook = Some(Arc::clone(&hook));
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets[0].counters.packets_sent == 1
+    });
+    wait_flag(&server.probe_seen);
+
+    let next_generation = task.next_generation;
+    let applied_command_sequence = task.applied_command_sequence;
+    let desired_membership = task
+        .targets
+        .iter()
+        .map(|target| (target.instance.clone(), target.desired))
+        .collect::<Vec<_>>();
+    let submitter = handle.clone();
+    let sender = thread::spawn(move || {
+        submitter.update_targets(vec![ManagedTargetConfig::new("new", "127.0.0.1:9")])
+    });
+    hook.wait_until_arrived();
+
+    let stop = handle.stop();
+    drive_task_until(&runtime, &mut task, |task| {
+        task.state == DriverState::Stopping
+            && task.stop_observed
+            && task.resources().stop.update_admission() == UpdateAdmission::Stopping
+            && matches!(task.targets[0].state, TargetState::Draining { .. })
+    });
+    let stopping_status = handle.status();
+    assert_eq!(stopping_status.lifecycle, ManagedLifecycle::Stopping);
+
+    hook.release();
+    let receipt = sender
+        .join()
+        .unwrap()
+        .expect("send must succeed while the receiver remains open during stopping");
+
+    runtime.block_on(poll_fn(|cx| {
+        assert!(task.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }));
+    let result = runtime.block_on(receipt);
+    assert!(!matches!(
+        &result,
+        Err(ManagedCommandApplyError::AcknowledgementDisconnected)
+    ));
+    assert!(matches!(result, Err(ManagedCommandApplyError::Stopping)));
+    assert_eq!(task.applied_command_sequence, applied_command_sequence);
+    assert_eq!(task.next_generation, next_generation);
+    assert_eq!(
+        task.targets
+            .iter()
+            .map(|target| (target.instance.clone(), target.desired))
+            .collect::<Vec<_>>(),
+        desired_membership
+    );
+    assert_eq!(handle.status(), stopping_status);
+
+    reply_gate.release();
+    wait_flag(&server.reply_sent);
+    let outcome = runtime.block_on(task);
+    runtime.block_on(stop);
+    assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+    server.finish();
+}
+
+#[test]
 fn accepted_update_before_stop_resolves_stopping() {
     let mut managed = config(ManagedPacing::Staggered);
     managed.completion = ManagedCompletionPolicy::ExplicitStop;

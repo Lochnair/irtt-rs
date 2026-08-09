@@ -257,9 +257,13 @@ impl ManagedClientHandle {
             hook.pause_after_admission();
         }
 
-        // Submission linearizes at the successful `try_send` below.  The
-        // driver checks stop immediately before non-suspending application;
-        // terminal sealing closes the receiver before draining accepted work.
+        // Observing `Open` only permits attempting submission. A successful
+        // `try_send` transfers command ownership to the driver. A concurrent
+        // stop may move admission to `Stopping` before this send, allowing the
+        // command to enqueue; the driver-side check immediately before
+        // `apply_targets` determines whether it applies or resolves as
+        // `Stopping`. Terminal sealing closes the receiver before draining
+        // accepted commands.
         let (acknowledgement, receiver) = oneshot::channel();
         match self.commands.try_send(ManagedCommand::UpdateTargets {
             targets,
