@@ -14,10 +14,9 @@
 //! values usually indicate client/server clock skew.
 //!
 //! [`Client`] is the runtime-free low-level blocking adapter. With the
-//! `tokio` feature, [`AsyncClient`] provides the corresponding Tokio adapter;
-//! [`managed`] contains the unified managed task/handle implementation and
-//! [`managed::BlockingManagedClient`] owns its dedicated runtime thread for
-//! synchronous managed callers.
+//! `tokio` feature, `AsyncClient` provides the corresponding Tokio adapter;
+//! [`managed`] contains the unified managed task/handle implementation,
+//! including the dedicated-runtime blocking frontend for synchronous callers.
 //!
 #![cfg_attr(
     not(all(target_os = "linux", feature = "ancillary")),

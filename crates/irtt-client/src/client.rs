@@ -94,8 +94,8 @@ use crate::{
 ///
 /// `Client` exposes the protocol steps directly: connect a UDP socket, open a
 /// session, send probes, receive replies, poll timeouts, and close. Callers
-/// that do not need to own this loop can use [`ManagedClient`](crate::ManagedClient)
-/// instead.
+/// that do not need to own this loop can use the unified managed API in
+/// [`crate::managed`] when the `tokio` feature is enabled.
 #[derive(Debug)]
 pub struct Client {
     runtime: SessionMachine,

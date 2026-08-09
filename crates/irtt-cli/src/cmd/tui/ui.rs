@@ -170,7 +170,7 @@ impl TuiState {
             idx
         };
 
-        let (status, recent, warning) = match &outcome.end_reason {
+        let (status, recent, primary_warning) = match &outcome.end_reason {
             ManagedTargetEndReason::TestComplete => {
                 (TargetStatus::Closed, "test completed".to_owned(), None)
             }
@@ -203,6 +203,19 @@ impl TuiState {
             }
         };
 
+        let cleanup_warning = outcome.cleanup_failure.as_ref().map(|failure| {
+            format!(
+                "cleanup failed ({:?} {:?}): {}",
+                failure.phase, failure.kind, failure.message
+            )
+        });
+        let warning = match (primary_warning, cleanup_warning.as_ref()) {
+            (Some(primary), Some(cleanup)) => Some(format!("{primary}; {cleanup}")),
+            (Some(primary), None) => Some(primary),
+            (None, Some(cleanup)) => Some(cleanup.clone()),
+            (None, None) => None,
+        };
+
         if let Some(target) = self.targets.get_mut(idx) {
             target.remote = outcome.remote.map(|remote| remote.to_string());
             target.status = status;
@@ -214,6 +227,9 @@ impl TuiState {
             self.last_warning = Some(warning);
         }
         self.push_event(format!("{label}: {recent}"));
+        if let Some(cleanup_warning) = cleanup_warning {
+            self.push_event(format!("{label}: {cleanup_warning}"));
+        }
 
         if self
             .targets
@@ -2019,15 +2035,18 @@ fn duration_ns(value: Duration) -> i128 {
     i128::try_from(value.as_nanos()).unwrap_or(i128::MAX)
 }
 
-#[cfg(any())]
+#[cfg(test)]
 mod tests {
     use super::*;
+    use irtt_client::managed::{
+        ManagedTargetFailure, ManagedTargetFailureKind, ManagedTargetFailurePhase, TargetId,
+    };
     use irtt_client::{
-        ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming, TargetId,
-        WarningKind,
+        ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming, WarningKind,
     };
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
+        sync::Arc,
         time::UNIX_EPOCH,
     };
 
@@ -2131,23 +2150,25 @@ mod tests {
         &state.targets[0]
     }
 
-    fn target_event(label: &str, event: ClientEvent) -> UiEventScope {
-        UiEventScope {
-            target: TargetId::from(label),
-            event,
+    fn target_instance(label: &str) -> TargetInstance {
+        TargetInstance {
+            id: TargetId::from(label),
+            generation: 1,
         }
     }
 
     fn target_outcome(label: &str, end_reason: ManagedTargetEndReason) -> ManagedTargetOutcome {
         ManagedTargetOutcome {
-            id: TargetId::from(label),
-            remote: remote(),
+            target: target_instance(label),
+            server_addr: Arc::from("127.0.0.1:2112"),
+            remote: Some(remote()),
             end_reason,
             packets_sent: 0,
             replies_received: 0,
             duplicates: 0,
             late: 0,
             warning_events: 0,
+            cleanup_failure: None,
         }
     }
 
@@ -2165,7 +2186,8 @@ mod tests {
     #[test]
     fn session_started_sets_remote_session_and_running_status() {
         let mut state = TuiState::default();
-        state.process_event(&ClientEvent::SessionStarted {
+        let target = target_instance("target");
+        let event = ClientEvent::SessionStarted {
             remote: remote(),
             token: 0xabc,
             negotiated: NegotiatedParams {
@@ -2173,7 +2195,8 @@ mod tests {
                 restrictions: Vec::new(),
             },
             at: ts(Duration::ZERO),
-        });
+        };
+        state.process_target_event(&target, &event);
 
         let target = primary_target(&state);
         assert_eq!(target.remote.as_deref(), Some("127.0.0.1:2112"));
@@ -2185,8 +2208,10 @@ mod tests {
     #[test]
     fn echo_reply_appends_bounded_primary_history() {
         let mut state = TuiState::default();
+        let target = target_instance("target");
         for seq in 0..(HISTORY_LIMIT as u32 + 3) {
-            state.process_event(&reply(seq, i128::from(seq) * 1_000));
+            let event = reply(seq, i128::from(seq) * 1_000);
+            state.process_target_event(&target, &event);
         }
 
         let target = primary_target(&state);
@@ -2205,13 +2230,15 @@ mod tests {
     #[test]
     fn duplicate_and_late_replies_do_not_append_primary_history() {
         let mut state = TuiState::default();
-        state.process_event(&ClientEvent::DuplicateReply {
+        let target = target_instance("target");
+        let duplicate = ClientEvent::DuplicateReply {
             seq: 7,
             remote: remote(),
             received_at: ts(Duration::from_secs(1)),
             bytes: 64,
-        });
-        state.process_event(&ClientEvent::LateReply {
+        };
+        state.process_target_event(&target, &duplicate);
+        let late = ClientEvent::LateReply {
             seq: 8,
             highest_seen: 9,
             remote: remote(),
@@ -2223,7 +2250,8 @@ mod tests {
             received_stats: None,
             bytes: 64,
             packet_meta: PacketMeta::default(),
-        });
+        };
+        state.process_target_event(&target, &late);
 
         let target = primary_target(&state);
         assert!(target.graph_history.is_empty());
@@ -2250,7 +2278,9 @@ mod tests {
         let mut state =
             TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
 
-        state.process_target_event(&target_event("b", reply(11, 2_500_000)));
+        let target = target_instance("b");
+        let event = reply(11, 2_500_000);
+        state.process_target_event(&target, &event);
 
         assert!(state.targets[0].graph_history.is_empty());
         assert_eq!(state.targets[0].stats.snapshot().packets.unique_replies, 0);
@@ -2268,31 +2298,29 @@ mod tests {
         let mut state =
             TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
 
-        state.process_target_event(&target_event(
-            "a",
-            ClientEvent::DuplicateReply {
-                seq: 7,
-                remote: remote(),
-                received_at: ts(Duration::from_secs(1)),
-                bytes: 64,
-            },
-        ));
-        state.process_target_event(&target_event(
-            "b",
-            ClientEvent::LateReply {
-                seq: 8,
-                highest_seen: 9,
-                remote: remote(),
-                sent_at: Some(ts(Duration::from_secs(1))),
-                received_at: ts(Duration::from_secs(2)),
-                rtt: Some(rtt(2_000_000)),
-                server_timing: None,
-                one_way: None,
-                received_stats: None,
-                bytes: 64,
-                packet_meta: PacketMeta::default(),
-            },
-        ));
+        let a = target_instance("a");
+        let duplicate = ClientEvent::DuplicateReply {
+            seq: 7,
+            remote: remote(),
+            received_at: ts(Duration::from_secs(1)),
+            bytes: 64,
+        };
+        state.process_target_event(&a, &duplicate);
+        let b = target_instance("b");
+        let late = ClientEvent::LateReply {
+            seq: 8,
+            highest_seen: 9,
+            remote: remote(),
+            sent_at: Some(ts(Duration::from_secs(1))),
+            received_at: ts(Duration::from_secs(2)),
+            rtt: Some(rtt(2_000_000)),
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
+        };
+        state.process_target_event(&b, &late);
 
         assert!(state.targets[0].graph_history.is_empty());
         assert!(state.targets[1].graph_history.is_empty());
@@ -2306,33 +2334,29 @@ mod tests {
         let mut state =
             TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
 
-        state.process_target_event(&target_event(
-            "a",
-            ClientEvent::EchoLoss {
-                seq: 3,
-                sent_at: ts(Duration::from_millis(3)),
-                timeout_at: Instant::now(),
+        let a = target_instance("a");
+        let loss = ClientEvent::EchoLoss {
+            seq: 3,
+            sent_at: ts(Duration::from_millis(3)),
+            timeout_at: Instant::now(),
+        };
+        state.process_target_event(&a, &loss);
+        let b = target_instance("b");
+        let warning = ClientEvent::Warning {
+            kind: WarningKind::WrongToken,
+            message: "wrong token".to_owned(),
+            at: ts(Duration::ZERO),
+        };
+        state.process_target_event(&b, &warning);
+        let no_test = ClientEvent::NoTestCompleted {
+            remote: remote(),
+            negotiated: NegotiatedParams {
+                params: irtt_proto::Params::default(),
+                restrictions: Vec::new(),
             },
-        ));
-        state.process_target_event(&target_event(
-            "b",
-            ClientEvent::Warning {
-                kind: WarningKind::WrongToken,
-                message: "wrong token".to_owned(),
-                at: ts(Duration::ZERO),
-            },
-        ));
-        state.process_target_event(&target_event(
-            "a",
-            ClientEvent::NoTestCompleted {
-                remote: remote(),
-                negotiated: NegotiatedParams {
-                    params: irtt_proto::Params::default(),
-                    restrictions: Vec::new(),
-                },
-                at: ts(Duration::ZERO),
-            },
-        ));
+            at: ts(Duration::ZERO),
+        };
+        state.process_target_event(&a, &no_test);
 
         assert_eq!(state.targets[0].stats.snapshot().events.loss_events, 1);
         assert_eq!(state.targets[0].status, TargetStatus::NoTest);
@@ -2349,30 +2373,28 @@ mod tests {
         let mut state =
             TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
 
-        state.process_target_event(&target_event(
-            "a",
-            ClientEvent::NoTestCompleted {
-                remote: remote(),
-                negotiated: NegotiatedParams {
-                    params: irtt_proto::Params::default(),
-                    restrictions: Vec::new(),
-                },
-                at: ts(Duration::ZERO),
+        let a = target_instance("a");
+        let no_test = ClientEvent::NoTestCompleted {
+            remote: remote(),
+            negotiated: NegotiatedParams {
+                params: irtt_proto::Params::default(),
+                restrictions: Vec::new(),
             },
-        ));
+            at: ts(Duration::ZERO),
+        };
+        state.process_target_event(&a, &no_test);
 
         assert_eq!(state.targets[0].status, TargetStatus::NoTest);
         assert_eq!(state.targets[1].status, TargetStatus::Opening);
         assert_eq!(state.status, TuiStatus::Running);
 
-        state.process_target_event(&target_event(
-            "b",
-            ClientEvent::SessionClosed {
-                remote: remote(),
-                token: 0xabc,
-                at: ts(Duration::ZERO),
-            },
-        ));
+        let b = target_instance("b");
+        let closed = ClientEvent::SessionClosed {
+            remote: remote(),
+            token: 0xabc,
+            at: ts(Duration::ZERO),
+        };
+        state.process_target_event(&b, &closed);
 
         assert_eq!(state.targets[1].status, TargetStatus::Closed);
         assert_eq!(state.status, TuiStatus::Complete);
@@ -2382,14 +2404,15 @@ mod tests {
     fn terminal_failure_marks_the_correct_target_failed() {
         let mut state =
             TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
-        let failure = irtt_client::ManagedTargetFailure {
-            kind: irtt_client::ManagedTargetFailureKind::OpeningTimeout,
-            message: "all open requests timed out".to_owned(),
+        let failure = ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Opening,
+            kind: ManagedTargetFailureKind::Timeout,
+            message: "all open requests timed out".into(),
         };
 
         state.process_target_outcome(&target_outcome(
             "b",
-            ManagedTargetEndReason::OpenFailed(failure),
+            ManagedTargetEndReason::Failed(failure),
         ));
 
         assert_eq!(state.targets[0].status, TargetStatus::Opening);
@@ -2397,7 +2420,7 @@ mod tests {
         assert!(state.targets[1]
             .last_warning
             .as_deref()
-            .is_some_and(|warning| warning.contains("opening timeout")));
+            .is_some_and(|warning| warning.contains("Timeout")));
     }
 
     #[test]
@@ -2407,9 +2430,10 @@ mod tests {
         state.process_target_outcome(&target_outcome("a", ManagedTargetEndReason::PeerClosed));
         state.process_target_outcome(&target_outcome(
             "b",
-            ManagedTargetEndReason::Failed(irtt_client::ManagedTargetFailure {
-                kind: irtt_client::ManagedTargetFailureKind::RuntimeProtocol,
-                message: "pending probe limit exceeded".to_owned(),
+            ManagedTargetEndReason::Failed(ManagedTargetFailure {
+                phase: ManagedTargetFailurePhase::Receiving,
+                kind: ManagedTargetFailureKind::Protocol,
+                message: "pending probe limit exceeded".into(),
             }),
         ));
 
@@ -2420,6 +2444,79 @@ mod tests {
             .last_warning
             .as_deref()
             .is_some_and(|warning| warning.contains("pending probe limit")));
+    }
+
+    #[test]
+    fn cleanup_failure_warns_without_changing_successful_target_status() {
+        let mut state = TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned()]);
+        let mut outcome = target_outcome("a", ManagedTargetEndReason::TestComplete);
+        outcome.remote = None;
+        outcome.cleanup_failure = Some(ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Closing,
+            kind: ManagedTargetFailureKind::Socket,
+            message: "close datagram failed".into(),
+        });
+
+        state.process_target_outcome(&outcome);
+
+        assert_eq!(state.targets[0].status, TargetStatus::Closed);
+        assert_eq!(state.targets[0].remote, None);
+        assert!(state.targets[0]
+            .last_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("cleanup failed (Closing Socket)")));
+        assert!(state
+            .recent_events
+            .iter()
+            .any(|event| event.contains("cleanup failed (Closing Socket)")));
+    }
+
+    #[test]
+    fn primary_and_cleanup_failures_are_both_visible() {
+        let mut state = TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned()]);
+        let mut outcome = target_outcome(
+            "a",
+            ManagedTargetEndReason::Failed(ManagedTargetFailure {
+                phase: ManagedTargetFailurePhase::Receiving,
+                kind: ManagedTargetFailureKind::Protocol,
+                message: "primary failure".into(),
+            }),
+        );
+        outcome.cleanup_failure = Some(ManagedTargetFailure {
+            phase: ManagedTargetFailurePhase::Closing,
+            kind: ManagedTargetFailureKind::Socket,
+            message: "cleanup failure".into(),
+        });
+
+        state.process_target_outcome(&outcome);
+
+        assert_eq!(state.targets[0].status, TargetStatus::Failed);
+        assert!(state.targets[0]
+            .last_warning
+            .as_deref()
+            .is_some_and(|warning| warning.contains("primary failure")
+                && warning.contains("cleanup failure")));
+        assert!(state
+            .recent_events
+            .iter()
+            .any(|event| event.contains("target failed: Protocol: primary failure")));
+        assert!(state
+            .recent_events
+            .iter()
+            .any(|event| event.contains("cleanup failed (Closing Socket): cleanup failure")));
+    }
+
+    #[test]
+    fn managed_outcomes_map_stopped_removed_and_replaced_statuses() {
+        for (reason, expected) in [
+            (ManagedTargetEndReason::Stopped, TargetStatus::Stopped),
+            (ManagedTargetEndReason::Removed, TargetStatus::Removed),
+            (ManagedTargetEndReason::Replaced, TargetStatus::Replaced),
+        ] {
+            let mut state = TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned()]);
+            state.process_target_outcome(&target_outcome("a", reason));
+            assert_eq!(state.targets[0].status, expected);
+        }
     }
 
     #[test]
@@ -2446,9 +2543,10 @@ mod tests {
         for label in ["a", "b"] {
             state.process_target_outcome(&target_outcome(
                 label,
-                ManagedTargetEndReason::OpenFailed(irtt_client::ManagedTargetFailure {
-                    kind: irtt_client::ManagedTargetFailureKind::OpeningProtocol,
-                    message: "server returned a zero connection token".to_owned(),
+                ManagedTargetEndReason::Failed(ManagedTargetFailure {
+                    phase: ManagedTargetFailurePhase::Opening,
+                    kind: ManagedTargetFailureKind::Protocol,
+                    message: "server returned a zero connection token".into(),
                 }),
             ));
         }
@@ -2465,8 +2563,12 @@ mod tests {
         let mut state =
             TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
 
-        state.process_target_event(&target_event("a", reply(1, 1_000_000)));
-        state.process_target_event(&target_event("b", reply(2, 2_000_000)));
+        let a = target_instance("a");
+        let a_reply = reply(1, 1_000_000);
+        state.process_target_event(&a, &a_reply);
+        let b = target_instance("b");
+        let b_reply = reply(2, 2_000_000);
+        state.process_target_event(&b, &b_reply);
         state.clear_visible_history();
 
         assert!(state.targets[0].graph_history.is_empty());
@@ -2480,11 +2582,13 @@ mod tests {
     #[test]
     fn warning_updates_recent_events_and_last_warning() {
         let mut state = TuiState::default();
-        state.process_event(&ClientEvent::Warning {
+        let target = target_instance("target");
+        let event = ClientEvent::Warning {
             kind: WarningKind::WrongToken,
             message: "wrong token".to_owned(),
             at: ts(Duration::ZERO),
-        });
+        };
+        state.process_target_event(&target, &event);
 
         assert_eq!(
             state.last_warning.as_deref(),
@@ -2501,7 +2605,7 @@ mod tests {
     fn dropped_events_mark_tui_statistics_incomplete() {
         let mut state = TuiState::default();
 
-        state.mark_dropped_group_events(9);
+        state.mark_dropped_managed_events(9);
 
         assert_eq!(state.dropped_events, 9);
         assert!(state
@@ -2511,20 +2615,20 @@ mod tests {
         assert!(state
             .recent_events
             .back()
-            .is_some_and(|event| event.contains("dropped 9 managed group events")));
+            .is_some_and(|event| event.contains("dropped 9 managed run events")));
     }
 
     #[test]
     fn dropped_single_client_events_are_visible() {
         let mut state = TuiState::default();
 
-        state.mark_dropped_client_events(3);
+        state.mark_dropped_managed_events(3);
 
         assert_eq!(state.dropped_events, 3);
         assert!(state
             .recent_events
             .back()
-            .is_some_and(|event| event.contains("dropped 3 managed client events")));
+            .is_some_and(|event| event.contains("dropped 3 managed run events")));
     }
 
     #[test]
@@ -2803,7 +2907,9 @@ mod tests {
     #[test]
     fn sample_details_preserve_signed_values() {
         let mut state = TuiState::default();
-        state.process_event(&reply(4, -1_250_000));
+        let target = target_instance("target");
+        let event = reply(4, -1_250_000);
+        state.process_target_event(&target, &event);
 
         let target = primary_target(&state);
         let sample = target.last_sample.unwrap();

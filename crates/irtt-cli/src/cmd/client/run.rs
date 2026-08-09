@@ -26,8 +26,8 @@ use crate::shared::client::expected_probe_count;
 use crate::shared::client::{
     is_shutdown_requested,
     session::{
-        peer_close_run_error, request_managed_stop_for_peer_close, request_managed_stop_once,
-        should_print_final_summary,
+        drain_managed_events, peer_close_run_error, request_managed_stop_for_peer_close,
+        request_managed_stop_once, should_print_final_summary, ManagedDrainState,
     },
 };
 #[cfg(feature = "stats")]
@@ -116,7 +116,6 @@ pub fn run_stream(
     let mut dropped_events = 0_u64;
     let mut interrupted = false;
     let mut stop_requested = false;
-    let mut peer_close_requested_stop = false;
     let mut subscription_closed = false;
     loop {
         if is_shutdown_requested(shutdown_requested) {
@@ -129,12 +128,11 @@ pub fn run_stream(
             continuous,
             interrupted,
             handle.status().peer_closed_target_outcomes,
-            &mut peer_close_requested_stop,
             &mut stop_requested,
         ) {
             drop(handle.stop());
         }
-        drain_events(
+        let drain_state = drain_events(
             &mut events,
             &mut stream_output,
             #[cfg(feature = "stats")]
@@ -142,35 +140,20 @@ pub fn run_stream(
             &mut terminal_targets,
             &mut dropped_events,
         )?;
+        match drain_state {
+            ManagedDrainState::Empty => thread::sleep(MANAGED_EVENT_WAIT_SLICE),
+            ManagedDrainState::Closed => subscription_closed = true,
+            ManagedDrainState::BudgetExhausted => {}
+        }
         if handle.status().final_outcome.is_some() || subscription_closed {
             break;
-        }
-        match events.try_recv() {
-            Ok(event) => process_event(
-                event,
-                &mut stream_output,
-                #[cfg(feature = "stats")]
-                &mut stats,
-                &mut terminal_targets,
-            )?,
-            Err(ManagedEventTryRecvError::Empty) => thread::sleep(MANAGED_EVENT_WAIT_SLICE),
-            Err(ManagedEventTryRecvError::Lagged(count)) => dropped_events += count,
-            Err(ManagedEventTryRecvError::Closed) => subscription_closed = true,
         }
     }
     if interrupted {
         eprintln!("interrupted, closing managed run...");
     }
-    drain_events(
-        &mut events,
-        &mut stream_output,
-        #[cfg(feature = "stats")]
-        &mut stats,
-        &mut terminal_targets,
-        &mut dropped_events,
-    )?;
     let outcome = owner.join()?;
-    drain_events(
+    drain_final_events(
         &mut events,
         &mut stream_output,
         #[cfg(feature = "stats")]
@@ -275,6 +258,24 @@ fn drain_events<W: Write>(
     #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
     terminal_targets: &mut HashSet<TargetInstance>,
     dropped_events: &mut u64,
+) -> io::Result<ManagedDrainState> {
+    drain_managed_events(events, dropped_events, |event| {
+        process_event(
+            event,
+            stream_output,
+            #[cfg(feature = "stats")]
+            stats,
+            terminal_targets,
+        )
+    })
+}
+
+fn drain_final_events<W: Write>(
+    events: &mut ManagedEventSubscription,
+    stream_output: &mut StreamOutput<'_, W>,
+    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
+    terminal_targets: &mut HashSet<TargetInstance>,
+    dropped_events: &mut u64,
 ) -> io::Result<()> {
     loop {
         match events.try_recv() {
@@ -286,19 +287,35 @@ fn drain_events<W: Write>(
                 terminal_targets,
             )?,
             Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
-            Err(ManagedEventTryRecvError::Lagged(count)) => *dropped_events += count,
+            Err(ManagedEventTryRecvError::Lagged(count)) => {
+                *dropped_events = dropped_events.saturating_add(count);
+            }
         }
     }
     Ok(())
 }
 
 fn report_target_failure(target: &ManagedTargetOutcome) {
+    for message in target_failure_messages(target) {
+        eprintln!("{message}");
+    }
+}
+
+fn target_failure_messages(target: &ManagedTargetOutcome) -> Vec<String> {
+    let mut messages = Vec::with_capacity(2);
     if let ManagedTargetEndReason::Failed(failure) = &target.end_reason {
-        eprintln!(
+        messages.push(format!(
             "irtt-rs: target {} failed ({:?} {:?}): {}",
             target.target.id, failure.phase, failure.kind, failure.message
-        );
+        ));
     }
+    if let Some(failure) = &target.cleanup_failure {
+        messages.push(format!(
+            "irtt-rs: target {} cleanup failed ({:?} {:?}): {}",
+            target.target.id, failure.phase, failure.kind, failure.message
+        ));
+    }
+    messages
 }
 fn dropped_event_warning(dropped_events: u64) -> Option<String> {
     (dropped_events > 0).then(|| format!("irtt-rs: warning: dropped {dropped_events} managed run event{}; output and statistics may be incomplete", if dropped_events == 1 { "" } else { "s" }))
@@ -419,14 +436,55 @@ fn finite_stats_memory_warning(args: &ClientArgs) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irtt_client::managed::{
+        ManagedTargetFailure, ManagedTargetFailureKind, ManagedTargetFailurePhase, TargetId,
+    };
+    use std::sync::Arc;
+
     #[test]
-    fn lagged_events_are_counted_exactly() {
-        let mut dropped = 0;
-        dropped += 7;
-        dropped += 3;
+    fn lagged_events_are_counted_saturatingly() {
+        let mut dropped = 0_u64;
+        dropped = dropped.saturating_add(7);
+        dropped = dropped.saturating_add(3);
         assert_eq!(dropped, 10);
+        assert_eq!(u64::MAX.saturating_add(1), u64::MAX);
         assert!(dropped_event_warning(dropped)
             .unwrap()
             .contains("dropped 10 managed run events"));
+    }
+
+    #[test]
+    fn target_failure_diagnostics_include_primary_and_cleanup_failures() {
+        let target = ManagedTargetOutcome {
+            target: TargetInstance {
+                id: TargetId::from("edge"),
+                generation: 1,
+            },
+            server_addr: Arc::from("127.0.0.1:2112"),
+            remote: None,
+            end_reason: ManagedTargetEndReason::Failed(ManagedTargetFailure {
+                phase: ManagedTargetFailurePhase::Receiving,
+                kind: ManagedTargetFailureKind::Protocol,
+                message: "primary failure".into(),
+            }),
+            packets_sent: 0,
+            replies_received: 0,
+            duplicates: 0,
+            late: 0,
+            warning_events: 0,
+            cleanup_failure: Some(ManagedTargetFailure {
+                phase: ManagedTargetFailurePhase::Closing,
+                kind: ManagedTargetFailureKind::Socket,
+                message: "cleanup failure".into(),
+            }),
+        };
+
+        assert_eq!(
+            target_failure_messages(&target),
+            [
+                "irtt-rs: target edge failed (Receiving Protocol): primary failure",
+                "irtt-rs: target edge cleanup failed (Closing Socket): cleanup failure",
+            ]
+        );
     }
 }

@@ -173,73 +173,51 @@ Add it from a local checkout:
 
 ```toml
 [dependencies]
-irtt-client = { path = "crates/irtt-client" }
+irtt-client = { path = "crates/irtt-client", features = ["tokio"] }
 ```
 
-Minimal managed-client example:
+Minimal managed-client example for a synchronous frontend:
 
 ```rust
 use std::time::Duration;
 
-use irtt_client::{
-    ClientConfig, ClientEvent, ManagedClient, SubscriberConfig,
+use irtt_client::managed::{
+    BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy,
+    ManagedTargetConfig, TargetId,
 };
+use irtt_client::ClientConfig;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ClientConfig {
-        server_addr: "netperf-eu.bufferbloat.net:2112".to_owned(),
-        duration: Some(Duration::from_secs(10)),
-        interval: Duration::from_secs(1),
-        ..ClientConfig::default()
+    let config = ManagedClientConfig {
+        client: ClientConfig {
+            duration: Some(Duration::from_secs(10)),
+            interval: Duration::from_secs(1),
+            ..ClientConfig::default()
+        },
+        completion: ManagedCompletionPolicy::FinishWhenQuiescent,
+        ..ManagedClientConfig::default()
     };
-
-    let (session, events) =
-        ManagedClient::start_with_subscription(
-            config,
-            SubscriberConfig::default(),
-        )?;
-
-    while let Ok(event) = events.recv() {
-        match event {
-            ClientEvent::EchoReply { seq, rtt, .. } => {
-                println!(
-                    "seq={seq} rtt_us={}",
-                    rtt.effective.as_micros()
-                );
-            }
-            ClientEvent::SessionClosed { .. } => break,
-            _ => {}
-        }
-    }
-
-    let outcome = session.join()?;
+    let targets = vec![ManagedTargetConfig::new(
+        TargetId::from("edge"),
+        "netperf-eu.bufferbloat.net:2112",
+    )];
+    let owner = BlockingManagedClient::start(config, targets)?;
+    let outcome = owner.join()?;
     println!("session ended: {:?}", outcome.end_reason);
 
     Ok(())
 }
 ```
 
-The client library emits structured events for session lifecycle, sent probes, successful replies, loss, duplicates, late replies, warnings, and shutdown.
+For presentation events, use `BlockingManagedClient::start_with_subscription`,
+`ManagedEvent`, and `ManagedEventTryRecvError`, while consulting the durable
+`handle.status()` and final outcome for authoritative state. Presentation
+events are bounded and lossy, not reliable history. Dynamic desired-target
+updates are available through `ManagedClientHandle::update_targets`.
 
-For shared-socket multi-target integrations, `ManagedClientGroup` publishes
-`ManagedGroupEvent::TargetFinished` exactly once for every terminal target
-incarnation, including open/runtime failures, removal, cancellation, no-test
-completion, and peer closure. Consumers can use `ManagedTargetEndReason` and
-`ManagedTargetFailureKind` for outcome and exit decisions without parsing
-diagnostic text.
-
-`ManagedGroupCompletionPolicy::AllTargetsComplete` supports finite static
-groups. `ExplicitCancellation` supports long-lived controllers; replacing the
-desired set with an empty vector removes current targets but leaves the group
-idle and ready for a later `update_targets` call. `join()` reports aggregate
-outcome counts and retains only the 256 most recent target outcomes, so
-long-running target churn remains bounded. The aggregate
-`peer_closed_target_outcomes` count includes peer closures omitted from that
-recent snapshot.
-
-Managed event subscriptions remain bounded and nonblocking. When using a
-dropping overflow policy, check `EventSubscription::dropped_events()` before
-trusting a complete statistical summary.
+`BlockingManagedClient` owns a dedicated Tokio runtime and thread for
+synchronous callers. Callers that already own Tokio can drive
+`ManagedClientTask` directly.
 
 ## Binaries and features
 

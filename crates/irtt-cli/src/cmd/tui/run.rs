@@ -12,7 +12,8 @@ use crate::{
     shared::client::{
         is_shutdown_requested,
         session::{
-            peer_close_run_error, request_managed_stop_for_peer_close, request_managed_stop_once,
+            drain_managed_events, peer_close_run_error, request_managed_stop_for_peer_close,
+            request_managed_stop_once, ManagedDrainState,
         },
     },
 };
@@ -72,7 +73,6 @@ pub fn run_tui(
     let handle = owner.handle();
     let mut interrupted = false;
     let mut stop_requested = false;
-    let mut peer_close_requested_stop = false;
     let mut terminal_targets = HashSet::new();
     let mut dropped_events = 0;
     let mut subscription_closed = false;
@@ -96,27 +96,25 @@ pub fn run_tui(
             continuous,
             interrupted,
             handle.status().peer_closed_target_outcomes,
-            &mut peer_close_requested_stop,
             &mut stop_requested,
         ) {
             drop(handle.stop());
         }
-        drain_tui_events(
+        let drain_state = drain_tui_events(
             &mut events,
             &mut state,
             &mut terminal_targets,
             &mut dropped_events,
         );
+        match drain_state {
+            ManagedDrainState::Empty => {
+                thread::sleep(managed_tui_wait_duration(&next_render, state.paused));
+            }
+            ManagedDrainState::Closed => subscription_closed = true,
+            ManagedDrainState::BudgetExhausted => {}
+        }
         if handle.status().final_outcome.is_some() || subscription_closed {
             break;
-        }
-        match events.try_recv() {
-            Ok(event) => process_tui_event(event, &mut state, &mut terminal_targets),
-            Err(ManagedEventTryRecvError::Empty) => {
-                thread::sleep(managed_tui_wait_duration(&next_render, state.paused))
-            }
-            Err(ManagedEventTryRecvError::Lagged(count)) => dropped_events += count,
-            Err(ManagedEventTryRecvError::Closed) => subscription_closed = true,
         }
         render_if_due(&mut terminal, &state, &mut next_render, false)?;
     }
@@ -126,14 +124,8 @@ pub fn run_tui(
     }
     state.set_status(TuiStatus::Closing);
     render_if_due(&mut terminal, &state, &mut next_render, true)?;
-    drain_tui_events(
-        &mut events,
-        &mut state,
-        &mut terminal_targets,
-        &mut dropped_events,
-    );
     let outcome = owner.join()?;
-    drain_tui_events(
+    drain_final_tui_events(
         &mut events,
         &mut state,
         &mut terminal_targets,
@@ -198,12 +190,27 @@ fn drain_tui_events(
     state: &mut TuiState,
     terminal_targets: &mut HashSet<TargetInstance>,
     dropped_events: &mut u64,
+) -> ManagedDrainState {
+    drain_managed_events(events, dropped_events, |event| {
+        process_tui_event(event, state, terminal_targets);
+        Ok::<(), std::convert::Infallible>(())
+    })
+    .expect("processing TUI managed events is infallible")
+}
+
+fn drain_final_tui_events(
+    events: &mut ManagedEventSubscription,
+    state: &mut TuiState,
+    terminal_targets: &mut HashSet<TargetInstance>,
+    dropped_events: &mut u64,
 ) {
     loop {
         match events.try_recv() {
             Ok(event) => process_tui_event(event, state, terminal_targets),
             Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
-            Err(ManagedEventTryRecvError::Lagged(count)) => *dropped_events += count,
+            Err(ManagedEventTryRecvError::Lagged(count)) => {
+                *dropped_events = dropped_events.saturating_add(count);
+            }
         }
     }
 }
