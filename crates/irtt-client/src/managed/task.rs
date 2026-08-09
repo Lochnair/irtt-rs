@@ -13,7 +13,7 @@ use std::{
 };
 
 use tokio::{
-    sync::{broadcast, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
     time::{self, Sleep},
 };
 
@@ -26,7 +26,8 @@ use crate::{
 };
 
 use super::{
-    classify_client_error, ManagedClientConfig, ManagedCompletionPolicy, ManagedConfigError,
+    classify_client_error, ManagedClientConfig, ManagedCommandAcknowledgement,
+    ManagedCommandApplyError, ManagedCommandError, ManagedCompletionPolicy, ManagedConfigError,
     ManagedDriverFailure, ManagedEndReason, ManagedEvent, ManagedEventSubscription,
     ManagedLifecycle, ManagedOutcome, ManagedPacing, ManagedStatus, ManagedSubscribeError,
     ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure, ManagedTargetFailureKind,
@@ -35,6 +36,7 @@ use super::{
 };
 
 const TARGET_WORK_BUDGET: usize = 128;
+const COMMAND_WORK_BUDGET: usize = 32;
 const POST_DEADLINE_RECEIVE_BUDGET: usize = TARGET_WORK_BUDGET;
 
 /// Entry point for constructing a unified Tokio managed task.
@@ -54,6 +56,7 @@ impl ManagedClient {
 #[derive(Debug)]
 struct StopSignal {
     requested: AtomicBool,
+    updates_accepted: AtomicBool,
     wake: watch::Sender<()>,
     acknowledged: AtomicBool,
     acknowledgement: watch::Sender<()>,
@@ -61,9 +64,17 @@ struct StopSignal {
 
 impl StopSignal {
     fn request(&self) {
+        self.updates_accepted.store(false, Ordering::Release);
         if !self.requested.swap(true, Ordering::AcqRel) {
             self.wake.send_replace(());
         }
+    }
+
+    fn updates_accepted(&self) -> bool {
+        self.updates_accepted.load(Ordering::Acquire)
+    }
+    fn close_updates(&self) {
+        self.updates_accepted.store(false, Ordering::Release);
     }
 
     fn is_requested(&self) -> bool {
@@ -81,6 +92,7 @@ impl StopSignal {
 #[derive(Clone)]
 pub struct ManagedClientHandle {
     stop: Arc<StopSignal>,
+    commands: mpsc::Sender<ManagedCommand>,
     status: watch::Receiver<Arc<ManagedStatus>>,
     events: broadcast::WeakSender<ManagedEvent>,
 }
@@ -112,6 +124,52 @@ impl ManagedClientHandle {
         self.stop.request();
         ManagedStopReceipt::new(Arc::clone(&self.stop))
     }
+
+    /// Submit one complete desired target set without awaiting queue capacity.
+    pub fn update_targets(
+        &self,
+        targets: Vec<ManagedTargetConfig>,
+    ) -> Result<ManagedCommandReceipt, ManagedCommandError> {
+        if !self.stop.updates_accepted() {
+            return Err(ManagedCommandError::Stopping);
+        }
+        let (acknowledgement, receiver) = oneshot::channel();
+        match self.commands.try_send(ManagedCommand::UpdateTargets {
+            targets,
+            acknowledgement,
+        }) {
+            Ok(()) => Ok(ManagedCommandReceipt { receiver }),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(ManagedCommandError::QueueFull),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(ManagedCommandError::DriverClosed),
+        }
+    }
+}
+
+/// Receipt for a target-set transaction accepted by the driver queue.
+#[must_use = "await the receipt to observe target-update application"]
+pub struct ManagedCommandReceipt {
+    receiver: oneshot::Receiver<Result<ManagedCommandAcknowledgement, ManagedCommandApplyError>>,
+}
+
+impl Future for ManagedCommandReceipt {
+    type Output = Result<ManagedCommandAcknowledgement, ManagedCommandApplyError>;
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        match Pin::new(&mut self.receiver).poll(cx) {
+            Poll::Ready(Ok(result)) => Poll::Ready(result),
+            Poll::Ready(Err(_)) => {
+                Poll::Ready(Err(ManagedCommandApplyError::AcknowledgementDisconnected))
+            }
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
+enum ManagedCommand {
+    UpdateTargets {
+        targets: Vec<ManagedTargetConfig>,
+        acknowledgement:
+            oneshot::Sender<Result<ManagedCommandAcknowledgement, ManagedCommandApplyError>>,
+    },
 }
 
 /// Receipt resolving once stop is durably observed or the task is terminal.
@@ -211,12 +269,66 @@ struct TargetCounters {
 
 struct TargetRuntime {
     instance: TargetInstance,
+    config: ManagedTargetConfig,
+    desired: bool,
+    retirement: Option<ManagedTargetEndReason>,
     server_addr: Arc<str>,
     remote: Option<std::net::SocketAddr>,
     counters: TargetCounters,
     send_waiting: bool,
     active: bool,
     state: TargetState,
+}
+
+struct PlannedTarget {
+    target: ManagedTargetConfig,
+    client_config: ClientConfig,
+    generation: u64,
+}
+
+struct PlannedRetirement {
+    index: usize,
+    reason: ManagedTargetEndReason,
+    synchronous: bool,
+}
+
+struct UpdatePlan {
+    retirements: Vec<PlannedRetirement>,
+    created: Vec<PlannedTarget>,
+    next_generation: u64,
+    next_command_sequence: u64,
+    prospective_live_count: usize,
+}
+
+fn synchronously_retireable(state: &TargetState) -> bool {
+    match state {
+        TargetState::Pending { .. } | TargetState::Connecting { .. } | TargetState::Terminal => {
+            true
+        }
+        TargetState::Opening { open, .. } => !open.has_in_flight_work(),
+        TargetState::Active { .. } | TargetState::Draining { .. } | TargetState::Closing { .. } => {
+            false
+        }
+    }
+}
+
+fn target_outcome(
+    target: &TargetRuntime,
+    end_reason: ManagedTargetEndReason,
+    cleanup_failure: Option<ManagedTargetFailure>,
+) -> ManagedTargetOutcome {
+    ManagedTargetOutcome {
+        target: target.instance.clone(),
+        server_addr: Arc::clone(&target.server_addr),
+        remote: target.remote,
+        end_reason,
+        packets_sent: target.counters.packets_sent,
+        replies_received: target.counters.replies_received,
+        duplicates: target.counters.duplicates,
+        late: target.counters.late,
+        warning_events: target.counters.warning_events,
+        cleanup_failure,
+    }
 }
 
 #[derive(Default)]
@@ -275,9 +387,14 @@ impl OutcomeHistory {
         )
     }
 
-    fn outcome(&self, end_reason: ManagedEndReason) -> ManagedOutcome {
+    fn outcome(
+        &self,
+        end_reason: ManagedEndReason,
+        applied_command_sequence: u64,
+    ) -> ManagedOutcome {
         ManagedOutcome {
             end_reason,
+            applied_command_sequence,
             total_target_outcomes: self.total,
             successful_target_outcomes: self.successful,
             failed_target_outcomes: self.failed,
@@ -315,6 +432,7 @@ pub struct ManagedClientTask {
     lifecycle: ManagedLifecycle,
     config: ManagedClientConfig,
     targets: Vec<TargetRuntime>,
+    commands: mpsc::Receiver<ManagedCommand>,
     history: OutcomeHistory,
     resources: Option<TaskResources>,
     wake: Option<WakeFuture>,
@@ -328,7 +446,8 @@ pub struct ManagedClientTask {
     last_stagger_send: Option<Instant>,
     stop_observed: bool,
     final_outcome: Option<Arc<ManagedOutcome>>,
-    _next_generation: u64,
+    next_generation: u64,
+    applied_command_sequence: u64,
     #[cfg(test)]
     event_observations: Option<EventObservations>,
     #[cfg(test)]
@@ -388,6 +507,7 @@ impl ManagedClientTask {
                 }
                 ManagedTargetStatus {
                     target: target.instance.clone(),
+                    desired: target.desired,
                     lifecycle,
                     server_addr: Arc::clone(&target.server_addr),
                     remote: target.remote,
@@ -397,7 +517,8 @@ impl ManagedClientTask {
         Arc::new(ManagedStatus {
             lifecycle: self.lifecycle,
             stop_requested: self.stop_observed,
-            desired_target_count: self.targets.len(),
+            applied_command_sequence: self.applied_command_sequence,
+            desired_target_count: self.targets.iter().filter(|target| target.desired).count(),
             connecting_target_count: connecting,
             opening_target_count: opening,
             active_target_count: active,
@@ -536,6 +657,7 @@ impl ManagedClientTask {
             return;
         }
         self.stop_observed = true;
+        self.resources().stop.close_updates();
         self.state = DriverState::Stopping;
         self.lifecycle = ManagedLifecycle::Stopping;
         self.replace_status();
@@ -543,6 +665,256 @@ impl ManagedClientTask {
         self.resources().stop.acknowledge();
         self.scan_remaining = self.targets.len();
         self.burst_remaining = 0;
+    }
+
+    fn effective_retirement(&self, index: usize) -> Option<ManagedTargetEndReason> {
+        self.targets[index].retirement.clone()
+    }
+
+    fn process_commands(&mut self, cx: &mut Context<'_>) -> bool {
+        let mut immediate = false;
+        for _ in 0..COMMAND_WORK_BUDGET {
+            match self.commands.poll_recv(cx) {
+                Poll::Ready(Some(ManagedCommand::UpdateTargets {
+                    targets,
+                    acknowledgement,
+                })) => {
+                    // This check is the driver-side application linearization point.
+                    // `apply_targets` cannot suspend, so a stop observed here wins over
+                    // this command; once it passes, this command may complete atomically.
+                    let result = if self.state != DriverState::Running
+                        || self.resources().stop.is_requested()
+                    {
+                        Err(ManagedCommandApplyError::Stopping)
+                    } else {
+                        self.apply_targets(targets)
+                    };
+                    let _ = acknowledgement.send(result);
+                    immediate = true;
+                }
+                Poll::Ready(None) | Poll::Pending => break,
+            }
+        }
+        immediate
+    }
+
+    fn apply_targets(
+        &mut self,
+        incoming: Vec<ManagedTargetConfig>,
+    ) -> Result<ManagedCommandAcknowledgement, ManagedCommandApplyError> {
+        let plan = self.plan_targets(incoming)?;
+        debug_assert!(plan.prospective_live_count <= self.config.max_live_target_generations);
+
+        let now = Instant::now();
+        let mut synchronous = HashSet::with_capacity(plan.retirements.len());
+        let mut finished = Vec::new();
+        for retirement in &plan.retirements {
+            let target = &mut self.targets[retirement.index];
+            target.desired = false;
+            if retirement.synchronous {
+                synchronous.insert(retirement.index);
+                if !matches!(target.state, TargetState::Terminal) {
+                    let outcome = target_outcome(target, retirement.reason.clone(), None);
+                    self.history.record(outcome.clone());
+                    finished.push(ManagedEvent::TargetFinished {
+                        outcome: Arc::new(outcome),
+                    });
+                }
+            } else {
+                target.retirement = Some(retirement.reason.clone());
+                if target.active {
+                    target.active = false;
+                    // Removal is directional: it may discard an elapsed gate but never
+                    // lengthens an existing future stagger gate.
+                    self.stagger_target_removed(now);
+                }
+            }
+        }
+        if !synchronous.is_empty() {
+            let mut index = 0;
+            self.targets.retain(|_| {
+                let keep = !synchronous.contains(&index);
+                index += 1;
+                keep
+            });
+            self.rebase_target_cursors();
+        }
+
+        let mut created_instances = Vec::with_capacity(plan.created.len());
+        for planned in plan.created {
+            let instance = TargetInstance {
+                id: planned.target.id.clone(),
+                generation: planned.generation,
+            };
+            created_instances.push(instance.clone());
+            self.targets.push(TargetRuntime {
+                instance,
+                server_addr: Arc::from(planned.target.server_addr.clone()),
+                config: planned.target,
+                desired: true,
+                retirement: None,
+                remote: None,
+                counters: TargetCounters::default(),
+                send_waiting: false,
+                active: false,
+                state: TargetState::Pending {
+                    client_config: planned.client_config,
+                },
+            });
+        }
+        self.next_generation = plan.next_generation;
+        self.applied_command_sequence = plan.next_command_sequence;
+        let stopping = self.targets.iter().all(|runtime| !runtime.desired)
+            && self.config.completion == ManagedCompletionPolicy::FinishWhenQuiescent;
+        if stopping {
+            self.resources().stop.close_updates();
+            self.state = DriverState::Stopping;
+            self.lifecycle = ManagedLifecycle::Stopping;
+        }
+
+        // A transaction has one externally visible durable point: all runtime and
+        // history changes above, then this exact status snapshot, then its events and
+        // acknowledgement.  Do not use per-transition publishing helpers here.
+        let status = self.snapshot();
+        self.resources().status.send_replace(Arc::clone(&status));
+        if stopping {
+            self.publish_event(ManagedEvent::Stopping);
+        }
+        for event in finished {
+            self.publish_event(event);
+        }
+        for target in created_instances {
+            self.publish_event(ManagedEvent::TargetStateChanged {
+                target,
+                lifecycle: ManagedTargetLifecycle::Pending,
+            });
+        }
+        Ok(ManagedCommandAcknowledgement {
+            sequence: self.applied_command_sequence,
+            status,
+        })
+    }
+
+    fn plan_targets(
+        &self,
+        incoming: Vec<ManagedTargetConfig>,
+    ) -> Result<UpdatePlan, ManagedCommandApplyError> {
+        let mut ids = HashSet::with_capacity(incoming.len());
+        let mut prepared = Vec::with_capacity(incoming.len());
+        for target in incoming {
+            if !ids.insert(target.id.clone()) {
+                return Err(ManagedCommandApplyError::DuplicateTargetId { id: target.id });
+            }
+            let mut client_config = self.config.client.clone();
+            client_config.server_addr.clone_from(&target.server_addr);
+            if let Some(auth) = &target.auth {
+                client_config.hmac_key.clone_from(&auth.hmac_key);
+            }
+            validate_target_config(&client_config).map_err(|source| {
+                ManagedCommandApplyError::InvalidTarget {
+                    id: target.id.clone(),
+                    source,
+                }
+            })?;
+            prepared.push((target, client_config));
+        }
+        let mut retirements = Vec::new();
+        for (index, runtime) in self.targets.iter().enumerate() {
+            if !runtime.desired || prepared.iter().any(|(target, _)| target == &runtime.config) {
+                continue;
+            }
+            let reason = if prepared
+                .iter()
+                .any(|(target, _)| target.id == runtime.instance.id)
+            {
+                ManagedTargetEndReason::Replaced
+            } else {
+                ManagedTargetEndReason::Removed
+            };
+            retirements.push(PlannedRetirement {
+                index,
+                reason,
+                synchronous: synchronously_retireable(&runtime.state),
+            });
+        }
+
+        let mut next_generation = self.next_generation;
+        let mut created = Vec::new();
+        for (target, client_config) in prepared {
+            if self
+                .targets
+                .iter()
+                .any(|runtime| runtime.desired && runtime.config == target)
+            {
+                continue;
+            }
+            let generation = next_generation;
+            next_generation = next_generation
+                .checked_add(1)
+                .ok_or(ManagedCommandApplyError::GenerationExhausted)?;
+            created.push(PlannedTarget {
+                target,
+                client_config,
+                generation,
+            });
+        }
+        let next_command_sequence = self
+            .applied_command_sequence
+            .checked_add(1)
+            .ok_or(ManagedCommandApplyError::CommandSequenceExhausted)?;
+        let synchronous = retirements
+            .iter()
+            .filter(|retirement| retirement.synchronous)
+            .map(|retirement| retirement.index)
+            .collect::<HashSet<_>>();
+        let prospective_live_count = self
+            .targets
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !synchronous.contains(index))
+            .count()
+            .saturating_add(created.len());
+        if prospective_live_count > self.config.max_live_target_generations {
+            return Err(ManagedCommandApplyError::LiveGenerationLimitExceeded {
+                required: prospective_live_count,
+                limit: self.config.max_live_target_generations,
+            });
+        }
+        Ok(UpdatePlan {
+            retirements,
+            created,
+            next_generation,
+            next_command_sequence,
+            prospective_live_count,
+        })
+    }
+
+    fn prune_undesired_terminal(&mut self) {
+        if !self
+            .targets
+            .iter()
+            .any(|target| !target.desired && matches!(target.state, TargetState::Terminal))
+        {
+            return;
+        }
+        self.targets
+            .retain(|target| target.desired || !matches!(target.state, TargetState::Terminal));
+        self.rebase_target_cursors();
+        self.replace_status();
+    }
+
+    fn rebase_target_cursors(&mut self) {
+        let len = self.targets.len();
+        if len == 0 {
+            self.cursor = 0;
+            self.send_cursor = 0;
+        } else {
+            self.cursor %= len;
+            self.send_cursor %= len;
+        }
+        self.scan_remaining = self.scan_remaining.min(len);
+        self.burst_remaining = self.burst_remaining.min(len);
+        self.stagger_remaining = self.stagger_remaining.min(len);
     }
 
     fn start_connecting(&mut self, index: usize, config: ClientConfig) {
@@ -554,8 +926,14 @@ impl ManagedClientTask {
         let state = mem::replace(&mut self.targets[index].state, TargetState::Terminal);
         match state {
             TargetState::Pending { client_config } => {
-                if self.state == DriverState::Stopping {
-                    self.finish_target(index, ManagedTargetEndReason::Stopped, None);
+                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
+                {
+                    self.finish_target(
+                        index,
+                        self.effective_retirement(index)
+                            .unwrap_or(ManagedTargetEndReason::Stopped),
+                        None,
+                    );
                     false
                 } else {
                     self.start_connecting(index, client_config);
@@ -563,8 +941,14 @@ impl ManagedClientTask {
                 }
             }
             TargetState::Connecting { mut future } => {
-                if self.state == DriverState::Stopping {
-                    self.finish_target(index, ManagedTargetEndReason::Stopped, None);
+                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
+                {
+                    self.finish_target(
+                        index,
+                        self.effective_retirement(index)
+                            .unwrap_or(ManagedTargetEndReason::Stopped),
+                        None,
+                    );
                     return false;
                 }
                 match future.as_mut().poll(cx) {
@@ -593,10 +977,14 @@ impl ManagedClientTask {
                 mut client,
                 mut open,
             } => {
-                if self.state == DriverState::Stopping {
+                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
+                {
+                    let retirement = self
+                        .effective_retirement(index)
+                        .unwrap_or(ManagedTargetEndReason::Stopped);
                     if !open.has_in_flight_work() {
                         self.targets[index].counters.packets_sent = client.packets_sent();
-                        self.finish_target(index, ManagedTargetEndReason::Stopped, None);
+                        self.finish_target(index, retirement, None);
                         return false;
                     }
                     open.request_stop_after_current_attempt();
@@ -608,9 +996,17 @@ impl ManagedClientTask {
                     }
                     Poll::Ready(Ok(OpenOutcome::Started { event, .. })) => {
                         self.publish_client_events(index, vec![event]);
-                        if self.state == DriverState::Stopping {
+                        if self.state == DriverState::Stopping
+                            || self.effective_retirement(index).is_some()
+                        {
                             self.targets[index].counters.packets_sent = client.packets_sent();
-                            self.begin_drain(index, client, ManagedTargetEndReason::Stopped, now)
+                            self.begin_drain(
+                                index,
+                                client,
+                                self.effective_retirement(index)
+                                    .unwrap_or(ManagedTargetEndReason::Stopped),
+                                now,
+                            )
                         } else {
                             self.install_target_state(index, TargetState::Active { client });
                             true
@@ -618,8 +1014,11 @@ impl ManagedClientTask {
                     }
                     Poll::Ready(Ok(OpenOutcome::NoTestCompleted { event, .. })) => {
                         self.publish_client_events(index, vec![event]);
-                        let end_reason = if self.state == DriverState::Stopping {
-                            ManagedTargetEndReason::Stopped
+                        let end_reason = if self.state == DriverState::Stopping
+                            || self.effective_retirement(index).is_some()
+                        {
+                            self.effective_retirement(index)
+                                .unwrap_or(ManagedTargetEndReason::Stopped)
                         } else {
                             ManagedTargetEndReason::NoTestComplete
                         };
@@ -627,7 +1026,9 @@ impl ManagedClientTask {
                         false
                     }
                     Poll::Ready(Err(error)) => {
-                        if self.state == DriverState::Stopping {
+                        if self.state == DriverState::Stopping
+                            || self.effective_retirement(index).is_some()
+                        {
                             let cleanup_failure =
                                 (!open.stopped_after_current_attempt()).then(|| {
                                     classify_client_error(
@@ -637,7 +1038,8 @@ impl ManagedClientTask {
                                 });
                             self.finish_target(
                                 index,
-                                ManagedTargetEndReason::Stopped,
+                                self.effective_retirement(index)
+                                    .unwrap_or(ManagedTargetEndReason::Stopped),
                                 cleanup_failure,
                             );
                         } else {
@@ -648,10 +1050,17 @@ impl ManagedClientTask {
                 }
             }
             TargetState::Active { mut client } => {
-                if self.state == DriverState::Stopping {
+                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
+                {
                     client.discard_prepared_probe();
                     self.targets[index].counters.packets_sent = client.packets_sent();
-                    return self.begin_drain(index, client, ManagedTargetEndReason::Stopped, now);
+                    return self.begin_drain(
+                        index,
+                        client,
+                        self.effective_retirement(index)
+                            .unwrap_or(ManagedTargetEndReason::Stopped),
+                        now,
+                    );
                 }
                 if client
                     .next_probe_timeout_deadline()
@@ -969,13 +1378,19 @@ impl ManagedClientTask {
     }
 
     fn active_count(&self) -> usize {
-        self.targets.iter().filter(|target| target.active).count()
+        self.targets
+            .iter()
+            .filter(|target| target.active && target.desired && target.retirement.is_none())
+            .count()
     }
 
     fn active_stagger_spacing(&self) -> Option<(usize, Duration)> {
         let mut active = 0;
         let mut minimum: Option<Duration> = None;
         for target in &self.targets {
+            if !target.desired || target.retirement.is_some() {
+                continue;
+            }
             let TargetState::Active { client } = &target.state else {
                 continue;
             };
@@ -1032,6 +1447,10 @@ impl ManagedClientTask {
         now: Instant,
         stagger_spacing: Option<(usize, Duration)>,
     ) -> SendResult {
+        if !self.targets[index].desired || self.targets[index].retirement.is_some() {
+            self.targets[index].send_waiting = false;
+            return SendResult::NotAttempted;
+        }
         let state = mem::replace(&mut self.targets[index].state, TargetState::Terminal);
         let TargetState::Active { mut client } = state else {
             self.targets[index].state = state;
@@ -1116,7 +1535,10 @@ impl ManagedClientTask {
             let index = self.send_cursor % self.targets.len();
             self.send_cursor = (self.send_cursor + 1) % self.targets.len();
             self.stagger_remaining -= 1;
-            if !matches!(self.targets[index].state, TargetState::Active { .. }) {
+            if !self.targets[index].desired
+                || self.targets[index].retirement.is_some()
+                || !matches!(self.targets[index].state, TargetState::Active { .. })
+            {
                 continue;
             }
             let stagger_spacing = self.active_stagger_spacing();
@@ -1183,7 +1605,7 @@ impl ManagedClientTask {
                         .into_iter()
                         .chain(client.next_probe_timeout_deadline())
                         .min();
-                    if !target.send_waiting {
+                    if target.desired && target.retirement.is_none() && !target.send_waiting {
                         send_deadline = send_deadline
                             .into_iter()
                             .chain(client.next_send_deadline())
@@ -1256,7 +1678,22 @@ impl ManagedClientTask {
     }
 
     fn seal(&mut self, end_reason: ManagedEndReason, failed: bool) -> Poll<ManagedOutcome> {
-        let outcome = Arc::new(self.history.outcome(end_reason));
+        while let Ok(ManagedCommand::UpdateTargets {
+            acknowledgement, ..
+        }) = self.commands.try_recv()
+        {
+            let error = match &end_reason {
+                ManagedEndReason::DriverFailed(failure) => {
+                    ManagedCommandApplyError::DriverFailed(failure.clone())
+                }
+                _ => ManagedCommandApplyError::Stopping,
+            };
+            let _ = acknowledgement.send(Err(error));
+        }
+        let outcome = Arc::new(
+            self.history
+                .outcome(end_reason, self.applied_command_sequence),
+        );
         self.final_outcome = Some(Arc::clone(&outcome));
         self.lifecycle = if failed {
             ManagedLifecycle::Failed
@@ -1326,8 +1763,10 @@ impl Future for ManagedClientTask {
             this.observe_stop();
         }
 
+        let mut immediate = this.process_commands(cx);
         let now = Instant::now();
-        let mut immediate = this.poll_target_pass(cx, now);
+        immediate |= this.poll_target_pass(cx, now);
+        this.prune_undesired_terminal();
         if this.state == DriverState::Running {
             immediate |= match this.config.pacing {
                 ManagedPacing::Staggered => this.poll_staggered_send(cx, now),
@@ -1338,13 +1777,21 @@ impl Future for ManagedClientTask {
         if this.all_targets_terminal() {
             match this.state {
                 DriverState::Stopping => {
-                    return this.seal(ManagedEndReason::StopRequested, false);
+                    return this.seal(
+                        if this.stop_observed {
+                            ManagedEndReason::StopRequested
+                        } else {
+                            ManagedEndReason::TargetsComplete
+                        },
+                        false,
+                    );
                 }
                 DriverState::Running
                     if this.config.completion == ManagedCompletionPolicy::FinishWhenQuiescent =>
                 {
                     this.state = DriverState::Stopping;
                     this.lifecycle = ManagedLifecycle::Stopping;
+                    this.resources().stop.close_updates();
                     this.replace_status();
                     this.publish_event(ManagedEvent::Stopping);
                     return this.seal(ManagedEndReason::TargetsComplete, false);
@@ -1385,6 +1832,9 @@ fn build_task(
 ) -> Result<(ManagedClientTask, ManagedClientHandle), ManagedConfigError> {
     if config.event_capacity == 0 {
         return Err(ManagedConfigError::ZeroEventCapacity);
+    }
+    if config.command_capacity == 0 {
+        return Err(ManagedConfigError::ZeroCommandCapacity);
     }
     if config.max_live_target_generations == 0 {
         return Err(ManagedConfigError::ZeroLiveGenerationLimit);
@@ -1428,9 +1878,12 @@ fn build_task(
         })?;
         runtimes.push(TargetRuntime {
             instance: TargetInstance {
-                id: target.id,
+                id: target.id.clone(),
                 generation,
             },
+            config: target.clone(),
+            desired: true,
+            retirement: None,
             server_addr: Arc::from(target.server_addr),
             remote: None,
             counters: TargetCounters::default(),
@@ -1446,6 +1899,7 @@ fn build_task(
     let (acknowledgement_sender, _) = watch::channel(());
     let stop = Arc::new(StopSignal {
         requested: AtomicBool::new(false),
+        updates_accepted: AtomicBool::new(true),
         wake: wake_sender,
         acknowledged: AtomicBool::new(false),
         acknowledgement: acknowledgement_sender,
@@ -1455,6 +1909,7 @@ fn build_task(
         .iter()
         .map(|target| ManagedTargetStatus {
             target: target.instance.clone(),
+            desired: true,
             lifecycle: ManagedTargetLifecycle::Pending,
             server_addr: Arc::clone(&target.server_addr),
             remote: None,
@@ -1463,6 +1918,7 @@ fn build_task(
     let initial = Arc::new(ManagedStatus {
         lifecycle: ManagedLifecycle::NotStarted,
         stop_requested: false,
+        applied_command_sequence: 0,
         desired_target_count: runtimes.len(),
         connecting_target_count: 0,
         opening_target_count: 0,
@@ -1480,6 +1936,7 @@ fn build_task(
         final_outcome: None,
     });
     let (status_sender, status_receiver) = watch::channel(initial);
+    let (command_sender, command_receiver) = mpsc::channel(config.command_capacity);
     let resources = TaskResources {
         status: status_sender,
         events: Some(event_sender),
@@ -1490,6 +1947,7 @@ fn build_task(
         lifecycle: ManagedLifecycle::NotStarted,
         config,
         targets: runtimes,
+        commands: command_receiver,
         history,
         resources: Some(resources),
         wake: Some(arm_wake(wake_receiver)),
@@ -1503,7 +1961,8 @@ fn build_task(
         last_stagger_send: None,
         stop_observed: false,
         final_outcome: None,
-        _next_generation: next_generation,
+        next_generation,
+        applied_command_sequence: 0,
         #[cfg(test)]
         event_observations: None,
         #[cfg(test)]
@@ -1513,6 +1972,7 @@ fn build_task(
     };
     let handle = ManagedClientHandle {
         stop,
+        commands: command_sender,
         status: status_receiver,
         events: weak_events,
     };

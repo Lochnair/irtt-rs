@@ -8,6 +8,8 @@ use super::TargetId;
 
 /// Default capacity of the lossy managed event channel.
 pub const DEFAULT_MANAGED_EVENT_CAPACITY: usize = 256;
+/// Default capacity of the bounded managed control queue.
+pub const DEFAULT_MANAGED_COMMAND_CAPACITY: usize = 64;
 /// Default number of recent target outcomes retained in status and output.
 pub const DEFAULT_MANAGED_OUTCOME_HISTORY_LIMIT: usize = 256;
 /// Default maximum number of simultaneously live target generations.
@@ -65,6 +67,7 @@ pub struct ManagedClientConfig {
     pub pacing: ManagedPacing,
     pub completion: ManagedCompletionPolicy,
     pub event_capacity: usize,
+    pub command_capacity: usize,
     pub outcome_history_limit: usize,
     pub max_live_target_generations: usize,
     pub final_drain: Duration,
@@ -77,6 +80,7 @@ impl Default for ManagedClientConfig {
             pacing: ManagedPacing::default(),
             completion: ManagedCompletionPolicy::default(),
             event_capacity: DEFAULT_MANAGED_EVENT_CAPACITY,
+            command_capacity: DEFAULT_MANAGED_COMMAND_CAPACITY,
             outcome_history_limit: DEFAULT_MANAGED_OUTCOME_HISTORY_LIMIT,
             max_live_target_generations: DEFAULT_MANAGED_MAX_LIVE_TARGET_GENERATIONS,
             final_drain: DEFAULT_MANAGED_FINAL_DRAIN,
@@ -111,6 +115,7 @@ pub enum ManagedTargetLifecycle {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedTargetStatus {
     pub target: TargetInstance,
+    pub desired: bool,
     pub lifecycle: ManagedTargetLifecycle,
     pub server_addr: Arc<str>,
     pub remote: Option<SocketAddr>,
@@ -121,6 +126,7 @@ pub struct ManagedTargetStatus {
 pub struct ManagedStatus {
     pub lifecycle: ManagedLifecycle,
     pub stop_requested: bool,
+    pub applied_command_sequence: u64,
     pub desired_target_count: usize,
     pub connecting_target_count: usize,
     pub opening_target_count: usize,
@@ -171,6 +177,7 @@ pub type ManagedEventSubscription = tokio::sync::broadcast::Receiver<ManagedEven
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedOutcome {
     pub end_reason: ManagedEndReason,
+    pub applied_command_sequence: u64,
     pub total_target_outcomes: u64,
     pub successful_target_outcomes: u64,
     pub failed_target_outcomes: u64,
@@ -258,6 +265,8 @@ pub enum ManagedConfigError {
     TooManyTargets { configured: usize, limit: usize },
     #[error("managed event capacity must be greater than zero")]
     ZeroEventCapacity,
+    #[error("managed command capacity must be greater than zero")]
+    ZeroCommandCapacity,
     #[error("managed live-generation limit must be greater than zero")]
     ZeroLiveGenerationLimit,
     #[error("managed final drain {duration:?} cannot be scheduled from the current instant")]
@@ -270,6 +279,48 @@ pub enum ManagedConfigError {
     },
     #[error("managed target generation space is exhausted")]
     GenerationExhausted,
+}
+
+/// Immediate failure to submit a managed target update.
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+pub enum ManagedCommandError {
+    #[error("managed target updates are no longer accepted")]
+    Stopping,
+    #[error("managed command queue is full")]
+    QueueFull,
+    #[error("managed command receiver is closed")]
+    DriverClosed,
+}
+
+/// Failure while applying an accepted managed target update.
+#[derive(Debug, Error)]
+pub enum ManagedCommandApplyError {
+    #[error("managed target updates are no longer accepted")]
+    Stopping,
+    #[error("duplicate target id {id}")]
+    DuplicateTargetId { id: TargetId },
+    #[error("invalid configuration for target {id}: {source}")]
+    InvalidTarget {
+        id: TargetId,
+        #[source]
+        source: ClientError,
+    },
+    #[error("target update requires {required} live generations but limit is {limit}")]
+    LiveGenerationLimitExceeded { required: usize, limit: usize },
+    #[error("managed target generation space is exhausted")]
+    GenerationExhausted,
+    #[error("managed command sequence is exhausted")]
+    CommandSequenceExhausted,
+    #[error("managed task ended before command acknowledgement")]
+    AcknowledgementDisconnected,
+    #[error("managed driver failed before command application: {0}")]
+    DriverFailed(ManagedDriverFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ManagedCommandAcknowledgement {
+    pub sequence: u64,
+    pub status: Arc<ManagedStatus>,
 }
 
 /// Failure to create a new event subscription.
