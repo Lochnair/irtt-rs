@@ -774,6 +774,14 @@ impl AsyncClient {
     }
 
     #[cfg(test)]
+    pub(crate) fn remove_pending_for_test(
+        &mut self,
+        wire_seq: u32,
+    ) -> Option<crate::probe::PendingProbe> {
+        self.machine.remove_pending_for_test(wire_seq)
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace_pending_for_test(&mut self, probe: crate::probe::PendingProbe) {
         self.machine.replace_pending_for_test(probe);
     }

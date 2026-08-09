@@ -1040,6 +1040,13 @@ impl SessionMachine {
 
 #[cfg(all(test, feature = "tokio"))]
 impl SessionMachine {
+    pub(crate) fn remove_pending_for_test(&mut self, wire_seq: u32) -> Option<PendingProbe> {
+        self.open_session_mut()
+            .expect("test pending probes require an open session")
+            .pending
+            .remove(wire_seq)
+    }
+
     pub(crate) fn replace_pending_for_test(&mut self, probe: PendingProbe) {
         let session = self
             .open_session_mut()
@@ -1838,14 +1845,14 @@ mod tests {
     fn exhaustive_timeout_polling_returns_every_due_loss() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let now = Instant::now();
-        for seq in [2, 0, 1] {
+        for seq in [2, 1, 0] {
             let sent_at = timestamp(now - Duration::from_secs(u64::from(seq) + 1));
             let session = active_mut(&mut machine);
             session.pending.preflight_insert(seq).unwrap();
             session.pending.commit_insert(PendingProbe {
                 wire_seq: seq,
                 sent_at,
-                timeout_at: now,
+                timeout_at: sent_at.mono + Duration::from_secs(1),
             });
         }
 

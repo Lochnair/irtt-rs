@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet, TryReserveError, VecDeque},
+    collections::{HashMap, HashSet, TryReserveError, VecDeque},
     time::Instant,
 };
 
@@ -12,21 +12,11 @@ pub(crate) struct PendingProbe {
     pub timeout_at: Instant,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
-struct DeadlineKey {
-    timeout_at: Instant,
-    sent_at: Instant,
-    wire_seq: u32,
-}
-
-impl From<&PendingProbe> for DeadlineKey {
-    fn from(probe: &PendingProbe) -> Self {
-        Self {
-            timeout_at: probe.timeout_at,
-            sent_at: probe.sent_at.mono,
-            wire_seq: probe.wire_seq,
-        }
-    }
+#[derive(Debug)]
+struct PendingEntry {
+    probe: PendingProbe,
+    previous: Option<u32>,
+    next: Option<u32>,
 }
 
 #[derive(Debug)]
@@ -37,8 +27,9 @@ pub(crate) struct ExpiredBatch {
 
 #[derive(Debug)]
 pub(crate) struct PendingMap {
-    map: HashMap<u32, PendingProbe>,
-    deadlines: BTreeSet<DeadlineKey>,
+    map: HashMap<u32, PendingEntry>,
+    first: Option<u32>,
+    last: Option<u32>,
     max_capacity: usize,
 }
 
@@ -46,7 +37,8 @@ impl PendingMap {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             map: HashMap::new(),
-            deadlines: BTreeSet::new(),
+            first: None,
+            last: None,
             max_capacity,
         }
     }
@@ -67,48 +59,98 @@ impl PendingMap {
     }
 
     pub fn commit_insert(&mut self, probe: PendingProbe) {
-        let inserted = self.deadlines.insert(DeadlineKey::from(&probe));
-        debug_assert!(inserted, "pending deadline index already contained probe");
-        let replaced = self.map.insert(probe.wire_seq, probe);
+        let wire_seq = probe.wire_seq;
+        let previous = self.last;
+        if let Some(previous) = previous {
+            let previous = self
+                .map
+                .get_mut(&previous)
+                .expect("pending list tail remains present");
+            // probe_timeout is fixed for an open session and committed sends
+            // have nondecreasing monotonic timestamps, so deadlines append.
+            debug_assert!(previous.probe.timeout_at <= probe.timeout_at);
+            debug_assert!(
+                previous.next.is_none(),
+                "pending list tail has no successor"
+            );
+            previous.next = Some(wire_seq);
+        } else {
+            debug_assert!(self.first.is_none(), "empty pending list has no head");
+            self.first = Some(wire_seq);
+        }
+
+        let replaced = self.map.insert(
+            wire_seq,
+            PendingEntry {
+                probe,
+                previous,
+                next: None,
+            },
+        );
         debug_assert!(replaced.is_none(), "preflight rejected pending collision");
-        self.assert_index_consistent();
+        self.last = Some(wire_seq);
+        self.assert_links_consistent();
     }
 
     pub fn remove(&mut self, wire_seq: u32) -> Option<PendingProbe> {
-        let probe = self.map.remove(&wire_seq)?;
-        let removed = self.deadlines.remove(&DeadlineKey::from(&probe));
-        debug_assert!(removed, "pending deadline index lost removed probe");
-        self.assert_index_consistent();
+        let PendingEntry {
+            probe,
+            previous,
+            next,
+        } = self.map.remove(&wire_seq)?;
+
+        if let Some(previous) = previous {
+            let previous = self
+                .map
+                .get_mut(&previous)
+                .expect("pending list predecessor remains present");
+            debug_assert_eq!(previous.next, Some(wire_seq));
+            previous.next = next;
+        } else {
+            debug_assert_eq!(self.first, Some(wire_seq));
+            self.first = next;
+        }
+        if let Some(next) = next {
+            let next = self
+                .map
+                .get_mut(&next)
+                .expect("pending list successor remains present");
+            debug_assert_eq!(next.previous, Some(wire_seq));
+            next.previous = previous;
+        } else {
+            debug_assert_eq!(self.last, Some(wire_seq));
+            self.last = previous;
+        }
+
+        self.assert_links_consistent();
         Some(probe)
     }
 
     pub(crate) fn drain_expired_bounded(&mut self, now: Instant, limit: usize) -> ExpiredBatch {
         let mut probes = Vec::with_capacity(limit.min(self.map.len()));
         while probes.len() < limit {
-            let Some(key) = self.deadlines.first().copied() else {
+            let Some(wire_seq) = self.first else {
                 break;
             };
-            if key.timeout_at > now {
+            let timeout_at = self
+                .map
+                .get(&wire_seq)
+                .expect("pending list head remains present")
+                .probe
+                .timeout_at;
+            if timeout_at > now {
                 break;
             }
 
-            let removed_key = self
-                .deadlines
-                .take(&key)
-                .expect("first pending deadline remains present");
-            debug_assert_eq!(removed_key, key);
             let probe = self
-                .map
-                .remove(&key.wire_seq)
-                .expect("pending deadline always has a pending probe");
-            debug_assert_eq!(DeadlineKey::from(&probe), key);
+                .remove(wire_seq)
+                .expect("pending list head remains present");
             probes.push(probe);
         }
-        self.assert_index_consistent();
         let more_due = self
-            .deadlines
-            .first()
-            .is_some_and(|key| key.timeout_at <= now);
+            .first
+            .and_then(|wire_seq| self.map.get(&wire_seq))
+            .is_some_and(|entry| entry.probe.timeout_at <= now);
         ExpiredBatch { probes, more_due }
     }
 
@@ -118,20 +160,39 @@ impl PendingMap {
 
     #[cfg(any(feature = "tokio", test))]
     pub fn next_timeout_deadline(&self) -> Option<Instant> {
-        self.deadlines.first().map(|key| key.timeout_at)
+        self.first
+            .and_then(|wire_seq| self.map.get(&wire_seq))
+            .map(|entry| entry.probe.timeout_at)
     }
 
     #[cfg(any(feature = "tokio", test))]
     pub fn latest_timeout_deadline(&self) -> Option<Instant> {
-        self.deadlines.last().map(|key| key.timeout_at)
+        self.last
+            .and_then(|wire_seq| self.map.get(&wire_seq))
+            .map(|entry| entry.probe.timeout_at)
     }
 
-    fn assert_index_consistent(&self) {
-        debug_assert_eq!(
-            self.deadlines.len(),
-            self.map.len(),
-            "pending deadline index cardinality diverged"
-        );
+    fn assert_links_consistent(&self) {
+        debug_assert_eq!(self.first.is_none(), self.map.is_empty());
+        debug_assert_eq!(self.last.is_none(), self.map.is_empty());
+        if let Some(first) = self.first {
+            debug_assert_eq!(
+                self.map
+                    .get(&first)
+                    .expect("pending list head remains present")
+                    .previous,
+                None
+            );
+        }
+        if let Some(last) = self.last {
+            debug_assert_eq!(
+                self.map
+                    .get(&last)
+                    .expect("pending list tail remains present")
+                    .next,
+                None
+            );
+        }
     }
 
     #[cfg(test)]
@@ -145,8 +206,15 @@ impl PendingMap {
     }
 
     #[cfg(test)]
-    pub fn deadline_index_len(&self) -> usize {
-        self.deadlines.len()
+    pub fn linkage(&self) -> (Option<u32>, Option<u32>) {
+        (self.first, self.last)
+    }
+
+    #[cfg(test)]
+    pub fn entry_links(&self, wire_seq: u32) -> Option<(Option<u32>, Option<u32>)> {
+        self.map
+            .get(&wire_seq)
+            .map(|entry| (entry.previous, entry.next))
     }
 }
 
@@ -367,12 +435,12 @@ mod tests {
     }
 
     #[test]
-    fn pending_map_indexes_deadline_extrema_and_removals() {
+    fn pending_map_unlinks_head_middle_and_tail_and_updates_extrema() {
         let mut map = PendingMap::new(4);
         let now = Instant::now();
-        insert(&mut map, pending(1, now + Duration::from_secs(3)));
-        insert(&mut map, pending(2, now + Duration::from_secs(1)));
-        insert(&mut map, pending(3, now + Duration::from_secs(2)));
+        insert(&mut map, pending(1, now + Duration::from_secs(1)));
+        insert(&mut map, pending(2, now + Duration::from_secs(2)));
+        insert(&mut map, pending(3, now + Duration::from_secs(3)));
 
         assert_eq!(
             map.next_timeout_deadline(),
@@ -382,44 +450,50 @@ mod tests {
             map.latest_timeout_deadline(),
             Some(now + Duration::from_secs(3))
         );
-        assert_eq!(map.deadline_index_len(), map.len());
-
-        assert!(map.remove(3).is_some());
-        assert_eq!(
-            map.next_timeout_deadline(),
-            Some(now + Duration::from_secs(1))
-        );
-        assert_eq!(
-            map.latest_timeout_deadline(),
-            Some(now + Duration::from_secs(3))
-        );
-        assert_eq!(map.deadline_index_len(), map.len());
+        assert_eq!(map.linkage(), (Some(1), Some(3)));
+        assert_eq!(map.entry_links(1), Some((None, Some(2))));
+        assert_eq!(map.entry_links(2), Some((Some(1), Some(3))));
+        assert_eq!(map.entry_links(3), Some((Some(2), None)));
 
         assert!(map.remove(2).is_some());
         assert_eq!(
             map.next_timeout_deadline(),
+            Some(now + Duration::from_secs(1))
+        );
+        assert_eq!(
+            map.latest_timeout_deadline(),
+            Some(now + Duration::from_secs(3))
+        );
+        assert_eq!(map.linkage(), (Some(1), Some(3)));
+        assert_eq!(map.entry_links(1), Some((None, Some(3))));
+        assert_eq!(map.entry_links(3), Some((Some(1), None)));
+
+        assert!(map.remove(1).is_some());
+        assert_eq!(
+            map.next_timeout_deadline(),
             Some(now + Duration::from_secs(3))
         );
         assert_eq!(
             map.latest_timeout_deadline(),
             Some(now + Duration::from_secs(3))
         );
-        assert_eq!(map.deadline_index_len(), map.len());
+        assert_eq!(map.linkage(), (Some(3), Some(3)));
+        assert_eq!(map.entry_links(3), Some((None, None)));
 
-        assert!(map.remove(1).is_some());
+        assert!(map.remove(3).is_some());
         assert_eq!(map.next_timeout_deadline(), None);
         assert_eq!(map.latest_timeout_deadline(), None);
-        assert_eq!(map.deadline_index_len(), map.len());
+        assert_eq!(map.linkage(), (None, None));
     }
 
     #[test]
     fn pending_map_bounded_expiration_matches_exhaustive_order() {
         let now = Instant::now();
         let probes = [
-            pending(4, now + Duration::from_secs(4)),
-            pending(2, now + Duration::from_secs(2)),
             pending(1, now + Duration::from_secs(1)),
+            pending(2, now + Duration::from_secs(2)),
             pending(3, now + Duration::from_secs(3)),
+            pending(4, now + Duration::from_secs(4)),
         ];
         let mut bounded = PendingMap::new(probes.len());
         let mut exhaustive = PendingMap::new(probes.len());
@@ -431,13 +505,12 @@ mod tests {
         let empty = bounded.drain_expired_bounded(now + Duration::from_secs(4), 0);
         assert!(empty.probes.is_empty());
         assert!(empty.more_due);
-        assert_eq!(bounded.deadline_index_len(), bounded.len());
+        assert_eq!(bounded.linkage(), (Some(1), Some(4)));
 
         let mut actual = Vec::new();
         loop {
             let batch = bounded.drain_expired_bounded(now + Duration::from_secs(4), 2);
             actual.extend(batch.probes.into_iter().map(|probe| probe.wire_seq));
-            assert_eq!(bounded.deadline_index_len(), bounded.len());
             if !batch.more_due {
                 break;
             }
@@ -451,11 +524,11 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(actual, vec![1, 2, 3, 4]);
-        assert_eq!(bounded.deadline_index_len(), 0);
+        assert_eq!(bounded.linkage(), (None, None));
     }
 
     #[test]
-    fn pending_map_sequence_reuse_leaves_no_stale_deadline() {
+    fn pending_map_sequence_reuse_leaves_no_stale_link() {
         let mut map = PendingMap::new(1);
         let now = Instant::now();
         insert(&mut map, pending(7, now));
@@ -463,7 +536,8 @@ mod tests {
         insert(&mut map, pending(7, now + Duration::from_secs(1)));
 
         assert!(map.drain_expired_bounded(now, usize::MAX).probes.is_empty());
-        assert_eq!(map.deadline_index_len(), map.len());
+        assert_eq!(map.linkage(), (Some(7), Some(7)));
+        assert_eq!(map.entry_links(7), Some((None, None)));
         assert_eq!(
             map.drain_expired_bounded(now + Duration::from_secs(1), usize::MAX)
                 .probes
@@ -472,7 +546,49 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7]
         );
-        assert_eq!(map.deadline_index_len(), map.len());
+        assert_eq!(map.linkage(), (None, None));
+    }
+
+    #[test]
+    fn pending_map_commit_uses_only_preflighted_map_capacity() {
+        let mut map = PendingMap::new(2);
+        let now = Instant::now();
+        map.preflight_insert(7).unwrap();
+        let capacity = map.capacity();
+
+        map.commit_insert(pending(7, now));
+
+        assert_eq!(map.capacity(), capacity);
+        assert_eq!(map.len(), 1);
+        assert_eq!(map.linkage(), (Some(7), Some(7)));
+    }
+
+    #[test]
+    fn pending_map_mixed_removals_preserve_links() {
+        let mut map = PendingMap::new(4);
+        let now = Instant::now();
+        for seq in 1..=4 {
+            insert(
+                &mut map,
+                pending(seq, now + Duration::from_secs(u64::from(seq))),
+            );
+        }
+
+        assert!(map.remove(2).is_some());
+        assert_eq!(map.entry_links(1), Some((None, Some(3))));
+        assert_eq!(map.entry_links(3), Some((Some(1), Some(4))));
+        let expired = map.drain_expired_bounded(now + Duration::from_secs(3), usize::MAX);
+        assert_eq!(
+            expired
+                .probes
+                .into_iter()
+                .map(|probe| probe.wire_seq)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert_eq!(map.linkage(), (Some(4), Some(4)));
+        assert!(map.remove(4).is_some());
+        assert_eq!(map.linkage(), (None, None));
     }
 
     #[test]

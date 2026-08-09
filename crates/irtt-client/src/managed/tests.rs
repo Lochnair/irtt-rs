@@ -359,6 +359,20 @@ fn replace_pending_for_timeout_test(
     client.replace_pending_for_test(probe);
 }
 
+fn remove_pending_for_timeout_test(
+    task: &mut ManagedClientTask,
+    index: usize,
+    wire_seq: u32,
+) -> PendingProbe {
+    let client = match &mut task.targets[index].state {
+        TargetState::Active { client } | TargetState::Draining { client, .. } => client,
+        _ => panic!("timeout test target must be active or draining"),
+    };
+    client
+        .remove_pending_for_test(wire_seq)
+        .expect("timeout test pending probe must exist")
+}
+
 fn poll_task_once(runtime: &Runtime, task: &mut Pin<Box<ManagedClientTask>>) {
     runtime.block_on(poll_fn(|cx| {
         assert!(task.as_mut().poll(cx).is_pending());
@@ -1880,11 +1894,7 @@ fn partial_timeout_batch_blocks_active_receive_until_loss_commits() {
     wait_flag(&server.probe_seen);
 
     let now = Instant::now();
-    replace_pending_for_timeout_test(
-        &mut task,
-        0,
-        timeout_probe(0, now - Duration::from_secs(1), now),
-    );
+    let _ = remove_pending_for_timeout_test(&mut task, 0, 0);
     for seq in 1..=u32::try_from(TIMEOUT_WORK_BUDGET).unwrap() {
         replace_pending_for_timeout_test(
             &mut task,
@@ -1896,6 +1906,11 @@ fn partial_timeout_batch_blocks_active_receive_until_loss_commits() {
             ),
         );
     }
+    replace_pending_for_timeout_test(
+        &mut task,
+        0,
+        timeout_probe(0, now - Duration::from_secs(1), now),
+    );
     reply_gate.release();
     wait_flag(&server.reply_sent);
 
@@ -1973,11 +1988,7 @@ fn partial_timeout_batch_blocks_draining_receive_until_loss_commits() {
     wait_flag(&server.probe_seen);
 
     let now = Instant::now();
-    replace_pending_for_timeout_test(
-        &mut task,
-        0,
-        timeout_probe(0, now - Duration::from_secs(1), now),
-    );
+    let _ = remove_pending_for_timeout_test(&mut task, 0, 0);
     for seq in 1..=u32::try_from(TIMEOUT_WORK_BUDGET).unwrap() {
         replace_pending_for_timeout_test(
             &mut task,
@@ -1989,6 +2000,11 @@ fn partial_timeout_batch_blocks_draining_receive_until_loss_commits() {
             ),
         );
     }
+    replace_pending_for_timeout_test(
+        &mut task,
+        0,
+        timeout_probe(0, now - Duration::from_secs(1), now),
+    );
     let TargetState::Active { client } =
         mem::replace(&mut task.targets[0].state, TargetState::Terminal)
     else {
