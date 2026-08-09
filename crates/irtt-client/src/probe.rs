@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, TryReserveError, VecDeque},
+    collections::{BTreeSet, HashMap, HashSet, TryReserveError, VecDeque},
     time::Instant,
 };
 
@@ -12,9 +12,33 @@ pub(crate) struct PendingProbe {
     pub timeout_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct DeadlineKey {
+    timeout_at: Instant,
+    sent_at: Instant,
+    wire_seq: u32,
+}
+
+impl From<&PendingProbe> for DeadlineKey {
+    fn from(probe: &PendingProbe) -> Self {
+        Self {
+            timeout_at: probe.timeout_at,
+            sent_at: probe.sent_at.mono,
+            wire_seq: probe.wire_seq,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ExpiredBatch {
+    pub probes: Vec<PendingProbe>,
+    pub more_due: bool,
+}
+
 #[derive(Debug)]
 pub(crate) struct PendingMap {
     map: HashMap<u32, PendingProbe>,
+    deadlines: BTreeSet<DeadlineKey>,
     max_capacity: usize,
 }
 
@@ -22,6 +46,7 @@ impl PendingMap {
     pub fn new(max_capacity: usize) -> Self {
         Self {
             map: HashMap::new(),
+            deadlines: BTreeSet::new(),
             max_capacity,
         }
     }
@@ -42,43 +67,75 @@ impl PendingMap {
     }
 
     pub fn commit_insert(&mut self, probe: PendingProbe) {
+        let inserted = self.deadlines.insert(DeadlineKey::from(&probe));
+        debug_assert!(inserted, "pending deadline index already contained probe");
         let replaced = self.map.insert(probe.wire_seq, probe);
         debug_assert!(replaced.is_none(), "preflight rejected pending collision");
+        self.assert_index_consistent();
     }
 
     pub fn remove(&mut self, wire_seq: u32) -> Option<PendingProbe> {
-        self.map.remove(&wire_seq)
+        let probe = self.map.remove(&wire_seq)?;
+        let removed = self.deadlines.remove(&DeadlineKey::from(&probe));
+        debug_assert!(removed, "pending deadline index lost removed probe");
+        self.assert_index_consistent();
+        Some(probe)
     }
 
     pub fn drain_expired(&mut self, now: Instant) -> Vec<PendingProbe> {
-        let expired_keys: Vec<u32> = self
-            .map
-            .iter()
-            .filter(|(_, probe)| probe.timeout_at <= now)
-            .map(|(key, _)| *key)
-            .collect();
-        let mut expired = Vec::with_capacity(expired_keys.len());
-        for key in expired_keys {
-            if let Some(probe) = self.map.remove(&key) {
-                expired.push(probe);
+        let batch = self.drain_expired_bounded(now, usize::MAX);
+        debug_assert!(!batch.more_due);
+        batch.probes
+    }
+
+    pub(crate) fn drain_expired_bounded(&mut self, now: Instant, limit: usize) -> ExpiredBatch {
+        let mut probes = Vec::with_capacity(limit.min(self.map.len()));
+        while probes.len() < limit {
+            let Some(key) = self.deadlines.first().copied() else {
+                break;
+            };
+            if key.timeout_at > now {
+                break;
             }
+
+            let removed_key = self
+                .deadlines
+                .take(&key)
+                .expect("first pending deadline remains present");
+            debug_assert_eq!(removed_key, key);
+            let probe = self
+                .map
+                .remove(&key.wire_seq)
+                .expect("pending deadline always has a pending probe");
+            debug_assert_eq!(DeadlineKey::from(&probe), key);
+            probes.push(probe);
         }
-        expired.sort_by_key(|p| p.sent_at.mono);
-        expired
+        self.assert_index_consistent();
+        let more_due = self
+            .deadlines
+            .first()
+            .is_some_and(|key| key.timeout_at <= now);
+        ExpiredBatch { probes, more_due }
     }
 
     pub fn len(&self) -> usize {
         self.map.len()
     }
 
-    #[cfg(feature = "tokio")]
     pub fn next_timeout_deadline(&self) -> Option<Instant> {
-        self.map.values().map(|probe| probe.timeout_at).min()
+        self.deadlines.first().map(|key| key.timeout_at)
     }
 
-    #[cfg(feature = "tokio")]
     pub fn latest_timeout_deadline(&self) -> Option<Instant> {
-        self.map.values().map(|probe| probe.timeout_at).max()
+        self.deadlines.last().map(|key| key.timeout_at)
+    }
+
+    fn assert_index_consistent(&self) {
+        debug_assert_eq!(
+            self.deadlines.len(),
+            self.map.len(),
+            "pending deadline index cardinality diverged"
+        );
     }
 
     #[cfg(test)]
@@ -89,6 +146,11 @@ impl PendingMap {
     #[cfg(test)]
     pub fn capacity(&self) -> usize {
         self.map.capacity()
+    }
+
+    #[cfg(test)]
+    pub fn deadline_index_len(&self) -> usize {
+        self.deadlines.len()
     }
 }
 
@@ -244,6 +306,11 @@ mod tests {
         }
     }
 
+    fn insert(map: &mut PendingMap, probe: PendingProbe) {
+        map.preflight_insert(probe.wire_seq).unwrap();
+        map.commit_insert(probe);
+    }
+
     #[test]
     fn pending_map_rejects_over_capacity() {
         let mut map = PendingMap::new(2);
@@ -301,6 +368,113 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn pending_map_indexes_deadline_extrema_and_removals() {
+        let mut map = PendingMap::new(4);
+        let now = Instant::now();
+        insert(&mut map, pending(1, now + Duration::from_secs(3)));
+        insert(&mut map, pending(2, now + Duration::from_secs(1)));
+        insert(&mut map, pending(3, now + Duration::from_secs(2)));
+
+        assert_eq!(
+            map.next_timeout_deadline(),
+            Some(now + Duration::from_secs(1))
+        );
+        assert_eq!(
+            map.latest_timeout_deadline(),
+            Some(now + Duration::from_secs(3))
+        );
+        assert_eq!(map.deadline_index_len(), map.len());
+
+        assert!(map.remove(3).is_some());
+        assert_eq!(
+            map.next_timeout_deadline(),
+            Some(now + Duration::from_secs(1))
+        );
+        assert_eq!(
+            map.latest_timeout_deadline(),
+            Some(now + Duration::from_secs(3))
+        );
+        assert_eq!(map.deadline_index_len(), map.len());
+
+        assert!(map.remove(2).is_some());
+        assert_eq!(
+            map.next_timeout_deadline(),
+            Some(now + Duration::from_secs(3))
+        );
+        assert_eq!(
+            map.latest_timeout_deadline(),
+            Some(now + Duration::from_secs(3))
+        );
+        assert_eq!(map.deadline_index_len(), map.len());
+
+        assert!(map.remove(1).is_some());
+        assert_eq!(map.next_timeout_deadline(), None);
+        assert_eq!(map.latest_timeout_deadline(), None);
+        assert_eq!(map.deadline_index_len(), map.len());
+    }
+
+    #[test]
+    fn pending_map_bounded_expiration_matches_exhaustive_order() {
+        let now = Instant::now();
+        let probes = [
+            pending(4, now + Duration::from_secs(4)),
+            pending(2, now + Duration::from_secs(2)),
+            pending(1, now + Duration::from_secs(1)),
+            pending(3, now + Duration::from_secs(3)),
+        ];
+        let mut bounded = PendingMap::new(probes.len());
+        let mut exhaustive = PendingMap::new(probes.len());
+        for probe in probes.iter().cloned() {
+            insert(&mut bounded, probe.clone());
+            insert(&mut exhaustive, probe);
+        }
+
+        let empty = bounded.drain_expired_bounded(now + Duration::from_secs(4), 0);
+        assert!(empty.probes.is_empty());
+        assert!(empty.more_due);
+        assert_eq!(bounded.deadline_index_len(), bounded.len());
+
+        let mut actual = Vec::new();
+        loop {
+            let batch = bounded.drain_expired_bounded(now + Duration::from_secs(4), 2);
+            actual.extend(batch.probes.into_iter().map(|probe| probe.wire_seq));
+            assert_eq!(bounded.deadline_index_len(), bounded.len());
+            if !batch.more_due {
+                break;
+            }
+        }
+        let expected = exhaustive
+            .drain_expired(now + Duration::from_secs(4))
+            .into_iter()
+            .map(|probe| probe.wire_seq)
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
+        assert_eq!(actual, vec![1, 2, 3, 4]);
+        assert_eq!(bounded.deadline_index_len(), 0);
+    }
+
+    #[test]
+    fn pending_map_sequence_reuse_leaves_no_stale_deadline() {
+        let mut map = PendingMap::new(1);
+        let now = Instant::now();
+        insert(&mut map, pending(7, now));
+        assert!(map.remove(7).is_some());
+        insert(&mut map, pending(7, now + Duration::from_secs(1)));
+
+        assert!(map.drain_expired(now).is_empty());
+        assert_eq!(map.deadline_index_len(), map.len());
+        assert_eq!(
+            map.drain_expired(now + Duration::from_secs(1))
+                .into_iter()
+                .map(|probe| probe.wire_seq)
+                .collect::<Vec<_>>(),
+            vec![7]
+        );
+        assert_eq!(map.deadline_index_len(), map.len());
     }
 
     #[test]

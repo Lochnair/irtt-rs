@@ -1804,6 +1804,34 @@ mod tests {
     }
 
     #[test]
+    fn exhaustive_timeout_polling_returns_every_due_loss() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        for seq in [2, 0, 1] {
+            let sent_at = timestamp(now - Duration::from_secs(u64::from(seq) + 1));
+            let session = active_mut(&mut machine);
+            session.pending.preflight_insert(seq).unwrap();
+            session.pending.commit_insert(PendingProbe {
+                wire_seq: seq,
+                sent_at,
+                timeout_at: now,
+            });
+        }
+
+        let events = machine.poll_timeouts_at(now).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ClientEvent::EchoLoss { seq: 2, .. },
+                ClientEvent::EchoLoss { seq: 1, .. },
+                ClientEvent::EchoLoss { seq: 0, .. },
+            ]
+        ));
+        assert_eq!(active(&machine).pending.len(), 0);
+        assert_eq!(active(&machine).timed_out.len(), 3);
+    }
+
+    #[test]
     fn wrapping_sequence_from_max_to_zero_remains_valid() {
         let mut machine = open_machine(2, Duration::from_secs(1));
         active_mut(&mut machine).next_wire_seq = u32::MAX;
