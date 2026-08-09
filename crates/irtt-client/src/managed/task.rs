@@ -1580,6 +1580,14 @@ impl ManagedClientTask {
             return SendResult::NotAttempted;
         };
         if client
+            .next_probe_timeout_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.targets[index].send_waiting = false;
+            self.targets[index].state = TargetState::Active { client };
+            return SendResult::NotAttempted;
+        }
+        if client
             .next_send_deadline()
             .is_none_or(|deadline| deadline > now)
         {
@@ -1718,44 +1726,17 @@ impl ManagedClientTask {
             return false;
         }
 
-        let mut due_targets = Vec::new();
-        for offset in 0..target_len {
-            let index = (self.timeout_cursor + offset) % target_len;
+        let mut more_due = false;
+        for _ in 0..TIMEOUT_WORK_BUDGET {
+            let index = self.timeout_cursor;
+            self.timeout_cursor = (self.timeout_cursor + 1) % target_len;
             if self.target_has_due_timeout(index, now) {
-                due_targets.push(index);
+                let step = self.poll_target_timeout(index, now);
+                more_due |= step.more_due;
             }
-        }
-        if due_targets.is_empty() {
-            return false;
         }
 
-        let mut remaining = TIMEOUT_WORK_BUDGET;
-        let mut position = 0;
-        let mut last_processed = None;
-        while remaining > 0 && !due_targets.is_empty() {
-            if position == due_targets.len() {
-                position = 0;
-            }
-            let index = due_targets[position];
-            let step = self.poll_target_timeout(index, now);
-            if step.expired == 0 {
-                due_targets.remove(position);
-                continue;
-            }
-
-            remaining -= step.expired;
-            last_processed = Some(index);
-            if step.more_due {
-                position += 1;
-            } else {
-                due_targets.remove(position);
-            }
-        }
-        if let Some(index) = last_processed {
-            self.timeout_cursor = (index + 1) % target_len;
-        }
-
-        !due_targets.is_empty()
+        more_due
     }
 
     fn target_has_due_timeout(&self, index: usize, now: Instant) -> bool {
@@ -1790,11 +1771,9 @@ impl ManagedClientTask {
         match state {
             TargetState::Active { mut client } => match client.poll_timeouts_bounded_at(now, 1) {
                 Ok(batch) => {
-                    let expired = batch.events.len();
                     self.publish_client_events(index, batch.events);
                     self.targets[index].state = TargetState::Active { client };
                     TimeoutStep {
-                        expired,
                         more_due: batch.more_due,
                     }
                 }
@@ -1819,7 +1798,6 @@ impl ManagedClientTask {
                 post_deadline_receives_remaining,
             } => match client.poll_timeouts_bounded_at(now, 1) {
                 Ok(batch) => {
-                    let expired = batch.events.len();
                     self.publish_client_events(index, batch.events);
                     let deadline = match self.drain_deadline(&client, drain_started_at) {
                         Some(candidate) => deadline.min(candidate),
@@ -1838,7 +1816,6 @@ impl ManagedClientTask {
                         post_deadline_receives_remaining,
                     };
                     TimeoutStep {
-                        expired,
                         more_due: batch.more_due,
                     }
                 }
@@ -2020,15 +1997,11 @@ enum SendResult {
 
 #[derive(Clone, Copy)]
 struct TimeoutStep {
-    expired: usize,
     more_due: bool,
 }
 
 impl TimeoutStep {
-    const NONE: Self = Self {
-        expired: 0,
-        more_due: false,
-    };
+    const NONE: Self = Self { more_due: false };
 }
 
 impl SendResult {
