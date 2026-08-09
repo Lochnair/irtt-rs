@@ -27,7 +27,7 @@ pub fn peer_close_run_error(
     ))
 }
 
-pub fn request_group_stop_for_peer_close(
+pub fn request_managed_stop_for_peer_close(
     continuous: bool,
     interrupted: bool,
     peer_closed_target_count: u64,
@@ -38,10 +38,10 @@ pub fn request_group_stop_for_peer_close(
         return false;
     }
     *peer_close_requested_stop = true;
-    request_group_stop_once(stop_requested)
+    request_managed_stop_once(stop_requested)
 }
 
-pub fn request_group_stop_once(stop_requested: &mut bool) -> bool {
+pub fn request_managed_stop_once(stop_requested: &mut bool) -> bool {
     if *stop_requested {
         return false;
     }
@@ -72,21 +72,21 @@ mod tests {
     fn grouped_peer_close_stop_policy_is_run_mode_and_one_shot() {
         let mut peer_close_requested_stop = false;
         let mut stop_requested = false;
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             false,
             false,
             1,
             &mut peer_close_requested_stop,
             &mut stop_requested,
         ));
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             true,
             true,
             1,
             &mut peer_close_requested_stop,
             &mut stop_requested,
         ));
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             true,
             false,
             0,
@@ -96,7 +96,7 @@ mod tests {
         assert!(!peer_close_requested_stop);
         assert!(!stop_requested);
 
-        assert!(request_group_stop_for_peer_close(
+        assert!(request_managed_stop_for_peer_close(
             true,
             false,
             1,
@@ -105,7 +105,7 @@ mod tests {
         ));
         assert!(peer_close_requested_stop);
         assert!(stop_requested);
-        assert!(!request_group_stop_for_peer_close(
+        assert!(!request_managed_stop_for_peer_close(
             true,
             false,
             1,

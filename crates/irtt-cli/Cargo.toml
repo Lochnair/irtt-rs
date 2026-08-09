@@ -30,7 +30,7 @@ required-features = ["tui"]
 
 [features]
 default = ["client", "stats"]
-client-runtime = ["dep:irtt-client", "dep:irtt-proto"]
+client-runtime = ["dep:irtt-client", "irtt-client/tokio", "dep:irtt-proto"]
 client = ["client-runtime"]
 stats = ["client-runtime", "dep:irtt-stats"]
 tui = ["client-runtime", "stats", "dep:ratatui", "dep:crossterm"]

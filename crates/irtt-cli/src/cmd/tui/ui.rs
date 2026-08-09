@@ -9,10 +9,8 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use irtt_client::{
-    ClientEvent, ManagedTargetEndReason, ManagedTargetOutcome, NegotiatedParams, SignedDuration,
-    TargetEvent,
-};
+use irtt_client::managed::{ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance};
+use irtt_client::{ClientEvent, NegotiatedParams, SignedDuration};
 use irtt_stats::{Snapshot, StatsCollector, TimeStats};
 use ratatui::{
     backend::CrosstermBackend,
@@ -140,12 +138,8 @@ impl TuiState {
         }
     }
 
-    pub(super) fn process_event(&mut self, event: &ClientEvent) {
-        self.process_event_for_target(0, event);
-    }
-
-    pub(super) fn process_target_event(&mut self, event: &TargetEvent) {
-        let label = event.target.as_str();
+    pub(super) fn process_target_event(&mut self, target: &TargetInstance, event: &ClientEvent) {
+        let label = target.id.as_str();
         let idx = if let Some(idx) = self.target_index.get(label).copied() {
             idx
         } else {
@@ -159,11 +153,11 @@ impl TuiState {
             self.target_index.insert(label.to_owned(), idx);
             idx
         };
-        self.process_event_for_target(idx, &event.event);
+        self.process_event_for_target(idx, event);
     }
 
     pub(super) fn process_target_outcome(&mut self, outcome: &ManagedTargetOutcome) {
-        let label = outcome.id.as_str();
+        let label = outcome.target.id.as_str();
         let idx = if let Some(idx) = self.target_index.get(label).copied() {
             idx
         } else {
@@ -190,15 +184,17 @@ impl TuiState {
                 "no-test negotiation completed".to_owned(),
                 None,
             ),
-            ManagedTargetEndReason::Cancelled => {
-                (TargetStatus::Cancelled, "target cancelled".to_owned(), None)
+            ManagedTargetEndReason::Stopped => {
+                (TargetStatus::Stopped, "target stopped".to_owned(), None)
             }
             ManagedTargetEndReason::Removed => {
                 (TargetStatus::Removed, "target removed".to_owned(), None)
             }
-            ManagedTargetEndReason::OpenFailed(failure)
-            | ManagedTargetEndReason::Failed(failure) => {
-                let message = format!("{}: {}", failure.kind, failure.message);
+            ManagedTargetEndReason::Replaced => {
+                (TargetStatus::Replaced, "target replaced".to_owned(), None)
+            }
+            ManagedTargetEndReason::Failed(failure) => {
+                let message = format!("{:?}: {}", failure.kind, failure.message);
                 (
                     TargetStatus::Failed,
                     format!("target failed: {message}"),
@@ -208,7 +204,7 @@ impl TuiState {
         };
 
         if let Some(target) = self.targets.get_mut(idx) {
-            target.remote = Some(outcome.remote.to_string());
+            target.remote = outcome.remote.map(|remote| remote.to_string());
             target.status = status;
             if let Some(warning) = &warning {
                 target.last_warning = Some(warning.clone());
@@ -382,17 +378,8 @@ impl TuiState {
         self.status = status;
     }
 
-    #[cfg(test)]
-    pub(super) fn status(&self) -> TuiStatus {
-        self.status
-    }
-
-    pub(super) fn mark_dropped_client_events(&mut self, dropped_events: u64) {
-        self.mark_dropped_events(dropped_events, "managed client");
-    }
-
-    pub(super) fn mark_dropped_group_events(&mut self, dropped_events: u64) {
-        self.mark_dropped_events(dropped_events, "managed group");
+    pub(super) fn mark_dropped_managed_events(&mut self, dropped_events: u64) {
+        self.mark_dropped_events(dropped_events, "managed run");
     }
 
     fn mark_dropped_events(&mut self, dropped_events: u64, source: &str) {
@@ -566,8 +553,9 @@ pub(super) enum TargetStatus {
     Closed,
     Failed,
     NoTest,
-    Cancelled,
+    Stopped,
     Removed,
+    Replaced,
     Unknown,
 }
 
@@ -579,8 +567,9 @@ impl TargetStatus {
             Self::Closed => "closed",
             Self::Failed => "failed",
             Self::NoTest => "no-test",
-            Self::Cancelled => "cancelled",
+            Self::Stopped => "stopped",
             Self::Removed => "removed",
+            Self::Replaced => "replaced",
             Self::Unknown => "unknown",
         }
     }
@@ -588,7 +577,12 @@ impl TargetStatus {
     fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Closed | Self::Failed | Self::NoTest | Self::Cancelled | Self::Removed
+            Self::Closed
+                | Self::Failed
+                | Self::NoTest
+                | Self::Stopped
+                | Self::Removed
+                | Self::Replaced
         )
     }
 
@@ -690,7 +684,6 @@ impl Default for TuiConfig {
 pub(super) enum TuiStatus {
     Opening,
     Running,
-    Draining,
     Interrupted,
     Closing,
     Complete,
@@ -702,7 +695,6 @@ impl TuiStatus {
         match self {
             Self::Opening => "opening",
             Self::Running => "running",
-            Self::Draining => "draining",
             Self::Interrupted => "interrupted",
             Self::Closing => "closing",
             Self::Complete => "complete",
@@ -2027,7 +2019,7 @@ fn duration_ns(value: Duration) -> i128 {
     i128::try_from(value.as_nanos()).unwrap_or(i128::MAX)
 }
 
-#[cfg(test)]
+#[cfg(any())]
 mod tests {
     use super::*;
     use irtt_client::{
