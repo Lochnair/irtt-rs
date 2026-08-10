@@ -215,9 +215,12 @@ fn trusted_zero_token_normal_reply_is_terminal() {
     let params = default_params();
     let server = start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);
-        socket
-            .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, 0, &params, None), peer)
-            .unwrap();
+        // encode_open_reply rejects a zero token without FLAG_CLOSE, so this
+        // deliberately non-compliant reply is built by encoding a normal
+        // reply with a placeholder token and then zeroing the token field.
+        let mut reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+        reply[HMAC_OFFSET..HMAC_OFFSET + 8].copy_from_slice(&0_u64.to_le_bytes());
+        socket.send_to(&reply, peer).unwrap();
     });
     let mut client = Client::connect(default_test_config(server.addr)).unwrap();
 
