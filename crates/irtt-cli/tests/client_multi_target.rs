@@ -203,6 +203,11 @@ fn continuous_single_target_interruption_drains_final_events_and_succeeds() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
+    // Only wait for the reply to be sent, not consumed: whether the client
+    // has already read it or it is still in flight when SIGINT lands is the
+    // scenario this test exercises. The echo_reply assertion below is what
+    // proves shutdown drains a reply that was still queued at interrupt time
+    // rather than losing it.
     server.wait_until_first_reply_sent();
     let signal_status = Command::new("kill")
         .args(["-INT", &child.id().to_string()])
