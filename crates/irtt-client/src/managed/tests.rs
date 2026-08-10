@@ -6,7 +6,7 @@ use std::{
     sync::{Arc, Condvar, Mutex},
     task::{Context, Poll, Waker},
     thread::{self, JoinHandle},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use irtt_proto::{
@@ -16,7 +16,10 @@ use irtt_proto::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::*;
-use crate::{socket::resolution_call_counts, ClientAuthConfig, NegotiationPolicy, RunMode};
+use crate::{
+    probe::PendingProbe, socket::resolution_call_counts, ClientAuthConfig, ClientTimestamp,
+    NegotiationPolicy, RunMode,
+};
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -316,6 +319,94 @@ fn client_events(
             _ => None,
         })
         .collect()
+}
+
+fn timeout_probe(seq: u32, sent_at: Instant, timeout_at: Instant) -> PendingProbe {
+    PendingProbe {
+        wire_seq: seq,
+        sent_at: ClientTimestamp {
+            mono: sent_at,
+            wall: SystemTime::UNIX_EPOCH,
+        },
+        timeout_at,
+    }
+}
+
+fn open_target_for_timeout_test(runtime: &Runtime, task: &mut ManagedClientTask, index: usize) {
+    let TargetState::Pending { client_config } =
+        mem::replace(&mut task.targets[index].state, TargetState::Terminal)
+    else {
+        panic!("timeout test target must start pending");
+    };
+    let client = runtime.block_on(async {
+        let mut client = AsyncClient::connect(client_config).await.unwrap();
+        client.open().await.unwrap();
+        client
+    });
+    task.targets[index].desired = false;
+    task.install_target_state(index, TargetState::Active { client });
+}
+
+fn replace_pending_for_timeout_test(
+    task: &mut ManagedClientTask,
+    index: usize,
+    probe: PendingProbe,
+) {
+    let client = match &mut task.targets[index].state {
+        TargetState::Active { client } | TargetState::Draining { client, .. } => client,
+        _ => panic!("timeout test target must be active or draining"),
+    };
+    client.replace_pending_for_test(probe);
+}
+
+fn remove_pending_for_timeout_test(
+    task: &mut ManagedClientTask,
+    index: usize,
+    wire_seq: u32,
+) -> PendingProbe {
+    let client = match &mut task.targets[index].state {
+        TargetState::Active { client } | TargetState::Draining { client, .. } => client,
+        _ => panic!("timeout test target must be active or draining"),
+    };
+    client
+        .remove_pending_for_test(wire_seq)
+        .expect("timeout test pending probe must exist")
+}
+
+fn close_timeout_test_target(runtime: &Runtime, task: &mut ManagedClientTask, index: usize) {
+    let (TargetState::Active { mut client } | TargetState::Draining { mut client, .. }) =
+        mem::replace(&mut task.targets[index].state, TargetState::Terminal)
+    else {
+        panic!("timeout test target did not remain active or draining");
+    };
+    runtime.block_on(client.close()).unwrap();
+}
+
+fn poll_task_once(runtime: &Runtime, task: &mut Pin<Box<ManagedClientTask>>) {
+    runtime.block_on(poll_fn(|cx| {
+        assert!(task.as_mut().poll(cx).is_pending());
+        Poll::Ready(())
+    }));
+}
+
+fn timeout_losses_for(
+    observations: &Mutex<Vec<(ManagedEvent, Arc<ManagedStatus>)>>,
+    id: &str,
+) -> usize {
+    observations
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(event, _)| {
+            matches!(
+                event,
+                ManagedEvent::Client {
+                    target,
+                    event: ClientEvent::EchoLoss { .. },
+                } if target.id.as_ref() == id
+            )
+        })
+        .count()
 }
 
 fn probes(records: &[PacketRecord]) -> Vec<Instant> {
@@ -722,6 +813,7 @@ fn pruning_preserves_target_cursor_progress() {
     )
     .unwrap();
     task.cursor = 5;
+    task.timeout_cursor = 5;
     task.send_cursor = 5;
     task.scan_remaining = 3;
     task.burst_remaining = 3;
@@ -729,6 +821,7 @@ fn pruning_preserves_target_cursor_progress() {
     task.targets.truncate(2);
     task.rebase_target_cursors();
     assert_eq!(task.cursor, 1);
+    assert_eq!(task.timeout_cursor, 1);
     assert_eq!(task.send_cursor, 1);
     assert_eq!(task.scan_remaining, 2);
     assert_eq!(task.burst_remaining, 2);
@@ -737,6 +830,7 @@ fn pruning_preserves_target_cursor_progress() {
     task.targets.clear();
     task.rebase_target_cursors();
     assert_eq!(task.cursor, 0);
+    assert_eq!(task.timeout_cursor, 0);
     assert_eq!(task.send_cursor, 0);
     assert_eq!(task.scan_remaining, 0);
     assert_eq!(task.burst_remaining, 0);
@@ -1651,6 +1745,869 @@ fn stagger_gate_tracks_active_membership() {
     assert_eq!(outcome.failed_target_outcomes, 0);
     first.finish();
     second.finish();
+}
+
+#[test]
+fn timeout_discovery_inspects_at_most_one_budget_of_targets() {
+    let target_count = TIMEOUT_WORK_BUDGET + 1;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.max_live_target_generations = target_count;
+    let targets = (0..target_count)
+        .map(|index| ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9"))
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+
+    task.timeout_inspections = 0;
+    assert!(!task.poll_timeout_pass(Instant::now()));
+
+    assert_eq!(task.timeout_inspections, TIMEOUT_WORK_BUDGET);
+    assert_eq!(task.timeout_cursor, TIMEOUT_WORK_BUDGET);
+}
+
+#[test]
+fn idle_timeout_discovery_inspects_one_target_once() {
+    let (mut task, _) = ManagedClient::task(
+        config(ManagedPacing::Burst),
+        vec![ManagedTargetConfig::new("idle", "127.0.0.1:9")],
+    )
+    .unwrap();
+
+    task.timeout_inspections = 0;
+    assert!(!task.poll_timeout_pass(Instant::now()));
+
+    assert_eq!(task.timeout_inspections, 1);
+    assert_eq!(task.timeout_cursor, 0);
+}
+
+#[test]
+fn idle_timeout_discovery_sweeps_small_target_set_once() {
+    let target_count = 8;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.max_live_target_generations = target_count;
+    let targets = (0..target_count)
+        .map(|index| ManagedTargetConfig::new(format!("idle-{index}"), "127.0.0.1:9"))
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+
+    task.timeout_inspections = 0;
+    assert!(!task.poll_timeout_pass(Instant::now()));
+
+    assert_eq!(task.timeout_inspections, target_count);
+    assert_eq!(task.timeout_cursor, 0);
+}
+
+#[test]
+fn sparse_timeout_backlog_progresses_within_one_poll() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let target_count = TIMEOUT_WORK_BUDGET + 1;
+    let late_index = target_count - 1;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.max_live_target_generations = target_count;
+    let targets = (0..target_count)
+        .map(|index| {
+            if index == late_index {
+                target("late", server.addr)
+            } else {
+                ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")
+            }
+        })
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    for target in &mut task.targets[..late_index] {
+        target.state = TargetState::Terminal;
+    }
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, late_index);
+    let now = Instant::now();
+    for seq in 0..u32::try_from(TIMEOUT_WORK_BUDGET + 64).unwrap() {
+        replace_pending_for_timeout_test(
+            &mut task,
+            late_index,
+            timeout_probe(
+                seq,
+                now - Duration::from_secs(2),
+                now - Duration::from_secs(1),
+            ),
+        );
+    }
+
+    assert!(!task.poll_timeout_pass(now));
+    assert!(task.poll_timeout_pass(now));
+
+    assert_eq!(
+        timeout_losses_for(&observations, "late"),
+        TIMEOUT_WORK_BUDGET
+    );
+    assert_eq!(task.timeout_backlog.len(), 1);
+    close_timeout_test_target(&runtime, &mut task, late_index);
+    drop(task);
+    server.finish();
+}
+
+#[test]
+fn sparse_timeout_backlog_persists_across_polls() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let target_count = (2 * TIMEOUT_WORK_BUDGET) + 1;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.max_live_target_generations = target_count;
+    let targets = std::iter::once(target("sparse", server.addr))
+        .chain(
+            (1..target_count)
+                .map(|index| ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")),
+        )
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    for target in &mut task.targets[1..] {
+        target.state = TargetState::Terminal;
+    }
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    let now = Instant::now();
+    for seq in 0..u32::try_from((2 * TIMEOUT_WORK_BUDGET) + 64).unwrap() {
+        replace_pending_for_timeout_test(
+            &mut task,
+            0,
+            timeout_probe(
+                seq,
+                now - Duration::from_secs(2),
+                now - Duration::from_secs(1),
+            ),
+        );
+    }
+
+    assert!(task.poll_timeout_pass(now));
+    assert_eq!(
+        timeout_losses_for(&observations, "sparse"),
+        TIMEOUT_WORK_BUDGET
+    );
+    assert_eq!(task.timeout_backlog.len(), 1);
+    assert_eq!(task.timeout_cursor, TIMEOUT_WORK_BUDGET);
+
+    assert!(task.poll_timeout_pass(now));
+    assert_eq!(
+        timeout_losses_for(&observations, "sparse"),
+        2 * TIMEOUT_WORK_BUDGET
+    );
+    assert_eq!(task.timeout_backlog.len(), 1);
+    assert_eq!(task.timeout_cursor, 2 * TIMEOUT_WORK_BUDGET);
+    close_timeout_test_target(&runtime, &mut task, 0);
+    drop(task);
+    server.finish();
+}
+
+#[test]
+fn timeout_backlog_round_robins_known_sparse_targets() {
+    let first = start_server(ServerBehavior::Echo, None);
+    let second = start_server(ServerBehavior::Echo, None);
+    let target_count = TIMEOUT_WORK_BUDGET + 2;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.max_live_target_generations = target_count;
+    let targets = vec![target("first", first.addr), target("second", second.addr)]
+        .into_iter()
+        .chain(
+            (2..target_count)
+                .map(|index| ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")),
+        )
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    for target in &mut task.targets[2..] {
+        target.state = TargetState::Terminal;
+    }
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    open_target_for_timeout_test(&runtime, &mut task, 1);
+    let now = Instant::now();
+    for index in 0..2 {
+        for seq in 0..u32::try_from(TIMEOUT_WORK_BUDGET + 1).unwrap() {
+            replace_pending_for_timeout_test(
+                &mut task,
+                index,
+                timeout_probe(
+                    seq,
+                    now - Duration::from_secs(2),
+                    now - Duration::from_secs(1),
+                ),
+            );
+        }
+        task.timeout_backlog.push_back(TimeoutBacklogEntry {
+            index,
+            generation: task.targets[index].instance.generation,
+        });
+    }
+    task.timeout_cursor = 2;
+
+    assert!(task.poll_timeout_pass(now));
+
+    assert_eq!(
+        timeout_losses_for(&observations, "first"),
+        TIMEOUT_WORK_BUDGET / 2
+    );
+    assert_eq!(
+        timeout_losses_for(&observations, "second"),
+        TIMEOUT_WORK_BUDGET / 2
+    );
+    assert_eq!(task.timeout_backlog.len(), 2);
+    close_timeout_test_target(&runtime, &mut task, 0);
+    close_timeout_test_target(&runtime, &mut task, 1);
+    drop(task);
+    first.finish();
+    second.finish();
+}
+
+#[test]
+fn timeout_backlog_does_not_starve_discovery() {
+    let first = start_server(ServerBehavior::Echo, None);
+    let second = start_server(ServerBehavior::Echo, None);
+    let target_count = (2 * TIMEOUT_WORK_BUDGET) + 1;
+    let late_index = target_count - 1;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.max_live_target_generations = target_count;
+    let targets = (0..target_count)
+        .map(|index| match index {
+            0 => target("backlog", first.addr),
+            index if index == late_index => target("late", second.addr),
+            _ => ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9"),
+        })
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    for target in &mut task.targets[1..late_index] {
+        target.state = TargetState::Terminal;
+    }
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    open_target_for_timeout_test(&runtime, &mut task, late_index);
+    let now = Instant::now();
+    for seq in 0..u32::try_from(3 * TIMEOUT_WORK_BUDGET).unwrap() {
+        replace_pending_for_timeout_test(
+            &mut task,
+            0,
+            timeout_probe(
+                seq,
+                now - Duration::from_secs(2),
+                now - Duration::from_secs(1),
+            ),
+        );
+    }
+    replace_pending_for_timeout_test(
+        &mut task,
+        late_index,
+        timeout_probe(
+            0,
+            now - Duration::from_secs(2),
+            now - Duration::from_secs(1),
+        ),
+    );
+    task.timeout_backlog.push_back(TimeoutBacklogEntry {
+        index: 0,
+        generation: task.targets[0].instance.generation,
+    });
+    task.timeout_cursor = 1;
+
+    assert!(task.poll_timeout_pass(now));
+    assert_eq!(timeout_losses_for(&observations, "late"), 0);
+    assert_eq!(task.timeout_cursor, TIMEOUT_WORK_BUDGET + 1);
+
+    assert!(task.poll_timeout_pass(now));
+    assert_eq!(timeout_losses_for(&observations, "late"), 1);
+    assert_eq!(task.timeout_cursor, 0);
+    assert_eq!(task.timeout_backlog.len(), 1);
+    close_timeout_test_target(&runtime, &mut task, 0);
+    close_timeout_test_target(&runtime, &mut task, late_index);
+    drop(task);
+    first.finish();
+    second.finish();
+}
+
+#[test]
+fn stale_timeout_backlog_entry_is_dropped_after_pruning() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let target_count = TIMEOUT_WORK_BUDGET + 2;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.max_live_target_generations = target_count;
+    let targets = vec![
+        ManagedTargetConfig::new("retired", "127.0.0.1:9"),
+        target("survivor", server.addr),
+    ]
+    .into_iter()
+    .chain(
+        (2..target_count)
+            .map(|index| ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")),
+    )
+    .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 1);
+    let now = Instant::now();
+    replace_pending_for_timeout_test(
+        &mut task,
+        1,
+        timeout_probe(
+            0,
+            now - Duration::from_secs(2),
+            now - Duration::from_secs(1),
+        ),
+    );
+    task.timeout_backlog.push_back(TimeoutBacklogEntry {
+        index: 0,
+        generation: task.targets[0].instance.generation,
+    });
+    task.targets[0].desired = false;
+    task.targets[0].state = TargetState::Terminal;
+    task.prune_undesired_terminal();
+    task.timeout_cursor = 1;
+
+    assert!(!task.poll_timeout_pass(now));
+    assert!(task.timeout_backlog.is_empty());
+    assert_eq!(timeout_losses_for(&observations, "survivor"), 0);
+
+    task.timeout_cursor = 0;
+    assert!(!task.poll_timeout_pass(now));
+    assert_eq!(timeout_losses_for(&observations, "survivor"), 1);
+    close_timeout_test_target(&runtime, &mut task, 0);
+    drop(task);
+    server.finish();
+}
+
+#[test]
+fn immediate_timeout_backlog_skips_global_deadline_scan() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (mut task, _) = ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    let now = Instant::now();
+    for seq in 0..u32::try_from(TIMEOUT_WORK_BUDGET + 1).unwrap() {
+        replace_pending_for_timeout_test(
+            &mut task,
+            0,
+            timeout_probe(
+                seq,
+                now - Duration::from_secs(2),
+                now - Duration::from_secs(1),
+            ),
+        );
+    }
+    task.timeout_backlog.push_back(TimeoutBacklogEntry {
+        index: 0,
+        generation: task.targets[0].instance.generation,
+    });
+    task.deadline_inspections = 0;
+
+    let mut task = Box::pin(task);
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(task.deadline_inspections, 0);
+    assert_eq!(task.timeout_backlog.len(), 1);
+
+    assert!(!task.poll_timeout_pass(now));
+    assert!(task.timeout_backlog.is_empty());
+    task.deadline_inspections = 0;
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(task.deadline_inspections, 1);
+    close_timeout_test_target(&runtime, &mut task, 0);
+    drop(task);
+    server.finish();
+}
+
+#[test]
+fn timeout_discovery_reaches_later_target_after_budget_slice() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let target_count = TIMEOUT_WORK_BUDGET + 1;
+    let late_index = target_count - 1;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.max_live_target_generations = target_count;
+    let targets = (0..target_count)
+        .map(|index| {
+            if index == late_index {
+                target("late", server.addr)
+            } else {
+                ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")
+            }
+        })
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    for target in &mut task.targets[..late_index] {
+        target.state = TargetState::Terminal;
+    }
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, late_index);
+    let now = Instant::now();
+    replace_pending_for_timeout_test(
+        &mut task,
+        late_index,
+        timeout_probe(0, now - Duration::from_secs(1), now),
+    );
+
+    task.timeout_inspections = 0;
+    assert!(!task.poll_timeout_pass(now));
+    assert_eq!(task.timeout_inspections, TIMEOUT_WORK_BUDGET);
+    assert_eq!(task.timeout_cursor, late_index);
+    assert_eq!(timeout_losses_for(&observations, "late"), 0);
+
+    task.timeout_inspections = 0;
+    assert!(!task.poll_timeout_pass(now));
+    assert_eq!(task.timeout_inspections, TIMEOUT_WORK_BUDGET);
+    assert_eq!(timeout_losses_for(&observations, "late"), 1);
+
+    let TargetState::Active { mut client } =
+        mem::replace(&mut task.targets[late_index].state, TargetState::Terminal)
+    else {
+        panic!("later timeout target did not remain active");
+    };
+    runtime.block_on(client.close()).unwrap();
+    drop(task);
+    server.finish();
+}
+
+#[test]
+fn timeout_work_is_bounded_per_task_poll_and_eventually_drains() {
+    let server = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (mut task, handle) =
+        ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    let now = Instant::now();
+    for seq in 0..u32::try_from(TIMEOUT_WORK_BUDGET + 1).unwrap() {
+        replace_pending_for_timeout_test(
+            &mut task,
+            0,
+            timeout_probe(
+                seq,
+                now - Duration::from_secs(2),
+                now - Duration::from_secs(1),
+            ),
+        );
+    }
+
+    let mut task = Box::pin(task);
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(
+        timeout_losses_for(&observations, "one"),
+        TIMEOUT_WORK_BUDGET
+    );
+    assert!(matches!(
+        &task.targets[0].state,
+        TargetState::Active { client }
+            if client.next_probe_timeout_deadline().is_some()
+    ));
+
+    drive_task_until(&runtime, &mut task, |task| {
+        matches!(
+            &task.targets[0].state,
+            TargetState::Active { client }
+                if client.next_probe_timeout_deadline().is_none()
+        )
+    });
+    assert_eq!(
+        timeout_losses_for(&observations, "one"),
+        TIMEOUT_WORK_BUDGET + 1
+    );
+
+    drop(handle.stop());
+    runtime.block_on(task);
+    server.finish();
+}
+
+#[test]
+fn timeout_work_round_robins_simultaneous_target_backlogs() {
+    let first = start_server(ServerBehavior::Echo, None);
+    let second = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (mut task, handle) = ManagedClient::task(
+        managed,
+        vec![target("first", first.addr), target("second", second.addr)],
+    )
+    .unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    open_target_for_timeout_test(&runtime, &mut task, 1);
+    let now = Instant::now();
+    let per_target = TIMEOUT_WORK_BUDGET + 16;
+    for index in 0..2 {
+        for seq in 0..u32::try_from(per_target).unwrap() {
+            replace_pending_for_timeout_test(
+                &mut task,
+                index,
+                timeout_probe(
+                    seq,
+                    now - Duration::from_secs(2),
+                    now - Duration::from_secs(1),
+                ),
+            );
+        }
+    }
+
+    let mut task = Box::pin(task);
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(
+        timeout_losses_for(&observations, "first"),
+        TIMEOUT_WORK_BUDGET / 2
+    );
+    assert_eq!(
+        timeout_losses_for(&observations, "second"),
+        TIMEOUT_WORK_BUDGET / 2
+    );
+    assert!(matches!(
+        &task.targets[0].state,
+        TargetState::Active { client }
+            if client.next_probe_timeout_deadline().is_some()
+    ));
+    assert!(matches!(
+        &task.targets[1].state,
+        TargetState::Active { client }
+            if client.next_probe_timeout_deadline().is_some()
+    ));
+
+    drive_task_until(&runtime, &mut task, |task| {
+        task.targets.iter().all(|target| {
+            matches!(
+                &target.state,
+                TargetState::Active { client }
+                    if client.next_probe_timeout_deadline().is_none()
+            )
+        })
+    });
+    assert_eq!(timeout_losses_for(&observations, "first"), per_target);
+    assert_eq!(timeout_losses_for(&observations, "second"), per_target);
+
+    drop(handle.stop());
+    runtime.block_on(task);
+    first.finish();
+    second.finish();
+}
+
+#[test]
+fn budget_deferred_timeout_blocks_send_until_timeout_processing() {
+    let reply_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&reply_gate)),
+    );
+    let target_count = TIMEOUT_WORK_BUDGET + 1;
+    let late_index = target_count - 1;
+    let mut managed = config(ManagedPacing::Burst);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    managed.client.interval = Duration::from_nanos(1);
+    managed.client.probe_timeout = Duration::from_secs(1);
+    managed.client.max_pending_probes = 1;
+    managed.max_live_target_generations = target_count;
+    let targets = (0..target_count)
+        .map(|index| {
+            if index == late_index {
+                target("late", server.addr)
+            } else {
+                ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")
+            }
+        })
+        .collect();
+    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
+    for target in &mut task.targets[..late_index] {
+        target.state = TargetState::Terminal;
+    }
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, late_index);
+    task.targets[late_index].desired = true;
+    let sent = match &mut task.targets[late_index].state {
+        TargetState::Active { client } => runtime.block_on(client.send_probe()).unwrap(),
+        _ => panic!("deferred-send target did not open"),
+    };
+    assert!(matches!(
+        sent.as_slice(),
+        [ClientEvent::EchoSent { seq: 0, .. }]
+    ));
+    wait_flag(&server.probe_seen);
+
+    let overdue = Instant::now();
+    replace_pending_for_timeout_test(
+        &mut task,
+        late_index,
+        timeout_probe(0, overdue - Duration::from_secs(1), overdue),
+    );
+    task.state = DriverState::Running;
+    task.lifecycle = ManagedLifecycle::Running;
+    task.timeout_cursor = 0;
+    task.send_cursor = late_index;
+
+    let mut task = Box::pin(task);
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(task.timeout_inspections, TIMEOUT_WORK_BUDGET);
+    assert_eq!(timeout_losses_for(&observations, "late"), 0);
+    assert!(matches!(
+        &task.targets[late_index].state,
+        TargetState::Active { client }
+            if client.packets_sent() == 1
+                && client.next_probe_timeout_deadline() == Some(overdue)
+    ));
+    assert!(!task.targets[late_index].send_waiting);
+
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(timeout_losses_for(&observations, "late"), 1);
+    assert!(matches!(
+        &task.targets[late_index].state,
+        TargetState::Active { client }
+            if client.next_probe_timeout_deadline().is_none()
+    ));
+
+    poll_task_once(&runtime, &mut task);
+    assert!(matches!(
+        &task.targets[late_index].state,
+        TargetState::Active { client } if client.packets_sent() == 2
+    ));
+
+    reply_gate.release();
+    let TargetState::Active { mut client } =
+        mem::replace(&mut task.targets[late_index].state, TargetState::Terminal)
+    else {
+        panic!("deferred-send target did not remain active");
+    };
+    runtime.block_on(client.close()).unwrap();
+    drop(task);
+    server.finish();
+}
+
+#[test]
+fn partial_timeout_batch_blocks_active_receive_until_loss_commits() {
+    let reply_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&reply_gate)),
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (mut task, handle) =
+        ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    let sent = match &mut task.targets[0].state {
+        TargetState::Active { client } => runtime.block_on(client.send_probe()).unwrap(),
+        _ => panic!("timeout test target did not open"),
+    };
+    assert!(matches!(
+        sent.as_slice(),
+        [ClientEvent::EchoSent { seq: 0, .. }]
+    ));
+    wait_flag(&server.probe_seen);
+
+    let now = Instant::now();
+    let _ = remove_pending_for_timeout_test(&mut task, 0, 0);
+    for seq in 1..=u32::try_from(TIMEOUT_WORK_BUDGET).unwrap() {
+        replace_pending_for_timeout_test(
+            &mut task,
+            0,
+            timeout_probe(
+                seq,
+                now - Duration::from_secs(2),
+                now - Duration::from_secs(1),
+            ),
+        );
+    }
+    replace_pending_for_timeout_test(
+        &mut task,
+        0,
+        timeout_probe(0, now - Duration::from_secs(1), now),
+    );
+    reply_gate.release();
+    wait_flag(&server.reply_sent);
+
+    let mut task = Box::pin(task);
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(
+        timeout_losses_for(&observations, "one"),
+        TIMEOUT_WORK_BUDGET
+    );
+    assert!(!client_events(&observations).iter().any(|event| {
+        matches!(
+            event,
+            ClientEvent::EchoLoss { seq: 0, .. }
+                | ClientEvent::LateReply { seq: 0, .. }
+                | ClientEvent::EchoReply { seq: 0, .. }
+        )
+    }));
+
+    drive_task_until(&runtime, &mut task, |_| {
+        client_events(&observations)
+            .iter()
+            .any(|event| matches!(event, ClientEvent::LateReply { seq: 0, .. }))
+    });
+    let classified = client_events(&observations)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ClientEvent::EchoLoss { seq: 0, .. }
+                    | ClientEvent::LateReply { seq: 0, .. }
+                    | ClientEvent::EchoReply { seq: 0, .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        classified.as_slice(),
+        [
+            ClientEvent::EchoLoss { seq: 0, .. },
+            ClientEvent::LateReply { seq: 0, .. }
+        ]
+    ));
+
+    drop(handle.stop());
+    runtime.block_on(task);
+    server.finish();
+}
+
+#[test]
+fn partial_timeout_batch_blocks_draining_receive_until_loss_commits() {
+    let reply_gate = Arc::new(PacketGate::default());
+    let server = start_server_with_gates(
+        ServerBehavior::Echo,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&reply_gate)),
+    );
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (mut task, handle) =
+        ManagedClient::task(managed, vec![target("one", server.addr)]).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    open_target_for_timeout_test(&runtime, &mut task, 0);
+    let sent = match &mut task.targets[0].state {
+        TargetState::Active { client } => runtime.block_on(client.send_probe()).unwrap(),
+        _ => panic!("timeout test target did not open"),
+    };
+    assert!(matches!(
+        sent.as_slice(),
+        [ClientEvent::EchoSent { seq: 0, .. }]
+    ));
+    wait_flag(&server.probe_seen);
+
+    let now = Instant::now();
+    let _ = remove_pending_for_timeout_test(&mut task, 0, 0);
+    for seq in 1..=u32::try_from(TIMEOUT_WORK_BUDGET).unwrap() {
+        replace_pending_for_timeout_test(
+            &mut task,
+            0,
+            timeout_probe(
+                seq,
+                now - Duration::from_secs(2),
+                now - Duration::from_secs(1),
+            ),
+        );
+    }
+    replace_pending_for_timeout_test(
+        &mut task,
+        0,
+        timeout_probe(0, now - Duration::from_secs(1), now),
+    );
+    let TargetState::Active { client } =
+        mem::replace(&mut task.targets[0].state, TargetState::Terminal)
+    else {
+        panic!("timeout test target did not remain active");
+    };
+    assert!(task.begin_drain(0, client, ManagedTargetEndReason::Stopped, now));
+    reply_gate.release();
+    wait_flag(&server.reply_sent);
+
+    let mut task = Box::pin(task);
+    poll_task_once(&runtime, &mut task);
+    assert_eq!(
+        timeout_losses_for(&observations, "one"),
+        TIMEOUT_WORK_BUDGET
+    );
+    assert!(matches!(
+        &task.targets[0].state,
+        TargetState::Draining {
+            primary_end: ManagedTargetEndReason::Stopped,
+            cleanup_failure: None,
+            ..
+        }
+    ));
+    assert!(!client_events(&observations).iter().any(|event| {
+        matches!(
+            event,
+            ClientEvent::EchoLoss { seq: 0, .. }
+                | ClientEvent::LateReply { seq: 0, .. }
+                | ClientEvent::EchoReply { seq: 0, .. }
+        )
+    }));
+
+    drive_task_until(&runtime, &mut task, |_| {
+        client_events(&observations)
+            .iter()
+            .any(|event| matches!(event, ClientEvent::LateReply { seq: 0, .. }))
+    });
+    let classified = client_events(&observations)
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ClientEvent::EchoLoss { seq: 0, .. }
+                    | ClientEvent::LateReply { seq: 0, .. }
+                    | ClientEvent::EchoReply { seq: 0, .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    assert!(matches!(
+        classified.as_slice(),
+        [
+            ClientEvent::EchoLoss { seq: 0, .. },
+            ClientEvent::LateReply { seq: 0, .. }
+        ]
+    ));
+
+    drop(handle.stop());
+    let outcome = runtime.block_on(task);
+    let target = &outcome.recent_target_outcomes[0];
+    assert!(matches!(target.end_reason, ManagedTargetEndReason::Stopped));
+    assert!(target.cleanup_failure.is_none());
+    server.finish();
 }
 
 #[test]

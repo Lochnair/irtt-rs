@@ -37,6 +37,7 @@ use super::{
 
 const TARGET_WORK_BUDGET: usize = 128;
 const COMMAND_WORK_BUDGET: usize = 32;
+const TIMEOUT_WORK_BUDGET: usize = 128;
 const POST_DEADLINE_RECEIVE_BUDGET: usize = TARGET_WORK_BUDGET;
 // Tokio 1.53 broadcast asserts this exact bound before rounding capacity to a
 // power of two; Tokio does not expose it as a public constant.
@@ -415,6 +416,12 @@ struct TargetRuntime {
     state: TargetState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimeoutBacklogEntry {
+    index: usize,
+    generation: u64,
+}
+
 struct PlannedTarget {
     target: ManagedTargetConfig,
     client_config: ClientConfig,
@@ -573,6 +580,8 @@ pub struct ManagedClientTask {
     wake: Option<WakeFuture>,
     timer: Option<Pin<Box<Sleep>>>,
     cursor: usize,
+    timeout_cursor: usize,
+    timeout_backlog: VecDeque<TimeoutBacklogEntry>,
     scan_remaining: usize,
     send_cursor: usize,
     burst_remaining: usize,
@@ -589,6 +598,10 @@ pub struct ManagedClientTask {
     stagger_observations: Option<StaggerObservations>,
     #[cfg(test)]
     drain_test_hook: DrainTestHook,
+    #[cfg(test)]
+    timeout_inspections: usize,
+    #[cfg(test)]
+    deadline_inspections: usize,
 }
 
 #[cfg(test)]
@@ -1046,9 +1059,11 @@ impl ManagedClientTask {
         let len = self.targets.len();
         if len == 0 {
             self.cursor = 0;
+            self.timeout_cursor = 0;
             self.send_cursor = 0;
         } else {
             self.cursor %= len;
+            self.timeout_cursor %= len;
             self.send_cursor %= len;
         }
         self.scan_remaining = self.scan_remaining.min(len);
@@ -1205,19 +1220,8 @@ impl ManagedClientTask {
                     .next_probe_timeout_deadline()
                     .is_some_and(|deadline| deadline <= now)
                 {
-                    match client.poll_timeouts_at(now) {
-                        Ok(events) => self.publish_client_events(index, events),
-                        Err(error) => {
-                            return self.begin_open_session_failure(
-                                index,
-                                client,
-                                ManagedTargetFailurePhase::Timing,
-                                error,
-                                now,
-                                OpenSessionFailureCleanup::Close,
-                            );
-                        }
-                    }
+                    self.targets[index].state = TargetState::Active { client };
+                    return true;
                 }
                 let received = match client.poll_recv(cx) {
                     Poll::Pending => false,
@@ -1277,35 +1281,26 @@ impl ManagedClientTask {
                     return false;
                 }
 
+                if client
+                    .next_probe_timeout_deadline()
+                    .is_some_and(|timeout| timeout <= now)
+                {
+                    self.targets[index].state = TargetState::Draining {
+                        client,
+                        drain_started_at,
+                        deadline,
+                        primary_end,
+                        cleanup_failure,
+                        post_deadline_receives_remaining,
+                    };
+                    return true;
+                }
+
                 #[cfg(test)]
                 let injected_receive_failure = self.take_drain_receive_failure();
                 #[cfg(not(test))]
                 let injected_receive_failure = None;
                 let mut retained_state_changed = false;
-                if client
-                    .next_probe_timeout_deadline()
-                    .is_some_and(|timeout| timeout <= now)
-                {
-                    match client.poll_timeouts_at(now) {
-                        Ok(events) => {
-                            self.publish_client_events(index, events);
-                            retained_state_changed = true;
-                        }
-                        Err(error) => {
-                            self.targets[index].counters.packets_sent = client.packets_sent();
-                            cleanup_failure.get_or_insert_with(|| {
-                                classify_client_error(ManagedTargetFailurePhase::Timing, &error)
-                            });
-                            return self.begin_close(
-                                index,
-                                client,
-                                primary_end,
-                                cleanup_failure,
-                                now,
-                            );
-                        }
-                    }
-                }
                 let received = match client.poll_recv(cx) {
                     Poll::Pending => false,
                     Poll::Ready(Ok(events)) => {
@@ -1596,6 +1591,14 @@ impl ManagedClientTask {
             return SendResult::NotAttempted;
         };
         if client
+            .next_probe_timeout_deadline()
+            .is_some_and(|deadline| deadline <= now)
+        {
+            self.targets[index].send_waiting = false;
+            self.targets[index].state = TargetState::Active { client };
+            return SendResult::NotAttempted;
+        }
+        if client
             .next_send_deadline()
             .is_none_or(|deadline| deadline > now)
         {
@@ -1728,13 +1731,176 @@ impl ManagedClientTask {
         immediate || self.scan_remaining > 0
     }
 
+    fn poll_timeout_pass(&mut self, now: Instant) -> bool {
+        let target_len = self.targets.len();
+        if target_len == 0 {
+            return false;
+        }
+
+        let mut transitions_remaining = TIMEOUT_WORK_BUDGET;
+        for _ in 0..target_len.min(TIMEOUT_WORK_BUDGET) {
+            if transitions_remaining == 0 {
+                break;
+            }
+            let index = self.timeout_cursor;
+            self.timeout_cursor = (self.timeout_cursor + 1) % target_len;
+            #[cfg(test)]
+            {
+                self.timeout_inspections += 1;
+            }
+            if self.target_has_due_timeout(index, now) {
+                let generation = self.targets[index].instance.generation;
+                let step = self.poll_target_timeout(index, now);
+                transitions_remaining -= 1;
+                if step.more_due {
+                    self.enqueue_timeout_backlog(index, generation);
+                }
+            }
+        }
+
+        while transitions_remaining > 0 {
+            let Some(entry) = self.timeout_backlog.pop_front() else {
+                break;
+            };
+            let valid = self
+                .targets
+                .get(entry.index)
+                .is_some_and(|target| target.instance.generation == entry.generation)
+                && self.target_has_due_timeout(entry.index, now);
+            if !valid {
+                continue;
+            }
+
+            let step = self.poll_target_timeout(entry.index, now);
+            transitions_remaining -= 1;
+            if step.more_due {
+                self.enqueue_timeout_backlog(entry.index, entry.generation);
+            }
+        }
+
+        !self.timeout_backlog.is_empty()
+    }
+
+    fn enqueue_timeout_backlog(&mut self, index: usize, generation: u64) {
+        if self.timeout_backlog.len() == TIMEOUT_WORK_BUDGET
+            || self
+                .timeout_backlog
+                .iter()
+                .any(|entry| entry.index == index && entry.generation == generation)
+        {
+            return;
+        }
+        self.timeout_backlog
+            .push_back(TimeoutBacklogEntry { index, generation });
+    }
+
+    fn target_has_due_timeout(&self, index: usize, now: Instant) -> bool {
+        match &self.targets[index].state {
+            TargetState::Active { client } => {
+                self.state != DriverState::Stopping
+                    && self.effective_retirement(index).is_none()
+                    && client
+                        .next_probe_timeout_deadline()
+                        .is_some_and(|deadline| deadline <= now)
+            }
+            TargetState::Draining {
+                client,
+                deadline: _deadline,
+                ..
+            } => {
+                #[cfg(test)]
+                let defer_work = self.drain_test_hook.defer_work_until_deadline && now < *_deadline;
+                #[cfg(not(test))]
+                let defer_work = false;
+                !defer_work
+                    && client
+                        .next_probe_timeout_deadline()
+                        .is_some_and(|timeout| timeout <= now)
+            }
+            _ => false,
+        }
+    }
+
+    fn poll_target_timeout(&mut self, index: usize, now: Instant) -> TimeoutStep {
+        let state = mem::replace(&mut self.targets[index].state, TargetState::Terminal);
+        match state {
+            TargetState::Active { mut client } => match client.poll_timeouts_bounded_at(now, 1) {
+                Ok(batch) => {
+                    self.publish_client_events(index, batch.events);
+                    self.targets[index].state = TargetState::Active { client };
+                    TimeoutStep {
+                        more_due: batch.more_due,
+                    }
+                }
+                Err(error) => {
+                    self.begin_open_session_failure(
+                        index,
+                        client,
+                        ManagedTargetFailurePhase::Timing,
+                        error,
+                        now,
+                        OpenSessionFailureCleanup::Close,
+                    );
+                    TimeoutStep::NONE
+                }
+            },
+            TargetState::Draining {
+                mut client,
+                drain_started_at,
+                deadline,
+                primary_end,
+                mut cleanup_failure,
+                post_deadline_receives_remaining,
+            } => match client.poll_timeouts_bounded_at(now, 1) {
+                Ok(batch) => {
+                    self.publish_client_events(index, batch.events);
+                    let deadline = match self.drain_deadline(&client, drain_started_at) {
+                        Some(candidate) => deadline.min(candidate),
+                        None => {
+                            cleanup_failure.get_or_insert_with(duration_overflow_failure);
+                            self.begin_close(index, client, primary_end, cleanup_failure, now);
+                            return TimeoutStep::NONE;
+                        }
+                    };
+                    self.targets[index].state = TargetState::Draining {
+                        client,
+                        drain_started_at,
+                        deadline,
+                        primary_end,
+                        cleanup_failure,
+                        post_deadline_receives_remaining,
+                    };
+                    TimeoutStep {
+                        more_due: batch.more_due,
+                    }
+                }
+                Err(error) => {
+                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    cleanup_failure.get_or_insert_with(|| {
+                        classify_client_error(ManagedTargetFailurePhase::Timing, &error)
+                    });
+                    self.begin_close(index, client, primary_end, cleanup_failure, now);
+                    TimeoutStep::NONE
+                }
+            },
+            state => {
+                self.targets[index].state = state;
+                TimeoutStep::NONE
+            }
+        }
+    }
+
     fn all_targets_terminal(&self) -> bool {
         self.targets
             .iter()
             .all(|target| matches!(target.state, TargetState::Terminal))
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&mut self) -> Option<Instant> {
+        #[cfg(test)]
+        {
+            self.deadline_inspections += self.targets.len();
+        }
         let mut non_send_deadline = None;
         let mut send_deadline = None;
         for target in &self.targets {
@@ -1888,6 +2054,15 @@ enum SendResult {
     Failed { accepted: bool },
 }
 
+#[derive(Clone, Copy)]
+struct TimeoutStep {
+    more_due: bool,
+}
+
+impl TimeoutStep {
+    const NONE: Self = Self { more_due: false };
+}
+
 impl SendResult {
     fn accepted(self) -> bool {
         matches!(
@@ -1922,6 +2097,7 @@ impl Future for ManagedClientTask {
             this.observe_stop();
         }
         let now = Instant::now();
+        immediate |= this.poll_timeout_pass(now);
         immediate |= this.poll_target_pass(cx, now);
         this.prune_undesired_terminal();
         if this.state == DriverState::Running {
@@ -1962,7 +2138,9 @@ impl Future for ManagedClientTask {
         }
 
         immediate |= this.register_stop_wake(cx);
-        immediate |= this.register_timer(cx);
+        if !immediate {
+            immediate |= this.register_timer(cx);
+        }
         if immediate {
             cx.waker().wake_by_ref();
         }
@@ -2129,6 +2307,8 @@ fn build_task(
         wake: Some(arm_wake(wake_receiver)),
         timer: None,
         cursor: 0,
+        timeout_cursor: 0,
+        timeout_backlog: VecDeque::with_capacity(TIMEOUT_WORK_BUDGET),
         scan_remaining: 0,
         send_cursor: 0,
         burst_remaining: 0,
@@ -2145,6 +2325,10 @@ fn build_task(
         stagger_observations: None,
         #[cfg(test)]
         drain_test_hook: DrainTestHook::default(),
+        #[cfg(test)]
+        timeout_inspections: 0,
+        #[cfg(test)]
+        deadline_inspections: 0,
     };
     let handle = ManagedClientHandle {
         stop,

@@ -157,6 +157,12 @@ pub(crate) struct ProbeCommit {
     next_packets_sent: u64,
 }
 
+#[derive(Debug)]
+pub(crate) struct TimeoutBatch {
+    pub events: Vec<ClientEvent>,
+    pub more_due: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProbeSent {
     pub(crate) seq: u32,
@@ -408,11 +414,21 @@ impl SessionMachine {
         &mut self,
         now: Instant,
     ) -> Result<Vec<ClientEvent>, ClientError> {
+        let batch = self.poll_timeouts_bounded_at(now, usize::MAX)?;
+        debug_assert!(!batch.more_due);
+        Ok(batch.events)
+    }
+
+    pub(crate) fn poll_timeouts_bounded_at(
+        &mut self,
+        now: Instant,
+        limit: usize,
+    ) -> Result<TimeoutBatch, ClientError> {
         let session = self.open_session_mut()?;
 
-        let expired = session.pending.drain_expired(now);
-        let mut events = Vec::with_capacity(expired.len());
-        for probe in expired {
+        let expired = session.pending.drain_expired_bounded(now, limit);
+        let mut events = Vec::with_capacity(expired.probes.len());
+        for probe in expired.probes {
             events.push(ClientEvent::EchoLoss {
                 seq: probe.wire_seq,
                 sent_at: probe.sent_at,
@@ -421,7 +437,10 @@ impl SessionMachine {
             session.timed_out.insert(probe);
         }
 
-        Ok(events)
+        Ok(TimeoutBatch {
+            events,
+            more_due: expired.more_due,
+        })
     }
 
     pub(crate) fn prepare_close(&self) -> Result<PreparedClose<'_>, ClientError> {
@@ -1016,6 +1035,25 @@ impl SessionMachine {
             timeout_at: now.mono,
         });
         session.completed.insert(0);
+    }
+}
+
+#[cfg(all(test, feature = "tokio"))]
+impl SessionMachine {
+    pub(crate) fn remove_pending_for_test(&mut self, wire_seq: u32) -> Option<PendingProbe> {
+        self.open_session_mut()
+            .expect("test pending probes require an open session")
+            .pending
+            .remove(wire_seq)
+    }
+
+    pub(crate) fn replace_pending_for_test(&mut self, probe: PendingProbe) {
+        let session = self
+            .open_session_mut()
+            .expect("test pending probes require an open session");
+        session.pending.remove(probe.wire_seq);
+        session.pending.preflight_insert(probe.wire_seq).unwrap();
+        session.pending.commit_insert(probe);
     }
 }
 
@@ -1801,6 +1839,34 @@ mod tests {
             Err(ClientError::DurationOverflow)
         ));
         assert_eq!(active(&machine).pending.len(), 0);
+    }
+
+    #[test]
+    fn exhaustive_timeout_polling_returns_every_due_loss() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        for seq in [2, 1, 0] {
+            let sent_at = timestamp(now - Duration::from_secs(u64::from(seq) + 1));
+            let session = active_mut(&mut machine);
+            session.pending.preflight_insert(seq).unwrap();
+            session.pending.commit_insert(PendingProbe {
+                wire_seq: seq,
+                sent_at,
+                timeout_at: sent_at.mono + Duration::from_secs(1),
+            });
+        }
+
+        let events = machine.poll_timeouts_at(now).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [
+                ClientEvent::EchoLoss { seq: 2, .. },
+                ClientEvent::EchoLoss { seq: 1, .. },
+                ClientEvent::EchoLoss { seq: 0, .. },
+            ]
+        ));
+        assert_eq!(active(&machine).pending.len(), 0);
+        assert_eq!(active(&machine).timed_out.len(), 3);
     }
 
     #[test]

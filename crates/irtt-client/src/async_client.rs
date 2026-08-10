@@ -27,7 +27,7 @@ use crate::{
     receive::try_recv_tokio_datagram,
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
-        PreparedProbe, SessionMachine, MAX_OPEN_PACKET_SIZE,
+        PreparedProbe, SessionMachine, TimeoutBatch, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_tokio_udp_socket, resolve_remote_tokio, validate_open_timeouts},
     socket_options::{apply_dscp_to_tokio_socket, clear_dscp_on_tokio_socket},
@@ -298,6 +298,14 @@ impl AsyncClient {
     /// Poll protocol timeouts using the caller's monotonic timestamp.
     pub fn poll_timeouts_at(&mut self, now: Instant) -> Result<Vec<ClientEvent>, ClientError> {
         self.machine.poll_timeouts_at(now)
+    }
+
+    pub(crate) fn poll_timeouts_bounded_at(
+        &mut self,
+        now: Instant,
+        limit: usize,
+    ) -> Result<TimeoutBatch, ClientError> {
+        self.machine.poll_timeouts_bounded_at(now, limit)
     }
 
     /// Send the retained close packet and commit local close exactly once.
@@ -763,6 +771,19 @@ impl AsyncClient {
     #[cfg(test)]
     pub(crate) fn poll_recv_ready_for_test(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.socket.poll_recv_ready(cx)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn remove_pending_for_test(
+        &mut self,
+        wire_seq: u32,
+    ) -> Option<crate::probe::PendingProbe> {
+        self.machine.remove_pending_for_test(wire_seq)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_pending_for_test(&mut self, probe: crate::probe::PendingProbe) {
+        self.machine.replace_pending_for_test(probe);
     }
 
     pub(crate) fn skip_missed_probe_slots_at(&mut self, now: Instant) -> Result<(), ClientError> {

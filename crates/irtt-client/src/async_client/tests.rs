@@ -16,7 +16,10 @@ use irtt_proto::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::*;
-use crate::{socket_options::tokio_socket_traffic_class, Client, RunMode, SocketConfig};
+use crate::{
+    probe::PendingProbe, socket_options::tokio_socket_traffic_class, Client, ClientTimestamp,
+    RunMode, SocketConfig,
+};
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -706,6 +709,35 @@ fn probe_false_readiness_resamples_all_timestamps() {
         ));
     });
     assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn public_timeout_polling_remains_exhaustive() {
+    let server = start_open_server(None, 0);
+    runtime().block_on(async {
+        let mut client = opened_client(server.addr, 0).await;
+        let now = Instant::now();
+        for seq in 0..3 {
+            client.replace_pending_for_test(PendingProbe {
+                wire_seq: seq,
+                sent_at: ClientTimestamp {
+                    mono: now - Duration::from_secs(2),
+                    wall: SystemTime::UNIX_EPOCH,
+                },
+                timeout_at: now - Duration::from_secs(1),
+            });
+        }
+
+        assert!(matches!(
+            client.poll_timeouts_at(now).unwrap().as_slice(),
+            [
+                ClientEvent::EchoLoss { seq: 0, .. },
+                ClientEvent::EchoLoss { seq: 1, .. },
+                ClientEvent::EchoLoss { seq: 2, .. },
+            ]
+        ));
+    });
+    assert_eq!(server.finish().len(), 1);
 }
 
 #[test]
