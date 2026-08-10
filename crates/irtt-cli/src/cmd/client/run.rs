@@ -69,14 +69,14 @@ pub fn run_stream(
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let continuous = args.is_continuous();
+    let target_count = targets.len();
     #[cfg(feature = "stats")]
-    if let Some(warning) = finite_stats_memory_warning(&args) {
+    if let Some(warning) = finite_stats_memory_warning(&args, target_count) {
         eprintln!("{warning}");
     }
     if is_shutdown_requested(shutdown_requested) {
         return Ok(());
     }
-    let target_count = targets.len();
     let config = ManagedClientConfig {
         client: args.to_client_config(),
         pacing: args.pacing.into(),
@@ -409,12 +409,14 @@ fn stats_config(continuous: bool) -> StatsConfig {
     }
 }
 #[cfg(feature = "stats")]
-fn finite_stats_memory_warning(args: &ClientArgs) -> Option<String> {
+fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option<String> {
     if args.is_continuous() || args.duration.is_zero() {
         return None;
     }
+    let target_count = u64::try_from(target_count).unwrap_or(u64::MAX);
     let estimated_bytes = expected_probe_count(args.duration, args.interval)
-        .saturating_mul(FINITE_STATS_BYTES_PER_PROBE);
+        .saturating_mul(FINITE_STATS_BYTES_PER_PROBE)
+        .saturating_mul(target_count);
     if estimated_bytes < FINITE_STATS_MEMORY_WARNING_BYTES {
         return None;
     }
@@ -440,6 +442,49 @@ mod tests {
         ManagedTargetFailure, ManagedTargetFailureKind, ManagedTargetFailurePhase, TargetId,
     };
     use std::sync::Arc;
+
+    #[cfg(feature = "stats")]
+    #[test]
+    fn finite_stats_memory_warning_accounts_for_target_count() {
+        use clap::Parser;
+
+        let args = ClientArgs::try_parse_from([
+            "irtt-cli",
+            "--duration",
+            "4200s",
+            "--interval",
+            "100ms",
+            "127.0.0.1:2112",
+        ])
+        .unwrap();
+
+        assert!(
+            finite_stats_memory_warning(&args, 1).is_none(),
+            "a single target's estimate should stay below the warning threshold"
+        );
+        assert!(
+            finite_stats_memory_warning(&args, 7).is_some(),
+            "seven targets' aggregate estimate should cross the warning threshold"
+        );
+    }
+
+    #[cfg(feature = "stats")]
+    #[test]
+    fn finite_stats_memory_warning_saturates_target_count_multiplication() {
+        use clap::Parser;
+
+        let args = ClientArgs::try_parse_from([
+            "irtt-cli",
+            "--duration",
+            "4200s",
+            "--interval",
+            "100ms",
+            "127.0.0.1:2112",
+        ])
+        .unwrap();
+
+        assert!(finite_stats_memory_warning(&args, usize::MAX).is_some());
+    }
 
     #[test]
     fn lagged_events_are_counted_saturatingly() {
