@@ -416,6 +416,12 @@ struct TargetRuntime {
     state: TargetState,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct TimeoutBacklogEntry {
+    index: usize,
+    generation: u64,
+}
+
 struct PlannedTarget {
     target: ManagedTargetConfig,
     client_config: ClientConfig,
@@ -575,6 +581,7 @@ pub struct ManagedClientTask {
     timer: Option<Pin<Box<Sleep>>>,
     cursor: usize,
     timeout_cursor: usize,
+    timeout_backlog: VecDeque<TimeoutBacklogEntry>,
     scan_remaining: usize,
     send_cursor: usize,
     burst_remaining: usize,
@@ -1728,8 +1735,11 @@ impl ManagedClientTask {
             return false;
         }
 
-        let mut more_due = false;
-        for _ in 0..TIMEOUT_WORK_BUDGET {
+        let mut transitions_remaining = TIMEOUT_WORK_BUDGET;
+        for _ in 0..target_len.min(TIMEOUT_WORK_BUDGET) {
+            if transitions_remaining == 0 {
+                break;
+            }
             let index = self.timeout_cursor;
             self.timeout_cursor = (self.timeout_cursor + 1) % target_len;
             #[cfg(test)]
@@ -1737,12 +1747,49 @@ impl ManagedClientTask {
                 self.timeout_inspections += 1;
             }
             if self.target_has_due_timeout(index, now) {
+                let generation = self.targets[index].instance.generation;
                 let step = self.poll_target_timeout(index, now);
-                more_due |= step.more_due;
+                transitions_remaining -= 1;
+                if step.more_due {
+                    self.enqueue_timeout_backlog(index, generation);
+                }
             }
         }
 
-        more_due
+        while transitions_remaining > 0 {
+            let Some(entry) = self.timeout_backlog.pop_front() else {
+                break;
+            };
+            let valid = self
+                .targets
+                .get(entry.index)
+                .is_some_and(|target| target.instance.generation == entry.generation)
+                && self.target_has_due_timeout(entry.index, now);
+            if !valid {
+                continue;
+            }
+
+            let step = self.poll_target_timeout(entry.index, now);
+            transitions_remaining -= 1;
+            if step.more_due {
+                self.enqueue_timeout_backlog(entry.index, entry.generation);
+            }
+        }
+
+        !self.timeout_backlog.is_empty()
+    }
+
+    fn enqueue_timeout_backlog(&mut self, index: usize, generation: u64) {
+        if self.timeout_backlog.len() == TIMEOUT_WORK_BUDGET
+            || self
+                .timeout_backlog
+                .iter()
+                .any(|entry| entry.index == index && entry.generation == generation)
+        {
+            return;
+        }
+        self.timeout_backlog
+            .push_back(TimeoutBacklogEntry { index, generation });
     }
 
     fn target_has_due_timeout(&self, index: usize, now: Instant) -> bool {
@@ -2085,7 +2132,9 @@ impl Future for ManagedClientTask {
         }
 
         immediate |= this.register_stop_wake(cx);
-        immediate |= this.register_timer(cx);
+        if !immediate {
+            immediate |= this.register_timer(cx);
+        }
         if immediate {
             cx.waker().wake_by_ref();
         }
@@ -2253,6 +2302,7 @@ fn build_task(
         timer: None,
         cursor: 0,
         timeout_cursor: 0,
+        timeout_backlog: VecDeque::with_capacity(TIMEOUT_WORK_BUDGET),
         scan_remaining: 0,
         send_cursor: 0,
         burst_remaining: 0,
