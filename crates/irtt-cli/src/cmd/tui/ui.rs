@@ -550,7 +550,7 @@ impl TuiTargetState {
             session: None,
             status: TargetStatus::Opening,
             negotiated: None,
-            graph_history: VecDeque::with_capacity(HISTORY_LIMIT),
+            graph_history: VecDeque::new(),
             last_sample: None,
             last_warning: None,
             stats: StatsCollector::new(stats_config),
@@ -1019,6 +1019,11 @@ pub(super) struct LastSample {
 fn push_bounded<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
     if items.len() == limit {
         items.pop_front();
+    } else if items.len() == items.capacity() && items.capacity() >= limit / 2 {
+        // Growth is naturally exponential; once we're within reach of `limit`,
+        // reserve exactly up to it instead of letting the next doubling step
+        // overshoot it for long-running, heavily populated buffers.
+        items.reserve_exact(limit - items.len());
     }
     items.push_back(item);
 }
@@ -2224,6 +2229,11 @@ mod tests {
         assert_eq!(
             target.stats.snapshot().packets.unique_replies,
             HISTORY_LIMIT as u64 + 3
+        );
+        assert!(
+            target.graph_history.capacity() < HISTORY_LIMIT + HISTORY_LIMIT / 10,
+            "expected saturated history capacity to stay close to the limit, got {}",
+            target.graph_history.capacity()
         );
     }
 
