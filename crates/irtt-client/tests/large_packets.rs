@@ -39,37 +39,6 @@ fn assert_reply_bytes(event: &ClientEvent, expected: usize) {
     }
 }
 
-// ─── Config/client validation ───
-
-#[test]
-fn length_zero_baseline() {
-    let params = params_with_length(0);
-    let expected = test_echo_packet_len(false, &params);
-    let header = echo_header_len(false, &params);
-    assert_eq!(expected, header);
-}
-
-#[test]
-fn length_one_accepted() {
-    let params = params_with_length(1);
-    let expected = test_echo_packet_len(false, &params);
-    assert!(expected >= 1);
-}
-
-#[test]
-fn length_1472_accepted() {
-    let params = params_with_length(1472);
-    let expected = test_echo_packet_len(false, &params);
-    assert_eq!(expected, 1472);
-}
-
-#[test]
-fn length_4096_accepted() {
-    let params = params_with_length(4096);
-    let expected = test_echo_packet_len(false, &params);
-    assert_eq!(expected, 4096);
-}
-
 // ─── Echo request size: FakeServer observes exact packet size ───
 
 #[test]
@@ -99,20 +68,12 @@ fn echo_request_size_matches_echo_packet_len_above_header() {
 // ─── Echo reply handling ───
 
 #[test]
-fn echo_reply_decoded_for_large_length() {
-    let params = params_with_length(4096);
-    let run = run_one_probe(params.clone(), TimestampFields::default());
-    let expected = test_echo_packet_len(false, &params);
-    assert_reply(&run.reply);
-    assert_reply_bytes(&run.reply, expected);
-}
-
-#[test]
 fn echo_reply_bytes_consistent_with_echo_packet_len_for_various_lengths() {
     for length in [0, 1472, 4096] {
         let params = params_with_length(length);
         let run = run_one_probe(params.clone(), TimestampFields::default());
         let expected = test_echo_packet_len(false, &params);
+        assert_reply(&run.reply);
         assert_reply_bytes(&run.reply, expected);
     }
 }

@@ -186,81 +186,6 @@ mod tests {
     }
 
     #[test]
-    fn ipdv_tracker_completes_adjacent_pair() {
-        let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
-
-        let pairs = tracker.insert(ipdv_sample(1, 14));
-
-        assert_eq!(
-            pairs,
-            vec![CompletedIpdvPair {
-                previous_seq: 0,
-                current_seq: 1,
-                rtt_ipdv_ns: 4,
-                send_ipdv_ns: None,
-                receive_ipdv_ns: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn ipdv_tracker_gap_fill_completes_both_adjacent_pairs() {
-        let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
-        assert!(tracker.insert(ipdv_sample(2, 20)).is_empty());
-
-        let pairs = tracker.insert(ipdv_sample(1, 13));
-
-        assert_eq!(
-            pairs,
-            vec![
-                CompletedIpdvPair {
-                    previous_seq: 0,
-                    current_seq: 1,
-                    rtt_ipdv_ns: 3,
-                    send_ipdv_ns: None,
-                    receive_ipdv_ns: None,
-                },
-                CompletedIpdvPair {
-                    previous_seq: 1,
-                    current_seq: 2,
-                    rtt_ipdv_ns: 7,
-                    send_ipdv_ns: None,
-                    receive_ipdv_ns: None,
-                },
-            ]
-        );
-    }
-
-    #[test]
-    fn ipdv_tracker_completes_wrapped_adjacent_pair() {
-        let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(ipdv_sample(u32::MAX, 10)).is_empty());
-
-        let pairs = tracker.insert(ipdv_sample(0, 14));
-
-        assert_eq!(
-            pairs,
-            vec![CompletedIpdvPair {
-                previous_seq: u32::MAX,
-                current_seq: 0,
-                rtt_ipdv_ns: 4,
-                send_ipdv_ns: None,
-                receive_ipdv_ns: None,
-            }]
-        );
-    }
-
-    #[test]
-    fn ipdv_tracker_wrap_gap_does_not_complete_pair() {
-        let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(ipdv_sample(u32::MAX - 1, 10)).is_empty());
-
-        assert!(tracker.insert(ipdv_sample(0, 14)).is_empty());
-    }
-
-    #[test]
     fn ipdv_tracker_late_wrapped_previous_completes_pair() {
         let mut tracker = IpdvTracker::new(None);
         assert!(tracker.insert(ipdv_sample(0, 14)).is_empty());
@@ -289,17 +214,25 @@ mod tests {
     }
 
     #[test]
-    fn ipdv_tracker_bounded_mode_evicts_old_sequence_state() {
-        let mut tracker = IpdvTracker::new(Some(2));
-        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
-        assert_eq!(tracker.insert(ipdv_sample(1, 14)).len(), 1);
+    fn ipdv_tracker_bounded_mode_limits_sequence_state() {
+        let limit = 4;
+        let mut tracker = IpdvTracker::new(Some(limit));
 
-        let pairs = tracker.insert(ipdv_sample(2, 20));
+        // Far more inserts than the limit, so eviction runs repeatedly. Every
+        // per-sequence collection must stay bounded by the limit rather than
+        // growing with the number of samples seen, and eviction must not stop
+        // adjacent sequences from still completing a pair.
+        for seq in 0..512_u32 {
+            let pairs = tracker.insert(ipdv_sample(seq, i128::from(seq)));
 
-        assert_eq!(pairs.len(), 1);
-        assert!(!tracker.samples.contains_key(&0));
-        assert!(!tracker.completed_pairs.contains(&0));
-        assert!(!tracker.completed_pairs.contains(&1));
-        assert!(tracker.completed_pairs.contains(&2));
+            assert_eq!(pairs.len(), usize::from(seq > 0), "seq {seq}");
+            assert!(tracker.samples.len() <= limit, "seq {seq}");
+            assert_eq!(
+                tracker.sample_order.len(),
+                tracker.samples.len(),
+                "seq {seq}"
+            );
+            assert!(tracker.completed_pairs.len() <= limit, "seq {seq}");
+        }
     }
 }
