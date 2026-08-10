@@ -600,6 +600,8 @@ pub struct ManagedClientTask {
     drain_test_hook: DrainTestHook,
     #[cfg(test)]
     timeout_inspections: usize,
+    #[cfg(test)]
+    deadline_inspections: usize,
 }
 
 #[cfg(test)]
@@ -1894,7 +1896,11 @@ impl ManagedClientTask {
             .all(|target| matches!(target.state, TargetState::Terminal))
     }
 
-    fn next_deadline(&self) -> Option<Instant> {
+    fn next_deadline(&mut self) -> Option<Instant> {
+        #[cfg(test)]
+        {
+            self.deadline_inspections += self.targets.len();
+        }
         let mut non_send_deadline = None;
         let mut send_deadline = None;
         for target in &self.targets {
@@ -2321,6 +2327,8 @@ fn build_task(
         drain_test_hook: DrainTestHook::default(),
         #[cfg(test)]
         timeout_inspections: 0,
+        #[cfg(test)]
+        deadline_inspections: 0,
     };
     let handle = ManagedClientHandle {
         stop,
