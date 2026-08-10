@@ -1,8 +1,8 @@
 use super::*;
 use irtt_proto::{
-    compute_hmac_in_place, echo_packet_len as checked_echo_packet_len, flags::FLAG_HMAC,
-    flags::FLAG_OPEN, flags::FLAG_REPLY, layout::PacketLayout, Clock, ReceivedStats, StampAt,
-    HMAC_SIZE, MAGIC,
+    echo_packet_len as checked_echo_packet_len, encode_echo_reply, encode_open_reply,
+    flags::FLAG_OPEN, flags::FLAG_REPLY, layout::PacketLayout, Clock, EchoReply, OpenReply,
+    ReceivedStats, StampAt,
 };
 use std::{
     net::UdpSocket,
@@ -61,18 +61,15 @@ pub(super) fn open_reply(
     params: &Params,
     hmac_key: Option<&[u8]>,
 ) -> Vec<u8> {
-    let mut packet = Vec::new();
-    packet.extend_from_slice(&MAGIC);
-    packet.push(flags | hmac_key.map_or(0, |_| FLAG_HMAC));
-    if hmac_key.is_some() {
-        packet.extend_from_slice(&[0_u8; HMAC_SIZE]);
-    }
-    packet.extend_from_slice(&token.to_le_bytes());
-    packet.extend_from_slice(&params.encode());
-    if let Some(key) = hmac_key {
-        compute_hmac_in_place(key, &mut packet, HMAC_OFFSET).unwrap();
-    }
-    packet
+    encode_open_reply(
+        &OpenReply {
+            flags,
+            token,
+            params: params.clone(),
+        },
+        hmac_key,
+    )
+    .unwrap()
 }
 
 pub(crate) fn echo_packet_len(hmac: bool, params: &Params) -> usize {
@@ -98,55 +95,28 @@ pub(super) fn echo_reply_packet_with_flags(
     hmac_key: Option<&[u8]>,
     flags: u8,
 ) -> Vec<u8> {
-    let has_hmac = hmac_key.is_some();
-    let layout = PacketLayout::echo(has_hmac, params);
-    let packet_len = echo_packet_len(has_hmac, params);
-    let mut packet = Vec::with_capacity(packet_len);
-
-    let mut flags = flags;
-    if has_hmac {
-        flags |= FLAG_HMAC;
-    }
-    packet.extend_from_slice(&MAGIC);
-    packet.push(flags);
-    if has_hmac {
-        packet.extend_from_slice(&[0_u8; HMAC_SIZE]);
-    }
-    packet.extend_from_slice(&token.to_le_bytes());
-    packet.extend_from_slice(&seq.to_le_bytes());
-
-    if layout.recv_count {
-        packet.extend_from_slice(&42_u32.to_le_bytes());
-    }
-    if layout.recv_window {
-        packet.extend_from_slice(&0x07_u64.to_le_bytes());
-    }
-
-    if layout.recv_wall {
-        packet.extend_from_slice(&timestamps.recv_wall.unwrap_or(0).to_le_bytes());
-    }
-    if layout.recv_mono {
-        packet.extend_from_slice(&timestamps.recv_mono.unwrap_or(0).to_le_bytes());
-    }
-    if layout.midpoint_wall {
-        packet.extend_from_slice(&timestamps.midpoint_wall.unwrap_or(0).to_le_bytes());
-    }
-    if layout.midpoint_mono {
-        packet.extend_from_slice(&timestamps.midpoint_mono.unwrap_or(0).to_le_bytes());
-    }
-    if layout.send_wall {
-        packet.extend_from_slice(&timestamps.send_wall.unwrap_or(0).to_le_bytes());
-    }
-    if layout.send_mono {
-        packet.extend_from_slice(&timestamps.send_mono.unwrap_or(0).to_le_bytes());
-    }
-
-    packet.resize(packet_len, 0);
-
-    if let Some(key) = hmac_key {
-        compute_hmac_in_place(key, &mut packet, HMAC_OFFSET).unwrap();
-    }
-    packet
+    let layout = PacketLayout::echo(hmac_key.is_some(), params);
+    let reply = EchoReply {
+        flags,
+        token,
+        sequence: seq,
+        recv_count: layout.recv_count.then_some(42),
+        recv_window: layout.recv_window.then_some(0x07),
+        timestamps: TimestampFields {
+            recv_wall: layout.recv_wall.then(|| timestamps.recv_wall.unwrap_or(0)),
+            recv_mono: layout.recv_mono.then(|| timestamps.recv_mono.unwrap_or(0)),
+            midpoint_wall: layout
+                .midpoint_wall
+                .then(|| timestamps.midpoint_wall.unwrap_or(0)),
+            midpoint_mono: layout
+                .midpoint_mono
+                .then(|| timestamps.midpoint_mono.unwrap_or(0)),
+            send_wall: layout.send_wall.then(|| timestamps.send_wall.unwrap_or(0)),
+            send_mono: layout.send_mono.then(|| timestamps.send_mono.unwrap_or(0)),
+        },
+        payload: Vec::new(),
+    };
+    encode_echo_reply(&reply, params, hmac_key).unwrap()
 }
 
 pub(super) fn open_success_server(params: Params) -> FakeServer {
