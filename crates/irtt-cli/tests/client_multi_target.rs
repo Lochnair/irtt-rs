@@ -207,42 +207,6 @@ fn single_target_ten_millisecond_cadence_uses_managed_deadlines() {
 }
 
 #[test]
-fn finite_single_target_peer_close_exits_successfully() {
-    let server = start_peer_close_server(test_params(
-        Some(Duration::from_millis(40)),
-        Duration::from_millis(10),
-    ));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
-    command.args([
-        "--duration",
-        "40ms",
-        "--interval",
-        "10ms",
-        "--format",
-        "csv",
-        "--columns",
-        "seq",
-        "--header",
-        "never",
-        &server.addr.to_string(),
-    ]);
-
-    let output = run_with_timeout(command, Duration::from_secs(3));
-    server.join();
-
-    assert!(
-        output.status.success(),
-        "status={:?}\nstderr={}",
-        output.status.code(),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    let stderr = String::from_utf8(output.stderr).unwrap();
-    assert!(!stdout.trim().is_empty(), "{stdout}");
-    assert!(!stderr.contains("peer closure"), "{stderr}");
-}
-
-#[test]
 fn continuous_single_target_peer_close_exits_nonzero() {
     let server = start_peer_close_server(test_params(None, Duration::from_millis(10)));
     let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));

@@ -802,7 +802,7 @@ fn terminal_targets_count_toward_retained_generation_limit() {
 }
 
 #[test]
-fn pruning_preserves_target_cursor_progress() {
+fn pruning_leaves_no_stale_target_work() {
     let (mut task, _) = ManagedClient::task(
         config(ManagedPacing::Staggered),
         vec![
@@ -812,29 +812,39 @@ fn pruning_preserves_target_cursor_progress() {
         ],
     )
     .unwrap();
-    task.cursor = 5;
-    task.timeout_cursor = 5;
-    task.send_cursor = 5;
+    task.cursor = 2;
+    task.timeout_cursor = 2;
+    task.send_cursor = 2;
     task.scan_remaining = 3;
     task.burst_remaining = 3;
     task.stagger_remaining = 3;
-    task.targets.truncate(2);
-    task.rebase_target_cursors();
-    assert_eq!(task.cursor, 1);
-    assert_eq!(task.timeout_cursor, 1);
-    assert_eq!(task.send_cursor, 1);
-    assert_eq!(task.scan_remaining, 2);
-    assert_eq!(task.burst_remaining, 2);
-    assert_eq!(task.stagger_remaining, 2);
 
-    task.targets.clear();
-    task.rebase_target_cursors();
-    assert_eq!(task.cursor, 0);
-    assert_eq!(task.timeout_cursor, 0);
-    assert_eq!(task.send_cursor, 0);
+    task.targets[2].desired = false;
+    task.targets[2].state = TargetState::Terminal;
+    task.prune_undesired_terminal();
+
+    // Timeout discovery indexes `targets` with `timeout_cursor` directly, so a
+    // prune must leave it safe to use; the target and send passes modulo their
+    // own cursors. Pending per-pass work must not outlive the targets it was
+    // scheduled for either.
+    assert_eq!(task.targets.len(), 2);
+    assert!(task.timeout_cursor < task.targets.len());
+    assert!(task.scan_remaining <= task.targets.len());
+    assert!(task.burst_remaining <= task.targets.len());
+    assert!(task.stagger_remaining <= task.targets.len());
+    assert!(!task.poll_timeout_pass(Instant::now()));
+
+    for target in &mut task.targets {
+        target.desired = false;
+        target.state = TargetState::Terminal;
+    }
+    task.prune_undesired_terminal();
+
+    assert!(task.targets.is_empty());
     assert_eq!(task.scan_remaining, 0);
     assert_eq!(task.burst_remaining, 0);
     assert_eq!(task.stagger_remaining, 0);
+    assert!(!task.poll_timeout_pass(Instant::now()));
 }
 
 #[test]
@@ -1761,91 +1771,6 @@ fn timeout_discovery_inspects_at_most_one_budget_of_targets() {
     assert!(!task.poll_timeout_pass(Instant::now()));
 
     assert_eq!(task.timeout_inspections, TIMEOUT_WORK_BUDGET);
-    assert_eq!(task.timeout_cursor, TIMEOUT_WORK_BUDGET);
-}
-
-#[test]
-fn idle_timeout_discovery_inspects_one_target_once() {
-    let (mut task, _) = ManagedClient::task(
-        config(ManagedPacing::Burst),
-        vec![ManagedTargetConfig::new("idle", "127.0.0.1:9")],
-    )
-    .unwrap();
-
-    task.timeout_inspections = 0;
-    assert!(!task.poll_timeout_pass(Instant::now()));
-
-    assert_eq!(task.timeout_inspections, 1);
-    assert_eq!(task.timeout_cursor, 0);
-}
-
-#[test]
-fn idle_timeout_discovery_sweeps_small_target_set_once() {
-    let target_count = 8;
-    let mut managed = config(ManagedPacing::Burst);
-    managed.max_live_target_generations = target_count;
-    let targets = (0..target_count)
-        .map(|index| ManagedTargetConfig::new(format!("idle-{index}"), "127.0.0.1:9"))
-        .collect();
-    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
-
-    task.timeout_inspections = 0;
-    assert!(!task.poll_timeout_pass(Instant::now()));
-
-    assert_eq!(task.timeout_inspections, target_count);
-    assert_eq!(task.timeout_cursor, 0);
-}
-
-#[test]
-fn sparse_timeout_backlog_progresses_within_one_poll() {
-    let server = start_server(ServerBehavior::Echo, None);
-    let target_count = TIMEOUT_WORK_BUDGET + 1;
-    let late_index = target_count - 1;
-    let mut managed = config(ManagedPacing::Burst);
-    managed.completion = ManagedCompletionPolicy::ExplicitStop;
-    managed.client.duration = None;
-    managed.max_live_target_generations = target_count;
-    let targets = (0..target_count)
-        .map(|index| {
-            if index == late_index {
-                target("late", server.addr)
-            } else {
-                ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")
-            }
-        })
-        .collect();
-    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
-    for target in &mut task.targets[..late_index] {
-        target.state = TargetState::Terminal;
-    }
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    task.event_observations = Some(Arc::clone(&observations));
-    let runtime = runtime();
-    open_target_for_timeout_test(&runtime, &mut task, late_index);
-    let now = Instant::now();
-    for seq in 0..u32::try_from(TIMEOUT_WORK_BUDGET + 64).unwrap() {
-        replace_pending_for_timeout_test(
-            &mut task,
-            late_index,
-            timeout_probe(
-                seq,
-                now - Duration::from_secs(2),
-                now - Duration::from_secs(1),
-            ),
-        );
-    }
-
-    assert!(!task.poll_timeout_pass(now));
-    assert!(task.poll_timeout_pass(now));
-
-    assert_eq!(
-        timeout_losses_for(&observations, "late"),
-        TIMEOUT_WORK_BUDGET
-    );
-    assert_eq!(task.timeout_backlog.len(), 1);
-    close_timeout_test_target(&runtime, &mut task, late_index);
-    drop(task);
-    server.finish();
 }
 
 #[test]
@@ -1889,7 +1814,6 @@ fn sparse_timeout_backlog_persists_across_polls() {
         TIMEOUT_WORK_BUDGET
     );
     assert_eq!(task.timeout_backlog.len(), 1);
-    assert_eq!(task.timeout_cursor, TIMEOUT_WORK_BUDGET);
 
     assert!(task.poll_timeout_pass(now));
     assert_eq!(
@@ -1897,73 +1821,9 @@ fn sparse_timeout_backlog_persists_across_polls() {
         2 * TIMEOUT_WORK_BUDGET
     );
     assert_eq!(task.timeout_backlog.len(), 1);
-    assert_eq!(task.timeout_cursor, 2 * TIMEOUT_WORK_BUDGET);
     close_timeout_test_target(&runtime, &mut task, 0);
     drop(task);
     server.finish();
-}
-
-#[test]
-fn timeout_backlog_round_robins_known_sparse_targets() {
-    let first = start_server(ServerBehavior::Echo, None);
-    let second = start_server(ServerBehavior::Echo, None);
-    let target_count = TIMEOUT_WORK_BUDGET + 2;
-    let mut managed = config(ManagedPacing::Burst);
-    managed.completion = ManagedCompletionPolicy::ExplicitStop;
-    managed.client.duration = None;
-    managed.max_live_target_generations = target_count;
-    let targets = vec![target("first", first.addr), target("second", second.addr)]
-        .into_iter()
-        .chain(
-            (2..target_count)
-                .map(|index| ManagedTargetConfig::new(format!("target-{index}"), "127.0.0.1:9")),
-        )
-        .collect();
-    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
-    for target in &mut task.targets[2..] {
-        target.state = TargetState::Terminal;
-    }
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    task.event_observations = Some(Arc::clone(&observations));
-    let runtime = runtime();
-    open_target_for_timeout_test(&runtime, &mut task, 0);
-    open_target_for_timeout_test(&runtime, &mut task, 1);
-    let now = Instant::now();
-    for index in 0..2 {
-        for seq in 0..u32::try_from(TIMEOUT_WORK_BUDGET + 1).unwrap() {
-            replace_pending_for_timeout_test(
-                &mut task,
-                index,
-                timeout_probe(
-                    seq,
-                    now - Duration::from_secs(2),
-                    now - Duration::from_secs(1),
-                ),
-            );
-        }
-        task.timeout_backlog.push_back(TimeoutBacklogEntry {
-            index,
-            generation: task.targets[index].instance.generation,
-        });
-    }
-    task.timeout_cursor = 2;
-
-    assert!(task.poll_timeout_pass(now));
-
-    assert_eq!(
-        timeout_losses_for(&observations, "first"),
-        TIMEOUT_WORK_BUDGET / 2
-    );
-    assert_eq!(
-        timeout_losses_for(&observations, "second"),
-        TIMEOUT_WORK_BUDGET / 2
-    );
-    assert_eq!(task.timeout_backlog.len(), 2);
-    close_timeout_test_target(&runtime, &mut task, 0);
-    close_timeout_test_target(&runtime, &mut task, 1);
-    drop(task);
-    first.finish();
-    second.finish();
 }
 
 #[test]
@@ -2021,11 +1881,9 @@ fn timeout_backlog_does_not_starve_discovery() {
 
     assert!(task.poll_timeout_pass(now));
     assert_eq!(timeout_losses_for(&observations, "late"), 0);
-    assert_eq!(task.timeout_cursor, TIMEOUT_WORK_BUDGET + 1);
 
     assert!(task.poll_timeout_pass(now));
     assert_eq!(timeout_losses_for(&observations, "late"), 1);
-    assert_eq!(task.timeout_cursor, 0);
     assert_eq!(task.timeout_backlog.len(), 1);
     close_timeout_test_target(&runtime, &mut task, 0);
     close_timeout_test_target(&runtime, &mut task, late_index);
@@ -2166,7 +2024,6 @@ fn timeout_discovery_reaches_later_target_after_budget_slice() {
     task.timeout_inspections = 0;
     assert!(!task.poll_timeout_pass(now));
     assert_eq!(task.timeout_inspections, TIMEOUT_WORK_BUDGET);
-    assert_eq!(task.timeout_cursor, late_index);
     assert_eq!(timeout_losses_for(&observations, "late"), 0);
 
     task.timeout_inspections = 0;

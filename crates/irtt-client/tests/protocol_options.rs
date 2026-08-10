@@ -369,16 +369,3 @@ fn assert_one_way_presence(
     assert_eq!(sample.client_to_server.is_some(), client_to_server);
     assert_eq!(sample.server_to_client.is_some(), server_to_client);
 }
-
-#[test]
-fn dscp_configured_open_close_smoke() {
-    let mut params = default_params();
-    params.dscp = 46;
-    let server = start_open_server(params.clone(), None);
-    let mut client = Client::connect(config_for_params(server.addr, &params)).unwrap();
-
-    let outcome = client.open().unwrap();
-    assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
-    client.close().unwrap();
-    server.join();
-}

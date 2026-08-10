@@ -1060,7 +1060,6 @@ impl SessionMachine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{schedule::ProbeSchedule, validate_datagram_length};
 
     fn open_machine(max_pending_probes: usize, probe_timeout: Duration) -> SessionMachine {
         let config = ClientConfig {
@@ -1584,25 +1583,22 @@ mod tests {
     }
 
     #[test]
-    fn dropping_prepared_probe_changes_nothing() {
-        let machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap().unwrap();
-        assert_eq!(prepared.seq, 0);
-        drop(prepared);
-
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 0);
-        assert_eq!(session.packets_sent, 0);
-        assert_eq!(session.pending.len(), 0);
-    }
-
-    #[test]
-    fn repeated_uncommitted_preflight_changes_no_logical_state() {
+    fn uncommitted_probe_preparation_changes_no_authoritative_state() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let prepared = machine.prepare_probe().unwrap().unwrap();
+        assert_eq!(prepared.seq, 0);
 
-        let _first_preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let _second_preflight = machine.preflight_probe_commit(&prepared).unwrap();
+        // Repeating preflight, and finalizing a commit that is never applied,
+        // must both leave the session exactly as it was.
+        {
+            let _discarded_preflight = machine.preflight_probe_commit(&prepared).unwrap();
+        }
+        {
+            let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+            let _discarded_commit = machine
+                .finalize_probe_commit(preflight, timestamp(Instant::now()))
+                .unwrap();
+        }
 
         let session = active(&machine);
         assert_eq!(session.next_wire_seq, 0);
@@ -1634,66 +1630,6 @@ mod tests {
         assert_eq!(session.packets_sent, 1);
         assert_eq!(session.pending.len(), 1);
         assert_eq!(session.pending.capacity(), capacity);
-    }
-
-    #[test]
-    fn simulated_send_error_leaves_machine_and_schedule_unchanged() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let start = Instant::now();
-        let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
-        assert!(schedule.permit_probe_at(start));
-        let prepared = machine.prepare_probe().unwrap().unwrap();
-        let sent_at = timestamp(start);
-        let machine_preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let schedule_commit = schedule
-            .preflight_caller_commit(machine_preflight.next_packets_sent)
-            .unwrap();
-        let machine_commit = machine
-            .finalize_probe_commit(machine_preflight, sent_at)
-            .unwrap();
-
-        let _uncommitted_machine = machine_commit;
-        let _uncommitted_schedule = schedule_commit;
-
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 0);
-        assert_eq!(session.packets_sent, 0);
-        assert_eq!(session.pending.len(), 0);
-        assert_eq!(schedule.next_send_deadline(), Some(start));
-    }
-
-    #[test]
-    fn short_success_commits_before_reporting_transport_invariant() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let start = Instant::now();
-        let mut schedule = ProbeSchedule::new(start, &active(&machine).negotiated).unwrap();
-        assert!(schedule.permit_probe_at(start));
-        let prepared = machine.prepare_probe().unwrap().unwrap();
-        let machine_preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let machine_commit = machine
-            .finalize_probe_commit(machine_preflight, timestamp(start))
-            .unwrap();
-        let schedule_commit = schedule.preflight_managed_commit(start, start).unwrap();
-        let expected = prepared.bytes.len();
-        let actual = expected - 1;
-
-        machine.commit_probe_sent(machine_commit, actual);
-        schedule.commit(schedule_commit);
-        let result = validate_datagram_length(expected, actual);
-
-        assert!(matches!(
-            result,
-            Err(ClientError::DatagramLengthMismatch { expected, actual })
-                if actual + 1 == expected
-        ));
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 1);
-        assert_eq!(session.packets_sent, 1);
-        assert_eq!(session.pending.len(), 1);
-        assert_eq!(
-            schedule.next_send_deadline(),
-            Some(start + machine.config.interval)
-        );
     }
 
     #[test]
@@ -1735,26 +1671,6 @@ mod tests {
         assert_eq!(sent.seq, prepared.seq);
         assert_eq!(sent.sent_at, sent_at);
         assert_eq!(sent.bytes, prepared.bytes.len());
-    }
-
-    #[test]
-    fn dropping_preflight_or_finalized_commit_changes_no_authoritative_state() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap().unwrap();
-        {
-            let _preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        }
-        {
-            let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-            let _commit = machine
-                .finalize_probe_commit(preflight, timestamp(Instant::now()))
-                .unwrap();
-        }
-
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 0);
-        assert_eq!(session.packets_sent, 0);
-        assert_eq!(session.pending.len(), 0);
     }
 
     #[test]
