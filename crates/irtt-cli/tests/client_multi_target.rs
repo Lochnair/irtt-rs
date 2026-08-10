@@ -11,10 +11,11 @@ use std::{
 };
 
 use irtt_proto::{
-    echo_packet_len,
+    echo_packet_len, encode_echo_reply, encode_open_reply,
     flags::{FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
     layout::PacketLayout,
-    Clock, Params, ReceivedStats, StampAt, TimestampFields, MAGIC, PROTOCOL_VERSION,
+    Clock, EchoReply, OpenReply, Params, ReceivedStats, StampAt, TimestampFields, MAGIC,
+    PROTOCOL_VERSION,
 };
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
@@ -743,7 +744,7 @@ fn start_echo_server_inner(
             let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
             socket
                 .send_to(
-                    &echo_reply_packet(
+                    &echo_reply_fixture(
                         TOKEN,
                         seq,
                         &params,
@@ -784,7 +785,7 @@ fn start_observed_echo_server(params: Params) -> ObservedFakeServer {
             let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
             socket
                 .send_to(
-                    &echo_reply_packet(
+                    &echo_reply_fixture(
                         TOKEN,
                         seq,
                         &params,
@@ -824,7 +825,7 @@ fn start_interruptible_echo_server(params: Params) -> InterruptibleFakeServer {
             let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
             socket
                 .send_to(
-                    &echo_reply_packet(
+                    &echo_reply_fixture(
                         TOKEN,
                         seq,
                         &params,
@@ -878,7 +879,7 @@ fn start_synchronized_peer_close_server(
             .expect("timed out waiting to release synchronized peer-close reply");
         socket
             .send_to(
-                &echo_reply_packet(
+                &echo_reply_fixture(
                     TOKEN,
                     seq,
                     &params,
@@ -923,7 +924,7 @@ fn start_gated_peer_close_server(
         let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
         socket
             .send_to(
-                &echo_reply_packet(
+                &echo_reply_fixture(
                     TOKEN,
                     seq,
                     &params,
@@ -960,7 +961,7 @@ fn start_open_failure_server_inner(
     let done = thread::spawn(move || {
         let (_, peer) = recv_request(&socket);
         socket
-            .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, 0, &params), peer)
+            .send_to(&invalid_zero_token_open_reply(&params), peer)
             .unwrap();
         if let Some(tx) = failure_tx {
             tx.send(()).unwrap();
@@ -984,15 +985,30 @@ fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
 }
 
 fn open_reply(flags: u8, token: u64, params: &Params) -> Vec<u8> {
+    encode_open_reply(
+        &OpenReply {
+            flags,
+            token,
+            params: params.clone(),
+        },
+        None,
+    )
+    .unwrap()
+}
+
+/// Intentionally malformed: a zero-token OPEN|REPLY without FLAG_CLOSE, which
+/// `irtt_proto::encode_open_reply` correctly rejects (`ProtoError::ZeroToken`).
+/// Built by hand because this exercises non-compliant peer behavior.
+fn invalid_zero_token_open_reply(params: &Params) -> Vec<u8> {
     let mut packet = Vec::new();
     packet.extend_from_slice(&MAGIC);
-    packet.push(flags);
-    packet.extend_from_slice(&token.to_le_bytes());
+    packet.push(FLAG_OPEN | FLAG_REPLY);
+    packet.extend_from_slice(&0_u64.to_le_bytes());
     packet.extend_from_slice(&params.encode());
     packet
 }
 
-fn echo_reply_packet(
+fn echo_reply_fixture(
     token: u64,
     seq: u32,
     params: &Params,
@@ -1000,41 +1016,27 @@ fn echo_reply_packet(
     flags: u8,
 ) -> Vec<u8> {
     let layout = PacketLayout::echo(false, params);
-    let packet_len = echo_packet_len(false, params).unwrap();
-    let mut packet = Vec::with_capacity(packet_len);
-
-    packet.extend_from_slice(&MAGIC);
-    packet.push(flags);
-    packet.extend_from_slice(&token.to_le_bytes());
-    packet.extend_from_slice(&seq.to_le_bytes());
-
-    if layout.recv_count {
-        packet.extend_from_slice(&42_u32.to_le_bytes());
-    }
-    if layout.recv_window {
-        packet.extend_from_slice(&0_u64.to_le_bytes());
-    }
-    if layout.recv_wall {
-        packet.extend_from_slice(&timestamps.recv_wall.unwrap_or(0).to_le_bytes());
-    }
-    if layout.recv_mono {
-        packet.extend_from_slice(&timestamps.recv_mono.unwrap_or(0).to_le_bytes());
-    }
-    if layout.midpoint_wall {
-        packet.extend_from_slice(&timestamps.midpoint_wall.unwrap_or(0).to_le_bytes());
-    }
-    if layout.midpoint_mono {
-        packet.extend_from_slice(&timestamps.midpoint_mono.unwrap_or(0).to_le_bytes());
-    }
-    if layout.send_wall {
-        packet.extend_from_slice(&timestamps.send_wall.unwrap_or(0).to_le_bytes());
-    }
-    if layout.send_mono {
-        packet.extend_from_slice(&timestamps.send_mono.unwrap_or(0).to_le_bytes());
-    }
-
-    packet.resize(packet_len, 0);
-    packet
+    let reply = EchoReply {
+        flags,
+        token,
+        sequence: seq,
+        recv_count: layout.recv_count.then_some(42),
+        recv_window: layout.recv_window.then_some(0),
+        timestamps: TimestampFields {
+            recv_wall: layout.recv_wall.then(|| timestamps.recv_wall.unwrap_or(0)),
+            recv_mono: layout.recv_mono.then(|| timestamps.recv_mono.unwrap_or(0)),
+            midpoint_wall: layout
+                .midpoint_wall
+                .then(|| timestamps.midpoint_wall.unwrap_or(0)),
+            midpoint_mono: layout
+                .midpoint_mono
+                .then(|| timestamps.midpoint_mono.unwrap_or(0)),
+            send_wall: layout.send_wall.then(|| timestamps.send_wall.unwrap_or(0)),
+            send_mono: layout.send_mono.then(|| timestamps.send_mono.unwrap_or(0)),
+        },
+        payload: Vec::new(),
+    };
+    encode_echo_reply(&reply, params, None).unwrap()
 }
 
 fn test_params(duration: Option<Duration>, interval: Duration) -> Params {
