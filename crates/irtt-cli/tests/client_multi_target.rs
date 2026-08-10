@@ -4,7 +4,7 @@ use std::{
     io::Read,
     net::{SocketAddr, UdpSocket},
     process::{Command, Output, Stdio},
-    sync::{mpsc, Arc, Barrier},
+    sync::mpsc,
     thread,
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -425,9 +425,26 @@ fn finite_multi_target_peer_close_is_accepted_as_completion() {
 #[test]
 fn continuous_all_peer_closed_targets_exit_nonzero() {
     let params = test_params(None, Duration::from_millis(10));
-    let first_probe_barrier = Arc::new(Barrier::new(2));
-    let a = start_synchronized_peer_close_server(params.clone(), Arc::clone(&first_probe_barrier));
-    let b = start_synchronized_peer_close_server(params, first_probe_barrier);
+    let (a_seen_tx, a_seen_rx) = mpsc::channel();
+    let (a_release_tx, a_release_rx) = mpsc::channel();
+    let (b_seen_tx, b_seen_rx) = mpsc::channel();
+    let (b_release_tx, b_release_rx) = mpsc::channel();
+    let a = start_synchronized_peer_close_server(params.clone(), a_seen_tx, a_release_rx);
+    let b = start_synchronized_peer_close_server(params, b_seen_tx, b_release_rx);
+    let coordinator = thread::spawn(move || {
+        a_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("timed out waiting for target A's first probe");
+        b_seen_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("timed out waiting for target B's first probe");
+        a_release_tx
+            .send(())
+            .expect("target A stopped waiting for peer-close release");
+        b_release_tx
+            .send(())
+            .expect("target B stopped waiting for peer-close release");
+    });
     let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
     command.args([
         "--duration",
@@ -447,6 +464,7 @@ fn continuous_all_peer_closed_targets_exit_nonzero() {
     ]);
 
     let output = run_with_timeout(command, Duration::from_secs(3));
+    coordinator.join().unwrap();
     a.join();
     b.join();
 
@@ -863,7 +881,8 @@ fn start_peer_close_server(params: Params) -> FakeServer {
 
 fn start_synchronized_peer_close_server(
     params: Params,
-    first_probe_barrier: Arc<Barrier>,
+    first_probe_seen_tx: mpsc::Sender<()>,
+    release_peer_close_rx: mpsc::Receiver<()>,
 ) -> FakeServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
@@ -887,7 +906,12 @@ fn start_synchronized_peer_close_server(
             "expected a complete echo probe before synchronized peer-close reply"
         );
         let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
-        first_probe_barrier.wait();
+        first_probe_seen_tx
+            .send(())
+            .expect("peer-close coordinator stopped waiting for first probe");
+        release_peer_close_rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("timed out waiting to release synchronized peer-close reply");
         socket
             .send_to(
                 &echo_reply_packet(
