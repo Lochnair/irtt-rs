@@ -26,6 +26,7 @@ use irtt_client::managed::{
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_WAIT_SLICE: Duration = Duration::from_millis(20);
 const MANAGED_EVENT_CAPACITY: usize = 16_384;
+const INPUT_EVENT_WORK_BUDGET: usize = 128;
 
 pub fn run_tui(
     args: TuiArgs,
@@ -216,7 +217,10 @@ fn drain_final_tui_events(
 }
 fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Result<bool> {
     let mut force_render = false;
-    while event::poll(Duration::ZERO)? {
+    for _ in 0..INPUT_EVENT_WORK_BUDGET {
+        if !event::poll(Duration::ZERO)? {
+            break;
+        }
         let Event::Key(key) = event::read()? else {
             continue;
         };
@@ -231,6 +235,7 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
                 state.quit_requested = true;
                 shutdown_requested.store(true, Ordering::Relaxed);
                 force_render = true;
+                break;
             }
             KeyCode::Char('r') => {
                 state.clear_visible_history();
