@@ -229,8 +229,20 @@ pub struct PacketCounts {
     /// exposed separately.
     pub bytes_received: u64,
     /// Highest cumulative server-reported packets received, when available.
+    ///
+    /// This is the only server-reported input to the directional loss estimates
+    /// in [`LossStats`].
     pub server_packets_received: Option<u64>,
-    /// Server-reported receive window, when available.
+    /// Raw server-reported receive window from the most recently processed
+    /// reply that carried one, when available.
+    ///
+    /// The value is stored exactly as the server reported it and is not
+    /// interpreted by this crate. It is a bounded bitmap of recent server
+    /// receive history rather than a fixed 64-packet loss mask, so a value of
+    /// `0x1` means no earlier history is represented and not that the previous
+    /// 63 packets were lost. Replies are aggregated in local arrival order, so
+    /// a late reply can leave an older window here than an already-processed
+    /// reply carried.
     pub server_received_window: Option<u64>,
 }
 

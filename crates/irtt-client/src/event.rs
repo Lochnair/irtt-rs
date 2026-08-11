@@ -361,7 +361,10 @@ pub struct OneWayDelaySample {
 pub struct ReceivedStatsSample {
     /// Server-reported count of received packets, when available.
     pub count: Option<u32>,
-    /// Server-reported receive window value, when available.
+    /// Raw server-reported receive window bitmap, when available.
+    ///
+    /// The bitmap is preserved exactly as it appeared on the wire; the client
+    /// does not interpret its bits.
     pub window: Option<u64>,
 }
 

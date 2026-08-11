@@ -2,7 +2,9 @@ mod common;
 
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
-use common::{adjusted_reply, sent, ts, unadjusted_late_reply, unadjusted_reply};
+use common::{
+    adjusted_reply, reply_with_received_stats, sent, ts, unadjusted_late_reply, unadjusted_reply,
+};
 use irtt_client::{
     ClientEvent, ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, SignedDuration,
 };
@@ -376,6 +378,32 @@ fn empty_and_all_lost_edges_are_defined() {
     let all_lost = collector.snapshot();
     assert_eq!(all_lost.loss.lost_packets, 1);
     assert_eq!(all_lost.loss.packet_loss_percent, 100.0);
+}
+
+#[test]
+fn receive_window_is_stored_raw_and_never_drives_directional_loss() {
+    // Window-only negotiation: the server reports a bitmap but no receive count.
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    collector.process(&sent(0, ts(0)));
+    collector.process(&reply_with_received_stats(0, 10, None, Some(0x1)));
+
+    // `0x1` represents no earlier history. It must be preserved verbatim and
+    // must not be read as 63 lost packets or stand in for a receive count.
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.packets.server_received_window, Some(0x1));
+    assert_eq!(snapshot.packets.server_packets_received, None);
+    assert_eq!(snapshot.loss.upstream_loss_packets, None);
+    assert_eq!(snapshot.loss.downstream_loss_packets, None);
+    assert_eq!(snapshot.loss.upstream_loss_percent, 0.0);
+    assert_eq!(snapshot.loss.downstream_loss_percent, 0.0);
+
+    // An advancing bitmap is stored verbatim across the full 64-bit range.
+    collector.process(&sent(1, ts(10)));
+    collector.process(&reply_with_received_stats(1, 10, None, Some(u64::MAX)));
+    assert_eq!(
+        collector.snapshot().packets.server_received_window,
+        Some(u64::MAX)
+    );
 }
 
 #[test]
