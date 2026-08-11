@@ -123,7 +123,14 @@ fn hmac_close_success_sends_authenticated_close_and_closes_session() {
 
 #[test]
 fn hmac_required_server_rejects_missing_or_wrong_client_key() {
-    for (hmac_key, expected_hmac_flag) in [(None, false), (Some(b"wrong-secret".to_vec()), true)] {
+    // Both rejections leave the client timing out, but they are different
+    // failures on the wire: a client with no key presents no HMAC field at
+    // all, while a client with the wrong key presents one that does not
+    // authenticate.
+    for (hmac_key, expected_hmac_flag, expected_bad_hmac) in [
+        (None, false, false),
+        (Some(b"wrong-secret".to_vec()), true, true),
+    ] {
         let server_key = b"compat-secret".to_vec();
         let server = start_hmac_required_open_drop_server(server_key, Duration::from_millis(250));
         let mut config = config_for_params(server.addr, &default_params());
@@ -134,13 +141,13 @@ fn hmac_required_server_rejects_missing_or_wrong_client_key() {
         assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
 
         let observations = server.observations(1);
-        assert!(matches!(
+        assert_eq!(
             observations.as_slice(),
             [ServerObservation::RejectedHmac {
-                hmac,
-                bad_hmac: true
-            }] if *hmac == expected_hmac_flag
-        ));
+                hmac: expected_hmac_flag,
+                bad_hmac: expected_bad_hmac,
+            }]
+        );
         server.join();
     }
 }

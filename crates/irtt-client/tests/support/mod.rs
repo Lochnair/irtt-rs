@@ -12,9 +12,10 @@ use std::{
 
 use irtt_client::{Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, SocketConfig};
 use irtt_proto::{
-    compute_hmac_in_place, echo_packet_len, encode_echo_reply, encode_open_reply, flags,
-    verify_hmac, Clock, EchoReply, OpenReply, PacketLayout, Params, ProtoError, ReceivedStats,
-    ServerFill, StampAt, TimestampFields, HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
+    compute_hmac_in_place, decode_request, echo_packet_len, encode_echo_reply, encode_open_reply,
+    flags, verify_packet_hmac, Clock, DecodedRequest, DecodedRequestKind, EchoReply, OpenReply,
+    PacketLayout, Params, ProtoError, ReceivedStats, ServerFill, StampAt, TimestampFields,
+    HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
 };
 
 pub use real_irtt::RealIrtServer;
@@ -252,7 +253,7 @@ where
 pub fn start_open_server(params: Params, hmac_key: Option<Vec<u8>>) -> FakeServer {
     start_fake_server(move |socket, tx| {
         let (request, peer) = recv_request(&socket);
-        let (open_params, hmac) = decode_open_request_params(&request, hmac_key.as_deref());
+        let (open_params, hmac) = open_request_params(&request, hmac_key.as_deref());
         tx.send(ServerObservation::Open {
             params: open_params,
             hmac,
@@ -273,10 +274,11 @@ pub fn start_hmac_required_open_drop_server(key: Vec<u8>, wait: Duration) -> Fak
     start_fake_server(move |socket, tx| {
         socket.set_read_timeout(Some(wait)).unwrap();
         while let Some(request) = recv_request_timeout(&socket) {
-            let hmac = request
-                .get(3)
-                .is_some_and(|flags| flags & flags::FLAG_HMAC != 0);
-            match verify_hmac(&key, &request, HMAC_OFFSET) {
+            let hmac = decode_request(&request).is_ok_and(|request| request.hmac_present);
+            // A server with a key drops any request that fails authentication,
+            // whether it carried no HMAC field at all or a field signed with
+            // the wrong key.
+            match verify_packet_hmac(&key, &request) {
                 Ok(()) => {}
                 Err(error) => {
                     tx.send(ServerObservation::RejectedHmac {
@@ -293,7 +295,7 @@ pub fn start_hmac_required_open_drop_server(key: Vec<u8>, wait: Duration) -> Fak
 pub fn start_hmac_close_server(params: Params, key: Vec<u8>) -> FakeServer {
     start_fake_server(move |socket, tx| {
         let (request, peer) = recv_request(&socket);
-        let (open_params, hmac) = decode_open_request_params(&request, Some(&key));
+        let (open_params, hmac) = open_request_params(&request, Some(&key));
         tx.send(ServerObservation::Open {
             params: open_params,
             hmac,
@@ -323,7 +325,7 @@ pub fn start_hmac_close_server(params: Params, key: Vec<u8>) -> FakeServer {
 pub fn start_bad_hmac_echo_reply_server(params: Params, key: Vec<u8>) -> FakeServer {
     start_fake_server(move |socket, tx| {
         let (request, peer) = recv_request(&socket);
-        let (open_params, hmac) = decode_open_request_params(&request, Some(&key));
+        let (open_params, hmac) = open_request_params(&request, Some(&key));
         tx.send(ServerObservation::Open {
             params: open_params,
             hmac,
@@ -368,7 +370,7 @@ pub fn start_bad_hmac_open_reply_server(
 ) -> FakeServer {
     start_fake_server(move |socket, tx| {
         let (request, peer) = recv_request(&socket);
-        let (open_params, hmac) = decode_open_request_params(&request, Some(&request_key));
+        let (open_params, hmac) = open_request_params(&request, Some(&request_key));
         tx.send(ServerObservation::Open {
             params: open_params,
             hmac,
@@ -398,7 +400,7 @@ fn start_one_probe_server(
 ) -> FakeServer {
     start_fake_server(move |socket, tx| {
         let (request, peer) = recv_request(&socket);
-        let (open_params, hmac) = decode_open_request_params(&request, hmac_key.as_deref());
+        let (open_params, hmac) = open_request_params(&request, hmac_key.as_deref());
         tx.send(ServerObservation::Open {
             params: open_params,
             hmac,
@@ -463,52 +465,48 @@ fn assert_started(outcome: OpenOutcome) -> NegotiatedParams {
     }
 }
 
-fn decode_open_request_params(packet: &[u8], hmac_key: Option<&[u8]>) -> (Params, bool) {
-    assert_eq!(&packet[..3], &MAGIC);
-    assert!(packet[3] & flags::FLAG_OPEN != 0);
-    let hmac = packet[3] & flags::FLAG_HMAC != 0;
-    assert_eq!(hmac, hmac_key.is_some());
+/// Admits a request the way a compliant server does: structural decode first,
+/// then HMAC presence policy, then authentication.
+fn admit_request<'a>(packet: &'a [u8], hmac_key: Option<&[u8]>) -> DecodedRequest<'a> {
+    let request = decode_request(packet).expect("fake peers only receive well-formed requests");
+    assert_eq!(request.hmac_present, hmac_key.is_some());
     if let Some(key) = hmac_key {
-        verify_hmac(key, packet, HMAC_OFFSET).unwrap();
+        verify_packet_hmac(key, packet).unwrap();
     }
-    let params_offset = 4 + if hmac { HMAC_SIZE } else { 0 };
-    (Params::decode(&packet[params_offset..]).unwrap(), hmac)
+    request
+}
+
+fn open_request_params(packet: &[u8], hmac_key: Option<&[u8]>) -> (Params, bool) {
+    let request = admit_request(packet, hmac_key);
+    match request.kind {
+        DecodedRequestKind::Open { params, .. } => {
+            (Params::decode(params).unwrap(), request.hmac_present)
+        }
+        other => panic!("expected an open request, got {other:?}"),
+    }
 }
 
 fn observe_echo_request(packet: &[u8], hmac_key: Option<&[u8]>) -> ServerObservation {
-    assert_eq!(&packet[..3], &MAGIC);
-    assert_eq!(packet[3] & flags::FLAG_OPEN, 0);
-    assert_eq!(packet[3] & flags::FLAG_REPLY, 0);
-    assert_eq!(packet[3] & flags::FLAG_CLOSE, 0);
-    let hmac = packet[3] & flags::FLAG_HMAC != 0;
-    assert_eq!(hmac, hmac_key.is_some());
-    if let Some(key) = hmac_key {
-        verify_hmac(key, packet, HMAC_OFFSET).unwrap();
-    }
-
-    let mut pos = 4 + if hmac { HMAC_SIZE } else { 0 };
-    let token = u64::from_le_bytes(packet[pos..pos + 8].try_into().unwrap());
-    pos += 8;
-    let sequence = u32::from_le_bytes(packet[pos..pos + 4].try_into().unwrap());
-
-    ServerObservation::Echo {
-        len: packet.len(),
-        hmac,
-        token,
-        sequence,
+    let request = admit_request(packet, hmac_key);
+    match request.kind {
+        DecodedRequestKind::Echo {
+            token, sequence, ..
+        } => ServerObservation::Echo {
+            len: packet.len(),
+            hmac: request.hmac_present,
+            token,
+            sequence,
+        },
+        other => panic!("expected an echo request, got {other:?}"),
     }
 }
 
 fn observe_close_request(packet: &[u8], hmac_key: &[u8]) -> ServerObservation {
-    assert_eq!(&packet[..3], &MAGIC);
-    assert_eq!(packet[3] & flags::FLAG_CLOSE, flags::FLAG_CLOSE);
-    assert_eq!(packet[3] & flags::FLAG_HMAC, flags::FLAG_HMAC);
-    verify_hmac(hmac_key, packet, HMAC_OFFSET).unwrap();
-
-    let token_offset = 4 + HMAC_SIZE;
-    let token = u64::from_le_bytes(packet[token_offset..token_offset + 8].try_into().unwrap());
-
-    ServerObservation::Close { hmac: true, token }
+    let request = admit_request(packet, Some(hmac_key));
+    match request.kind {
+        DecodedRequestKind::Close { token } => ServerObservation::Close { hmac: true, token },
+        other => panic!("expected a close request, got {other:?}"),
+    }
 }
 
 // irtt-proto has no encode_close_reply/CloseReply API yet, so this stays a

@@ -1,9 +1,8 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use irtt_proto::{
-    close::CloseRequest, decode_echo_reply, echo_packet_len, encode_close_request,
-    encode_echo_request, encode_open_request, flags, EchoReply, EchoRequest, OpenReply,
-    OpenRequest, Params, ServerFill, TimestampFields, PROTOCOL_VERSION,
+    decode_echo_reply, echo_packet_len, encode_request, flags, EchoReply, OpenReply, Params,
+    RequestToEncode, ServerFill, TimestampFields, PROTOCOL_VERSION,
 };
 
 use crate::{
@@ -211,11 +210,13 @@ impl SessionMachine {
 
     pub(crate) fn prepare_open_request(&self) -> Result<PreparedOpenRequest, ClientError> {
         self.ensure_connected()?;
-        let request = OpenRequest {
-            params: self.requested.clone(),
-            close: self.config.run_mode == RunMode::NoTest,
-        };
-        let bytes = encode_open_request(&request, self.config.hmac_key.as_deref())?;
+        let bytes = encode_request(
+            RequestToEncode::Open {
+                params: &self.requested,
+                no_test: self.config.run_mode == RunMode::NoTest,
+            },
+            self.config.hmac_key.as_deref(),
+        )?;
         Ok(PreparedOpenRequest {
             bytes: bytes.into_boxed_slice(),
         })
@@ -252,8 +253,8 @@ impl SessionMachine {
 
         let reply_is_close = flags::has(reply.flags, flags::FLAG_CLOSE);
         let cleanup_close = if !reply_is_close && reply.token != 0 {
-            let bytes = encode_close_request(
-                &CloseRequest { token: reply.token },
+            let bytes = encode_request(
+                RequestToEncode::Close { token: reply.token },
                 self.config.hmac_key.as_deref(),
             )
             .map_err(ClientError::from)
@@ -310,14 +311,13 @@ impl SessionMachine {
 
     pub(crate) fn prepare_probe(&self) -> Result<Option<PreparedProbe>, ClientError> {
         let session = self.open_session()?;
-        let request = EchoRequest {
-            token: session.token,
-            sequence: session.next_wire_seq,
-            payload: vec![],
-        };
-        let bytes = encode_echo_request(
-            &request,
-            &session.negotiated.params,
+        let bytes = encode_request(
+            RequestToEncode::Echo {
+                token: session.token,
+                sequence: session.next_wire_seq,
+                params: &session.negotiated.params,
+                payload: &[],
+            },
             self.config.hmac_key.as_deref(),
         )?;
         Ok(Some(PreparedProbe {
@@ -1077,8 +1077,8 @@ mod tests {
         machine.state = MachineState::Open(Box::new(ActiveSession {
             token: 0x0102_0304_0506_0708,
             negotiated,
-            local_close_packet: encode_close_request(
-                &CloseRequest {
+            local_close_packet: encode_request(
+                RequestToEncode::Close {
                     token: 0x0102_0304_0506_0708,
                 },
                 None,
@@ -1452,8 +1452,8 @@ mod tests {
             let prepared = machine.prepare_close().unwrap();
             assert_eq!(
                 prepared.bytes,
-                encode_close_request(
-                    &CloseRequest {
+                encode_request(
+                    RequestToEncode::Close {
                         token: 0x0102_0304_0506_0708,
                     },
                     None,

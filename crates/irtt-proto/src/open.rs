@@ -7,51 +7,15 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenRequest {
-    pub params: Params,
-    pub close: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenReply {
     pub flags: u8,
     pub token: u64,
     pub params: Params,
 }
 
-pub fn encode_open_request(request: &OpenRequest, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
-    let mut flags = FLAG_OPEN;
-    if request.close {
-        flags |= FLAG_CLOSE;
-    }
-    let params = request.params.encode();
-    let mut out = envelope::begin(
-        flags,
-        hmac_key,
-        &[FlagRule::Require(FLAG_OPEN), FlagRule::Reject(FLAG_REPLY)],
-        PacketLayout::open_request(hmac_key.is_some()).header_len() + params.len(),
-    )?;
-    out.extend_from_slice(&params);
-    envelope::finish(out, hmac_key)
-}
-
-pub fn decode_open_request(packet: &[u8], hmac_key: Option<&[u8]>) -> Result<OpenRequest> {
-    let envelope = envelope::decode(
-        packet,
-        hmac_key,
-        &[FlagRule::Require(FLAG_OPEN), FlagRule::Reject(FLAG_REPLY)],
-    )?;
-    envelope::verify(packet, hmac_key)?;
-
-    Ok(OpenRequest {
-        params: Params::decode(&packet[envelope.body_offset..])?,
-        close: has(envelope.flags, FLAG_CLOSE),
-    })
-}
-
 pub fn encode_open_reply(reply: &OpenReply, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
     let params = reply.params.encode();
-    let mut out = envelope::begin(
+    let mut out = envelope::begin_checked(
         reply.flags,
         hmac_key,
         &[FlagRule::Require(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
@@ -114,42 +78,6 @@ mod tests {
             clock: Clock::Both,
             ..Params::default()
         }
-    }
-
-    #[test]
-    fn open_request_has_no_token() {
-        let packet = encode_open_request(
-            &OpenRequest {
-                params: default_params(),
-                close: false,
-            },
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(packet.len(), 24);
-        assert_eq!(&packet[..4], &[0x14, 0xa7, 0x5b, 0x01]);
-        assert_eq!(&packet[4..], &default_params().encode());
-    }
-
-    #[test]
-    fn hmac_open_request_inserts_hmac_before_params() {
-        let packet = encode_open_request(
-            &OpenRequest {
-                params: default_params(),
-                close: false,
-            },
-            Some(b"testkey"),
-        )
-        .unwrap();
-
-        assert_eq!(
-            packet.len(),
-            4 + HMAC_SIZE + default_params().encode().len()
-        );
-        assert_eq!(&packet[..4], &[0x14, 0xa7, 0x5b, FLAG_OPEN | FLAG_HMAC]);
-        assert_eq!(&packet[4 + HMAC_SIZE..], &default_params().encode());
-        hmac::verify_hmac(b"testkey", &packet, hmac::hmac_offset()).unwrap();
     }
 
     #[test]

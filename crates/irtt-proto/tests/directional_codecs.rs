@@ -1,10 +1,8 @@
 use irtt_proto::{
-    decode_close_request, decode_echo_reply, decode_echo_request, decode_open_reply,
-    decode_open_request, echo_packet_len, encode_close_request, encode_echo_reply,
-    encode_echo_request, encode_open_reply, encode_open_request, hmac::compute_hmac_in_place,
-    Clock, CloseRequest, EchoReply, EchoRequest, OpenReply, OpenRequest, PacketLayout, Params,
-    ProtoError, ReceivedStats, StampAt, TimestampFields, FLAG_CLOSE, FLAG_HMAC, FLAG_OPEN,
-    FLAG_REPLY, MAGIC,
+    decode_echo_reply, decode_open_reply, decode_request, echo_packet_len, encode_echo_reply,
+    encode_open_reply, encode_request, hmac::compute_hmac_in_place, Clock, DecodedRequestKind,
+    EchoReply, OpenReply, PacketLayout, Params, ProtoError, ReceivedStats, RequestToEncode,
+    StampAt, TimestampFields, FLAG_CLOSE, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY, MAGIC,
 };
 
 /// Wire offset of the HMAC digest within an ECHO reply: the fixed 4-byte
@@ -26,10 +24,11 @@ fn params() -> Params {
     }
 }
 
-fn echo_request(payload: Vec<u8>) -> EchoRequest {
-    EchoRequest {
+fn echo_request<'a>(params: &'a Params, payload: &'a [u8]) -> RequestToEncode<'a> {
+    RequestToEncode::Echo {
         token: TOKEN,
         sequence: 17,
+        params,
         payload,
     }
 }
@@ -120,21 +119,8 @@ fn peer_close_echo_reply_round_trips_without_a_close_reply_codec() {
 }
 
 #[test]
-fn inverse_codecs_supply_their_packet_type_rules() {
+fn reply_encoders_supply_their_packet_type_rules() {
     let params = Params::default();
-    let open_reply_packet = encode_open_reply(
-        &OpenReply {
-            flags: FLAG_OPEN | FLAG_REPLY,
-            token: TOKEN,
-            params: params.clone(),
-        },
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        decode_open_request(&open_reply_packet, None),
-        Err(ProtoError::UnexpectedFlag(FLAG_REPLY))
-    );
     assert_eq!(
         encode_open_reply(
             &OpenReply {
@@ -145,13 +131,6 @@ fn inverse_codecs_supply_their_packet_type_rules() {
             None,
         ),
         Err(ProtoError::MissingFlag(FLAG_OPEN))
-    );
-
-    let echo_reply_packet =
-        encode_echo_reply(&echo_reply(&params, FLAG_REPLY), &params, None).unwrap();
-    assert_eq!(
-        decode_echo_request(&echo_reply_packet, &params, None),
-        Err(ProtoError::UnexpectedFlag(FLAG_REPLY))
     );
     assert_eq!(
         encode_echo_reply(
@@ -164,37 +143,45 @@ fn inverse_codecs_supply_their_packet_type_rules() {
         ),
         Err(ProtoError::MissingFlag(FLAG_REPLY))
     );
+}
 
-    let close_packet = encode_close_request(&CloseRequest { token: TOKEN }, None).unwrap();
-    assert_eq!(
-        decode_echo_request(&close_packet, &params, None),
-        Err(ProtoError::UnexpectedFlag(FLAG_CLOSE))
-    );
+/// Every packet the reply encoders produce must be rejected by the inbound
+/// request decoder: a server never answers a datagram carrying `FLAG_REPLY`.
+#[test]
+fn encoded_replies_are_never_admitted_as_inbound_requests() {
+    let params = Params::default();
 
-    let no_test_packet = encode_open_request(
-        &OpenRequest {
-            params,
-            close: true,
-        },
-        None,
-    )
-    .unwrap();
-    assert_eq!(
-        decode_close_request(&no_test_packet, None),
-        Err(ProtoError::UnexpectedFlag(FLAG_OPEN))
-    );
+    for reply_flags in [FLAG_OPEN | FLAG_REPLY, FLAG_OPEN | FLAG_REPLY | FLAG_CLOSE] {
+        let packet = encode_open_reply(
+            &OpenReply {
+                flags: reply_flags,
+                token: if reply_flags & FLAG_CLOSE == 0 {
+                    TOKEN
+                } else {
+                    0
+                },
+                params: params.clone(),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            decode_request(&packet),
+            Err(ProtoError::UnexpectedFlag(FLAG_REPLY))
+        );
+    }
+
+    for reply_flags in [FLAG_REPLY, FLAG_REPLY | FLAG_CLOSE] {
+        let packet = encode_echo_reply(&echo_reply(&params, reply_flags), &params, None).unwrap();
+        assert_eq!(
+            decode_request(&packet),
+            Err(ProtoError::UnexpectedFlag(FLAG_REPLY))
+        );
+    }
 }
 
 #[test]
-fn codec_specific_malformed_bodies_and_exact_lengths_are_rejected() {
-    let mut malformed_open_request = MAGIC.to_vec();
-    malformed_open_request.push(FLAG_OPEN);
-    malformed_open_request.extend_from_slice(&[1, 0x80]);
-    assert_eq!(
-        decode_open_request(&malformed_open_request, None),
-        Err(ProtoError::TruncatedVarint)
-    );
-
+fn reply_bodies_are_decoded_semantically_and_reject_malformed_params() {
     let mut malformed_open_reply = MAGIC.to_vec();
     malformed_open_reply.push(FLAG_OPEN | FLAG_REPLY);
     malformed_open_reply.extend_from_slice(&TOKEN.to_le_bytes());
@@ -202,46 +189,6 @@ fn codec_specific_malformed_bodies_and_exact_lengths_are_rejected() {
     assert_eq!(
         decode_open_reply(&malformed_open_reply, None),
         Err(ProtoError::TruncatedVarint)
-    );
-
-    let params = Params {
-        length: 20,
-        ..Params::default()
-    };
-    let echo_packet = encode_echo_request(&echo_request(Vec::new()), &params, None).unwrap();
-    assert_eq!(
-        decode_echo_request(&echo_packet[..19], &params, None),
-        Err(ProtoError::PacketLengthMismatch {
-            expected: 20,
-            actual: 19,
-        })
-    );
-    let mut long_echo_packet = echo_packet;
-    long_echo_packet.push(0);
-    assert_eq!(
-        decode_echo_request(&long_echo_packet, &params, None),
-        Err(ProtoError::PacketLengthMismatch {
-            expected: 20,
-            actual: 21,
-        })
-    );
-
-    let close_packet = encode_close_request(&CloseRequest { token: TOKEN }, None).unwrap();
-    assert_eq!(
-        decode_close_request(&close_packet[..11], None),
-        Err(ProtoError::PacketLengthMismatch {
-            expected: 12,
-            actual: 11,
-        })
-    );
-    let mut long_close_packet = close_packet;
-    long_close_packet.push(0);
-    assert_eq!(
-        decode_close_request(&long_close_packet, None),
-        Err(ProtoError::PacketLengthMismatch {
-            expected: 12,
-            actual: 13,
-        })
     );
 }
 
@@ -323,17 +270,10 @@ fn echo_payload_is_copied_zero_filled_and_bounded_in_both_directions() {
         ..Params::default()
     };
 
-    let request = echo_request(vec![1, 2]);
-    let packet = encode_echo_request(&request, &params, None).unwrap();
+    let packet = encode_request(echo_request(&params, &[1, 2]), None).unwrap();
     assert_eq!(&packet[16..], &[1, 2, 0, 0]);
-    let decoded = decode_echo_request(&packet, &params, None).unwrap();
-    assert_eq!(decoded.payload, vec![1, 2, 0, 0]);
     assert_eq!(
-        encode_echo_request(&decoded, &params, None).unwrap(),
-        packet
-    );
-    assert_eq!(
-        encode_echo_request(&echo_request(vec![0; 5]), &params, None),
+        encode_request(echo_request(&params, &[0; 5]), None),
         Err(ProtoError::PayloadTooLarge {
             available: 4,
             provided: 5,
@@ -611,18 +551,23 @@ fn non_midpoint_stamp_at_has_no_longer_form_exception() {
     );
 }
 
+/// The midpoint compatibility length is a *reply* concept. An inbound ECHO
+/// request of that length is just a longer request, which a receiver accepts
+/// without applying any negotiated length rule.
 #[test]
-fn echo_request_decoding_rejects_the_compat_length() {
+fn echo_request_decoding_has_no_compat_length_rule() {
     let params = midpoint_params(Clock::Wall, 0);
-    let packet = encode_echo_request(&echo_request(Vec::new()), &params, None).unwrap();
+    let packet = encode_request(echo_request(&params, &[]), None).unwrap();
 
     let mut too_long = packet.clone();
     too_long.extend_from_slice(&[0; 8]);
+    let request = decode_request(&too_long).unwrap();
     assert_eq!(
-        decode_echo_request(&too_long, &params, None),
-        Err(ProtoError::PacketLengthMismatch {
-            expected: packet.len(),
-            actual: too_long.len(),
-        })
+        request.kind,
+        DecodedRequestKind::Echo {
+            token: TOKEN,
+            sequence: 17,
+            tail: &too_long[16..],
+        }
     );
 }

@@ -1,9 +1,9 @@
 use crate::{
     envelope::{self, FlagRule},
-    flags::{FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
+    flags::{FLAG_OPEN, FLAG_REPLY},
     layout::{echo_packet_len, PacketLayout},
     params::{Clock, Params, StampAt},
-    ProtoError, Result, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE, TOKEN_SIZE,
+    ProtoError, Result, SEQ_SIZE, TIMESTAMP_SIZE, TOKEN_SIZE,
 };
 
 /// Upstream irtt 0.9.1 always emits both midpoint timestamp fields (wall,
@@ -35,13 +35,6 @@ fn midpoint_compat_packet_len(layout: PacketLayout, normal_len: usize) -> usize 
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct EchoRequest {
-    pub token: u64,
-    pub sequence: u32,
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchoReply {
     pub flags: u8,
     pub token: u64,
@@ -62,69 +55,6 @@ pub struct TimestampFields {
     pub send_mono: Option<i64>,
 }
 
-pub fn encode_echo_request(
-    request: &EchoRequest,
-    params: &Params,
-    hmac_key: Option<&[u8]>,
-) -> Result<Vec<u8>> {
-    let layout = PacketLayout::echo(hmac_key.is_some(), params);
-    let len = echo_packet_len(hmac_key.is_some(), params)?;
-    let payload_offset = layout.header_len();
-    let available_payload_len = len.saturating_sub(payload_offset);
-    if request.payload.len() > available_payload_len {
-        return Err(ProtoError::PayloadTooLarge {
-            available: available_payload_len,
-            provided: request.payload.len(),
-        });
-    }
-    let mut out = envelope::begin(
-        0,
-        hmac_key,
-        &[
-            FlagRule::Reject(FLAG_OPEN),
-            FlagRule::Reject(FLAG_REPLY),
-            FlagRule::Reject(FLAG_CLOSE),
-        ],
-        len,
-    )?;
-    out.extend_from_slice(&request.token.to_le_bytes());
-    out.extend_from_slice(&request.sequence.to_le_bytes());
-    push_zeroed_layout_tail(layout, &mut out);
-    out.resize(len, 0);
-    out[payload_offset..payload_offset + request.payload.len()].copy_from_slice(&request.payload);
-
-    envelope::finish(out, hmac_key)
-}
-
-pub fn decode_echo_request(
-    packet: &[u8],
-    params: &Params,
-    hmac_key: Option<&[u8]>,
-) -> Result<EchoRequest> {
-    let envelope = envelope::decode(
-        packet,
-        hmac_key,
-        &[
-            FlagRule::Reject(FLAG_OPEN),
-            FlagRule::Reject(FLAG_REPLY),
-            FlagRule::Reject(FLAG_CLOSE),
-        ],
-    )?;
-    let layout = PacketLayout::echo(hmac_key.is_some(), params);
-    validate_echo_length(packet, params, layout, false)?;
-    envelope::verify(packet, hmac_key)?;
-
-    let mut pos = envelope.body_offset;
-    let token = read_u64(packet, &mut pos);
-    let sequence = read_u32(packet, &mut pos);
-
-    Ok(EchoRequest {
-        token,
-        sequence,
-        payload: packet[layout.header_len()..].to_vec(),
-    })
-}
-
 pub fn encode_echo_reply(
     reply: &EchoReply,
     params: &Params,
@@ -141,7 +71,7 @@ pub fn encode_echo_reply(
         });
     }
 
-    let mut out = envelope::begin(
+    let mut out = envelope::begin_checked(
         reply.flags,
         hmac_key,
         &[FlagRule::Reject(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
@@ -183,7 +113,7 @@ pub fn decode_echo_reply(
         &[FlagRule::Reject(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
     )?;
     let layout = PacketLayout::echo(hmac_key.is_some(), params);
-    let midpoint_compat = validate_echo_length(packet, params, layout, true)?;
+    let midpoint_compat = validate_echo_length(packet, params, layout)?;
     envelope::verify(packet, hmac_key)?;
 
     let header_len = layout.header_len()
@@ -238,18 +168,12 @@ pub fn decode_echo_reply(
 
 /// Validates the packet length against the negotiated layout. Returns
 /// `Ok(true)` when the packet matched the upstream midpoint compatibility
-/// length rather than the exact negotiated length (only possible when
-/// `allow_midpoint_compat` is set).
+/// length rather than the exact negotiated length.
 ///
 /// The negotiated length is always checked first, so when the compatibility
 /// form is not longer than the negotiated form the two are indistinguishable
 /// by length and normal negotiated parsing wins. See [`decode_echo_reply`].
-fn validate_echo_length(
-    packet: &[u8],
-    params: &Params,
-    layout: PacketLayout,
-    allow_midpoint_compat: bool,
-) -> Result<bool> {
+fn validate_echo_length(packet: &[u8], params: &Params, layout: PacketLayout) -> Result<bool> {
     let header_len = layout.header_len();
     if packet.len() < header_len {
         return Err(ProtoError::PacketTooShort {
@@ -261,7 +185,7 @@ fn validate_echo_length(
     if packet.len() == expected_len {
         return Ok(false);
     }
-    if allow_midpoint_compat && is_midpoint_single_clock(params) {
+    if is_midpoint_single_clock(params) {
         let compat_len = midpoint_compat_packet_len(layout, expected_len);
         if compat_len > expected_len && packet.len() == compat_len {
             return Ok(true);
@@ -271,18 +195,6 @@ fn validate_echo_length(
         expected: expected_len,
         actual: packet.len(),
     })
-}
-
-fn push_zeroed_layout_tail(layout: PacketLayout, out: &mut Vec<u8>) {
-    if layout.recv_count {
-        out.extend_from_slice(&[0; RECV_COUNT_SIZE]);
-    }
-    if layout.recv_window {
-        out.extend_from_slice(&[0; RECV_WINDOW_SIZE]);
-    }
-    for _ in 0..layout.timestamp_count() {
-        out.extend_from_slice(&[0; TIMESTAMP_SIZE]);
-    }
 }
 
 fn push_echo_reply_tail(reply: &EchoReply, layout: PacketLayout, out: &mut Vec<u8>) -> Result<()> {
@@ -350,7 +262,7 @@ mod tests {
     use crate::{
         hmac,
         params::{Clock, ReceivedStats, StampAt},
-        write_header, FLAG_HMAC, HMAC_SIZE,
+        write_header, FLAG_HMAC, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE,
     };
 
     fn default_params() -> Params {
@@ -370,108 +282,18 @@ mod tests {
         }
     }
 
-    fn echo_request_with_payload(payload: Vec<u8>) -> EchoRequest {
-        EchoRequest {
-            token: 0x7896_b6ab_8771_5213,
-            sequence: 9,
-            payload,
+    /// Zero-fills every negotiated reply field, matching what a peer that
+    /// reports no optional values would put on the wire.
+    fn push_zeroed_layout_tail(layout: PacketLayout, out: &mut Vec<u8>) {
+        if layout.recv_count {
+            out.extend_from_slice(&[0; RECV_COUNT_SIZE]);
         }
-    }
-
-    #[test]
-    fn echo_request_encodes_default_placeholders() {
-        let params = default_params();
-        let packet = encode_echo_request(
-            &EchoRequest {
-                token: 0x7896_b6ab_8771_5213,
-                sequence: 0,
-                payload: Vec::new(),
-            },
-            &params,
-            None,
-        )
-        .unwrap();
-        assert_eq!(packet.len(), 60);
-        assert_eq!(&packet[..4], &[0x14, 0xa7, 0x5b, 0x00]);
-        assert_eq!(&packet[4..12], &0x7896_b6ab_8771_5213u64.to_le_bytes());
-        assert!(packet[12..].iter().all(|byte| *byte == 0));
-    }
-
-    #[test]
-    fn echo_request_encodes_exact_fit_payload() {
-        let params = params_with_payload_space(4);
-        let request = echo_request_with_payload(vec![1, 2, 3, 4]);
-        let packet = encode_echo_request(&request, &params, None).unwrap();
-        let payload_offset = PacketLayout::echo(false, &params).header_len();
-
-        assert_eq!(&packet[payload_offset..], &[1, 2, 3, 4]);
-    }
-
-    #[test]
-    fn echo_request_encodes_shorter_payload_and_zero_fills_remainder() {
-        let params = params_with_payload_space(4);
-        let request = echo_request_with_payload(vec![1, 2]);
-        let packet = encode_echo_request(&request, &params, None).unwrap();
-        let payload_offset = PacketLayout::echo(false, &params).header_len();
-
-        assert_eq!(&packet[payload_offset..], &[1, 2, 0, 0]);
-    }
-
-    #[test]
-    fn echo_request_rejects_oversized_payload() {
-        let params = params_with_payload_space(4);
-        let request = echo_request_with_payload(vec![1, 2, 3, 4, 5]);
-        let original = request.clone();
-
-        assert_eq!(
-            encode_echo_request(&request, &params, None),
-            Err(ProtoError::PayloadTooLarge {
-                available: 4,
-                provided: 5,
-            })
-        );
-        assert_eq!(request, original);
-    }
-
-    #[test]
-    fn echo_request_rejects_negative_requested_length() {
-        let request = echo_request_with_payload(Vec::new());
-        let params = Params {
-            length: -1,
-            ..Params::default()
-        };
-
-        assert_eq!(
-            encode_echo_request(&request, &params, None),
-            Err(ProtoError::NegativePacketLength { length: -1 })
-        );
-    }
-
-    #[test]
-    fn hmac_echo_request_places_token_and_sequence_after_hmac() {
-        let params = default_params();
-        let packet = encode_echo_request(
-            &EchoRequest {
-                token: 0x7896_b6ab_8771_5213,
-                sequence: 9,
-                payload: Vec::new(),
-            },
-            &params,
-            Some(b"testkey"),
-        )
-        .unwrap();
-
-        assert_eq!(packet.len(), 76);
-        assert_eq!(&packet[..4], &[0x14, 0xa7, 0x5b, FLAG_HMAC]);
-        assert_eq!(
-            &packet[4 + HMAC_SIZE..4 + HMAC_SIZE + TOKEN_SIZE],
-            &0x7896_b6ab_8771_5213u64.to_le_bytes()
-        );
-        assert_eq!(
-            &packet[4 + HMAC_SIZE + TOKEN_SIZE..4 + HMAC_SIZE + TOKEN_SIZE + SEQ_SIZE],
-            &9_u32.to_le_bytes()
-        );
-        hmac::verify_hmac(b"testkey", &packet, hmac::hmac_offset()).unwrap();
+        if layout.recv_window {
+            out.extend_from_slice(&[0; RECV_WINDOW_SIZE]);
+        }
+        for _ in 0..layout.timestamp_count() {
+            out.extend_from_slice(&[0; TIMESTAMP_SIZE]);
+        }
     }
 
     #[test]
