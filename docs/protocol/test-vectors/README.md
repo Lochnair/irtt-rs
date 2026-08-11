@@ -160,8 +160,8 @@ b9 07 05 06 06 06 07 06
 - Bytes 4-19: HMAC `ff 90 16 a7 aa 53 78 16 9e c3 a2 d5 54 dc 30 36`
 - Bytes 20-39: Parameter payload
 
-**HMAC verified independently with Python (HMAC-MD5 over entire packet
-with HMAC field zeroed).**
+**HMAC cross-checked with a separately written Python script (HMAC-MD5 over the
+entire packet with the HMAC field zeroed).**
 
 ---
 

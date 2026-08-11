@@ -1,8 +1,23 @@
 # IRTT-Compatible Client Protocol Specification
 
-**Version:** 1.1-verified  
-**Date:** 2026-04-28  
-**Verified against:** irtt 0.9.1, protocol version 1, macOS Darwin 25.3.0 arm64
+- **Version:** 1.3-verified
+- **Date:** 2026-08-11
+- **Verified against:** irtt 0.9.1 release, protocol version 1, macOS Darwin
+  25.3.0 / 25.5.0 arm64
+
+**Changes in 1.2:** corrections and clarifications arising from server-side
+verification. See Sections 19.3, 19.9, 19.10, 19.13, 19.14 and 19.15, and the
+companion `IRTT_SERVER_PROTOCOL_SPEC.md`.
+
+**Changes in 1.3:** the reply-length tolerance of Sections 8.5 and 19.14 is
+narrowed from "accept any longer reply" to the one verified single-clock midpoint
+case, and stated as a single additional accepted length —
+`upstream_0_9_1_reply_len` exactly — rather than a `+1..+8` range; the normal
+minimum and expected reply size is stated as `compatible_reply_len` rather than
+the negotiated `Length` value alone; the monotonic-only decoding ambiguity is
+recorded rather than papered over with a heuristic; the DSCP wire encoding is
+separated from user-facing notation (Section 10.8); and the stale suggestion that
+servers reject a protocol-version mismatch is removed (Section 6.2).
 
 ---
 
@@ -25,11 +40,12 @@ as interoperability requirements, consistent with RFC 2119.
 ## 2. Scope
 
 - **Client-only implementation.** Server implementation is out of scope unless
-  server behavior is needed to understand client interoperability.
+  server behavior is needed to understand client interoperability. Server
+  behavior is specified separately in `IRTT_SERVER_PROTOCOL_SPEC.md`, which
+  shares this document's wire format.
 - **Compatible with existing IRTT servers** running protocol version 1.
 - This specification describes protocol and measurement behavior; CLI design
   is not prescribed.
-- Server implementation is out of scope.
 
 ---
 
@@ -187,8 +203,11 @@ A client session progresses through the following externally observable states:
     extracted from the reply payload. The client stores the connection token.
     Transitions to Active Test (or Completed if the no-test flag was set).
   - An open reply with the close flag set, **when the client did NOT set
-    Close in its request**: the server rejected the session (e.g., protocol
-    version mismatch). Transition to Failed.
+    Close in its request**: the server rejected the session. Transition to
+    Failed. Note that upstream 0.9.1 servers were never observed to produce
+    such a rejection — in particular they do **not** reject a mismatched
+    protocol version this way (see below and Section 19.13) — so a client MUST
+    handle the shape without depending on any server actually emitting it.
   - An open reply with the close flag set, **when the client DID set Close
     in its request** (no-test mode): the server acknowledged the open+close.
     The connection token is zero. Transition to Completed.
@@ -203,11 +222,20 @@ A client session progresses through the following externally observable states:
   The client MUST reject (as an error) the following server parameter changes:
   - Duration increased beyond what was requested.
   - Length increased beyond what was requested.
-  - Interval reduced below a safety floor (see Section 19.9 for verification).
+  - Interval reduced below a safety floor of **1 second**. This rejection
+    applies in loose mode as well as strict mode.
+    [**Verified 2026-08-11** — see Section 19.9.]
 
 - **Protocol version check:** The client MUST verify that the server's
   protocol version matches exactly. Protocol version 1 is the current
   version. Mismatch MUST cause the session to fail.
+
+  The client cannot rely on the server to detect the mismatch. Upstream 0.9.1
+  servers do **not** reject a mismatched protocol version: they rewrite it to 1,
+  open a normal session, and return `ProtocolVersion = 1` with the Close flag
+  clear. Version checking is therefore effectively client-side only.
+  [**Verified 2026-08-11** — see Section 19.13 and
+  `IRTT_SERVER_PROTOCOL_SPEC.md` Section 7.5.]
 
 ### 6.3 Active Test
 
@@ -276,7 +304,7 @@ parameters).
 | Echo Request (Test Packet) | Client → Server | Active test | Yes | Carry test payload with sequence number |
 | Echo Reply | Server → Client | Active test | Yes | Return test payload with timestamps and stats |
 | Close Request | Client → Server | Closing phase | Yes | Signal session end |
-| Close Reply | Server → Client | Closing phase | No | Acknowledge close (server MAY send this) |
+| Close Reply | Server → Client | Closing phase | No | Not part of normal operation. Upstream servers send nothing in response to a close; such a datagram is tolerated by clients but has no demonstrated purpose in protocol version 1 |
 
 ---
 
@@ -445,7 +473,103 @@ set (see Section 19.3 — not yet verified by black-box testing).
 - Received Window (8 bytes) — if negotiated, contains 64-bit received bitmap
 - Timestamp fields — according to negotiated stamp_at and clock settings
 
-**Payload:** Server-filled according to negotiation.
+**Payload:** Server-filled according to negotiation. The client MUST NOT rely on
+the payload's content: server fill is applied as a continuous stream, so a reply
+payload does not necessarily begin at the start of the configured fill pattern.
+
+**Reply length:** The normal, expected size of an echo reply is
+`compatible_reply_len` — the larger of the negotiated Length and the mandatory
+field block, defined below. That, and not the negotiated `Length` value on its
+own, is the minimum: the client MUST reject a reply *shorter* than
+`compatible_reply_len`. (The two differ whenever the negotiated Length is smaller
+than the field block, including the common case of a negotiated Length of 0.)
+There is exactly one verified case in which a reply is *longer*, and the required
+tolerance is scoped to it — see below. This is **not** a general rule that
+overlong replies are acceptable; outside that one case, a client MUST keep
+applying its ordinary strict validation to unexpectedly sized datagrams.
+
+**The one case: dual-field midpoint from upstream 0.9.1.** When midpoint
+timestamps are negotiated, upstream 0.9.1 servers emit **two** midpoint timestamp
+fields on the wire — the midpoint wall field followed by the midpoint monotonic
+field, in that order — **even when the negotiated clock selects only one clock**.
+A single-clock midpoint reply therefore carries one 8-byte field more than the
+negotiated parameters imply. (This describes bytes on the wire only; it implies
+nothing about how any server represents a midpoint internally.)
+
+The extra field enlarges the reply's *minimum* size; it does **not** add 8 bytes
+to every reply. Writing `normal_header` for the field block the negotiated
+parameters imply and `upstream_header` for that block plus one 8-byte timestamp
+field:
+
+```
+normal_header   = negotiated field block
+upstream_header = normal_header + one 8-byte timestamp field
+
+compatible_reply_len     = max(negotiated_length, normal_header)
+upstream_0_9_1_reply_len = max(negotiated_length, upstream_header)
+```
+
+Three distinct quantities, not to be conflated: `negotiated_length` is the value
+of the negotiated Length parameter; `normal_header` is the negotiated mandatory
+field block; `compatible_reply_len` is the actual normal packet length implied by
+both.
+
+So the excess is +8 while the negotiated length is at or below `normal_header`,
+shrinks through +7…+1 between the two minima, and is **0** once the negotiated
+length reaches `upstream_header` — there the extra field displaces 8 bytes of
+payload instead of lengthening the datagram. Those figures are values the
+difference takes **across different negotiations**. For any one set of negotiated
+Params both quantities are fixed numbers, and the upstream reply has exactly one
+length.
+
+**Required tolerance.** When the negotiated parameters are StampAt = Midpoint
+with a single Clock, a conforming client MUST accept a reply whose length is
+**exactly** `upstream_0_9_1_reply_len`. It MUST NOT require the extra field to be
+present, and MUST NOT treat its presence as an error.
+
+Where `upstream_0_9_1_reply_len > compatible_reply_len`, that form is identifiable
+by length alone and the difference between the two values is between 1 and 8
+bytes. This is one extra accepted length, **not** a `+1..+8` window: a client MUST
+NOT accept an arbitrary length in that span, and MUST reject any length strictly
+between `compatible_reply_len` and `upstream_0_9_1_reply_len` just as it rejects
+any other unexpected length.
+
+**Accepted echo reply lengths, in full.** Compute both values once from the
+negotiated Params. A conforming client then accepts exactly these lengths:
+
+| Received `packet_len` | Condition | Outcome |
+|---|---|---|
+| `== compatible_reply_len` | always | **accepted** — the normal exact form |
+| `== upstream_0_9_1_reply_len` | single-clock Midpoint **and** `upstream_0_9_1_reply_len > compatible_reply_len` | **accepted** — the identifiable upstream midpoint compatibility form |
+| any other value | — | **rejected** |
+
+When `upstream_0_9_1_reply_len == compatible_reply_len` the two rows collapse: the
+packet is accepted at the normal exact length, the wire form is ambiguous, and no
+generic monotonic correction is applied (see below).
+
+**Values read by a positional decoder.** The extra field is last, and field
+offsets are derived from the negotiated parameters:
+
+- **Clock = wall:** the negotiated field comes first, so the value read is
+  correct.
+- **Clock = monotonic:** the first 8-byte region holds the *wall*-domain value, so
+  an ordinary positional decoder reads a nanoseconds-since-epoch magnitude into
+  its monotonic slot instead of a process-relative one.
+
+**Do not correct for that blindly.** Once the negotiated length reaches
+`upstream_header`, the upstream form and a conforming single-clock form produce
+datagrams of the same size, and nothing distinguishes them — the second 8-byte
+region is a timestamp under one form and ordinary payload under the other. A
+client MAY take its monotonic value from the second region **only when the
+dual-field form is otherwise identifiable** — that is, when
+`upstream_0_9_1_reply_len > compatible_reply_len` for the negotiated Params and
+the datagram length is exactly `upstream_0_9_1_reply_len`. In the equal-length
+regime (`upstream_0_9_1_reply_len == compatible_reply_len`) the value SHOULD
+be recorded as ambiguous rather than guessed. Either way the packet MUST still be
+accepted, and a client that applies no correction MUST NOT fail on the resulting
+implausible value. See the server specification, Section 11.3.1.
+[**Verified 2026-08-11**, extended **2026-08-11** with a negotiated-length sweep
+— see Section 19.14.]
 
 ### 8.5.1 Close Request Packet
 
@@ -505,8 +629,10 @@ default to zero on the receiving end).
 
 Unknown parameter tags MUST be silently ignored by the receiver.
 
-The maximum serialized parameter buffer size is believed to be 128 bytes
-(see Section 19.10 for verification).
+There is **no protocol limit** on the size of a received parameter payload; a
+receiver MUST tolerate a payload larger than any it would itself produce.
+Allocating at least 128 bytes for the parameter buffer is a safe local
+implementation choice, not a protocol rule (see Section 19.10).
 
 **ReceivedStats enum values:**
 
@@ -548,7 +674,14 @@ A conforming client MUST set `ProtocolVersion` to 1 in its open request.
 
 A conforming client MUST verify that the server's returned protocol version
 matches exactly. If there is a mismatch, the client MUST abort the session.
-The server will also set the Close flag if there is a version mismatch.
+
+**Do not depend on the server to signal the mismatch.** Upstream 0.9.1 servers
+accept any value in the `ProtocolVersion` parameter — including 0, 2, a negative
+value, or the tag being absent entirely — rewrite it to 1, create a normal
+session, and return an open reply with the Close flag clear and a non-zero
+token. A server MAY reject an unknown version by replying with the Close flag
+set and a zero token, but existing servers do not.
+[**Verified 2026-08-11** — see Section 19.13.]
 
 ### 9.2 Unknown Fields and Extensions
 
@@ -628,10 +761,18 @@ The following configuration parameters affect protocol behavior:
 - **Effect:** Sets the TOS/Traffic Class byte in the IP header for both
   client and server packets during the active test phase.
 - **Default:** 0 (best effort).
-- **Valid values:** 0-255 (full TOS byte value). The DSCP field occupies
-  the upper 6 bits; the lower 2 bits (ECN) are typically zero.
-  Common values: 0 (best effort), 0xb8 (EF), 0xa0 (CS5), 0x20 (CS1).
-  [**Verified 2026-04-28** — see BLACKBOX_VERIFICATION_REPORT.md Finding B.]
+- **Wire encoding (protocol fact):** the DSCP parameter carries the **raw IP TOS
+  / Traffic Class byte**, range **0–255** — not a 6-bit codepoint. The
+  differentiated-services codepoint occupies the upper 6 bits of that byte and
+  the lower 2 (ECN) are typically zero, so Expedited Forwarding is **0xb8
+  (184)** on the wire. Other common values: 0 (best effort), 0xa0 (CS5), 0x20
+  (CS1). [**Verified 2026-04-28** — see BLACKBOX_VERIFICATION_REPORT.md
+  Finding B.]
+- **Out of scope — user-facing notation.** Whether an implementation's command
+  line and configuration accept a 0–63 codepoint (shifting it left by two to
+  produce the wire byte) or the raw 0–255 byte is a presentation decision for
+  that project, to be made and implemented separately. It is not a protocol
+  fact and this specification does not prescribe it.
 - **Protocol:** The server echoes packets with the negotiated DSCP value.
   The server MAY disallow DSCP and reset it to 0.
 - **Observed behavior:** DSCP/TOS is applied only to echo request and echo
@@ -696,9 +837,14 @@ The following configuration parameters affect protocol behavior:
 - **Client receive timestamp:** SHOULD be captured as close as possible to
   the receive system call return, before any packet processing.
 - **Server timestamps:** Determined by the negotiated StampAt parameter:
-  - Receive: captured when the server receives the packet.
-  - Send: captured just before the server sends the reply.
-  - Midpoint: the average of receive and send times.
+  - Receive: the server's arrival instant for the request.
+  - Send: the server's departure instant for the reply.
+  - Midpoint: the average of the two.
+
+  A client can rely on the pair bracketing the server's handling of that request,
+  and on receive never being later than send. It cannot observe, and MUST NOT
+  assume, anything about where a given server takes those readings internally or
+  how much of its own send and receive path falls outside them.
 
 ### 11.2 Clock Types
 
@@ -857,21 +1003,45 @@ When the 64-bit received window is present in a reply:
 - A set bit means the server received that packet; a clear bit means it
   did not.
 
-The window may not be valid for all replies. Bit 0 (LSB) is always set
-for valid windows, since it represents the current packet which was
-received. [**Verified 2026-04-28** — see Section 19.7.] Implementations
-SHOULD treat a window value of 0 as potentially invalid and avoid using
-it for loss classification.
+Bit 0 (LSB) is always set in a window emitted by a server, since it represents
+the current packet which was received. [**Verified 2026-04-28** — see
+Section 19.7.] Implementations SHOULD treat a window value of 0 as potentially
+invalid and avoid using it for loss classification. Note that upstream 0.9.1
+servers never emit 0 when the window is negotiated at all.
+[**Verified 2026-08-11** — see Section 19.15.]
+
+**A window of `0x1` carries no historical information.** Upstream 0.9.1 servers
+reset the window to `0x1` — not merely fail to update it — whenever a request
+arrives with a sequence number lower than the highest already seen, or with a
+gap of 64 or more from the previous request. `0x1` does **not** mean the previous
+63 packets were lost; it means no useful prior received-history is represented in
+the window after that transition. A single reordered packet discards everything
+the window knew about the previous 63 sequence numbers, and later packets rebuild
+it from scratch. A client that reads `0x1` literally will misclassify up to 63
+earlier packets as lost upstream after one reordering event.
+
+A conforming client SHOULD treat a window value of `0x1` on any reply other than
+the first of the session as "no historical information available" rather than as
+"the server received nothing earlier."
+[**Verified 2026-08-11** — see Section 19.15 and
+`test-vectors/SERVER_BEHAVIORAL_VECTORS.md` Section 1.]
 
 The client processes the received window to classify previous packets:
 - If a packet was not received by the client but the window says the server
   received it → lost downstream.
 - If a packet was not received by the client and the window says the server
   did not receive it → lost upstream.
-- If the window cannot confirm (e.g., more than 64 packets ago, or window
-  was invalid) → generic loss.
+- If the window cannot confirm (e.g., more than 64 packets ago, or the window
+  carries no history) → generic loss.
 
 The window has a maximum lookback of 63 packets (bits 1-63).
+
+**Scope note.** The paragraphs above state what the window field *represents* on
+the wire, which is what was verified. The downstream/upstream loss
+classification built on top of it is a client-side interpretation question that
+has not been audited to the same standard here, and it is scheduled for its own
+review on the implementation side. Treat the classification rules as a starting
+point rather than as verified protocol semantics.
 
 ### 12.9 Statistics
 
@@ -935,13 +1105,24 @@ no receive or send timestamp fields may also be present.
 
 ### 13.7 Close Flag in Echo Reply
 
-If the server sets the Close flag in an echo reply, the client SHOULD
-process the reply normally (record measurements) and then close the
-connection. This is defensive handling for the possibility that the
-server can forcibly end a session mid-test.
+A server MAY forcibly end a session mid-test by setting the Close flag (0x04) on
+an otherwise complete echo reply. This is the only in-band mechanism for a
+server-initiated close; there is no standalone server close packet.
 
-**Note:** This behavior has not been directly verified by black-box
-testing (see Section 19.3). Implementations SHOULD handle it defensively.
+A client MUST handle this case. On receiving an echo reply with the Close flag
+set, the client MUST stop the test, MUST NOT send further test packets for that
+session, and SHOULD report the partial results gathered so far as a successful
+(if truncated) run rather than as an error.
+
+Whether the close-flagged reply's own measurement is recorded is an
+implementation choice. Upstream 0.9.1 clients **discard** it: the run is
+terminated on the "server closed" condition before the measurement is recorded.
+
+The session token is invalid from that moment; a close request the client sends
+afterwards will be silently dropped by the server, which is normal.
+
+[**Verified 2026-08-11** — see Section 19.3 and
+`IRTT_SERVER_PROTOCOL_SPEC.md` Section 15.2.]
 
 ---
 
@@ -962,7 +1143,8 @@ testing (see Section 19.3). Implementations SHOULD handle it defensively.
 | Send error during test | SHOULD abort, report partial results. |
 | Receive error during test | SHOULD abort, report partial results. |
 | Individual malformed packet during test | SHOULD abort. |
-| Short reply (shorter than negotiated length) | SHOULD abort. |
+| Short reply (shorter than `compatible_reply_len`, the normal compatible reply length — not merely shorter than the negotiated Length) | SHOULD abort. |
+| Reply at an unexpected length (any length other than `compatible_reply_len`, or the single-clock midpoint form at exactly `upstream_0_9_1_reply_len`) | SHOULD abort. See Section 8.5. |
 | Stamp-at mismatch in reply | SHOULD abort. |
 | Clock mismatch in reply | SHOULD abort. |
 | Unexpected sequence number | SHOULD abort. |
@@ -1331,18 +1513,32 @@ combinations. See BLACKBOX_VERIFICATION_REPORT.md Section 19.2 for the
 complete table. The minimum is 16 bytes (no stats, no timestamps) and the
 maximum default is 76 bytes (both+both+both+HMAC).
 
-### 19.3 Server Close During Test — OPEN / Verification Required
+### 19.3 Server Close During Test — ✅ RESOLVED
 
-**Status:** Not tested. Hard to trigger reliably with black-box testing.
+**Status:** Verified 2026-08-11, irtt 0.9.1, macOS arm64.
 
-**Question:** Can the server set the Close flag on an echo reply mid-test
-(e.g., due to exceeding a duration limit)? If so, how should the client
-respond?
+**Result:** Yes. A server that enforces a maximum test duration answers the
+first echo request arriving after its hard deadline (the configured maximum
+duration plus a 2-second grace, measured from the session's first echo request)
+with a complete, ordinary echo reply that additionally has the Close flag set,
+and removes the session at the same moment. Measured: a 1-second maximum
+produced a close-flagged reply 3.01 s after the first echo; a 2-second maximum
+produced one at 4.06 s.
 
-**Compatibility recommendation:** The client SHOULD check for the Close
-flag in echo replies and, if set, process the reply normally (record
-measurements) and then terminate the session. This is defensive handling
-for a scenario that has not been directly observed in black-box testing.
+A conforming client never reaches this deadline, because it stops sending at the
+negotiated duration. The mechanism exists to bound sessions from clients that
+ignore the negotiation.
+
+Observed upstream 0.9.1 client reaction: it discards the close-flagged reply's
+measurement, terminates the run with a "server closed connection" condition,
+prints the partial results, and exits with a success status.
+
+No other server condition was observed to set the Close flag on an echo reply:
+idle expiry, shutdown, rate limiting, oversize requests and authentication
+failure were each exercised and none produced one.
+
+See Section 13.7, `IRTT_SERVER_PROTOCOL_SPEC.md` Section 15.2, and
+`captures/server-close.pcapng` (frame 36 carries flags `0x06`).
 
 ### 19.4 Varint Encoding Compatibility — ✅ RESOLVED
 
@@ -1357,8 +1553,8 @@ verified. See BLACKBOX_VERIFICATION_REPORT.md Section 19.4.
 **Status:** Verified 2026-04-28, irtt 0.9.1, macOS arm64.
 
 **Result:** HMAC-MD5 is computed over the entire packet buffer (including
-payload) with the 16-byte HMAC field zeroed. Independently verified with
-Python for all four packet types (open request, echo request, echo reply,
+payload) with the 16-byte HMAC field zeroed. Cross-checked with a separately
+written Python script for all four packet types (open request, echo request, echo reply,
 close request). The spec's test vectors (18.1 and 18.2) also verify
 correctly at 92-byte packet size.
 
@@ -1379,6 +1575,12 @@ window values: seq 0 → 0x01, seq 1 → 0x03, seq 2 → 0x07. A window
 value of 0 can be used as the invalid sentinel. See
 BLACKBOX_VERIFICATION_REPORT.md Section 19.7.
 
+**Extended 2026-08-11.** Upstream 0.9.1 was subsequently confirmed never to emit
+0 when the window is negotiated at all, and the far more common `0x1` was found
+to be a *valid* window carrying no history — which is a distinct condition from
+the 0 sentinel and must not be treated the same way. See Section 19.15 and
+Section 12.8.
+
 ### 19.8 Open Reply Without HMAC When Client Expects HMAC — ✅ RESOLVED
 
 **Status:** Verified 2026-04-28, irtt 0.9.1, macOS arm64.
@@ -1388,24 +1590,43 @@ The client times out with `[OpenTimeout] no reply from server`. Same
 behavior for wrong key and no key. See BLACKBOX_VERIFICATION_REPORT.md
 Section 19.8.
 
-### 19.9 Minimum Restricted Interval Safety Floor — PARTIALLY RESOLVED
+### 19.9 Minimum Restricted Interval Safety Floor — ✅ RESOLVED
 
-**Status:** Partially tested 2026-04-28.
+**Status:** Verified 2026-08-11, irtt 0.9.1, macOS arm64.
 
-**Result:** In strict mode, the client rejects ANY server parameter change
-with a non-zero exit code. In loose mode, changes are accepted with a
-warning. The exact safety floor for server-decreased intervals could not
-be tested without a cooperative malicious server. See
-BLACKBOX_VERIFICATION_REPORT.md Section 19.9.
+**Result:** The safety floor is **1 second**, and it is enforced in loose mode
+as well as strict mode.
 
-### 19.10 Maximum Parameter Buffer Size — PARTIALLY RESOLVED
+The test uses an ordinary, unmodified server: a server restricts the negotiated
+interval to at most one quarter of its idle timeout, so an idle timeout below
+4 seconds forces a reduction below 1 second for a client requesting 1 second.
 
-**Status:** Partially tested 2026-04-28.
+| Server idle timeout | Returned interval | Client outcome |
+|---------------------|-------------------|----------------|
+| 2 s | 500 ms | Aborts: reduction below 1 s — strict **and** loose |
+| 3 s | 750 ms | Aborts: reduction below 1 s — strict **and** loose |
+| 4 s | 1 s (no reduction for a 1 s request) | Proceeds |
 
-**Result:** Largest observed parameter payload was 52 bytes (all params
-including 24-character ServerFill). Upper bound estimate is ~82 bytes. The
-128-byte limit appears safe. See BLACKBOX_VERIFICATION_REPORT.md
-Section 19.10.
+A reduction to exactly 1 second (requesting 2 s against a 4 s idle timeout) is
+treated as an ordinary server restriction: rejected in strict mode, accepted in
+loose mode.
+
+See `test-vectors/SERVER_BEHAVIORAL_VECTORS.md` Section 4.4.
+
+### 19.10 Maximum Parameter Buffer Size — ✅ RESOLVED (as a local choice)
+
+**Status:** Verified 2026-08-11, irtt 0.9.1, macOS arm64.
+
+**Result:** There is no protocol limit on the size of a received parameter
+payload. An open request carrying over 200 bytes of parameters (80 repetitions
+of an unknown tag) was accepted and answered normally by an upstream server.
+
+The largest payload a version-1 peer can legitimately *produce* remains small:
+the observed maximum from a real client was 52 bytes, and the theoretical
+maximum with all tags at their widest encodings plus a 32-byte ServerFill string
+is under 90 bytes. Allocating at least 128 bytes for the parameter buffer is a
+safe **implementation choice**, not a protocol requirement, and a receiver
+SHOULD tolerate larger payloads rather than rejecting them.
 
 ### 19.11 Field Ordering Verification — ✅ RESOLVED
 
@@ -1428,6 +1649,97 @@ negative value?
 
 This edge case requires server processing time to exceed the raw
 client-measured RTT, which is extremely unlikely under normal conditions.
+
+### 19.13 Server-Side Protocol Version Enforcement — ✅ RESOLVED
+
+**Status:** Verified 2026-08-11, irtt 0.9.1, macOS arm64.
+
+**Result:** Upstream servers do not enforce the protocol version. Open requests
+carrying `ProtocolVersion` values of 0, 2 and −1, and requests omitting the tag
+entirely, each produced a session-creating open reply with flags `0x03`
+(Open|Reply), a non-zero token, and `ProtocolVersion = 1` in the returned
+parameters.
+
+**Consequence for the client:** the mismatch check in Sections 6.2 and 9.1 is
+the only line of defence and MUST be implemented. A client that assumes the
+server will reject it will silently run a test against an incompatible peer.
+
+### 19.14 Reply Length Longer Than Negotiated — ✅ RESOLVED
+
+**Status:** Verified 2026-08-11, irtt 0.9.1, macOS arm64. Extended 2026-08-11
+with a negotiated-length sweep and a version comparison.
+
+**Result:** Yes, in one specific, verified case. When midpoint timestamps are
+negotiated with a single clock (wall only or monotonic only), upstream 0.9.1
+servers emit both midpoint fields on the wire — wall field then monotonic field —
+which is one 8-byte field more than the negotiated parameters imply. Measured
+across all combinations of received-stats and clock with midpoint timestamps;
+confirmed at the application layer by an upstream client reporting 36-byte
+packets while receiving 44-byte datagrams, and completing normally.
+
+**The excess is bounded by the ordinary length rule, not constant.** Reply length
+is the larger of the negotiated length and the field block; the extra field
+enlarges only the field block. Measured with received-stats = both, midpoint,
+wall (`normal_header` 36, `upstream_header` 44): negotiated lengths 0, 16, 32,
+36 → 44-byte replies; 37 → 44 (+7); 40 → 44 (+4); 43 → 44 (+1); 44 → 44 (0);
+45, 64, 1024, 4096 → exactly the negotiated length (0). At 4096 the midpoint
+region still contains both fields — the extra field displaces payload rather than
+extending the datagram. Any claim that upstream replies are simply "the
+negotiated length plus 8" is wrong outside the first regime. Each cell of that
+sweep is a different negotiation with a single reply length; the +7 / +4 / +1
+figures are differences between negotiations, never alternative lengths available
+within one.
+
+**Scope of the requirement.** For single-clock midpoint the client MUST accept a
+reply at **exactly** `upstream_0_9_1_reply_len`. Where that value exceeds
+`compatible_reply_len` the form is identifiable by length alone and the two
+values differ by between 1 and 8 bytes — but that is one additional accepted
+length, not a `+1..+8` window, and a length strictly between the two MUST be
+rejected like any other unexpected length. That is the whole of the tolerance: it
+does **not** generalise to accepting arbitrary overlong echo replies, and the
+client MUST continue to reject replies *shorter* than `compatible_reply_len` —
+the normal compatible reply length, not merely the negotiated `Length` value —
+and to validate every other unexpectedly sized datagram strictly. It MUST NOT
+require the extra field to be present.
+
+**The monotonic-only ambiguity.** Once the negotiated length reaches
+`upstream_header`, the upstream and conforming forms are the same size and are not
+distinguishable from the datagram alone. A client MUST NOT unconditionally read
+the second 8-byte region as the monotonic value whenever midpoint + monotonic is
+negotiated — against a conforming server that region is ordinary payload. Apply a
+correction only when the dual-field form is otherwise identifiable, meaning
+`upstream_0_9_1_reply_len > compatible_reply_len` and the datagram is exactly
+that length; otherwise record the value as ambiguous, and accept the packet
+either way. See the server specification, Section 11.3.1.
+
+A server that emits only the negotiated fields is also fully interoperable: a
+server built to do so was driven by the upstream 0.9.1 client for wall-only,
+monotonic-only and dual-clock midpoint configurations and every run completed
+cleanly. Upstream 0.9.0 behaves that way on the wire; the dual-field form appears
+in 0.9.1 and is unchanged in the tested post-0.9.1 tree.
+
+### 19.15 Received Window After Reordering or a Large Gap — ✅ RESOLVED
+
+**Status:** Verified 2026-08-11, irtt 0.9.1, macOS arm64.
+
+**Result:** The window is **reset to `0x1`**, not merely left unshifted, in both
+of these cases:
+
+- a request whose sequence number is lower than the highest already seen
+  (reordering, or a late gap fill);
+- a request whose sequence number is 64 or more ahead of the previous one.
+
+The count still increments. A gap of exactly 63 preserves the older packet in
+bit 63; a gap of 64 discards everything.
+
+The window value 0 was never observed; bit 0 is always set. 32-bit sequence
+wraparound is handled as ordinary modular arithmetic and does not disturb the
+window.
+
+Full input → output tables are in
+`test-vectors/SERVER_BEHAVIORAL_VECTORS.md` Section 1, with a capture in
+`captures/server-recv-window.pcapng`. See Section 12.8 for the classification
+consequence.
 
 ---
 

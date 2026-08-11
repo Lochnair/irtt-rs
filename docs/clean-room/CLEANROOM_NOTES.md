@@ -2,10 +2,41 @@
 
 ## Purpose
 
-This document records the clean-room boundary for the IRTT client
-reimplementation project. The goal is to ensure that the implementation
-is developed from a behavioral/protocol specification only, without exposure
-to the GPL-licensed upstream source code.
+This document records the clean-room boundary for the IRTT reimplementation
+project. The goal is to ensure that the implementation is developed from a
+behavioral/protocol specification only, without exposure to the GPL-licensed
+upstream source code.
+
+It covers three passes and a final sanitization:
+
+- the **client** pass (2026-04-28), producing
+  `../protocol/IRTT_CLIENT_PROTOCOL_SPEC.md`;
+- the **server** pass (2026-08-11), producing
+  `../protocol/IRTT_SERVER_PROTOCOL_SPEC.md` and its behavioral vectors, and
+  applying corrections back to the client specification;
+- the **midpoint timestamp follow-up** (2026-08-11);
+- the **final sanitization pass** (2026-08-11), recorded at the end of this file.
+
+## How to Read This File
+
+This is a provenance record. It states *what class of material was excluded* and
+*what discipline was applied*; it deliberately does **not** restate the excluded
+material. A note that says "an upstream identifier was removed" and then quotes
+the identifier has removed nothing. Earlier revisions of this file made exactly
+that mistake, and the audit sections below have been rewritten to describe
+categories rather than instances.
+
+Two things that are *not* contamination, recorded here so they are not
+re-flagged:
+
+- **Parameter names.** ProtocolVersion, Duration, Interval, Length,
+  ReceivedStats, StampAt, Clock, DSCP and ServerFill appear throughout the
+  specifications. They come from upstream's **published** documentation of its
+  client's machine-readable output, not from source inspection.
+- **Quoted diagnostic text.** Where a document quotes a message printed by the
+  upstream client or server, that is transcribed program output observed during
+  testing — the same thing any black-box tester sees — and is cited as evidence
+  of observed behavior.
 
 ## Clean-Room Boundary
 
@@ -13,23 +44,21 @@ to the GPL-licensed upstream source code.
   upstream source code, documentation, tests, CLI behavior, and release
   notes to understand the IRTT protocol.
 
-- **Clean side:** The implementation agent will receive only the
-  `IRTT_CLIENT_PROTOCOL_SPEC.md` document. The implementation agent MUST NOT
+- **Clean side:** The implementation agent will receive only the documents
+  under `docs/protocol/` and this notes file. The implementation agent MUST NOT
   see the upstream source code.
 
 ## Source Materials Inspected
 
-The following materials from the upstream IRTT repository (heistp/irtt,
-GPLv2) were inspected to produce the protocol specification:
+The following materials from the upstream IRTT project (heistp/irtt, GPLv2) were
+inspected to produce the protocol specification:
 
-1. **Documentation files:**
-   - `README.md` — project overview, FAQ, features, limitations
-   - `doc/irtt.md` — main man page
-   - `doc/irtt-client.md` — client man page with CLI options and JSON output format
-   - `doc/irtt-server.md` — server man page (referenced, not fully read)
-   - `CHANGES.md` — changelog
+1. **Published end-user documentation:** the project overview and FAQ, the
+   general and per-command manual pages, and the changelog. This material is
+   public and may be relied on directly; it is cited in the specifications where
+   used.
 
-2. **Source files (inspected for protocol behavior only):**
+2. **Source (inspected for protocol behavior only):**
    - Protocol version and constants
    - Packet format, field layout, magic bytes, flags
    - Parameter serialization format (tag-value pairs, varint encoding)
@@ -64,66 +93,60 @@ copied.
 
 ## Post-Drafting Audit
 
-After the initial specification was drafted, a clean-room audit was
-performed. The following issues were identified and corrected:
+After the initial specification was drafted, a clean-room audit was performed.
+The categories of problem found and corrected were:
 
-1. **Upstream private type names leaked:** "ctoken" and "seqno" appeared
-   as parenthetical abbreviations in the terminology table. Removed.
+1. **Upstream private abbreviations in the terminology table.** Removed and
+   replaced with descriptive names.
 
-2. **Upstream implementation preference disclosed:** A note about IPv4
-   preference in dual-stack resolution revealed an upstream implementation
-   choice. Removed.
+2. **An upstream implementation preference disclosed** in the address-resolution
+   discussion. Removed; the spec now leaves the choice to the implementer.
 
-3. **Go-specific function references:** References to `binary.PutUvarint`,
-   `binary.PutVarint`, and `encoding/binary` package named the upstream
-   language's standard library. Replaced with language-neutral descriptions
-   (LEB128, protobuf-style zigzag).
+3. **Implementation-language standard-library references** in the parameter
+   encoding section. Replaced with language-neutral descriptions (LEB128,
+   protobuf-style zigzag).
 
-4. **Internal scheduling algorithm described:** The send scheduling section
-   described a specific "snap-to-interval" drift-correction algorithm that
-   mirrored upstream control flow. Replaced with observable behavior
-   description (packets sent at approximately ideal times, drift
-   compensation is implementation-defined).
+4. **An internal scheduling algorithm described** in the send-scheduling section,
+   mirroring upstream control flow. Replaced with observable behavior: packets
+   are sent at approximately their ideal times and drift compensation is
+   implementation-defined.
 
-5. **Upstream timer algorithm named:** "The upstream uses exponential
-   averaging of timer errors" revealed an internal implementation choice.
-   Removed.
+5. **An upstream timer-smoothing strategy named.** Removed.
 
-6. **RTT edge case speculated:** The spec asserted that server processing
-   time exceeding raw RTT should cause subtraction to be skipped — a guard
-   the upstream does not actually implement. Moved to Open Questions.
+6. **An RTT edge-case guard asserted** that upstream does not in fact implement.
+   Moved to Open Questions.
 
-7. **Received window validity asserted normatively:** The behavior of
-   window=0 as an invalidity sentinel was stated as fact when it should be
-   verification-required. Softened with reference to Open Questions.
+7. **Received-window validity asserted normatively** when it was
+   verification-required. Softened with a reference to Open Questions.
 
-8. **Go concurrency term leaked:** "goroutine" appeared in the result model
-   section. Replaced with "operation."
+8. **An implementation-language concurrency term** in the result-model section.
+   Replaced with a neutral word.
 
-9. **Upstream test design referenced:** Section 18.2 described what "the
-   upstream test" was testing internally. Rewritten to describe the test
-   vector neutrally.
+9. **Upstream test internals referenced** in the test-vector section. Rewritten
+   to describe the vector neutrally.
 
-10. **Upstream constants asserted normatively:** The minimum restricted
-    interval (1 second) and maximum parameter buffer size (128 bytes) are
-    internal constants that were stated as protocol requirements. Moved to
-    Open Questions with verification suggestions.
+10. **Internal constants asserted as protocol requirements** — a minimum
+    restricted interval and a maximum parameter buffer size. Moved to Open
+    Questions with verification suggestions. Both were subsequently settled by
+    measurement (Sections 19.9 and 19.10 of the client specification).
 
-11. **Timestamp capture order stated as MUST:** Implementation-level timing
-    advice was stated as a protocol requirement. Changed to SHOULD with
-    measurement-accuracy rationale.
+11. **Timestamp capture order stated as MUST** when it was implementation-level
+    timing advice. Downgraded, and later rewritten again in the final
+    sanitization pass to describe only the externally relevant relationship.
 
-12. **Internal recording structure described:** Section 19.6 described a
-    "pre-send timestamp" used for send-call-time measurement, which is an
-    internal recording detail. Rewritten to focus on observable behavior.
+12. **An internal recording structure described** in the send-timing discussion.
+    Rewritten to focus on observable behavior.
 
-13. **Self-contradictory correction note:** Section 8.2 contained an inline
-    "Correction:" note that was confusing and revealed the drafting process.
-    Cleaned up.
+13. **A self-contradictory inline correction note** that revealed the drafting
+    process. Cleaned up.
 
-14. **Field ordering lacked verification note:** The critical field order
-    in Section 8.1.3 was derived from source and stated without any
-    verification caveat. Added verification note and new Open Question 19.11.
+14. **Field ordering stated without a verification caveat** despite being
+    source-derived at the time. Verification note added, and the ordering was
+    subsequently confirmed by capture across six field combinations
+    (Section 19.11).
+
+No instance of the removed material is reproduced here. Restating a private
+identifier in order to record that it was removed would defeat the removal.
 
 ## Clean-Room Compliance Checklist
 
@@ -145,45 +168,445 @@ performed. The following issues were identified and corrected:
 
 ## Second-Pass Clean-Room Scrub
 
-A second independent review was performed on 2026-04-28 by an agent that
-had not seen the upstream source. The following issues were identified and
-corrected:
+A second review was performed on 2026-04-28 by an agent that had not seen the
+upstream source. The categories of problem found and corrected were:
 
-1. **Implementation architecture directive in scope:** Section 2 stated
-   "Library-first implementation target," which prescribes internal
-   architecture. Removed; the spec now says only that CLI design is not
-   prescribed.
+1. **An implementation-architecture directive in the scope section**, which
+   prescribed internal structure. Removed; the specification now constrains only
+   observable behavior.
 
-2. **Concurrency architecture leaked:** Section 6.3 described "a separate
-   receive path processes incoming reply packets concurrently," which
-   prescribes an internal threading/task model. Rewritten to state the
-   observable requirement (send and receive occur concurrently) without
+2. **A concurrency architecture prescribed** in the active-test section,
+   implying an internal threading or task model. Rewritten to state the
+   observable requirement — sending and receiving proceed concurrently — without
    prescribing how.
 
-3. **Source-derived design rationale in echo request:** Section 8.4
-   explained that zeroed fields exist to "use the same field layout that
-   appears in echo replies," which reveals internal design reasoning.
-   Simplified to state only the observable purpose (reaching the
-   negotiated packet length).
+3. **Source-derived design rationale** offered for the zeroed placeholder fields
+   in an echo request. Simplified to the observable purpose: reaching the
+   negotiated packet length.
 
-4. **Source-exhaustive knowledge parenthetical:** Section 8.6 said
-   "(currently only ServerFill)" for string-typed values, revealing
-   knowledge of the complete parameter set from source inspection.
-   Removed the parenthetical.
+4. **A parenthetical revealing source-exhaustive knowledge** of the complete
+   parameter set. Removed.
 
-5. **Upstream CLI syntax leaked:** Section 10.10 used `NxD`/`NrD`/`D`
-   notation for wait variants, which mirrors upstream CLI option syntax.
+5. **Upstream CLI option syntax mirrored** in the wait-variant notation.
    Replaced with plain-language descriptions.
 
-6. **Algorithm name disclosed:** Section 12.9 named "Welford's online
-   algorithm" as a MAY recommendation. This is implementation guidance.
-   Replaced with "the method of computing running statistics is
-   implementation-defined."
+6. **A named statistics algorithm recommended.** Replaced with a statement that
+   the method of computing running statistics is implementation-defined.
 
-7. **Implementation-specific error category:** Section 14 listed
-   "Allocate results buffer failure," implying a pre-allocated buffer
-   strategy. Generalized to "Insufficient resources for test parameters."
+7. **An implementation-specific error category** that implied a particular
+   allocation strategy. Generalized.
 
-8. **Language-specific references in CLEANROOM_NOTES.md:** The Purpose
-   section named "the Rust implementation" and the checklist mentioned
-   "No Rust API design." Both replaced with language-neutral phrasing.
+8. **Implementation-language references in this notes file itself.** Replaced
+   with language-neutral phrasing.
+
+As above, the removed instances are described by category and not reproduced.
+
+---
+
+## Server Pass (2026-08-11)
+
+### Scope
+
+A second contaminated-side pass characterised the upstream **server** and
+produced `../protocol/IRTT_SERVER_PROTOCOL_SPEC.md`, together with
+`../protocol/test-vectors/SERVER_BEHAVIORAL_VECTORS.md` and four new captures.
+Corrections and clarifications arising from it were applied to the client
+specification.
+
+### Upstream Material Inspected
+
+Three upstream builds are involved in this work, and the sanitized output names
+whichever one it means everywhere it matters:
+
+| Build | Role |
+|-------|------|
+| **0.9.1 release** | the behavioral baseline; every unqualified statement refers to it |
+| **0.9.0 release** | comparison only, for the version difference in the midpoint follow-up |
+| **development tree, six upstream commits past the 0.9.1 tag** | comparison only; post-release work, **not** part of 0.9.1, and never allowed to redefine the baseline |
+
+*Provenance correction (final sanitization pass):* an earlier revision described
+that development tree as "eight commits past the 0.9.1 tag". The count was wrong
+— it included two commits belonging to this clean-room project itself, which were
+present in the same working tree but are not upstream work. The upstream count is
+**six**, and the outgoing documents now say so consistently.
+
+Inspection covered, at a high level:
+
+1. **Published documentation:** the server manual page, the changelog, and the
+   project overview's security, FAQ and roadmap sections.
+2. **Source (for behavior only):** request admission and validation, session
+   creation and lookup, parameter restriction, echo handling, reception
+   statistics, timestamp selection, payload filling, close handling, session
+   expiry, and server configuration defaults.
+3. **Release history:** tags and commits between 0.9.1 and the checked-out
+   development head, to classify version differences.
+
+Source inspection was used only to decide **what to test**. Every normative
+statement in the sanitized output rests on an observed experiment, a capture, or
+published end-user documentation — not on the source.
+
+### Method, and What Each Part of It Establishes
+
+The distinction below is load-bearing and is preserved in the outgoing documents.
+
+- **Black-box observation — a raw UDP harness.** It drove a real upstream server
+  directly, so that requests no conforming client would emit could be tested
+  (out-of-order sequence numbers, truncated packets, invalid flag combinations,
+  foreign-endpoint packets, corrupted authentication, and so on). It shares no
+  code with any implementation. Its measurements are stated as observed wire
+  behavior.
+- **Black-box observation — the real upstream client.** Driving the unmodified
+  upstream client and observing what it recorded, reported and exited with is an
+  observation of a genuinely independent second implementation.
+- **Measurement, not constant-reading.** Timing boundaries (idle-expiry grace,
+  maximum-duration grace, interval caps) were established by measuring the
+  server's responses, not by reading values out of the source.
+- **Contaminated-side consistency validation — a server written on this side.**
+  A server was built from the behavioral model and driven by the real upstream
+  client across eleven configurations. Because it was written on the contaminated
+  side it is **not** an independent implementation, and nothing in the outgoing
+  documents rests on it. What it establishes is that the specification as written
+  is sufficient to build something the upstream client accepts; the client's
+  acceptance is the black-box part. Earlier revisions called this an "independent
+  server"; that description was inaccurate and has been corrected throughout.
+- All research scripts, logs, probe sources and notes were kept outside `docs/`
+  and are not part of the outgoing material.
+
+### Statement of Non-Copying (Server Pass)
+
+No upstream source code, comments, pseudocode, tests, or file/module names were
+copied into any document under `docs/`. The sanitized output describes
+externally observable behavior only.
+
+Where upstream behavior differs from what a naive reading of the wire format
+would suggest — the received-window reset on reordering, the unenforced protocol
+version, the midpoint dual-field emission — that difference is documented as an
+**observation**, with the input that produces it and the output it yields. No
+explanation of *why* the implementation behaves that way appears in the
+sanitized output, because any such explanation would necessarily be
+source-derived.
+
+*Amended 2026-08-11:* this remains true of the received-window and
+protocol-version items. For the dual-field midpoint emission, one narrowly scoped
+**source-assisted historical conclusion** was admitted and labelled — a judgement
+that the measured 0.9.0-to-0.9.1 difference was unintended. See "Midpoint
+Timestamp Follow-Up" below.
+
+Two upstream robustness defects are recorded in the server specification
+(`../protocol/IRTT_SERVER_PROTOCOL_SPEC.md` Section 22) because both are
+reachable from ordinary client traffic and a clean implementation has to decide
+what to do instead. They are stated as observed outcomes plus **robustness
+recommendations for the clean implementation** — explicitly not as
+interoperability requirements, since no conforming client can observe which
+choice a server made — with no description of the internal cause.
+
+### Server-Pass Sanitization Audit
+
+The following were checked for and are absent from all files under `docs/`:
+
+1. Upstream private function, type, field and variable names.
+2. Upstream source file names, module names and package names.
+3. Implementation-language identifiers, standard-library references and
+   concurrency vocabulary.
+4. Copied or paraphrased upstream comments.
+5. Source-shaped pseudocode and control-flow transcription.
+6. Internal constants that are not externally observable. Timing values that
+   *are* observable (the idle-expiry grace, the maximum-duration grace, the
+   interval cap ratio) are stated with the measurement that establishes them and
+   are labelled as server policy, not protocol law.
+7. Internal data-structure descriptions. Session lookup is described purely in
+   terms of which packets are accepted and which are dropped.
+8. Token generation strategy. The specification states only the uniqueness
+   requirement and explicitly leaves generation to the implementer.
+
+The following items were considered and deliberately **excluded** from the
+sanitized output as implementation-internal:
+
+- how session state is stored, indexed, or reclaimed;
+- how packet buffers are managed or reused;
+- the mechanism by which expired sessions are noticed;
+- any description of why the received-window behavior takes the form it does.
+
+### Clean-Room Compliance Checklist (Server Pass)
+
+- [x] No upstream source code included.
+- [x] No upstream comments quoted.
+- [x] No upstream private function or type names included.
+- [x] No upstream file/module layout described.
+- [x] No implementation-language references remain.
+- [x] No pseudocode derived from upstream implementation.
+- [x] No internal data structures or algorithms described.
+- [x] Observable behavior separated from server policy throughout.
+- [x] Every normative statement backed by an experiment, capture, or public
+      documentation.
+- [x] Version differences classified explicitly, with each build named (server
+      specification Section 21).
+- [x] Unresolved questions recorded rather than inferred (server
+      specification Section 23).
+- [x] Contaminated-side consistency validation performed against the real
+      upstream client, and labelled as such rather than as independent
+      verification.
+- [x] Contaminated research notes, scripts and probe sources kept outside
+      `docs/`.
+
+---
+
+## Midpoint Timestamp Follow-Up (2026-08-11)
+
+### Scope
+
+A focused contaminated-side investigation of one behavior: the timestamp layout
+upstream 0.9.1 emits for StampAt = Midpoint. It produced changes to the server
+specification (Sections 9.2, 11.3.1, 21.1, 21.2, 23.4, 24), the client
+specification (Sections 8.5, 19.14), the verification report (Part III,
+Finding S-18, plus a caveat on Section 19.2) and the behavioral vectors
+(Section 5.2 and its new subsections).
+
+### A Different Provenance Mix From the Earlier Passes
+
+The earlier passes used source inspection **only to decide what to test**. This
+pass went further: contaminated-side analysis was used to form expectations,
+which were then tested. The sanitized output therefore contains one class of
+statement the earlier passes did not, and it is labelled wherever it appears.
+What crosses the boundary falls into four kinds:
+
+- **Black-box observed** — the wire order (wall field then monotonic field), the
+  affected StampAt/Clock combinations, the dependence of the reply length on the
+  negotiated length, the value an ordinary positional decoder reads in the
+  monotonic-only case, and the 0.9.0 / 0.9.1 / tested-post-0.9.1 comparison. All
+  measured with a raw UDP harness against three separate server builds, and
+  cross-checked at the application layer with the real upstream client.
+- **Source-assisted historical conclusion** — one judgement only: that the
+  measured difference between 0.9.0 and 0.9.1 is an unintended regression rather
+  than a designed feature. It is labelled where it appears, it is not normative,
+  and the measured version difference is stated separately and stands on its own.
+- **Interoperability requirement** — narrowly, what a clean client must tolerate
+  for this one verified case.
+- **Robustness / implementation recommendation** — what a clean server should
+  emit.
+
+The specification wording keeps these four apart explicitly, so a clean-side
+reader can tell which statements they may rely on as observed fact.
+
+Note in particular what is **not** in the list. An earlier revision also carried
+a characterisation of how upstream conceptually represents a midpoint value.
+That was an internal model, it was source-derived, and the useful wire behavior
+is fully established without it, so it was removed from all implementation-facing
+documentation in the final sanitization pass.
+
+### What Was Deliberately Not Transferred
+
+Detailed upstream implementation structure, internal representation, control
+flow, change-level source evidence, and the source-derived reasoning supporting
+the regression diagnosis were retained only on the contaminated side.
+
+That sentence is the whole of the disclosure, and deliberately so. An earlier
+revision of this file enumerated the withheld findings in enough detail that
+reading the list conveyed much of what the list claimed to be withholding. Naming
+the categories is what a provenance record needs; restating the contents defeats
+the exclusion it is recording.
+
+What crossed the boundary from that body of work is one sentence of conclusion —
+labelled source-assisted, non-normative, and separable from every requirement in
+the outgoing documents.
+
+### Method
+
+- A raw UDP harness performed the open negotiation, sent a single echo request,
+  and reported the exact reply datagram length and the bytes at each timestamp
+  offset. It shares no code with any implementation.
+- Three server builds were exercised, each named wherever its results are used:
+  the **0.9.1 release**, the **0.9.0 release**, and a build of the upstream
+  development tree **six upstream commits past the 0.9.1 tag**. Builds and
+  harness live outside this tree.
+- The real upstream client was used as a second, genuinely independent observer
+  for the application-layer effects.
+
+### Clean-Room Compliance Checklist (Midpoint Follow-Up)
+
+- [x] No upstream source code, comments or pseudocode included.
+- [x] No upstream private function, type or field names included.
+- [x] No upstream control flow described.
+- [x] No upstream file or module layout described.
+- [x] No internal conceptual model of upstream's timestamp representation
+      included.
+- [x] The single source-assisted statement labelled as such, confined to a
+      historical judgement, and never presented as black-box verified.
+- [x] Black-box observation, source-assisted conclusion, interoperability
+      requirement and robustness recommendation kept distinct.
+- [x] Excluded contaminated-side material described by category only, without
+      restating its content.
+- [x] Earlier over-general claim ("always 8 bytes longer") corrected rather than
+      left standing.
+
+---
+
+## Final Sanitization Pass (2026-08-11)
+
+A last audit of the entire outgoing `docs/` tree before it crosses the airlock.
+No new protocol research was performed; this pass only corrected, reclassified
+and removed.
+
+### Provenance
+
+- Every statement now names the build it came from. The **0.9.1 release** is the
+  baseline; the **0.9.0 release** and the **development tree six upstream commits
+  past the 0.9.1 tag** appear only where explicitly labelled, and neither is
+  allowed to stand in for 0.9.1.
+- The "eight commits past the 0.9.1 tag" figure was corrected to **six**. The
+  earlier count wrongly included two commits belonging to this clean-room project
+  itself.
+- The server written on this side is now described everywhere as **contaminated-
+  side consistency validation**, never as an independent implementation. Only the
+  raw UDP harness and the real upstream client are treated as black-box
+  observers.
+
+### Statement classification
+
+The outgoing documents now separate five kinds of statement and never conflate
+them: interoperability requirement; black-box observed upstream behavior;
+upstream policy or default; robustness recommendation for the clean
+implementation; and source-assisted historical conclusion.
+
+Specific reclassifications made in this pass:
+
+- Surviving a failed reply send is a **robustness recommendation**, not a
+  protocol MUST. No conforming client can observe which choice a server made.
+- Upstream's absence of session and per-peer bounds is **observed policy**, and
+  the documents now say explicitly that it is not something a compatible server
+  should reproduce. The clean server is expected to be bounded; the shape of that
+  policy is left to the clean project.
+- The fill-validation, DSCP-clamping and length-clamping items in the hazards
+  section were likewise moved from "requirement" to robustness recommendation.
+- The server specification's conformance summary is split: interoperability
+  MUST / MUST NOT lists, and a separate list of robustness recommendations.
+
+### Architecture neutrality
+
+The outgoing documents prescribe no runtime or architecture for the clean server
+— no blocking-versus-async choice, no runtime-free API, no core-type shape, no
+socket ownership arrangement. Those are clean-project decisions and belong in the
+clean repository after the airlock, not in protocol documentation. The
+architecture-neutrality statement in the server specification's scope section was
+extended to say so directly.
+
+### Wording removed or rewritten
+
+- **Source-derived timestamp placement.** Statements locating a timestamp
+  immediately before or after a particular system call were replaced with the
+  externally relevant property: the pair must bracket the server's handling of
+  the request, receive never later than send. Where an implementation takes its
+  readings is not observable and is no longer described.
+- **Validation-order narrative.** The packet-admission section was rewritten from
+  a numbered processing sequence into a table of discard conditions plus the two
+  ordering relationships that were actually verified externally (Open-versus-Close
+  and Open-versus-echo-shaped-body interpretation precedence for an otherwise
+  admissible datagram, which overrides no independent rejection condition; and the
+  indistinguishability of an authentication failure from an unknown token).
+  Behavioral wording replaced control-flow wording throughout.
+- **Internal midpoint model.** The characterisation of upstream's internal
+  representation of a midpoint timestamp was removed from all
+  implementation-facing documentation. What remains is the wire fact: a
+  dual-field midpoint representation, wall field followed by monotonic field.
+- **DSCP.** The wire parameter is now stated plainly as the raw IP TOS /
+  Traffic-Class byte, range 0–255, with Expedited Forwarding at 0xb8 / 184. The
+  future user-facing notation for the clean project is marked out of scope rather
+  than baked into the protocol documents.
+
+### Corrected claims
+
+- **Midpoint reply length.** Every "negotiated length + 8" and "normal packet
+  length + 8" claim was removed. The documents now state the model uniformly:
+  `upstream_header` is `normal_header` plus one 8-byte timestamp field;
+  `compatible_reply_len = max(negotiated_length, normal_header)`;
+  `upstream_0_9_1_reply_len = max(negotiated_length, upstream_header)`; and the
+  observable excess is +8, then +7…+1, then 0 as the negotiated length rises. The
+  measured sweeps demonstrating this were preserved.
+- **Overlong replies.** The blanket requirement that a client tolerate any reply
+  longer than the negotiated length was narrowed to the one verified case:
+  single-clock midpoint at **exactly** `upstream_0_9_1_reply_len`. That is one
+  additional accepted length per negotiation, not a `+1..+8` window — where
+  `upstream_0_9_1_reply_len > compatible_reply_len` the two values differ by
+  between 1 and 8 bytes, but a length strictly between them is rejected like any
+  other unexpected length. The documents say explicitly that this does not
+  generalise to arbitrary overlong echo replies and that strict validation of
+  other malformed or oversized packets is retained.
+- **Normal minimum reply size.** Reply-length validation is stated against
+  `compatible_reply_len`, the normal compatible reply length, rather than against
+  the negotiated `Length` value alone; the two differ whenever the negotiated
+  Length is below the mandatory field block.
+- **Monotonic-only midpoint.** The suggestion that a client may simply read the
+  second 8-byte region as the monotonic value was replaced with a conservative
+  rule. In the equal-length regime the conforming and upstream forms are
+  indistinguishable, so the second region may be ordinary payload; a correction
+  is permitted only where the dual-field form is otherwise identifiable, the
+  ambiguity is recorded rather than resolved by heuristic, and the packet must be
+  accepted either way.
+- **0.9.0 → 0.9.1.** Any claim of no protocol-visible change between the two was
+  corrected. Published release-note content and measured wire behavior are now
+  stated separately, and they disagree on this point.
+- **Protocol version.** Stale text using "protocol version mismatch" as an
+  example of a normal server rejection was removed. Upstream 0.9.1 accepts
+  version 0, 2, negative and absent, and returns 1; enforcement is client-side.
+- **Received window.** The documents now state that `0x1` means no useful prior
+  received-history is represented, **not** that the previous 63 packets were
+  lost. Downstream/upstream loss classification is flagged as a separate question
+  scheduled for its own clean-side audit.
+- **Close semantics.** No production standalone close-reply codec is specified.
+  Such a datagram was observed to be tolerated by upstream clients but has no
+  demonstrated purpose in protocol version 1, and the documents say so.
+- **Parameter payload size.** The "believed to be 128 bytes" limit was replaced
+  with the measured result: no protocol limit on a received payload; 128 bytes is
+  a local allocation choice.
+
+### Contamination scan
+
+The whole outgoing `docs/` tree was scanned against a private-token list derived
+on the contaminated side from the upstream tree. That list is **not** reproduced
+here, and neither is any token from it.
+
+Scanned for and now absent: upstream private function, type, field and variable
+identifiers; implementation-language identifiers and standard-library references;
+upstream source filenames, module and package names; source-derived commit
+identifiers; local filesystem paths; scratchpad paths; and temporary build paths.
+
+The residual hits found and fixed in this pass were all in the audit prose of
+this file, which had been quoting the identifiers it claimed to have removed, and
+one tooling-environment block in the verification report that carried a local
+installation path and an implementation-language version string.
+
+Retained deliberately, and not contamination: the public upstream project
+identity (`heistp/irtt`) where provenance requires it; the parameter names, which
+come from upstream's published documentation; and quoted upstream program output,
+which is observed black-box evidence.
+
+### Captures
+
+Every `.pcapng` intended to cross was metadata-reviewed. Four had already been
+container-normalized during the server pass; the remaining ten still carried
+capture-machine hardware and operating-system identification, the local capture
+interface name and description, and the capture filter string. All ten were
+regenerated to strip that metadata.
+
+No capture contained a hostname, a username, a filesystem path, a command string
+or any reference to an upstream checkout.
+
+**Packet bytes were not altered.** For each regenerated file the full frame
+hexdump and the per-frame epoch timestamps were compared before and after and
+were identical. No capture had to be excluded from the outgoing set.
+
+### Outgoing tree hygiene
+
+The outgoing `docs/` tree contains only specifications, the verification report,
+behavioral and packet vectors, and captures. No research scripts, probe sources,
+upstream source archives, build outputs, temporary logs, dirty source notes or
+private-identifier lists are present, and the contaminated-side material for the
+midpoint work was left where it already lives, outside `docs/`.
+
+One incidental local file sits inside `docs/` and is **not** outgoing material: a
+local tool-permissions file under a dotted directory. It is ignored by version
+control, it is not tracked, and it may not be copied across the airlock. The
+macOS Finder metadata file previously listed here is no longer present; the
+exclusion still stands, since Finder can recreate one at any time. Re-verified
+2026-08-11: the dotted directory is the only ignored entry under `docs/`, and no
+Finder metadata file exists anywhere in the outgoing tree.
