@@ -9,9 +9,11 @@ use crate::socket_options::socket_traffic_class;
     target_os = "illumos",
     target_os = "haiku",
 )))]
-fn normal_open_applies_negotiated_dscp_after_open_and_close_clears_it() {
+fn normal_open_applies_negotiated_traffic_class_after_open_and_close_clears_it() {
     let mut params = default_params();
-    params.dscp = 46;
+    // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF): a
+    // compliant server echoes back the raw byte it received, unchanged.
+    params.dscp = 184;
     let server = start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);
         let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
@@ -48,7 +50,7 @@ fn normal_open_applies_negotiated_dscp_after_open_and_close_clears_it() {
     target_os = "illumos",
     target_os = "haiku",
 )))]
-fn normal_open_uses_negotiated_dscp_not_requested_dscp() {
+fn normal_open_uses_negotiated_traffic_class_not_requested_dscp() {
     let mut returned = default_params();
     returned.dscp = 0;
     let server = open_success_server(returned);
@@ -82,9 +84,10 @@ fn normal_open_uses_negotiated_dscp_not_requested_dscp() {
     target_os = "illumos",
     target_os = "haiku",
 )))]
-fn failed_close_send_restores_negotiated_dscp_and_keeps_session_open() {
+fn failed_close_send_restores_negotiated_traffic_class_and_keeps_session_open() {
     let mut params = default_params();
-    params.dscp = 46;
+    // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF).
+    params.dscp = 184;
     let server = start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);
         socket
@@ -106,7 +109,7 @@ fn failed_close_send_restores_negotiated_dscp_and_keeps_session_open() {
     assert!(matches!(error, ClientError::Socket(_)));
     assert!(client.runtime.is_open());
     assert!(client.schedule.is_some());
-    assert_eq!(client.applied_dscp, Some(46));
+    assert_eq!(client.applied_traffic_class, Some(184));
     assert_eq!(
         socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
         184
@@ -139,7 +142,7 @@ fn failed_close_keeps_send_error_primary_when_dscp_restoration_also_fails() {
     assert!(error.to_string().contains("injected close send failure"));
     assert!(client.runtime.is_open());
     assert!(client.schedule.is_some());
-    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.applied_traffic_class, Some(0));
     client.close().unwrap();
     server.join();
 }
@@ -152,9 +155,10 @@ fn failed_close_keeps_send_error_primary_when_dscp_restoration_also_fails() {
     target_os = "illumos",
     target_os = "haiku",
 )))]
-fn authenticated_peer_close_clears_schedule_and_negotiated_dscp() {
+fn authenticated_peer_close_clears_schedule_and_negotiated_traffic_class() {
     let mut params = default_params();
-    params.dscp = 46;
+    // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF).
+    params.dscp = 184;
     let server = start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);
         socket
@@ -195,7 +199,7 @@ fn authenticated_peer_close_clears_schedule_and_negotiated_dscp() {
         ]
     ));
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     assert_eq!(
         socket_traffic_class(&client.socket, client.remote).unwrap(),
         0

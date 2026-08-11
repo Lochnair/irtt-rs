@@ -2,16 +2,18 @@ use std::fmt;
 
 use irtt_proto::{Clock, Params, ReceivedStats, StampAt, PROTOCOL_VERSION};
 
-use crate::{
-    config::{NegotiationPolicy, MAX_DSCP_CODEPOINT},
-    error::ClientError,
-};
+use crate::{config::NegotiationPolicy, error::ClientError};
 
 /// Protocol parameters accepted for a session.
 ///
 /// `params` contains the server-returned values that the client will use for
 /// echo packets. `restrictions` records accepted differences from the request
 /// when loose negotiation is enabled.
+///
+/// `params.dscp` is the raw IP TOS / Traffic Class byte, not a DSCP
+/// codepoint: for a configured codepoint of 46 (EF), an unrestricted
+/// negotiation leaves `params.dscp == 184`. [`NegotiationRestriction::DscpChanged`]
+/// reports codepoints instead, for consistency with [`crate::ClientConfig::dscp`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiatedParams {
     /// Server-returned protocol parameters used for the session.
@@ -57,6 +59,10 @@ pub enum NegotiationRestriction {
     /// Returned clock source differs from the request.
     ClockChanged { requested: Clock, negotiated: Clock },
     /// Returned DSCP codepoint differs from the request.
+    ///
+    /// These values are DSCP codepoints (`0..=63`) for human-facing
+    /// consistency with [`crate::ClientConfig::dscp`], not the raw wire
+    /// `Params::dscp` byte carried by [`NegotiatedParams::params`].
     DscpChanged { requested: i64, negotiated: i64 },
     /// Returned server payload fill behavior differs from the request.
     ServerFillChanged,
@@ -268,8 +274,11 @@ pub(crate) fn negotiate_params(
             policy,
             &mut restrictions,
             NegotiationRestriction::DscpChanged {
-                requested: requested.dscp,
-                negotiated: returned.dscp,
+                // `requested`/`negotiated` here are raw wire TOS/Traffic Class
+                // bytes; shift back to the codepoint the user actually
+                // configured for a human-facing restriction.
+                requested: requested.dscp >> 2,
+                negotiated: returned.dscp >> 2,
             },
         )?;
     }
@@ -309,10 +318,14 @@ fn validate_duration_restriction(requested: i64, returned: i64) -> Result<(), Cl
     Ok(())
 }
 
+/// Validates a server-returned `Params::dscp`, which is a raw IP TOS /
+/// Traffic Class byte and therefore valid across the full `0..=255` wire
+/// range, not the `0..=`[`MAX_DSCP_CODEPOINT`](crate::config::MAX_DSCP_CODEPOINT)
+/// range of the public codepoint.
 fn validate_dscp_restriction(returned: i64) -> Result<(), ClientError> {
-    if !(0..=i64::from(MAX_DSCP_CODEPOINT)).contains(&returned) {
+    if !(0..=255).contains(&returned) {
         return Err(ClientError::NegotiationRejected {
-            reason: format!("dscp must be in range 0..={MAX_DSCP_CODEPOINT}"),
+            reason: "dscp must be in range 0..=255".to_owned(),
         });
     }
 
@@ -348,7 +361,8 @@ mod tests {
             received_stats: ReceivedStats::Both,
             stamp_at: StampAt::Both,
             clock: Clock::Both,
-            dscp: 46,
+            // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF).
+            dscp: 184,
             server_fill: Some(ServerFill {
                 value: "rand".to_owned(),
             }),
@@ -402,8 +416,8 @@ mod tests {
         assert_eq!(
             rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
             NegotiationRestriction::DscpChanged {
-                requested: requested.dscp,
-                negotiated: returned.dscp,
+                requested: requested.dscp >> 2,
+                negotiated: returned.dscp >> 2,
             }
             .message()
         );

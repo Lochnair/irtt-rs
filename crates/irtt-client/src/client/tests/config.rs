@@ -42,7 +42,10 @@ fn params_from_config_maps_compatibility_fields() {
     assert_eq!(params.received_stats, ReceivedStats::Window);
     assert_eq!(params.stamp_at, StampAt::Midpoint);
     assert_eq!(params.clock, Clock::Wall);
-    assert_eq!(params.dscp, 46, "config DSCP codepoint must not be shifted");
+    assert_eq!(
+        params.dscp, 184,
+        "config DSCP codepoint 46 must be shifted into raw wire byte 184"
+    );
     assert_eq!(
         params.server_fill.as_ref().map(|fill| fill.value.as_str()),
         Some("rand")
@@ -67,7 +70,11 @@ fn params_from_config_accepts_boundary_values() {
         dscp: 63,
         ..ClientConfig::default()
     };
-    assert_eq!(params_from_config(&config).unwrap().dscp, 63);
+    assert_eq!(
+        params_from_config(&config).unwrap().dscp,
+        252,
+        "boundary codepoint 63 must be shifted into raw wire byte 252"
+    );
 }
 
 #[test]

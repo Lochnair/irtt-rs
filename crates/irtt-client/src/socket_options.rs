@@ -10,6 +10,13 @@ use crate::{
     error::ClientError,
 };
 
+/// Converts a public DSCP codepoint (`0..=`[`MAX_DSCP_CODEPOINT`]) into the
+/// raw IP TOS / Traffic Class byte it occupies the upper six bits of.
+///
+/// This is the single place `codepoint << 2` is spelled out; both the
+/// config-to-wire conversion and any direct codepoint-based socket
+/// application go through this function so the shift cannot be duplicated or
+/// accidentally applied twice.
 pub(crate) fn dscp_codepoint_to_traffic_class(dscp: u8) -> Result<u32, ClientError> {
     if dscp > MAX_DSCP_CODEPOINT {
         return Err(ClientError::InvalidConfig {
@@ -19,13 +26,19 @@ pub(crate) fn dscp_codepoint_to_traffic_class(dscp: u8) -> Result<u32, ClientErr
     Ok(u32::from(dscp) << 2)
 }
 
-pub(crate) fn apply_dscp_to_socket(
+/// Applies an already-raw IP TOS / Traffic Class byte to the socket directly,
+/// without any codepoint shift.
+pub(crate) fn apply_traffic_class_to_socket(
     socket: &UdpSocket,
     remote: SocketAddr,
-    dscp_codepoint: u8,
+    traffic_class: u8,
 ) -> Result<(), ClientError> {
-    let traffic_class = dscp_codepoint_to_traffic_class(dscp_codepoint)?;
-    set_socket_traffic_class(socket, remote, traffic_class, "set negotiated DSCP")
+    set_socket_traffic_class(
+        socket,
+        remote,
+        u32::from(traffic_class),
+        "set negotiated DSCP",
+    )
 }
 
 pub(crate) fn clear_dscp_on_socket(
@@ -35,14 +48,20 @@ pub(crate) fn clear_dscp_on_socket(
     set_socket_traffic_class(socket, remote, 0, "clear DSCP before close")
 }
 
+/// Applies an already-raw IP TOS / Traffic Class byte to the Tokio socket
+/// directly, without any codepoint shift.
 #[cfg(feature = "tokio")]
-pub(crate) fn apply_dscp_to_tokio_socket(
+pub(crate) fn apply_traffic_class_to_tokio_socket(
     socket: &tokio::net::UdpSocket,
     remote: SocketAddr,
-    dscp_codepoint: u8,
+    traffic_class: u8,
 ) -> Result<(), ClientError> {
-    let traffic_class = dscp_codepoint_to_traffic_class(dscp_codepoint)?;
-    set_tokio_socket_traffic_class(socket, remote, traffic_class, "set negotiated DSCP")
+    set_tokio_socket_traffic_class(
+        socket,
+        remote,
+        u32::from(traffic_class),
+        "set negotiated DSCP",
+    )
 }
 
 #[cfg(feature = "tokio")]
@@ -454,10 +473,10 @@ mod tests {
         let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
         socket.connect(remote).unwrap();
 
-        apply_dscp_to_socket(&socket, remote, 46).unwrap();
-        let traffic_class = socket_traffic_class(&socket, remote).unwrap();
-        assert_eq!(traffic_class & 0xfc, 184);
-        assert_eq!(traffic_class & 0b11, 0);
+        // 184 is the raw wire TOS/Traffic Class byte for DSCP codepoint 46
+        // (EF); applying it directly must not shift it again.
+        apply_traffic_class_to_socket(&socket, remote, 184).unwrap();
+        assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 184);
 
         clear_dscp_on_socket(&socket, remote).unwrap();
         assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 0);
@@ -487,10 +506,8 @@ mod tests {
             socket.set_nonblocking(true).unwrap();
             let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
 
-            apply_dscp_to_tokio_socket(&socket, remote, 46).unwrap();
-            let traffic_class = tokio_socket_traffic_class(&socket, remote).unwrap();
-            assert_eq!(traffic_class & 0xfc, 184);
-            assert_eq!(traffic_class & 0b11, 0);
+            apply_traffic_class_to_tokio_socket(&socket, remote, 184).unwrap();
+            assert_eq!(tokio_socket_traffic_class(&socket, remote).unwrap(), 184);
 
             clear_dscp_on_tokio_socket(&socket, remote).unwrap();
             assert_eq!(tokio_socket_traffic_class(&socket, remote).unwrap(), 0);
@@ -515,7 +532,7 @@ mod tests {
             return;
         };
 
-        apply_dscp_to_socket(&socket, remote, 46).unwrap();
+        apply_traffic_class_to_socket(&socket, remote, 184).unwrap();
         let traffic_class = match socket_traffic_class(&socket, remote) {
             Ok(traffic_class) => traffic_class,
             Err(error) if is_unsupported_socket_readback(&error) => {
@@ -524,8 +541,7 @@ mod tests {
             }
             Err(error) => panic!("{error}"),
         };
-        assert_eq!(traffic_class & 0xfc, 184);
-        assert_eq!(traffic_class & 0b11, 0);
+        assert_eq!(traffic_class, 184);
 
         clear_dscp_on_socket(&socket, remote).unwrap();
         assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 0);

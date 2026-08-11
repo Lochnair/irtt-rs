@@ -18,6 +18,7 @@ use crate::{
     metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
     session::{negotiate_params, NegotiatedParams},
+    socket_options::dscp_codepoint_to_traffic_class,
     timing::ClientTimestamp,
 };
 
@@ -848,7 +849,7 @@ pub(crate) fn params_from_config(config: &ClientConfig) -> Result<Params, Client
         received_stats: config.received_stats,
         stamp_at: config.stamp_at,
         clock: config.clock,
-        dscp: i64::from(config.dscp),
+        dscp: i64::from(dscp_codepoint_to_traffic_class(config.dscp)?),
         server_fill: config.server_fill.clone().map(|value| ServerFill { value }),
     })
 }

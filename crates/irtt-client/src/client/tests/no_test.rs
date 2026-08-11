@@ -13,7 +13,7 @@ fn no_test_success_validates_params() {
     assert_eq!(negotiated.params, params);
     assert!(client.next_send_deadline().is_none());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     server.join();
 }
 

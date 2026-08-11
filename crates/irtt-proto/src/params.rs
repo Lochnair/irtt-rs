@@ -20,6 +20,11 @@ pub struct Params {
     pub received_stats: ReceivedStats,
     pub stamp_at: StampAt,
     pub clock: Clock,
+    /// Raw IP TOS / Traffic Class byte (`0..=255`), not a six-bit DSCP
+    /// codepoint. A codepoint occupies the upper six bits of this byte;
+    /// callers that accept a codepoint from users or configuration must shift
+    /// it left by two before assigning it here. `encode`/`decode` carry this
+    /// value as-is and never apply that shift themselves.
     pub dscp: i64,
     pub server_fill: Option<ServerFill>,
 }
@@ -298,7 +303,11 @@ mod tests {
     }
 
     #[test]
-    fn params_round_trip_dscp_codepoints_without_shifting() {
+    fn params_round_trip_dscp_values_are_encoded_without_shifting() {
+        // `Params::dscp` is a raw wire byte; encode/decode carry whatever
+        // value is set without interpreting or shifting it, regardless of
+        // whether it happens to look like a codepoint (46) or a raw TOS byte
+        // (184).
         for dscp in [0, 46, 63, 64, 184, -1] {
             let params = Params {
                 protocol_version: 1,
@@ -316,11 +325,11 @@ mod tests {
         let encoded = params.encode();
         assert!(
             encoded.windows(2).any(|bytes| bytes == [8, 92]),
-            "DSCP 46 must be encoded as param value 46"
+            "dscp value 46 must be encoded as param value 46"
         );
         assert!(
             !encoded.windows(3).any(|bytes| bytes == [8, 0xf0, 0x02]),
-            "DSCP 46 must not be shifted to TOS byte 184 in Params encoding"
+            "Params::encode must not shift dscp 46 to 184; any codepoint shift is a caller concern"
         );
         assert_eq!(Params::decode(&encoded).unwrap().dscp, 46);
     }

@@ -30,7 +30,7 @@ use crate::{
         PreparedProbe, SessionMachine, TimeoutBatch, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_tokio_udp_socket, resolve_remote_tokio, validate_open_timeouts},
-    socket_options::{apply_dscp_to_tokio_socket, clear_dscp_on_tokio_socket},
+    socket_options::{apply_traffic_class_to_tokio_socket, clear_dscp_on_tokio_socket},
     timing::ClientTimestamp,
 };
 
@@ -49,7 +49,7 @@ struct PreparedAsyncOpen {
     machine: PreparedOpenAcceptance,
     schedule: Option<ProbeSchedule>,
     recv_buffer_len: Option<usize>,
-    negotiated_dscp: Option<u8>,
+    negotiated_traffic_class: Option<u8>,
 }
 
 #[derive(Debug)]
@@ -219,7 +219,7 @@ pub struct AsyncClient {
     schedule: Option<ProbeSchedule>,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
-    applied_dscp: Option<u8>,
+    applied_traffic_class: Option<u8>,
     prepared_open: Option<PreparedOpenRequest>,
     prepared_probe: Option<PreparedProbe>,
     #[cfg(test)]
@@ -247,7 +247,7 @@ impl AsyncClient {
             schedule: None,
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
-            applied_dscp: None,
+            applied_traffic_class: None,
             prepared_open: Some(prepared_open),
             prepared_probe: None,
             #[cfg(test)]
@@ -618,7 +618,7 @@ impl AsyncClient {
                 self.schedule = None;
                 self.prepared_probe = None;
                 if self.clear_peer_close_dscp().is_ok() {
-                    self.applied_dscp = None;
+                    self.applied_traffic_class = None;
                 }
             }
             return Poll::Ready(Ok(events));
@@ -641,7 +641,7 @@ impl AsyncClient {
                     source,
                 }));
             }
-            let previous_dscp = self.applied_dscp;
+            let previous_traffic_class = self.applied_traffic_class;
             let expected_bytes = prepared.bytes.len();
 
             #[cfg(test)]
@@ -661,7 +661,7 @@ impl AsyncClient {
             let mut rollback = DscpRollback::armed(
                 &self.socket,
                 self.remote,
-                previous_dscp,
+                previous_traffic_class,
                 #[cfg(test)]
                 &self.test_hooks.fail_dscp_restore,
             );
@@ -698,7 +698,7 @@ impl AsyncClient {
             rollback.disarm();
             self.schedule = None;
             self.prepared_probe = None;
-            self.applied_dscp = None;
+            self.applied_traffic_class = None;
 
             if let Err(error) = validate_datagram_length(expected_bytes, bytes) {
                 return Poll::Ready(Err(error));
@@ -811,7 +811,7 @@ impl AsyncClient {
                 machine,
                 schedule: None,
                 recv_buffer_len: None,
-                negotiated_dscp: None,
+                negotiated_traffic_class: None,
             });
         };
         let schedule = match ProbeSchedule::new(opened_at.mono, negotiated) {
@@ -826,12 +826,12 @@ impl AsyncClient {
                 return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }));
             }
         };
-        let negotiated_dscp = match u8::try_from(negotiated.params.dscp) {
-            Ok(dscp) => dscp,
+        let negotiated_traffic_class = match u8::try_from(negotiated.params.dscp) {
+            Ok(traffic_class) => traffic_class,
             Err(_) => {
                 return Err(Box::new(PreparedAsyncOpenFailure {
                     primary: ClientError::InvalidConfig {
-                        reason: "negotiated dscp must be in range 0..=63".to_owned(),
+                        reason: "negotiated dscp must be in range 0..=255".to_owned(),
                     },
                     machine,
                 }));
@@ -855,12 +855,16 @@ impl AsyncClient {
                 source: io::Error::other("injected negotiated DSCP failure"),
             })
         } else {
-            apply_dscp_to_tokio_socket(&self.socket, self.remote, negotiated_dscp)
+            apply_traffic_class_to_tokio_socket(&self.socket, self.remote, negotiated_traffic_class)
         };
         #[cfg(not(test))]
-        let dscp_result = apply_dscp_to_tokio_socket(&self.socket, self.remote, negotiated_dscp);
+        let dscp_result = apply_traffic_class_to_tokio_socket(
+            &self.socket,
+            self.remote,
+            negotiated_traffic_class,
+        );
         if let Err(primary) = dscp_result {
-            self.restore_dscp_best_effort(self.applied_dscp);
+            self.restore_dscp_best_effort(self.applied_traffic_class);
             return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }));
         }
 
@@ -868,7 +872,7 @@ impl AsyncClient {
             machine,
             schedule: Some(schedule),
             recv_buffer_len: Some(recv_buffer_len),
-            negotiated_dscp: Some(negotiated_dscp),
+            negotiated_traffic_class: Some(negotiated_traffic_class),
         })
     }
 
@@ -878,7 +882,7 @@ impl AsyncClient {
         }
         let outcome = self.machine.commit_open(prepared.machine);
         self.schedule = prepared.schedule;
-        self.applied_dscp = prepared.negotiated_dscp;
+        self.applied_traffic_class = prepared.negotiated_traffic_class;
         self.prepared_open = None;
         outcome
     }
@@ -950,9 +954,11 @@ impl AsyncClient {
         clear_dscp_on_tokio_socket(&self.socket, self.remote)
     }
 
-    fn restore_dscp_best_effort(&self, previous_dscp: Option<u8>) {
-        let _ = match previous_dscp {
-            Some(dscp) => apply_dscp_to_tokio_socket(&self.socket, self.remote, dscp),
+    fn restore_dscp_best_effort(&self, previous_traffic_class: Option<u8>) {
+        let _ = match previous_traffic_class {
+            Some(traffic_class) => {
+                apply_traffic_class_to_tokio_socket(&self.socket, self.remote, traffic_class)
+            }
             None => clear_dscp_on_tokio_socket(&self.socket, self.remote),
         };
     }
@@ -961,7 +967,7 @@ impl AsyncClient {
 struct DscpRollback<'a> {
     socket: &'a tokio::net::UdpSocket,
     remote: SocketAddr,
-    previous_dscp: Option<u8>,
+    previous_traffic_class: Option<u8>,
     armed: bool,
     #[cfg(test)]
     fail_restore: &'a Cell<bool>,
@@ -971,13 +977,13 @@ impl<'a> DscpRollback<'a> {
     fn armed(
         socket: &'a tokio::net::UdpSocket,
         remote: SocketAddr,
-        previous_dscp: Option<u8>,
+        previous_traffic_class: Option<u8>,
         #[cfg(test)] fail_restore: &'a Cell<bool>,
     ) -> Self {
         Self {
             socket,
             remote,
-            previous_dscp,
+            previous_traffic_class,
             armed: true,
             #[cfg(test)]
             fail_restore,
@@ -996,8 +1002,10 @@ impl<'a> DscpRollback<'a> {
                 source: io::Error::other("injected DSCP restore failure"),
             });
         }
-        match self.previous_dscp {
-            Some(dscp) => apply_dscp_to_tokio_socket(self.socket, self.remote, dscp)?,
+        match self.previous_traffic_class {
+            Some(traffic_class) => {
+                apply_traffic_class_to_tokio_socket(self.socket, self.remote, traffic_class)?
+            }
             None => clear_dscp_on_tokio_socket(self.socket, self.remote)?,
         }
         self.armed = false;

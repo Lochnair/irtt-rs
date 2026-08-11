@@ -158,7 +158,22 @@ pub fn params_for_modes(received_stats: ReceivedStats, stamp_at: StampAt, clock:
     }
 }
 
+/// Builds a [`ClientConfig`] whose negotiated `Params` will match `params`.
+///
+/// `params.dscp` is the raw IP TOS / Traffic Class byte, while
+/// [`ClientConfig::dscp`] is the six-bit codepoint that produces it; shift
+/// right by two to recover the codepoint the resulting config must request.
+/// Panics if `params.dscp` has any ECN bits set, since those cannot be
+/// recovered from a codepoint and this helper's contract would silently stop
+/// holding otherwise.
 pub fn config_for_params(addr: SocketAddr, params: &Params) -> ClientConfig {
+    let traffic_class =
+        u8::try_from(params.dscp).expect("test DSCP must fit the raw traffic-class byte");
+    assert_eq!(
+        traffic_class & 0b11,
+        0,
+        "test Params::dscp must be representable by ClientConfig's DSCP codepoint"
+    );
     ClientConfig {
         server_addr: addr.to_string(),
         duration: if params.duration_ns == 0 {
@@ -175,7 +190,7 @@ pub fn config_for_params(addr: SocketAddr, params: &Params) -> ClientConfig {
         received_stats: params.received_stats,
         stamp_at: params.stamp_at,
         clock: params.clock,
-        dscp: u8::try_from(params.dscp).unwrap(),
+        dscp: traffic_class >> 2,
         server_fill: params.server_fill.as_ref().map(|fill| fill.value.clone()),
         open_timeouts: vec![Duration::from_millis(200)],
         socket_config: SocketConfig {

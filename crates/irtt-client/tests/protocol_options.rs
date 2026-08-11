@@ -163,7 +163,8 @@ fn hmac_rich_mode_uses_negotiated_echo_layout_and_decodes_reply() {
 fn strict_open_rejects_changed_compatibility_params_from_server() {
     let mut requested = default_params();
     requested.length = 256;
-    requested.dscp = 46;
+    // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF).
+    requested.dscp = 184;
     requested.server_fill = server_fill("rand");
 
     for returned in changed_compatibility_params(&requested) {
@@ -183,7 +184,8 @@ fn strict_open_rejects_changed_compatibility_params_from_server() {
 fn loose_open_uses_returned_params_for_echo_layout_and_reply_parsing() {
     let mut requested = default_params();
     requested.length = 128;
-    requested.dscp = 46;
+    // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF).
+    requested.dscp = 184;
     requested.server_fill = server_fill("rand");
 
     let mut returned = requested.clone();

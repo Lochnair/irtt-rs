@@ -124,7 +124,7 @@ mod tests {
     use crate::{
         event::PacketMeta,
         receive::{configure_receive_metadata, recv_datagram},
-        socket_options::apply_dscp_to_socket,
+        socket_options::apply_traffic_class_to_socket,
         timing::ClientTimestamp,
     };
 
@@ -277,7 +277,7 @@ mod tests {
     fn ipv4_traffic_class_metadata_is_observed_when_kernel_provides_it() {
         let (sender, receiver) = connected_ipv4_loopback_pair();
         configure_receive_metadata(&receiver, sender.local_addr().unwrap()).unwrap();
-        apply_dscp_to_socket(&sender, receiver.local_addr().unwrap(), 46).unwrap();
+        apply_traffic_class_to_socket(&sender, receiver.local_addr().unwrap(), 184).unwrap();
         sender.send(b"dscp").unwrap();
 
         let mut buf = [0_u8; 16];
@@ -299,7 +299,7 @@ mod tests {
             return;
         };
         configure_receive_metadata(&receiver, sender.local_addr().unwrap()).unwrap();
-        apply_dscp_to_socket(&sender, receiver.local_addr().unwrap(), 46).unwrap();
+        apply_traffic_class_to_socket(&sender, receiver.local_addr().unwrap(), 184).unwrap();
         sender.send(b"dscp").unwrap();
 
         let mut buf = [0_u8; 16];
