@@ -68,6 +68,10 @@ impl ServerCore {
     }
 
     /// The number of live sessions.
+    ///
+    /// This is the observable a caller genuinely needs — how much session state
+    /// the server is holding against its bound. The sessions themselves stay
+    /// crate-private until their shape settles.
     #[must_use]
     pub fn session_count(&self) -> usize {
         self.sessions.len()
@@ -78,8 +82,11 @@ impl ServerCore {
     /// This is a lookup by token alone and is therefore *not* an admission
     /// check: a request is bound to a session only when the token matches and
     /// it arrived from the session's exact endpoint.
-    #[must_use]
-    pub fn session(&self, token: u64) -> Option<&Session> {
+    //
+    // Called only by tests until echo and close processing arrive, which is
+    // what a token lookup is for.
+    #[allow(dead_code)]
+    pub(crate) fn session(&self, token: u64) -> Option<&Session> {
         self.sessions.get(&token)
     }
 

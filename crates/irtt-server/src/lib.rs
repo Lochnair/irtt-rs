@@ -50,4 +50,3 @@ mod tests;
 pub use config::{ServerConfig, DEFAULT_MAX_SESSIONS};
 pub use core::ServerCore;
 pub use error::ServerError;
-pub use session::Session;

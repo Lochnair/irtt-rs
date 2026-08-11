@@ -9,8 +9,13 @@ use irtt_proto::Params;
 /// state (activity, deadlines, expiry) belong to the slices that implement
 /// those behaviors, and are deliberately absent rather than present as
 /// placeholders.
+///
+/// Deliberately crate-private. The next slices are all but certain to add and
+/// restructure fields here, and nothing outside the crate needs a session yet;
+/// publishing internal session state before ECHO even exists would buy nothing
+/// and commit us to a shape we are about to change.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Session {
+pub(crate) struct Session {
     peer: SocketAddr,
     params: Params,
 }
@@ -27,15 +32,23 @@ impl Session {
     /// all form part of its identity. Echo and close processing, once
     /// implemented, must require both a token match and an exact endpoint match
     /// before touching a session.
-    #[must_use]
-    pub fn peer(&self) -> SocketAddr {
+    //
+    // Read only by tests until then. The endpoint has to be captured at open
+    // time — it is not recoverable later — so this slice stores state whose
+    // production consumer is the next one, and the tests prove it is stored
+    // exactly.
+    #[allow(dead_code)]
+    pub(crate) fn peer(&self) -> SocketAddr {
         self.peer
     }
 
     /// The negotiated parameters the server returned for this session and will
     /// enforce for it.
-    #[must_use]
-    pub fn params(&self) -> &Params {
+    //
+    // Also awaiting its production consumer: echo replies are built from the
+    // negotiated params.
+    #[allow(dead_code)]
+    pub(crate) fn params(&self) -> &Params {
         &self.params
     }
 }
