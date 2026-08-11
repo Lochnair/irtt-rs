@@ -14,7 +14,7 @@ fn echo_reply_metadata_propagates_observed_dscp_with_ancillary() {
         let (size, _) = socket.recv_from(&mut buf).unwrap();
         tx.send(buf[..size].to_vec()).unwrap();
         let seq = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-        crate::socket_options::apply_dscp_to_socket(&socket, peer, 46).unwrap();
+        crate::socket_options::apply_traffic_class_to_socket(&socket, peer, 184).unwrap();
         let reply_packet =
             echo_reply_packet(TOKEN, seq, &params, &TimestampFields::default(), None);
         socket.send_to(&reply_packet, peer).unwrap();

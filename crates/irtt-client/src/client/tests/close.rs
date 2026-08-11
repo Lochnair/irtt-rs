@@ -45,7 +45,7 @@ fn close_sends_one_close_packet_with_negotiated_token() {
     ));
     assert!(!client.runtime.is_open());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     let packets: Vec<_> = server.rx.iter().take(2).collect();
     let close = &packets[1];
     assert_eq!(close[3], flags::FLAG_CLOSE);
@@ -82,7 +82,7 @@ fn close_event_reservation_failure_precedes_dscp_clear_and_send() {
     assert!(client.test_hooks.fail_close_dscp_clear.get());
     assert!(client.runtime.is_open());
     assert!(client.schedule.is_some());
-    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.applied_traffic_class, Some(0));
 
     client.test_hooks.fail_close_dscp_clear.set(false);
     client.close().unwrap();
@@ -114,7 +114,7 @@ fn close_dscp_clear_failure_precedes_send_and_preserves_open_state() {
     assert_eq!(client.test_hooks.close_send_attempts.get(), 0);
     assert!(client.runtime.is_open());
     assert!(client.schedule.is_some());
-    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.applied_traffic_class, Some(0));
 
     client.close().unwrap();
     assert_eq!(client.test_hooks.close_send_attempts.get(), 1);
@@ -147,7 +147,7 @@ fn close_send_failure_leaves_machine_and_schedule_open_for_retry() {
     assert_eq!(client.test_hooks.close_sent_at.get(), Some(sent_at));
     assert!(client.runtime.is_open());
     assert!(client.schedule.is_some());
-    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.applied_traffic_class, Some(0));
     assert_eq!(client.test_hooks.close_send_attempts.get(), 1);
 
     assert!(matches!(
@@ -196,7 +196,7 @@ fn short_successful_close_commits_before_length_mismatch() {
     ));
     assert!(!client.runtime.is_open());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     assert_eq!(client.test_hooks.close_sent_at.get(), None);
     assert!(matches!(client.close(), Err(ClientError::AlreadyClosed)));
     server.join();
@@ -351,7 +351,7 @@ fn peer_close_dscp_cleanup_failure_preserves_events_and_closed_state() {
     ));
     assert!(client.is_peer_closed());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.applied_traffic_class, Some(0));
     assert_eq!(client.test_hooks.close_send_attempts.get(), 0);
     let open = server.rx.recv_timeout(Duration::from_millis(100)).unwrap();
     let echo = server.rx.recv_timeout(Duration::from_millis(100)).unwrap();

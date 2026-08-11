@@ -20,7 +20,7 @@ use crate::{
         SessionMachine, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
-    socket_options::{apply_dscp_to_socket, clear_dscp_on_socket},
+    socket_options::{apply_traffic_class_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
 };
 
@@ -42,8 +42,8 @@ struct PreparedClientOpen {
     machine: PreparedOpenAcceptance,
     schedule: Option<ProbeSchedule>,
     recv_buffer_len: Option<usize>,
-    negotiated_dscp: Option<u8>,
-    previous_dscp: Option<u8>,
+    negotiated_traffic_class: Option<u8>,
+    previous_traffic_class: Option<u8>,
     post_open_recv_timeout: Option<Duration>,
 }
 
@@ -103,7 +103,7 @@ pub struct Client {
     socket: UdpSocket,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
-    applied_dscp: Option<u8>,
+    applied_traffic_class: Option<u8>,
     #[cfg(test)]
     test_hooks: ClientTestHooks,
     #[cfg(test)]
@@ -132,7 +132,7 @@ impl Client {
             socket,
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
-            applied_dscp: None,
+            applied_traffic_class: None,
             #[cfg(test)]
             test_hooks: ClientTestHooks::default(),
             #[cfg(test)]
@@ -192,14 +192,14 @@ impl Client {
                 operation: "close event result",
                 source,
             })?;
-        let previous_dscp = self.applied_dscp;
+        let previous_traffic_class = self.applied_traffic_class;
         let expected_bytes = prepared.bytes.len();
 
         self.clear_close_dscp()?;
         let bytes = match self.send_close_datagram(prepared.bytes) {
             Ok(bytes) => bytes,
             Err(err) => {
-                self.restore_dscp_best_effort(previous_dscp);
+                self.restore_dscp_best_effort(previous_traffic_class);
                 return Err(ClientError::Socket(err));
             }
         };
@@ -213,7 +213,7 @@ impl Client {
             .unwrap_or_else(ClientTimestamp::now);
         let event = self.runtime.commit_local_close(prepared.commit, sent_at);
         self.schedule = None;
-        self.applied_dscp = None;
+        self.applied_traffic_class = None;
 
         validate_datagram_length(expected_bytes, bytes)?;
         events.push(event);
@@ -275,7 +275,7 @@ impl Client {
         if self.runtime.is_peer_closed() {
             self.schedule = None;
             if self.clear_close_dscp().is_ok() {
-                self.applied_dscp = None;
+                self.applied_traffic_class = None;
             }
         }
         Ok(events)
@@ -521,8 +521,8 @@ impl Client {
                 machine,
                 schedule: None,
                 recv_buffer_len: None,
-                negotiated_dscp: None,
-                previous_dscp: self.applied_dscp,
+                negotiated_traffic_class: None,
+                previous_traffic_class: self.applied_traffic_class,
                 post_open_recv_timeout: self.runtime.config().socket_config.recv_timeout,
             });
         };
@@ -540,12 +540,12 @@ impl Client {
             .recv_buffer_len_override
             .get()
             .unwrap_or(recv_buffer_len);
-        let negotiated_dscp = match u8::try_from(negotiated.params.dscp) {
-            Ok(dscp) => dscp,
+        let negotiated_traffic_class = match u8::try_from(negotiated.params.dscp) {
+            Ok(traffic_class) => traffic_class,
             Err(_) => {
                 return Err(Box::new(PreparedClientOpenFailure {
                     primary: ClientError::InvalidConfig {
-                        reason: "negotiated dscp must be in range 0..=63".to_owned(),
+                        reason: "negotiated dscp must be in range 0..=255".to_owned(),
                     },
                     machine,
                 }));
@@ -556,8 +556,8 @@ impl Client {
             machine,
             schedule: Some(schedule),
             recv_buffer_len: Some(recv_buffer_len),
-            negotiated_dscp: Some(negotiated_dscp),
-            previous_dscp: self.applied_dscp,
+            negotiated_traffic_class: Some(negotiated_traffic_class),
+            previous_traffic_class: self.applied_traffic_class,
             post_open_recv_timeout: self.runtime.config().socket_config.recv_timeout,
         })
     }
@@ -570,12 +570,14 @@ impl Client {
             machine,
             schedule,
             recv_buffer_len,
-            negotiated_dscp,
-            previous_dscp,
+            negotiated_traffic_class,
+            previous_traffic_class,
             post_open_recv_timeout,
         } = prepared;
 
-        if let (Some(recv_buffer_len), Some(negotiated_dscp)) = (recv_buffer_len, negotiated_dscp) {
+        if let (Some(recv_buffer_len), Some(negotiated_traffic_class)) =
+            (recv_buffer_len, negotiated_traffic_class)
+        {
             let previous_len = self.recv_buffer.len();
             let additional = recv_buffer_len.saturating_sub(previous_len);
             if let Err(source) = self.recv_buffer.try_reserve(additional) {
@@ -591,23 +593,23 @@ impl Client {
             self.test_hooks
                 .prepared_active_session_before_dscp
                 .set(machine.has_prepared_active_session());
-            if let Err(primary) = self.apply_open_dscp(negotiated_dscp) {
+            if let Err(primary) = self.apply_open_dscp(negotiated_traffic_class) {
                 self.recv_buffer.truncate(previous_len);
-                self.restore_dscp_best_effort(previous_dscp);
+                self.restore_dscp_best_effort(previous_traffic_class);
                 self.send_cleanup_close_best_effort(machine.cleanup_close_packet());
                 return Err(primary);
             }
             if let Err(source) = self.restore_open_read_timeout(post_open_recv_timeout) {
                 let primary = ClientError::ReadTimeoutRestore { source };
                 self.recv_buffer.truncate(previous_len);
-                self.restore_dscp_best_effort(previous_dscp);
+                self.restore_dscp_best_effort(previous_traffic_class);
                 self.send_cleanup_close_best_effort(machine.cleanup_close_packet());
                 return Err(primary);
             }
 
             let outcome = self.runtime.commit_open(machine);
             self.schedule = schedule;
-            self.applied_dscp = Some(negotiated_dscp);
+            self.applied_traffic_class = Some(negotiated_traffic_class);
             Ok(outcome)
         } else {
             debug_assert!(schedule.is_none());
@@ -616,18 +618,20 @@ impl Client {
             }
             let outcome = self.runtime.commit_open(machine);
             self.schedule = None;
-            self.applied_dscp = None;
+            self.applied_traffic_class = None;
             Ok(outcome)
         }
     }
 
-    fn restore_dscp_best_effort(&self, previous_dscp: Option<u8>) {
+    fn restore_dscp_best_effort(&self, previous_traffic_class: Option<u8>) {
         #[cfg(test)]
         if self.test_hooks.fail_dscp_restore.replace(false) {
             return;
         }
-        let _ = match previous_dscp {
-            Some(dscp) => apply_dscp_to_socket(&self.socket, self.remote, dscp),
+        let _ = match previous_traffic_class {
+            Some(traffic_class) => {
+                apply_traffic_class_to_socket(&self.socket, self.remote, traffic_class)
+            }
             None => clear_dscp_on_socket(&self.socket, self.remote),
         };
     }
@@ -654,7 +658,7 @@ impl Client {
         }
     }
 
-    fn apply_open_dscp(&self, dscp: u8) -> Result<(), ClientError> {
+    fn apply_open_dscp(&self, traffic_class: u8) -> Result<(), ClientError> {
         #[cfg(test)]
         if self.test_hooks.fail_open_dscp.replace(false) {
             return Err(ClientError::SocketOption {
@@ -663,7 +667,7 @@ impl Client {
                 source: io::Error::other("injected negotiated DSCP failure"),
             });
         }
-        apply_dscp_to_socket(&self.socket, self.remote, dscp)
+        apply_traffic_class_to_socket(&self.socket, self.remote, traffic_class)
     }
 
     fn restore_open_read_timeout(&self, timeout: Option<Duration>) -> io::Result<()> {

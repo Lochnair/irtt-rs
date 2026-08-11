@@ -10,7 +10,7 @@ fn successful_open_handshake() {
     let negotiated = assert_open_started(client.open().unwrap());
     assert_eq!(negotiated.params, params);
     assert!(client.schedule.is_some());
-    assert_eq!(client.applied_dscp, Some(0));
+    assert_eq!(client.applied_traffic_class, Some(0));
     server.join();
 }
 
@@ -284,7 +284,7 @@ fn schedule_duration_overflow_cannot_partially_open() {
     assert!(failure.machine.cleanup_close_packet().is_some());
     assert!(client.runtime.prepare_open_request().is_ok());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     assert_eq!(client.recv_buffer.len(), previous_recv_len);
     server.join();
 }
@@ -346,7 +346,9 @@ fn cleanup_send_failure_does_not_replace_primary_open_error() {
 #[test]
 fn receive_buffer_reservation_failure_precedes_dscp_application() {
     let mut returned = default_params();
-    returned.dscp = 46;
+    // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF), matching
+    // what the client below requests so negotiation succeeds unchanged.
+    returned.dscp = 184;
     let server = start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);
         socket
@@ -376,7 +378,7 @@ fn receive_buffer_reservation_failure_precedes_dscp_application() {
     assert!(client.test_hooks.fail_open_dscp.get());
     assert!(client.runtime.prepare_open_request().is_ok());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     server.join();
 }
 
@@ -406,7 +408,7 @@ fn dscp_application_failure_leaves_machine_connected() {
     assert!(client.test_hooks.prepared_active_session_before_dscp.get());
     assert!(client.runtime.prepare_open_request().is_ok());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     server.join();
 }
 
@@ -432,7 +434,7 @@ fn read_timeout_restoration_failure_leaves_machine_connected() {
     ));
     assert!(client.runtime.prepare_open_request().is_ok());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     server.join();
 }
 
@@ -458,6 +460,6 @@ fn dscp_rollback_failure_keeps_timeout_restoration_primary() {
     assert!(matches!(error, ClientError::ReadTimeoutRestore { .. }));
     assert!(client.runtime.prepare_open_request().is_ok());
     assert!(client.schedule.is_none());
-    assert_eq!(client.applied_dscp, None);
+    assert_eq!(client.applied_traffic_class, None);
     server.join();
 }

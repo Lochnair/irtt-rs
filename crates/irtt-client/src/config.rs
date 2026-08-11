@@ -12,8 +12,10 @@ use irtt_proto::{Clock, ReceivedStats, StampAt};
 pub(crate) const DEFAULT_PORT: u16 = 2112;
 /// Largest valid DSCP codepoint accepted by client configuration.
 ///
-/// DSCP is a six-bit value in the range `0..=63`. The client maps it into the
-/// socket traffic-class field when configuring packet priority.
+/// DSCP is a six-bit value in the range `0..=63`. The client shifts it left
+/// by two bits into the raw IP TOS / Traffic Class byte carried by
+/// [`irtt_proto::Params::dscp`] and applied to the socket during the active
+/// test phase.
 pub const MAX_DSCP_CODEPOINT: u8 = 63;
 /// Largest IPv4 TTL or IPv6 hop-limit value accepted by client configuration.
 ///

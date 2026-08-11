@@ -493,7 +493,7 @@ fn opening_cancellation_before_submission_is_transactional() {
         assert!(client.machine.prepare_open_request().is_ok());
         assert!(client.prepared_open.is_some());
         assert!(client.schedule.is_none());
-        assert_eq!(client.applied_dscp, None);
+        assert_eq!(client.applied_traffic_class, None);
     });
     assert!(server.finish().is_empty());
 }
@@ -527,7 +527,7 @@ fn opening_cancellation_after_submission_can_retry() {
         assert!(client.machine.prepare_open_request().is_ok());
         assert!(client.prepared_open.is_some());
         assert!(client.schedule.is_none());
-        assert_eq!(client.applied_dscp, None);
+        assert_eq!(client.applied_traffic_class, None);
         assert!(matches!(
             client.open().await.unwrap(),
             OpenOutcome::Started { .. }
@@ -555,7 +555,7 @@ fn adapter_failure_sends_preencoded_cleanup_without_committing_open() {
         ));
         assert!(client.machine.prepare_open_request().is_ok());
         assert!(client.schedule.is_none());
-        assert_eq!(client.applied_dscp, None);
+        assert_eq!(client.applied_traffic_class, None);
     });
     assert_eq!(server.finish().len(), 2);
 }
@@ -598,7 +598,7 @@ fn no_test_open_has_no_schedule_or_dscp_state() {
         ));
         assert!(client.prepared_open.is_none());
         assert!(client.schedule.is_none());
-        assert_eq!(client.applied_dscp, None);
+        assert_eq!(client.applied_traffic_class, None);
         assert!(client.is_run_complete());
         assert!(matches!(
             client.close().await,
@@ -879,7 +879,7 @@ fn peer_close_dscp_failure_preserves_events_and_logical_ownership() {
         assert!(client.is_run_complete());
         assert!(client.schedule.is_none());
         assert!(client.prepared_probe.is_none());
-        assert_eq!(client.applied_dscp, Some(46));
+        assert_eq!(client.applied_traffic_class, Some(184));
         assert_eq!(client.next_send_deadline(), None);
         assert_eq!(socket_dscp(&client), 46);
     });
@@ -936,7 +936,7 @@ fn close_cancellation_and_would_block_restore_dscp_before_suspend() {
         assert!(client.machine.is_open());
         assert!(client.schedule.is_some());
         assert_eq!(client.next_send_deadline(), deadline);
-        assert_eq!(client.applied_dscp, Some(46));
+        assert_eq!(client.applied_traffic_class, Some(184));
         assert_eq!(client.test_hooks.send_attempts.get(), attempts);
         assert_eq!(socket_dscp(&client), 46);
 
@@ -947,7 +947,7 @@ fn close_cancellation_and_would_block_restore_dscp_before_suspend() {
         drop(close);
         assert!(client.machine.is_open());
         assert!(client.schedule.is_some());
-        assert_eq!(client.applied_dscp, Some(46));
+        assert_eq!(client.applied_traffic_class, Some(184));
         assert_eq!(socket_dscp(&client), 46);
 
         assert!(matches!(
@@ -955,7 +955,7 @@ fn close_cancellation_and_would_block_restore_dscp_before_suspend() {
             [ClientEvent::SessionClosed { .. }]
         ));
         assert!(client.schedule.is_none());
-        assert_eq!(client.applied_dscp, None);
+        assert_eq!(client.applied_traffic_class, None);
     });
     assert_eq!(server.finish().len(), 2);
 }
@@ -972,7 +972,7 @@ fn close_errors_preserve_open_state_and_primary_send_error() {
         assert!(client.machine.is_open());
         assert!(client.schedule.is_some());
         assert_eq!(client.next_send_deadline(), deadline);
-        assert_eq!(client.applied_dscp, Some(46));
+        assert_eq!(client.applied_traffic_class, Some(184));
         assert_eq!(socket_dscp(&client), 46);
 
         client.test_hooks.fail_dscp_restore.set(true);
@@ -1001,7 +1001,7 @@ fn close_would_block_restore_failure_stops_without_committing() {
         ));
         assert!(client.machine.is_open());
         assert!(client.schedule.is_some());
-        assert_eq!(client.applied_dscp, Some(46));
+        assert_eq!(client.applied_traffic_class, Some(184));
     });
     assert_eq!(server.finish().len(), 1);
 }
@@ -1027,7 +1027,7 @@ fn successful_short_close_commits_before_length_error() {
         assert!(!client.machine.is_open());
         assert!(client.schedule.is_none());
         assert!(client.prepared_probe.is_none());
-        assert_eq!(client.applied_dscp, None);
+        assert_eq!(client.applied_traffic_class, None);
         assert!(matches!(
             client.machine.prepare_close(),
             Err(ClientError::AlreadyClosed)
@@ -1085,7 +1085,11 @@ fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
         open_negotiated(&blocking_open),
         open_negotiated(&async_open)
     );
-    assert_eq!(open_negotiated(&async_open).params.dscp, 46);
+    assert_eq!(
+        open_negotiated(&async_open).params.dscp,
+        184,
+        "negotiated Params::dscp is the raw wire byte for codepoint 46"
+    );
     assert_matching_event_shape(&blocking_sent[0], &async_sent[0]);
     assert_matching_event_shape(&blocking_reply[0], &async_reply[0]);
     assert_matching_event_shape(&blocking_close[0], &async_close[0]);

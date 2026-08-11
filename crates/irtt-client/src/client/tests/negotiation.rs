@@ -33,13 +33,17 @@ fn strict_negotiation_rejects_changed_params() {
         ..ClientConfig::default()
     };
     let requested = params_from_config(&config).unwrap();
+    assert_eq!(
+        requested.dscp, 184,
+        "codepoint 46 must become raw wire byte 184"
+    );
     let mut returned = requested.clone();
     returned.dscp = 0;
     assert_eq!(
         rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
         NegotiationRestriction::DscpChanged {
-            requested: requested.dscp,
-            negotiated: returned.dscp,
+            requested: 46,
+            negotiated: 0,
         }
         .message()
     );
@@ -183,17 +187,34 @@ fn strict_negotiation_rejects_negative_returned_length() {
 
 #[test]
 fn loose_negotiation_rejects_runtime_invalid_returned_dscp() {
-    let config = ClientConfig::default();
+    let config = ClientConfig {
+        dscp: 46,
+        ..ClientConfig::default()
+    };
     let requested = params_from_config(&config).unwrap();
+    assert_eq!(
+        requested.dscp, 184,
+        "codepoint 46 must become raw wire byte 184"
+    );
 
-    for dscp in [-1, 64] {
+    for dscp in [-1, 256] {
         let mut returned = requested.clone();
         returned.dscp = dscp;
         assert_eq!(
             rejection_reason(&requested, &returned, NegotiationPolicy::Loose),
-            "dscp must be in range 0..=63"
+            "dscp must be in range 0..=255"
         );
     }
+
+    // A raw returned value of 184 must be accepted even though it exceeds the
+    // 0..=63 codepoint range; it is the correctly negotiated wire value for
+    // codepoint 46 and is not subject to the codepoint bound at all.
+    let returned = requested.clone();
+    assert!(
+        assert_negotiates(&requested, &returned, NegotiationPolicy::Loose)
+            .restrictions
+            .is_empty()
+    );
 }
 
 #[test]
