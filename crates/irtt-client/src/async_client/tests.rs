@@ -9,9 +9,8 @@ use std::{
 };
 
 use irtt_proto::{
-    decode_close_request, decode_echo_request, decode_open_request, encode_echo_reply,
-    encode_open_reply, flags, EchoReply, OpenReply, Params, ReceivedStats, StampAt,
-    TimestampFields,
+    decode_request, encode_echo_reply, encode_open_reply, flags, verify_packet_hmac,
+    DecodedRequestKind, EchoReply, OpenReply, Params, ReceivedStats, StampAt, TimestampFields,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -102,6 +101,47 @@ fn recv_packet(socket: &UdpSocket, tx: &mpsc::Sender<Vec<u8>>) -> (Vec<u8>, Sock
     (packet, peer)
 }
 
+/// Admits a request the way a compliant server does: structural decode first,
+/// then HMAC presence policy, then authentication. Returns `None` for anything
+/// a server would silently discard.
+fn decode_server_request<'a>(
+    packet: &'a [u8],
+    key: Option<&[u8]>,
+) -> Option<DecodedRequestKind<'a>> {
+    let request = decode_request(packet).ok()?;
+    if request.hmac_present != key.is_some() {
+        return None;
+    }
+    if let Some(key) = key {
+        verify_packet_hmac(key, packet).ok()?;
+    }
+    Some(request.kind)
+}
+
+/// Returns the requested parameters and whether this was a no-test open.
+fn open_request(packet: &[u8], key: Option<&[u8]>) -> (Params, bool) {
+    match decode_server_request(packet, key) {
+        Some(DecodedRequestKind::Open { params, no_test }) => {
+            (Params::decode(params).unwrap(), no_test)
+        }
+        other => panic!("expected an authenticated open request, got {other:?}"),
+    }
+}
+
+fn echo_request_sequence(packet: &[u8], key: Option<&[u8]>) -> u32 {
+    match decode_server_request(packet, key) {
+        Some(DecodedRequestKind::Echo { sequence, .. }) => sequence,
+        other => panic!("expected an authenticated echo request, got {other:?}"),
+    }
+}
+
+fn close_request_token(packet: &[u8], key: Option<&[u8]>) -> u64 {
+    match decode_server_request(packet, key) {
+        Some(DecodedRequestKind::Close { token }) => token,
+        other => panic!("expected an authenticated close request, got {other:?}"),
+    }
+}
+
 fn send_open_reply(
     socket: &UdpSocket,
     peer: SocketAddr,
@@ -128,16 +168,16 @@ fn open_session(
     key: Option<&[u8]>,
 ) -> (Params, SocketAddr) {
     let (packet, peer) = recv_packet(socket, tx);
-    let request = decode_open_request(&packet, key).unwrap();
+    let (params, _) = open_request(&packet, key);
     send_open_reply(
         socket,
         peer,
-        request.params.clone(),
+        params.clone(),
         key,
         flags::FLAG_OPEN | flags::FLAG_REPLY,
         TOKEN,
     );
-    (request.params, peer)
+    (params, peer)
 }
 
 fn echo_reply(
@@ -175,12 +215,12 @@ fn start_open_server(key: Option<Vec<u8>>, packets_after_open: usize) -> TestSer
 fn start_no_test_server() -> TestServer {
     start_server(move |socket, tx| {
         let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
-        assert!(request.close);
+        let (params, no_test) = open_request(&open_packet, None);
+        assert!(no_test);
         send_open_reply(
             &socket,
             peer,
-            request.params,
+            params,
             None,
             flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
             0,
@@ -192,12 +232,12 @@ fn start_peer_close_server() -> TestServer {
     start_server(move |socket, tx| {
         let (params, peer) = open_session(&socket, &tx, None);
         let (probe_packet, _) = recv_packet(&socket, &tx);
-        let probe = decode_echo_request(&probe_packet, &params, None).unwrap();
+        let sequence = echo_request_sequence(&probe_packet, None);
         socket
             .send_to(
                 &echo_reply(
                     &params,
-                    probe.sequence,
+                    sequence,
                     TOKEN,
                     flags::FLAG_REPLY | flags::FLAG_CLOSE,
                     None,
@@ -213,27 +253,16 @@ fn start_echo_close_server(key: Option<Vec<u8>>) -> TestServer {
         let (params, peer) = open_session(&socket, &tx, key.as_deref());
 
         let (probe_packet, _) = recv_packet(&socket, &tx);
-        let probe = decode_echo_request(&probe_packet, &params, key.as_deref()).unwrap();
+        let sequence = echo_request_sequence(&probe_packet, key.as_deref());
         socket
             .send_to(
-                &echo_reply(
-                    &params,
-                    probe.sequence,
-                    TOKEN,
-                    flags::FLAG_REPLY,
-                    key.as_deref(),
-                ),
+                &echo_reply(&params, sequence, TOKEN, flags::FLAG_REPLY, key.as_deref()),
                 peer,
             )
             .unwrap();
 
         let (close_packet, _) = recv_packet(&socket, &tx);
-        assert_eq!(
-            decode_close_request(&close_packet, key.as_deref())
-                .unwrap()
-                .token,
-            TOKEN
-        );
+        assert_eq!(close_request_token(&close_packet, key.as_deref()), TOKEN);
     })
 }
 
@@ -275,13 +304,13 @@ fn open_ignores_malformed_and_bad_hmac_without_resending() {
     let server_key = key.clone();
     let server = start_server(move |socket, tx| {
         let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, Some(&server_key)).unwrap();
+        let (params, _) = open_request(&open_packet, Some(&server_key));
         socket.send_to(&[0_u8], peer).unwrap();
         let mut bad_hmac = encode_open_reply(
             &OpenReply {
                 flags: flags::FLAG_OPEN | flags::FLAG_REPLY,
                 token: TOKEN,
-                params: request.params.clone(),
+                params: params.clone(),
             },
             Some(&server_key),
         )
@@ -291,7 +320,7 @@ fn open_ignores_malformed_and_bad_hmac_without_resending() {
         send_open_reply(
             &socket,
             peer,
-            request.params,
+            params,
             Some(&server_key),
             flags::FLAG_OPEN | flags::FLAG_REPLY,
             TOKEN,
@@ -342,14 +371,14 @@ fn opening_poll_budget_yields_then_public_open_completes() {
     let (queued, queue_ready) = mpsc::channel();
     let server = start_server(move |socket, tx| {
         let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
+        let (params, _) = open_request(&open_packet, None);
         for _ in 0..=OPEN_POLL_WORK_BUDGET {
             socket.send_to(&[0_u8], peer).unwrap();
         }
         send_open_reply(
             &socket,
             peer,
-            request.params,
+            params,
             None,
             flags::FLAG_OPEN | flags::FLAG_REPLY,
             TOKEN,
@@ -391,7 +420,7 @@ fn opening_poll_budget_yields_then_public_open_completes() {
 fn ignored_open_traffic_cannot_extend_the_absolute_attempt_deadline() {
     let server = start_server(move |socket, tx| {
         let (first_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&first_packet, None).unwrap();
+        let (params, _) = open_request(&first_packet, None);
         socket
             .set_read_timeout(Some(Duration::from_millis(10)))
             .unwrap();
@@ -411,7 +440,7 @@ fn ignored_open_traffic_cannot_extend_the_absolute_attempt_deadline() {
                     send_open_reply(
                         &socket,
                         second_peer,
-                        request.params,
+                        params,
                         None,
                         flags::FLAG_OPEN | flags::FLAG_REPLY,
                         TOKEN,
@@ -445,11 +474,11 @@ fn ignored_open_traffic_cannot_extend_the_absolute_attempt_deadline() {
 fn authenticated_rejection_is_terminal_without_retry() {
     let server = start_server(move |socket, tx| {
         let (open_packet, peer) = recv_packet(&socket, &tx);
-        let request = decode_open_request(&open_packet, None).unwrap();
+        let (params, _) = open_request(&open_packet, None);
         send_open_reply(
             &socket,
             peer,
-            request.params,
+            params,
             None,
             flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
             0,
@@ -502,12 +531,12 @@ fn opening_cancellation_before_submission_is_transactional() {
 fn opening_cancellation_after_submission_can_retry() {
     let server = start_server(move |socket, tx| {
         let (first, _) = recv_packet(&socket, &tx);
-        let first = decode_open_request(&first, None).unwrap();
+        let (first_params, _) = open_request(&first, None);
         let (_, peer) = recv_packet(&socket, &tx);
         send_open_reply(
             &socket,
             peer,
-            first.params,
+            first_params,
             None,
             flags::FLAG_OPEN | flags::FLAG_REPLY,
             TOKEN,
@@ -541,7 +570,7 @@ fn adapter_failure_sends_preencoded_cleanup_without_committing_open() {
     let server = start_server(move |socket, tx| {
         open_session(&socket, &tx, None);
         let (close, _) = recv_packet(&socket, &tx);
-        assert_eq!(decode_close_request(&close, None).unwrap().token, TOKEN);
+        assert_eq!(close_request_token(&close, None), TOKEN);
     });
 
     runtime().block_on(async {
@@ -837,10 +866,10 @@ fn receive_retries_false_readiness_and_shares_packet_classification() {
     let server = start_server(move |socket, tx| {
         let (params, peer) = open_session(&socket, &tx, None);
         let (probe_packet, _) = recv_packet(&socket, &tx);
-        let probe = decode_echo_request(&probe_packet, &params, None).unwrap();
+        let sequence = echo_request_sequence(&probe_packet, None);
         socket
             .send_to(
-                &echo_reply(&params, probe.sequence, TOKEN, flags::FLAG_REPLY, None),
+                &echo_reply(&params, sequence, TOKEN, flags::FLAG_REPLY, None),
                 peer,
             )
             .unwrap();
@@ -891,10 +920,7 @@ fn recv_after_local_close_and_no_test_fails_on_first_poll() {
     let close_server = start_server(move |socket, tx| {
         open_session(&socket, &tx, None);
         let (close_packet, _) = recv_packet(&socket, &tx);
-        assert_eq!(
-            decode_close_request(&close_packet, None).unwrap().token,
-            TOKEN
-        );
+        assert_eq!(close_request_token(&close_packet, None), TOKEN);
     });
     runtime().block_on(async {
         let mut client = opened_client(close_server.addr, 0).await;

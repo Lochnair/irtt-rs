@@ -6,8 +6,8 @@ use std::{
 };
 
 use irtt_proto::{
-    decode_close_request, decode_echo_request, decode_open_request, encode_echo_reply,
-    encode_open_reply, flags, EchoReply, OpenReply, ReceivedStats, StampAt, TimestampFields,
+    decode_request, encode_echo_reply, encode_open_reply, flags, DecodedRequestKind, EchoReply,
+    OpenReply, Params, ReceivedStats, StampAt, TimestampFields,
 };
 use tokio::{runtime::Builder, time::timeout};
 
@@ -69,8 +69,10 @@ impl EchoServer {
         let worker = thread::spawn(move || {
             let mut buffer = [0_u8; 8192];
             let (open_len, peer) = socket.recv_from(&mut buffer).unwrap();
-            let request = decode_open_request(&buffer[..open_len], None).unwrap();
-            let negotiated = request.params;
+            let negotiated = match decode_request(&buffer[..open_len]).unwrap().kind {
+                DecodedRequestKind::Open { params, .. } => Params::decode(params).unwrap(),
+                other => panic!("expected an open request, got {other:?}"),
+            };
             let reply = encode_open_reply(
                 &OpenReply {
                     flags: flags::FLAG_OPEN | flags::FLAG_REPLY,
@@ -84,27 +86,33 @@ impl EchoServer {
 
             loop {
                 let (len, packet_peer) = socket.recv_from(&mut buffer).unwrap();
-                let packet = &buffer[..len];
-                if let Ok(probe) = decode_echo_request(packet, &negotiated, None) {
-                    worker_probe.set();
-                    let reply = encode_echo_reply(
-                        &EchoReply {
-                            flags: flags::FLAG_REPLY,
-                            token: TOKEN,
-                            sequence: probe.sequence,
-                            recv_count: None,
-                            recv_window: None,
-                            timestamps: TimestampFields::default(),
-                            payload: Vec::new(),
-                        },
-                        &negotiated,
-                        None,
-                    )
-                    .unwrap();
-                    socket.send_to(&reply, packet_peer).unwrap();
-                } else if decode_close_request(packet, None).is_ok() {
-                    worker_close.set();
-                    return;
+                let Ok(request) = decode_request(&buffer[..len]) else {
+                    continue;
+                };
+                match request.kind {
+                    DecodedRequestKind::Echo { sequence, .. } => {
+                        worker_probe.set();
+                        let reply = encode_echo_reply(
+                            &EchoReply {
+                                flags: flags::FLAG_REPLY,
+                                token: TOKEN,
+                                sequence,
+                                recv_count: None,
+                                recv_window: None,
+                                timestamps: TimestampFields::default(),
+                                payload: Vec::new(),
+                            },
+                            &negotiated,
+                            None,
+                        )
+                        .unwrap();
+                        socket.send_to(&reply, packet_peer).unwrap();
+                    }
+                    DecodedRequestKind::Close { .. } => {
+                        worker_close.set();
+                        return;
+                    }
+                    DecodedRequestKind::Open { .. } => {}
                 }
             }
         });

@@ -10,8 +10,8 @@ use std::{
 };
 
 use irtt_proto::{
-    decode_close_request, decode_echo_request, decode_open_request, encode_echo_reply,
-    encode_open_reply, flags, EchoReply, OpenReply, ReceivedStats, StampAt, TimestampFields,
+    decode_request, encode_echo_reply, encode_open_reply, flags, verify_packet_hmac,
+    DecodedRequestKind, EchoReply, OpenReply, Params, ReceivedStats, StampAt, TimestampFields,
 };
 use tokio::runtime::{Builder, Runtime};
 
@@ -86,6 +86,31 @@ impl PacketGate {
         self.release_ready.notify_all();
     }
 }
+
+/// Admits a request the way a compliant server does: structural decode first,
+/// then HMAC presence policy, then authentication. Returns `None` for anything
+/// a server would silently discard.
+fn decode_server_request<'a>(
+    packet: &'a [u8],
+    key: Option<&[u8]>,
+) -> Option<DecodedRequestKind<'a>> {
+    let request = decode_request(packet).ok()?;
+    if request.hmac_present != key.is_some() {
+        return None;
+    }
+    if let Some(key) = key {
+        verify_packet_hmac(key, packet).ok()?;
+    }
+    Some(request.kind)
+}
+
+fn decode_open_params(packet: &[u8], key: Option<&[u8]>) -> Params {
+    match decode_server_request(packet, key) {
+        Some(DecodedRequestKind::Open { params, .. }) => Params::decode(params).unwrap(),
+        other => panic!("expected an authenticated open request, got {other:?}"),
+    }
+}
+
 fn start_server(behavior: ServerBehavior, key: Option<Vec<u8>>) -> TestServer {
     start_server_negotiating(behavior, key, None)
 }
@@ -124,11 +149,10 @@ fn start_server_with_gates(
             kind: PacketKind::Open,
             at: Instant::now(),
         });
-        let request = decode_open_request(&buffer[..open_len], key.as_deref()).unwrap();
+        let mut negotiated = decode_open_params(&buffer[..open_len], key.as_deref());
         if let Some(gate) = &open_gate {
             gate.arrive_and_wait();
         }
-        let mut negotiated = request.params.clone();
         if let Some(interval) = interval {
             negotiated.interval_ns = i64::try_from(interval.as_nanos()).unwrap();
         }
@@ -164,77 +188,78 @@ fn start_server_with_gates(
                 return;
             };
             let packet = &buffer[..len];
-            if let Ok(probe) = decode_echo_request(packet, &negotiated, key.as_deref()) {
-                thread_records.lock().unwrap().push(PacketRecord {
-                    kind: PacketKind::Probe,
-                    at: Instant::now(),
-                });
-                let (seen, ready) = &*thread_probe_seen;
-                *seen.lock().unwrap() = true;
-                ready.notify_all();
-                if let ServerBehavior::DelayedEcho(delay) = behavior {
-                    thread::sleep(delay);
-                }
-                if let ServerBehavior::DeferredBurst(count) = behavior {
-                    if deferred_burst_sent {
+            match decode_server_request(packet, key.as_deref()) {
+                Some(DecodedRequestKind::Echo { sequence, .. }) => {
+                    thread_records.lock().unwrap().push(PacketRecord {
+                        kind: PacketKind::Probe,
+                        at: Instant::now(),
+                    });
+                    let (seen, ready) = &*thread_probe_seen;
+                    *seen.lock().unwrap() = true;
+                    ready.notify_all();
+                    if let ServerBehavior::DelayedEcho(delay) = behavior {
+                        thread::sleep(delay);
+                    }
+                    if let ServerBehavior::DeferredBurst(count) = behavior {
+                        if deferred_burst_sent {
+                            continue;
+                        }
+                        deferred_burst_sent = true;
+                        thread::sleep(Duration::from_millis(30));
+                        for reply_index in 0..count {
+                            let reply = encode_echo_reply(
+                                &EchoReply {
+                                    flags: flags::FLAG_REPLY,
+                                    token: TOKEN,
+                                    sequence: if reply_index < 2 { sequence } else { u32::MAX },
+                                    recv_count: None,
+                                    recv_window: None,
+                                    timestamps: TimestampFields::default(),
+                                    payload: Vec::new(),
+                                },
+                                &negotiated,
+                                key.as_deref(),
+                            )
+                            .unwrap();
+                            socket.send_to(&reply, packet_peer).unwrap();
+                        }
                         continue;
                     }
-                    deferred_burst_sent = true;
-                    thread::sleep(Duration::from_millis(30));
-                    for reply_index in 0..count {
-                        let reply = encode_echo_reply(
-                            &EchoReply {
-                                flags: flags::FLAG_REPLY,
-                                token: TOKEN,
-                                sequence: if reply_index < 2 {
-                                    probe.sequence
-                                } else {
-                                    u32::MAX
-                                },
-                                recv_count: None,
-                                recv_window: None,
-                                timestamps: TimestampFields::default(),
-                                payload: Vec::new(),
-                            },
-                            &negotiated,
-                            key.as_deref(),
-                        )
-                        .unwrap();
-                        socket.send_to(&reply, packet_peer).unwrap();
+                    if let Some(gate) = &reply_gate {
+                        gate.arrive_and_wait();
                     }
-                    continue;
+                    let peer_close = matches!(behavior, ServerBehavior::PeerClose);
+                    let reply = encode_echo_reply(
+                        &EchoReply {
+                            flags: flags::FLAG_REPLY
+                                | if peer_close { flags::FLAG_CLOSE } else { 0 },
+                            token: TOKEN,
+                            sequence,
+                            recv_count: None,
+                            recv_window: None,
+                            timestamps: TimestampFields::default(),
+                            payload: Vec::new(),
+                        },
+                        &negotiated,
+                        key.as_deref(),
+                    )
+                    .unwrap();
+                    socket.send_to(&reply, packet_peer).unwrap();
+                    let (sent, ready) = &*thread_reply_sent;
+                    *sent.lock().unwrap() = true;
+                    ready.notify_all();
+                    if peer_close {
+                        return;
+                    }
                 }
-                if let Some(gate) = &reply_gate {
-                    gate.arrive_and_wait();
-                }
-                let peer_close = matches!(behavior, ServerBehavior::PeerClose);
-                let reply = encode_echo_reply(
-                    &EchoReply {
-                        flags: flags::FLAG_REPLY | if peer_close { flags::FLAG_CLOSE } else { 0 },
-                        token: TOKEN,
-                        sequence: probe.sequence,
-                        recv_count: None,
-                        recv_window: None,
-                        timestamps: TimestampFields::default(),
-                        payload: Vec::new(),
-                    },
-                    &negotiated,
-                    key.as_deref(),
-                )
-                .unwrap();
-                socket.send_to(&reply, packet_peer).unwrap();
-                let (sent, ready) = &*thread_reply_sent;
-                *sent.lock().unwrap() = true;
-                ready.notify_all();
-                if peer_close {
+                Some(DecodedRequestKind::Close { .. }) => {
+                    thread_records.lock().unwrap().push(PacketRecord {
+                        kind: PacketKind::Close,
+                        at: Instant::now(),
+                    });
                     return;
                 }
-            } else if decode_close_request(packet, key.as_deref()).is_ok() {
-                thread_records.lock().unwrap().push(PacketRecord {
-                    kind: PacketKind::Close,
-                    at: Instant::now(),
-                });
-                return;
+                Some(DecodedRequestKind::Open { .. }) | None => {}
             }
         }
     });

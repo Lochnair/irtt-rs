@@ -8,7 +8,7 @@ fn hmac_open_success() {
     let params = params_from_config(&config).unwrap();
     let server = start_fake_server(move |socket, tx| {
         let (request, peer) = recv_request(&socket, &tx);
-        verify_hmac(&key, &request, HMAC_OFFSET).unwrap();
+        verify_packet_hmac(&key, &request).unwrap();
         let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, Some(&key));
         socket.send_to(&reply, peer).unwrap();
     });
@@ -85,7 +85,7 @@ fn post_token_hmac_negotiation_failure_sends_authenticated_cleanup_close() {
     let packets: Vec<_> = server.rx.iter().take(2).collect();
     let cleanup = &packets[1];
     assert_eq!(cleanup[3], flags::FLAG_CLOSE | FLAG_HMAC);
-    verify_hmac(&key, cleanup, HMAC_OFFSET).unwrap();
+    verify_packet_hmac(&key, cleanup).unwrap();
     assert_eq!(
         u64::from_le_bytes(cleanup[4 + HMAC_SIZE..12 + HMAC_SIZE].try_into().unwrap()),
         TOKEN
@@ -113,7 +113,7 @@ fn hmac_close_packet_includes_valid_hmac() {
     let packets: Vec<_> = server.rx.iter().take(2).collect();
     let close = &packets[1];
     assert_eq!(close[3], flags::FLAG_CLOSE | FLAG_HMAC);
-    verify_hmac(&key, close, HMAC_OFFSET).unwrap();
+    verify_packet_hmac(&key, close).unwrap();
     assert_eq!(
         u64::from_le_bytes(close[4 + HMAC_SIZE..12 + HMAC_SIZE].try_into().unwrap()),
         TOKEN
@@ -191,7 +191,7 @@ fn hmac_echo_request_reply_works() {
         let mut buf = [0_u8; 2048];
         if let Ok((size, _)) = socket.recv_from(&mut buf) {
             tx.send(buf[..size].to_vec()).unwrap();
-            verify_hmac(&server_key, &buf[..size], HMAC_OFFSET).unwrap();
+            verify_packet_hmac(&server_key, &buf[..size]).unwrap();
             let seq = u32::from_le_bytes(
                 buf[4 + HMAC_SIZE + 8..4 + HMAC_SIZE + 12]
                     .try_into()

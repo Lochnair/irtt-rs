@@ -2,7 +2,7 @@ use hmac::{Hmac, KeyInit, Mac};
 use md5::Md5;
 use subtle::ConstantTimeEq;
 
-use crate::{ProtoError, Result, HEADER_SIZE, HMAC_SIZE};
+use crate::{envelope, flags::FLAG_HMAC, ProtoError, Result, HEADER_SIZE, HMAC_SIZE};
 
 // HMAC-MD5 is used for compatibility with the IRTT wire protocol, not as a
 // new cryptographic recommendation. Verification uses HMAC with constant-time
@@ -34,6 +34,12 @@ pub fn compute_hmac_in_place(key: &[u8], packet: &mut [u8], hmac_offset: usize) 
     Ok(())
 }
 
+/// Verifies an HMAC field at an explicit offset.
+///
+/// This is the low-level primitive, kept for hand-built and captured wire
+/// vectors that name their own field position. Code handling real packets
+/// should use [`verify_packet_hmac`], which locates the field itself and
+/// rejects a packet that does not carry `FLAG_HMAC`.
 pub fn verify_hmac(key: &[u8], packet: &[u8], hmac_offset: usize) -> Result<()> {
     if packet.len().saturating_sub(hmac_offset) < HMAC_SIZE {
         return Err(ProtoError::InvalidHmacOffset);
@@ -45,6 +51,29 @@ pub fn verify_hmac(key: &[u8], packet: &[u8], hmac_offset: usize) -> Result<()> 
     } else {
         Err(ProtoError::BadHmac)
     }
+}
+
+/// Verifies the authentication field of a whole IRTT packet.
+///
+/// The field is the standard 16 bytes immediately after the 4-byte header, so
+/// callers never compute an offset themselves. This is cryptographic
+/// verification only: it says nothing about which key *should* apply to the
+/// packet, nor about session state. Choosing the key is the caller's policy.
+///
+/// # Errors
+///
+/// Returns [`ProtoError::PacketTooShort`], [`ProtoError::BadMagic`] or
+/// [`ProtoError::ReservedFlags`] for a structurally invalid header,
+/// [`ProtoError::MissingFlag`] when the packet does not carry `FLAG_HMAC`,
+/// [`ProtoError::InvalidHmacOffset`] when the field is truncated, and
+/// [`ProtoError::BadHmac`] when the MAC does not match. The packet is never
+/// modified.
+pub fn verify_packet_hmac(key: &[u8], packet: &[u8]) -> Result<()> {
+    let envelope = envelope::decode_structural(packet)?;
+    if !envelope.hmac_present {
+        return Err(ProtoError::MissingFlag(FLAG_HMAC));
+    }
+    verify_hmac(key, packet, hmac_offset())
 }
 
 pub(crate) fn hmac_offset() -> usize {

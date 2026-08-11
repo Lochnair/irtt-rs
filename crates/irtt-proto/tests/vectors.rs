@@ -1,9 +1,54 @@
 use irtt_proto::{
-    decode_close_request, decode_echo_reply, decode_echo_request, decode_open_reply,
-    decode_open_request, encode_close_request, encode_echo_reply, encode_echo_request,
-    encode_open_reply, encode_open_request, verify_hmac, Clock, CloseRequest, EchoRequest,
-    OpenRequest, Params, ProtoError, ReceivedStats, StampAt, FLAG_REPLY,
+    decode_echo_reply, decode_open_reply, decode_request, encode_echo_reply, encode_open_reply,
+    encode_request, verify_hmac, verify_packet_hmac, Clock, DecodedRequestKind, Params, ProtoError,
+    ReceivedStats, RequestToEncode, StampAt, FLAG_REPLY,
 };
+
+/// Asserts that `packet` structurally decodes as an OPEN request carrying
+/// `params`, with the expected no-test and HMAC-presence flags.
+#[track_caller]
+fn assert_open_request(packet: &[u8], params: &Params, no_test: bool, hmac_present: bool) {
+    let request = decode_request(packet).unwrap();
+    assert_eq!(request.hmac_present, hmac_present);
+    match request.kind {
+        DecodedRequestKind::Open {
+            no_test: decoded_no_test,
+            params: encoded,
+        } => {
+            assert_eq!(decoded_no_test, no_test);
+            assert_eq!(&Params::decode(encoded).unwrap(), params);
+        }
+        other => panic!("expected an open request, got {other:?}"),
+    }
+}
+
+/// Asserts that `packet` structurally decodes as an ECHO request with the
+/// expected token and sequence number. The tail is deliberately not compared
+/// against a logical payload: recovering the sender's payload offset needs
+/// `Params`, which structural decoding does not take.
+#[track_caller]
+fn assert_echo_request(packet: &[u8], token: u64, sequence: u32, hmac_present: bool) {
+    let request = decode_request(packet).unwrap();
+    assert_eq!(request.hmac_present, hmac_present);
+    match request.kind {
+        DecodedRequestKind::Echo {
+            token: decoded_token,
+            sequence: decoded_sequence,
+            ..
+        } => {
+            assert_eq!(decoded_token, token);
+            assert_eq!(decoded_sequence, sequence);
+        }
+        other => panic!("expected an echo request, got {other:?}"),
+    }
+}
+
+#[track_caller]
+fn assert_close_request(packet: &[u8], token: u64, hmac_present: bool) {
+    let request = decode_request(packet).unwrap();
+    assert_eq!(request.hmac_present, hmac_present);
+    assert_eq!(request.kind, DecodedRequestKind::Close { token });
+}
 
 fn hex(input: &str) -> Vec<u8> {
     input
@@ -42,22 +87,16 @@ fn hmac_params_2s() -> Params {
 fn vector_1_open_request_no_hmac() {
     let expected = hex("14 a7 5b 01 01 02 02 80 f8 82 ad 16 03 80 a8 d6
          b9 07 05 06 06 06 07 06");
-    let packet = encode_open_request(
-        &OpenRequest {
-            params: default_params_3s(),
-            close: false,
+    let packet = encode_request(
+        RequestToEncode::Open {
+            params: &default_params_3s(),
+            no_test: false,
         },
         None,
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_open_request(&expected, None),
-        Ok(OpenRequest {
-            params: default_params_3s(),
-            close: false,
-        })
-    );
+    assert_open_request(&expected, &default_params_3s(), false, false);
 }
 
 #[test]
@@ -76,25 +115,18 @@ fn vector_3_echo_request_no_hmac() {
          00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
          00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
          00 00 00 00 00 00 00 00 00 00 00 00");
-    let packet = encode_echo_request(
-        &EchoRequest {
+    let packet = encode_request(
+        RequestToEncode::Echo {
             token: 0x7896_b6ab_8771_5213,
             sequence: 0,
-            payload: Vec::new(),
+            params: &default_params_3s(),
+            payload: &[],
         },
-        &default_params_3s(),
         None,
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_echo_request(&expected, &default_params_3s(), None),
-        Ok(EchoRequest {
-            token: 0x7896_b6ab_8771_5213,
-            sequence: 0,
-            payload: Vec::new(),
-        })
-    );
+    assert_echo_request(&expected, 0x7896_b6ab_8771_5213, 0, false);
 }
 
 #[test]
@@ -116,20 +148,15 @@ fn vector_4_echo_reply_no_hmac() {
 #[test]
 fn vector_5_close_request_no_hmac() {
     let expected = hex("14 a7 5b 04 13 52 71 87 ab b6 96 78");
-    let packet = encode_close_request(
-        &CloseRequest {
+    let packet = encode_request(
+        RequestToEncode::Close {
             token: 0x7896_b6ab_8771_5213,
         },
         None,
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_close_request(&expected, None),
-        Ok(CloseRequest {
-            token: 0x7896_b6ab_8771_5213,
-        })
-    );
+    assert_close_request(&expected, 0x7896_b6ab_8771_5213, false);
 }
 
 #[test]
@@ -137,23 +164,18 @@ fn vector_6_hmac_open_request() {
     let expected = hex("14 a7 5b 09 ff 90 16 a7 aa 53 78 16 9e c3 a2 d5
          54 dc 30 36 01 02 02 80 d0 ac f3 0e 03 80 a8 d6
          b9 07 05 06 06 06 07 06");
-    let packet = encode_open_request(
-        &OpenRequest {
-            params: hmac_params_2s(),
-            close: false,
+    let packet = encode_request(
+        RequestToEncode::Open {
+            params: &hmac_params_2s(),
+            no_test: false,
         },
         Some(b"testkey"),
     )
     .unwrap();
     assert_eq!(packet, expected);
     verify_hmac(b"testkey", &packet, 4).unwrap();
-    assert_eq!(
-        decode_open_request(&expected, Some(b"testkey")),
-        Ok(OpenRequest {
-            params: hmac_params_2s(),
-            close: false,
-        })
-    );
+    verify_packet_hmac(b"testkey", &packet).unwrap();
+    assert_open_request(&expected, &hmac_params_2s(), false, true);
 }
 
 #[test]
@@ -163,67 +185,51 @@ fn vector_7_hmac_echo_request() {
          00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
          00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
          00 00 00 00 00 00 00 00 00 00 00 00");
-    let packet = encode_echo_request(
-        &EchoRequest {
+    let packet = encode_request(
+        RequestToEncode::Echo {
             token: 0x4387_e9eb_5d3f_ca59,
             sequence: 0,
-            payload: Vec::new(),
+            params: &default_params_3s(),
+            payload: &[],
         },
-        &default_params_3s(),
         Some(b"testkey"),
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_echo_request(&expected, &default_params_3s(), Some(b"testkey")),
-        Ok(EchoRequest {
-            token: 0x4387_e9eb_5d3f_ca59,
-            sequence: 0,
-            payload: Vec::new(),
-        })
-    );
+    verify_packet_hmac(b"testkey", &packet).unwrap();
+    assert_echo_request(&expected, 0x4387_e9eb_5d3f_ca59, 0, true);
 }
 
 #[test]
 fn vector_8_hmac_close_request() {
     let expected = hex("14 a7 5b 0c f5 cd 0f a9 de 9d 7d 66 8d 91 a5 32
          48 0e 42 e0 59 ca 3f 5d eb e9 87 43");
-    let packet = encode_close_request(
-        &CloseRequest {
+    let packet = encode_request(
+        RequestToEncode::Close {
             token: 0x4387_e9eb_5d3f_ca59,
         },
         Some(b"testkey"),
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_close_request(&expected, Some(b"testkey")),
-        Ok(CloseRequest {
-            token: 0x4387_e9eb_5d3f_ca59,
-        })
-    );
+    verify_packet_hmac(b"testkey", &packet).unwrap();
+    assert_close_request(&expected, 0x4387_e9eb_5d3f_ca59, true);
 }
 
 #[test]
 fn vector_9_no_test_open_close_request() {
     let expected = hex("14 a7 5b 05 01 02 02 80 e0 ba 84 bf 03 03 80 a8
          d6 b9 07 05 06 06 06 07 06");
-    let packet = encode_open_request(
-        &OpenRequest {
-            params: default_params_60s(),
-            close: true,
+    let packet = encode_request(
+        RequestToEncode::Open {
+            params: &default_params_60s(),
+            no_test: true,
         },
         None,
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_open_request(&expected, None),
-        Ok(OpenRequest {
-            params: default_params_60s(),
-            close: true,
-        })
-    );
+    assert_open_request(&expected, &default_params_60s(), true, false);
 }
 
 #[test]
@@ -240,25 +246,18 @@ fn vector_10_no_test_open_close_reply() {
 #[test]
 fn vector_11_minimal_echo_packet() {
     let expected = hex("14 a7 5b 00 4e 15 61 5c a2 6f 31 a0 00 00 00 00");
-    let packet = encode_echo_request(
-        &EchoRequest {
+    let packet = encode_request(
+        RequestToEncode::Echo {
             token: 0xa031_6fa2_5c61_154e,
             sequence: 0,
-            payload: Vec::new(),
+            params: &Params::default(),
+            payload: &[],
         },
-        &Params::default(),
         None,
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_echo_request(&expected, &Params::default(), None),
-        Ok(EchoRequest {
-            token: 0xa031_6fa2_5c61_154e,
-            sequence: 0,
-            payload: Vec::new(),
-        })
-    );
+    assert_echo_request(&expected, 0xa031_6fa2_5c61_154e, 0, false);
 }
 
 #[test]
@@ -296,33 +295,20 @@ fn spec_18_1_hmac_echo_request_fixture() {
         clock: Clock::Both,
         ..Params::default()
     };
-    let packet = encode_echo_request(
-        &EchoRequest {
+    let key = [0x3c, 0x68, 0x1d, 0x39, 0x41, 0x1d, 0x72, 0x43];
+    let packet = encode_request(
+        RequestToEncode::Echo {
             token: 0x886b_c9a7_22b3_3eea,
             sequence: 0x6fe2_a1bb,
-            payload: [0xff, 0xfe, 0xfd, 0xfc].repeat(4),
+            params: &params,
+            payload: &[0xff, 0xfe, 0xfd, 0xfc].repeat(4),
         },
-        &params,
-        Some(&[0x3c, 0x68, 0x1d, 0x39, 0x41, 0x1d, 0x72, 0x43]),
+        Some(&key),
     )
     .unwrap();
     assert_eq!(packet, expected);
-    assert_eq!(
-        decode_echo_request(
-            &expected,
-            &Params {
-                length: 92,
-                received_stats: ReceivedStats::Both,
-                stamp_at: StampAt::Both,
-                clock: Clock::Both,
-                ..Params::default()
-            },
-            Some(&[0x3c, 0x68, 0x1d, 0x39, 0x41, 0x1d, 0x72, 0x43]),
-        )
-        .unwrap()
-        .payload,
-        [0xff, 0xfe, 0xfd, 0xfc].repeat(4)
-    );
+    verify_packet_hmac(&key, &packet).unwrap();
+    assert_echo_request(&expected, 0x886b_c9a7_22b3_3eea, 0x6fe2_a1bb, true);
 }
 
 #[test]
