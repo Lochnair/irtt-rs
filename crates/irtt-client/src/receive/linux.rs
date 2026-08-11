@@ -1,10 +1,13 @@
-#![allow(unsafe_code)]
 use std::{
-    io, mem,
+    io::{self, IoSliceMut},
     net::{SocketAddr, UdpSocket},
     os::fd::{AsRawFd, RawFd},
-    ptr,
     time::{Duration, SystemTime, UNIX_EPOCH},
+};
+
+use nix::sys::{
+    socket::{recvmsg, setsockopt, sockopt, ControlMessageOwned, MsgFlags, RecvMsg},
+    time::TimeSpec,
 };
 
 use crate::{metadata::ReceiveMeta, receive::ReceivedDatagram, timing::ClientTimestamp};
@@ -12,7 +15,7 @@ use crate::{metadata::ReceiveMeta, receive::ReceivedDatagram, timing::ClientTime
 const CONTROL_LEN: usize = 128;
 
 pub(crate) fn configure_receive_metadata(socket: &UdpSocket, remote: SocketAddr) -> io::Result<()> {
-    enable_kernel_rx_timestamps(socket)?;
+    setsockopt(socket, sockopt::ReceiveTimestampns, &true)?;
     let socket = socket2::SockRef::from(socket);
     if remote.is_ipv4() {
         socket.set_recv_tos_v4(true)
@@ -21,32 +24,11 @@ pub(crate) fn configure_receive_metadata(socket: &UdpSocket, remote: SocketAddr)
     }
 }
 
-fn enable_kernel_rx_timestamps(socket: &UdpSocket) -> io::Result<()> {
-    let enabled: libc::c_int = 1;
-    let result = unsafe {
-        // SAFETY: The file descriptor is borrowed from a valid `UdpSocket`.
-        // `enabled` is a properly aligned `c_int`, and the length matches the
-        // pointed-to value for the `SO_TIMESTAMPNS` boolean socket option.
-        libc::setsockopt(
-            socket.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_TIMESTAMPNS,
-            (&enabled as *const libc::c_int).cast(),
-            mem::size_of_val(&enabled) as libc::socklen_t,
-        )
-    };
-    if result == -1 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
 pub(crate) fn recv_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
 ) -> Result<ReceivedDatagram, io::Error> {
-    recv_datagram_fd(socket.as_raw_fd(), buf, 0)
+    recv_datagram_fd(socket.as_raw_fd(), buf, MsgFlags::empty())
 }
 
 #[cfg(feature = "tokio")]
@@ -55,120 +37,67 @@ pub(crate) fn try_recv_tokio_datagram(
     buf: &mut [u8],
 ) -> Result<ReceivedDatagram, io::Error> {
     socket.try_io(tokio::io::Interest::READABLE, || {
-        recv_datagram_fd(socket.as_raw_fd(), buf, libc::MSG_DONTWAIT)
+        recv_datagram_fd(socket.as_raw_fd(), buf, MsgFlags::MSG_DONTWAIT)
     })
 }
 
 fn recv_datagram_fd(
     socket_fd: RawFd,
     buf: &mut [u8],
-    flags: libc::c_int,
+    flags: MsgFlags,
 ) -> Result<ReceivedDatagram, io::Error> {
     let mut control = ControlBuffer::new();
-    let mut iov = libc::iovec {
-        iov_base: buf.as_mut_ptr().cast(),
-        iov_len: buf.len(),
-    };
-    let mut msg: libc::msghdr = unsafe { mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = control.len();
+    let mut iov = [IoSliceMut::new(buf)];
 
-    let len = unsafe {
-        // SAFETY: `msg` points to one writable iovec backed by `buf`, and the
-        // control buffer is writable and lives until `recvmsg` returns. The
-        // socket file descriptor is borrowed from a valid UDP socket.
-        libc::recvmsg(socket_fd, &mut msg, flags)
-    };
-    if len < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let len = usize::try_from(len).map_err(|_| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            "recvmsg returned an unrepresentable datagram length",
-        )
-    })?;
+    // The socket is connected, so the source address is not needed; `()` skips
+    // copying it out.
+    let msg = recvmsg::<()>(socket_fd, &mut iov, Some(control.as_mut_slice()), flags)?;
     let received_at = ClientTimestamp::now();
-    let meta = unsafe {
-        // SAFETY: `msg` was initialized by a successful `recvmsg` call. The
-        // parser only reads cmsghdr entries within `msg_controllen` and ignores
-        // short or unrelated control messages.
-        parse_receive_meta(&msg)
-    };
 
     Ok(ReceivedDatagram {
-        len,
+        len: msg.bytes,
         received_at,
-        meta,
+        meta: receive_meta(&msg),
     })
 }
 
-unsafe fn parse_receive_meta(msg: &libc::msghdr) -> ReceiveMeta {
+fn receive_meta<S>(msg: &RecvMsg<'_, '_, S>) -> ReceiveMeta {
     let mut meta = ReceiveMeta::default();
-    let mut cmsg = libc::CMSG_FIRSTHDR(msg);
-    while !cmsg.is_null() {
-        let cmsg_ref = &*cmsg;
-        let header_len = libc::CMSG_LEN(0) as usize;
-        if cmsg_ref.cmsg_len < header_len {
-            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
-            continue;
+    // A control buffer the kernel had to truncate (`MSG_CTRUNC`) cannot be
+    // walked reliably, so `cmsgs` refuses to parse it. The datagram itself is
+    // still valid; report it without ancillary metadata.
+    let Ok(cmsgs) = msg.cmsgs() else {
+        return meta;
+    };
+
+    for cmsg in cmsgs {
+        match cmsg {
+            ControlMessageOwned::ScmTimestampns(timestamp) => {
+                meta.kernel_rx_timestamp = system_time_from_timespec(timestamp);
+            }
+            ControlMessageOwned::Ipv4Tos(tos) => {
+                meta.traffic_class = Some(tos);
+            }
+            ControlMessageOwned::Ipv6TClass(traffic_class) => {
+                meta.traffic_class = u8::try_from(traffic_class).ok();
+            }
+            _ => {}
         }
-        let data_len = cmsg_ref.cmsg_len - header_len;
-        if is_traffic_class_cmsg(cmsg_ref) {
-            meta.traffic_class = read_int_cmsg_low_byte(cmsg, data_len);
-        } else if is_kernel_rx_timestamp_cmsg(cmsg_ref) {
-            meta.kernel_rx_timestamp = read_timespec_cmsg(cmsg, data_len);
-        }
-        cmsg = libc::CMSG_NXTHDR(msg, cmsg);
     }
     meta
 }
 
-fn is_traffic_class_cmsg(cmsg: &libc::cmsghdr) -> bool {
-    (cmsg.cmsg_level == libc::IPPROTO_IP && cmsg.cmsg_type == libc::IP_TOS)
-        || (cmsg.cmsg_level == libc::IPPROTO_IPV6 && cmsg.cmsg_type == libc::IPV6_TCLASS)
-}
-
-fn is_kernel_rx_timestamp_cmsg(cmsg: &libc::cmsghdr) -> bool {
-    cmsg.cmsg_level == libc::SOL_SOCKET && cmsg.cmsg_type == libc::SCM_TIMESTAMPNS
-}
-
-unsafe fn read_u8_cmsg(cmsg: *mut libc::cmsghdr, data_len: usize) -> Option<u8> {
-    if data_len >= mem::size_of::<u8>() {
-        Some(*libc::CMSG_DATA(cmsg).cast::<u8>())
-    } else {
-        None
-    }
-}
-
-unsafe fn read_int_cmsg_low_byte(cmsg: *mut libc::cmsghdr, data_len: usize) -> Option<u8> {
-    if data_len >= mem::size_of::<libc::c_int>() {
-        let value = ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::c_int>());
-        Some((value & 0xff) as u8)
-    } else {
-        read_u8_cmsg(cmsg, data_len)
-    }
-}
-
-unsafe fn read_timespec_cmsg(cmsg: *mut libc::cmsghdr, data_len: usize) -> Option<SystemTime> {
-    if data_len < mem::size_of::<libc::timespec>() {
+fn system_time_from_timespec(timespec: TimeSpec) -> Option<SystemTime> {
+    let seconds = u64::try_from(timespec.tv_sec()).ok()?;
+    let nanos = u32::try_from(timespec.tv_nsec()).ok()?;
+    if nanos >= 1_000_000_000 {
         return None;
     }
-    let timespec = ptr::read_unaligned(libc::CMSG_DATA(cmsg).cast::<libc::timespec>());
-    system_time_from_timespec(timespec)
-}
-
-fn system_time_from_timespec(timespec: libc::timespec) -> Option<SystemTime> {
-    if timespec.tv_sec < 0 || timespec.tv_nsec < 0 || timespec.tv_nsec >= 1_000_000_000 {
-        return None;
-    }
-    let seconds = u64::try_from(timespec.tv_sec).ok()?;
-    let nanos = u32::try_from(timespec.tv_nsec).ok()?;
     UNIX_EPOCH.checked_add(Duration::new(seconds, nanos))
 }
 
+/// Reusable per-receive control buffer. `recvmsg` control data must satisfy
+/// `cmsghdr` alignment, which 8-byte alignment covers on supported targets.
 #[repr(align(8))]
 struct ControlBuffer([u8; CONTROL_LEN]);
 
@@ -177,12 +106,8 @@ impl ControlBuffer {
         Self([0; CONTROL_LEN])
     }
 
-    fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.0.as_mut_ptr()
-    }
-
-    fn len(&self) -> usize {
-        self.0.len()
+    fn as_mut_slice(&mut self) -> &mut [u8] {
+        &mut self.0
     }
 }
 
@@ -193,6 +118,8 @@ mod tests {
         net::{SocketAddr, UdpSocket},
         time::{Duration, UNIX_EPOCH},
     };
+
+    use nix::sys::time::TimeSpec;
 
     use crate::{
         event::PacketMeta,
@@ -412,11 +339,7 @@ mod tests {
 
     #[test]
     fn timespec_conversion_accepts_valid_unix_timestamp() {
-        let timestamp = super::system_time_from_timespec(libc::timespec {
-            tv_sec: 1,
-            tv_nsec: 2,
-        })
-        .unwrap();
+        let timestamp = super::system_time_from_timespec(TimeSpec::new(1, 2)).unwrap();
 
         assert_eq!(
             timestamp.duration_since(UNIX_EPOCH).unwrap(),
@@ -426,25 +349,10 @@ mod tests {
 
     #[test]
     fn timespec_conversion_rejects_negative_or_invalid_values() {
+        assert_eq!(super::system_time_from_timespec(TimeSpec::new(-1, 0)), None);
+        assert_eq!(super::system_time_from_timespec(TimeSpec::new(0, -1)), None);
         assert_eq!(
-            super::system_time_from_timespec(libc::timespec {
-                tv_sec: -1,
-                tv_nsec: 0,
-            }),
-            None
-        );
-        assert_eq!(
-            super::system_time_from_timespec(libc::timespec {
-                tv_sec: 0,
-                tv_nsec: -1,
-            }),
-            None
-        );
-        assert_eq!(
-            super::system_time_from_timespec(libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 1_000_000_000,
-            }),
+            super::system_time_from_timespec(TimeSpec::new(0, 1_000_000_000)),
             None
         );
     }
