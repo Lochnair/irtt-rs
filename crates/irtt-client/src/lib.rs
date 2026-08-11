@@ -18,11 +18,7 @@
 //! [`managed`] contains the unified managed task/handle implementation,
 //! including the dedicated-runtime blocking frontend for synchronous callers.
 //!
-#![cfg_attr(
-    not(all(target_os = "linux", feature = "ancillary")),
-    forbid(unsafe_code)
-)]
-#![cfg_attr(all(target_os = "linux", feature = "ancillary"), deny(unsafe_code))]
+#![forbid(unsafe_code)]
 
 #[cfg(feature = "tokio")]
 mod async_client;
