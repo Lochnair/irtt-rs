@@ -2,9 +2,37 @@ use crate::{
     envelope::{self, FlagRule},
     flags::{FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
     layout::{echo_packet_len, PacketLayout},
-    params::Params,
+    params::{Clock, Params, StampAt},
     ProtoError, Result, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE, TOKEN_SIZE,
 };
+
+/// Upstream irtt 0.9.1 always emits both midpoint timestamp fields (wall,
+/// then monotonic) in an ECHO reply for single-clock `StampAt::Midpoint`
+/// negotiations, even though only one clock was negotiated. That makes the
+/// compatibility header exactly one timestamp longer than the negotiated
+/// header.
+const MIDPOINT_COMPAT_EXTRA: usize = TIMESTAMP_SIZE;
+
+fn is_midpoint_single_clock(params: &Params) -> bool {
+    params.stamp_at == StampAt::Midpoint && !matches!(params.clock, Clock::Both)
+}
+
+/// Total datagram length of the upstream dual-midpoint compatibility form.
+///
+/// Both lengths are `max(negotiated_length, header)`, so this is *not*
+/// `normal_len + TIMESTAMP_SIZE`. The extra midpoint field only lengthens the
+/// datagram while the larger header is still pushing past the negotiated
+/// length; beyond that it displaces payload instead, and the two forms have
+/// identical length. The difference is therefore 8, 7..1, or 0 depending on
+/// the negotiated length.
+///
+/// Deriving this from `normal_len` keeps the identity exact —
+/// `max(negotiated_length, compat_header) == max(compat_header, normal_len)` —
+/// and cannot overflow, because `compat_header` is a small bounded header
+/// size rather than an attacker-influenced packet length.
+fn midpoint_compat_packet_len(layout: PacketLayout, normal_len: usize) -> usize {
+    (layout.header_len() + MIDPOINT_COMPAT_EXTRA).max(normal_len)
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EchoRequest {
@@ -83,7 +111,7 @@ pub fn decode_echo_request(
         ],
     )?;
     let layout = PacketLayout::echo(hmac_key.is_some(), params);
-    validate_echo_length(packet, params, layout)?;
+    validate_echo_length(packet, params, layout, false)?;
     envelope::verify(packet, hmac_key)?;
 
     let mut pos = envelope.body_offset;
@@ -128,6 +156,22 @@ pub fn encode_echo_reply(
     envelope::finish(out, hmac_key)
 }
 
+/// Decodes an ECHO reply, accepting the upstream irtt 0.9.1 dual-midpoint
+/// compatibility form when it is identifiable by datagram length.
+///
+/// For single-clock `StampAt::Midpoint` negotiations upstream emits both
+/// midpoint fields (wall, then monotonic). When that larger header makes the
+/// datagram longer than the negotiated length, the compatibility form is
+/// unambiguous and both fields are parsed, exposing only the negotiated
+/// clock's value.
+///
+/// When the negotiated length already covers the larger header the two forms
+/// have identical length and are indistinguishable from the packet alone. The
+/// reply is still accepted, parsed against the negotiated layout. For a
+/// monotonic-only negotiation that means the value exposed as `midpoint_mono`
+/// is whatever occupies the negotiated field position, which for an upstream
+/// peer is its wall timestamp — this cannot be corrected deterministically
+/// without out-of-band knowledge of the peer, so no heuristic is applied.
 pub fn decode_echo_reply(
     packet: &[u8],
     params: &Params,
@@ -139,23 +183,40 @@ pub fn decode_echo_reply(
         &[FlagRule::Reject(FLAG_OPEN), FlagRule::Require(FLAG_REPLY)],
     )?;
     let layout = PacketLayout::echo(hmac_key.is_some(), params);
-    validate_echo_length(packet, params, layout)?;
+    let midpoint_compat = validate_echo_length(packet, params, layout, true)?;
     envelope::verify(packet, hmac_key)?;
 
-    let header_len = layout.header_len();
+    let header_len = layout.header_len()
+        + if midpoint_compat {
+            MIDPOINT_COMPAT_EXTRA
+        } else {
+            0
+        };
     let mut pos = envelope.body_offset;
     let token = read_u64(packet, &mut pos);
     let sequence = read_u32(packet, &mut pos);
     let recv_count = layout.recv_count.then(|| read_u32(packet, &mut pos));
     let recv_window = layout.recv_window.then(|| read_u64(packet, &mut pos));
-    let timestamps = TimestampFields {
-        recv_wall: layout.recv_wall.then(|| read_i64(packet, &mut pos)),
-        recv_mono: layout.recv_mono.then(|| read_i64(packet, &mut pos)),
-        midpoint_wall: layout.midpoint_wall.then(|| read_i64(packet, &mut pos)),
-        midpoint_mono: layout.midpoint_mono.then(|| read_i64(packet, &mut pos)),
-        send_wall: layout.send_wall.then(|| read_i64(packet, &mut pos)),
-        send_mono: layout.send_mono.then(|| read_i64(packet, &mut pos)),
+    let recv_wall = layout.recv_wall.then(|| read_i64(packet, &mut pos));
+    let recv_mono = layout.recv_mono.then(|| read_i64(packet, &mut pos));
+    let (midpoint_wall, midpoint_mono) = if midpoint_compat {
+        let wall = read_i64(packet, &mut pos);
+        let mono = read_i64(packet, &mut pos);
+        match params.clock {
+            Clock::Wall => (Some(wall), None),
+            Clock::Monotonic => (None, Some(mono)),
+            Clock::Both => {
+                unreachable!("midpoint compat only applies to single-clock negotiations")
+            }
+        }
+    } else {
+        (
+            layout.midpoint_wall.then(|| read_i64(packet, &mut pos)),
+            layout.midpoint_mono.then(|| read_i64(packet, &mut pos)),
+        )
     };
+    let send_wall = layout.send_wall.then(|| read_i64(packet, &mut pos));
+    let send_mono = layout.send_mono.then(|| read_i64(packet, &mut pos));
 
     Ok(EchoReply {
         flags: envelope.flags,
@@ -163,12 +224,32 @@ pub fn decode_echo_reply(
         sequence,
         recv_count,
         recv_window,
-        timestamps,
+        timestamps: TimestampFields {
+            recv_wall,
+            recv_mono,
+            midpoint_wall,
+            midpoint_mono,
+            send_wall,
+            send_mono,
+        },
         payload: packet[header_len..].to_vec(),
     })
 }
 
-fn validate_echo_length(packet: &[u8], params: &Params, layout: PacketLayout) -> Result<()> {
+/// Validates the packet length against the negotiated layout. Returns
+/// `Ok(true)` when the packet matched the upstream midpoint compatibility
+/// length rather than the exact negotiated length (only possible when
+/// `allow_midpoint_compat` is set).
+///
+/// The negotiated length is always checked first, so when the compatibility
+/// form is not longer than the negotiated form the two are indistinguishable
+/// by length and normal negotiated parsing wins. See [`decode_echo_reply`].
+fn validate_echo_length(
+    packet: &[u8],
+    params: &Params,
+    layout: PacketLayout,
+    allow_midpoint_compat: bool,
+) -> Result<bool> {
     let header_len = layout.header_len();
     if packet.len() < header_len {
         return Err(ProtoError::PacketTooShort {
@@ -177,13 +258,19 @@ fn validate_echo_length(packet: &[u8], params: &Params, layout: PacketLayout) ->
         });
     }
     let expected_len = echo_packet_len(layout.hmac, params)?;
-    if packet.len() != expected_len {
-        return Err(ProtoError::PacketLengthMismatch {
-            expected: expected_len,
-            actual: packet.len(),
-        });
+    if packet.len() == expected_len {
+        return Ok(false);
     }
-    Ok(())
+    if allow_midpoint_compat && is_midpoint_single_clock(params) {
+        let compat_len = midpoint_compat_packet_len(layout, expected_len);
+        if compat_len > expected_len && packet.len() == compat_len {
+            return Ok(true);
+        }
+    }
+    Err(ProtoError::PacketLengthMismatch {
+        expected: expected_len,
+        actual: packet.len(),
+    })
 }
 
 fn push_zeroed_layout_tail(layout: PacketLayout, out: &mut Vec<u8>) {
