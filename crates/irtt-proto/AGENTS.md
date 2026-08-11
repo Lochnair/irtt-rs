@@ -2,13 +2,22 @@
 
 Repository-wide guidance in the root `AGENTS.md` also applies here.
 
-`irtt-proto` is the pure protocol boundary. Keep it free of sockets, runtimes, client/server lifecycle, statistics, and presentation concerns.
+`irtt-proto` is the pure protocol boundary. Keep it free of sockets, runtimes, client/server lifecycle, session tables, statistics, and presentation concerns.
+
+As `irtt-server` is built, it may need server-facing wire-inspection
+primitives here, such as request decoding, reply encoding, packet/header
+validation, HMAC-presence inspection, and token/header inspection before
+Params-dependent decoding.
 
 For protocol behavior, consult before changing semantics:
 
 - `docs/protocol/IRTT_CLIENT_PROTOCOL_SPEC.md`
+- `docs/protocol/IRTT_SERVER_PROTOCOL_SPEC.md`
 - `docs/protocol/BLACKBOX_VERIFICATION_REPORT.md`
 - `docs/protocol/test-vectors/README.md`
+- `docs/protocol/test-vectors/SERVER_BEHAVIORAL_VECTORS.md`
+
+Protocol changes that affect server-side parsing, encoding, or session-facing wire semantics must consult the server spec and behavioral vectors as well as the client-side material above.
 
 Focused unit and table-driven tests are explicitly encouraged in this crate. Exact wire vectors, layout rules, flag combinations, malformed inputs, boundary values, HMAC behavior, and encode/decode round trips are durable compatibility coverage rather than test-count inflation.
 

@@ -15,13 +15,19 @@ Before editing, also check for a more specific `AGENTS.md` in the target subtree
 
 Compatibility and interoperability references:
 
-- `docs/protocol/IRTT_CLIENT_PROTOCOL_SPEC.md` — verified wire/measurement
+- `docs/protocol/IRTT_CLIENT_PROTOCOL_SPEC.md` — verified client-side
   compatibility baseline.
-- `docs/protocol/BLACKBOX_VERIFICATION_REPORT.md` — black-box observations
-  resolving ambiguous behavior in the original specification.
-- `docs/protocol/test-vectors/README.md` — captured packet vectors.
+- `docs/protocol/IRTT_SERVER_PROTOCOL_SPEC.md` — verified server-side
+  compatibility baseline.
+- `docs/protocol/BLACKBOX_VERIFICATION_REPORT.md` — black-box evidence and
+  corrections supporting both the client and server baselines.
+- `docs/protocol/test-vectors/README.md` — captured client-facing packet
+  vectors.
+- `docs/protocol/test-vectors/SERVER_BEHAVIORAL_VECTORS.md` — black-box
+  server behavioral vectors, edge cases, and session behavior.
 - `docs/protocol/captures/` — packet captures referenced by the verification
-  report.
+  report and behavioral vectors. Behavioral vectors and captures are
+  evidence/artifacts, not architecture prescriptions.
 - `docs/INTEROP_COMPARISON.md` — procedures for black-box comparison against
   the upstream `irtt` executable.
 - `docs/clean-room/CLEANROOM_NOTES.md` — provenance only; not a normative
@@ -33,9 +39,9 @@ For compatibility questions, the verified spec and black-box observations define
 
 ## Architecture
 
-Main boundary:
+Main boundary (`irtt-server` is planned, not yet implemented):
 
-> `irtt-proto` implements wire semantics. `irtt-client` implements client/session behavior. `irtt-stats` aggregates events. `irtt-cli` presents and orchestrates them.
+> `irtt-proto` — wire semantics shared by client/server. `irtt-client` — client/session behavior. `irtt-server` — server/session behavior and Tokio runtime/orchestration. `irtt-stats` — statistics over client-facing events/results as currently designed. `irtt-cli` — presentation/orchestration.
 
 - `irtt-proto`: pure protocol encoding/decoding, flags, layouts, params, varints/zigzag, HMAC-MD5, validation. No sockets, runtimes, lifecycle, stats, or presentation.
 - `irtt-client`: socket/session lifecycle, negotiation, probe send/receive, timing metadata, classification, bounded state, and events.
@@ -43,12 +49,25 @@ Main boundary:
   - `AsyncClient`: optional Tokio low-level adapter.
   - `ManagedClientTask` / `ManagedClientHandle`: unified Tokio managed driver/control surface.
   - `BlockingManagedClient`: synchronous owner using a dedicated current-thread Tokio runtime.
+- `irtt-server`: planned; see "Server architecture (`irtt-server`)" below.
 - `irtt-stats`: cumulative/rolling/finite statistics over client events. No wire/session state machine logic.
 - `irtt-cli`: argument parsing, managed orchestration, output, summaries, TUI, diagnostics, and exit behavior. Do not duplicate protocol/session state machines here.
 
-Tokio must remain optional for `irtt-client`; default builds must remain runtime-free and Tokio-free unless an explicit architectural change says otherwise.
+Tokio must remain optional for `irtt-client`; default builds must remain runtime-free and Tokio-free unless an explicit architectural change says otherwise. This rule is specific to `irtt-client` — do not generalize it to `irtt-server`, which has the opposite policy below.
 
-A first-class reusable `irtt-server` crate is a valid project direction. It must follow the same clean-room boundary and share wire logic through `irtt-proto`. A future real server may replace compliant fake peers in integration tests; purpose-built adversarial peers remain appropriate for intentionally malformed or non-compliant behavior.
+### Server architecture (`irtt-server`)
+
+`irtt-server` is a planned first-class reusable server crate. It does not exist yet; this section describes the intended boundary for it, not an implemented API.
+
+- It shares wire semantics with the client through `irtt-proto` and follows the same clean-room boundary.
+- It must **not** depend on `irtt-client` merely to reuse protocol behavior.
+- Unlike `irtt-client`, the server has no product requirement to remain runtime-free: `irtt-server` is intentionally **Tokio-native**, and Tokio does not need to be optional for it.
+- There is currently no requirement for a blocking server API, alternate async runtimes, a runtime abstraction layer, or a runtime-free server feature. Do not build blocking/runtime variants merely for symmetry with the client, and do not invent a mirrored client-style API family (`BlockingServer`, `AsyncServer`, `ManagedServer`, `BlockingManagedServer`, or similar) ahead of agreement.
+- Protocol/session logic should be separated from socket/runtime orchestration where that materially improves deterministic testing, ownership clarity, state-machine reasoning, or maintainability. A `ServerCore`-like internal boundary is therefore desirable, but its exact name/API is not prescribed, it need not be public, it is not a promise of runtime independence, and simple code should not be tortured merely to make the core artificially pure.
+- Runtime/server orchestration belongs around that core and may freely use Tokio for UDP sockets, `recv_from`/`send_to`, IPv4/IPv6 listeners, timers, session expiry, max-duration deadlines, shutdown, bounded control/config channels where useful, and `select!`-style orchestration.
+- The CLI server applet, when added, should remain thin orchestration/configuration over reusable `irtt-server`, not contain a second server state machine.
+- Resource policy: the server should use bounded session/resource policy. Upstream's observed lack of useful default session/per-peer bounds (see `IRTT_SERVER_PROTOCOL_SPEC.md`) is not an interoperability requirement and must not be reproduced merely for compatibility.
+- Testing: once a real `irtt-server` exists, prefer it for normal compliant fake-peer behavior where practical. Keep narrow adversarial/raw peers for intentionally malformed, ambiguous, or non-compliant wire behavior.
 
 ## Engineering rules
 
