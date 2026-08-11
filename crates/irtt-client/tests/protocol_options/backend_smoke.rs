@@ -127,6 +127,9 @@ fn backend_clock_smoke() {
                         assert!(st.send_wall_ns.is_some());
                         assert!(st.send_mono_ns.is_some());
                     }
+                    Clock::Unspecified => {
+                        unreachable!("clients never request an unspecified clock")
+                    }
                 }
             }
             other => panic!("expected EchoReply, got {other:?}"),

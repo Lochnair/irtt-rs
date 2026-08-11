@@ -11,6 +11,11 @@ pub const MAX_SERVER_FILL_BYTES: usize = 32;
 /// Higher-level callers should validate user or configuration input before
 /// encoding. The normal `irtt-client` configuration path enforces
 /// [`MAX_SERVER_FILL_BYTES`] for `server_fill`.
+///
+/// [`Params::default`] is the **wire** default: every integer field is zero and
+/// [`clock`](Params::clock) is [`Clock::Unspecified`], which is what an open
+/// request with an empty parameter payload means. It is not a set of sensible
+/// client settings; a client builds its request from its own configuration.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Params {
     pub protocol_version: i64,
@@ -63,21 +68,67 @@ impl Params {
     ///
     /// This includes invalid enum values, malformed UTF-8, and `server_fill`
     /// values longer than [`MAX_SERVER_FILL_BYTES`].
+    ///
+    /// Absent parameters take their wire default, so a caller cannot tell an
+    /// omitted tag from one explicitly encoded as zero. Use
+    /// [`decode_with_presence`](Params::decode_with_presence) when that
+    /// distinction matters; both share one parser.
     pub fn decode(input: &[u8]) -> Result<Self> {
+        Self::decode_with_presence(input).map(|decoded| decoded.params)
+    }
+
+    /// Decodes parameters and additionally reports which known tags appeared.
+    ///
+    /// This is the same parser and the same validation as [`decode`], with the
+    /// presence of each known tag retained. A receiver needs it because the
+    /// protocol gives an omitted tag and an explicit zero the same value but
+    /// not the same meaning: an absent Duration or Interval is accepted as the
+    /// wire default zero, while one explicitly encoded as zero is invalid.
+    ///
+    /// Presence means the tag appeared at least once. Repeated known tags keep
+    /// last-value-wins, and unknown tags remain ignored and untracked.
+    ///
+    /// [`decode`]: Params::decode
+    pub fn decode_with_presence(input: &[u8]) -> Result<DecodedParams> {
         let mut params = Self::default();
+        let mut presence = ParamPresence::default();
         let mut pos = 0;
         while pos < input.len() {
             let (tag, used) = varint::decode_uvarint(&input[pos..])?;
             pos += used;
             match tag {
-                1 => params.protocol_version = read_int(input, &mut pos)?,
-                2 => params.duration_ns = read_int(input, &mut pos)?,
-                3 => params.interval_ns = read_int(input, &mut pos)?,
-                4 => params.length = read_int(input, &mut pos)?,
-                5 => params.received_stats = ReceivedStats::try_from(read_int(input, &mut pos)?)?,
-                6 => params.stamp_at = StampAt::try_from(read_int(input, &mut pos)?)?,
-                7 => params.clock = Clock::try_from(read_int(input, &mut pos)?)?,
-                8 => params.dscp = read_int(input, &mut pos)?,
+                1 => {
+                    params.protocol_version = read_int(input, &mut pos)?;
+                    presence.protocol_version = true;
+                }
+                2 => {
+                    params.duration_ns = read_int(input, &mut pos)?;
+                    presence.duration_ns = true;
+                }
+                3 => {
+                    params.interval_ns = read_int(input, &mut pos)?;
+                    presence.interval_ns = true;
+                }
+                4 => {
+                    params.length = read_int(input, &mut pos)?;
+                    presence.length = true;
+                }
+                5 => {
+                    params.received_stats = ReceivedStats::try_from(read_int(input, &mut pos)?)?;
+                    presence.received_stats = true;
+                }
+                6 => {
+                    params.stamp_at = StampAt::try_from(read_int(input, &mut pos)?)?;
+                    presence.stamp_at = true;
+                }
+                7 => {
+                    params.clock = Clock::try_from(read_int(input, &mut pos)?)?;
+                    presence.clock = true;
+                }
+                8 => {
+                    params.dscp = read_int(input, &mut pos)?;
+                    presence.dscp = true;
+                }
                 9 => {
                     let (len, used) = varint::decode_uvarint(&input[pos..])?;
                     pos += used;
@@ -97,6 +148,7 @@ impl Params {
                         .to_owned();
                     pos += len;
                     params.server_fill = Some(ServerFill { value });
+                    presence.server_fill = true;
                 }
                 _ => {
                     let (_, used) = varint::decode_uvarint(&input[pos..])?;
@@ -104,8 +156,36 @@ impl Params {
                 }
             }
         }
-        Ok(params)
+        Ok(DecodedParams { params, presence })
     }
+}
+
+/// Decoded parameters together with which known tags the payload carried.
+///
+/// Produced by [`Params::decode_with_presence`].
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DecodedParams {
+    /// The decoded values. Absent parameters hold their wire default.
+    pub params: Params,
+    /// Which known tags appeared in the payload.
+    pub presence: ParamPresence,
+}
+
+/// Which known parameter tags a decoded payload carried.
+///
+/// A field is `true` when its tag appeared at least once, whatever value it
+/// carried. Unknown tags are ignored and are not represented here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ParamPresence {
+    pub protocol_version: bool,
+    pub duration_ns: bool,
+    pub interval_ns: bool,
+    pub length: bool,
+    pub received_stats: bool,
+    pub stamp_at: bool,
+    pub clock: bool,
+    pub dscp: bool,
+    pub server_fill: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,12 +259,31 @@ impl TryFrom<i64> for StampAt {
     }
 }
 
+/// Which server clock sources supply timestamp fields.
+///
+/// # The zero value
+///
+/// [`Clock::Unspecified`] is the **wire default**, meaning the Clock tag was
+/// absent from an open parameter payload — which is valid, and is what an empty
+/// payload decodes to. It does not mean a peer may send an explicit Clock tag
+/// encoding zero: [`TryFrom<i64>`](Clock::try_from) still rejects an explicit
+/// zero as an invalid enum value, so this state is only ever reached by
+/// omission. [`encode`](Params::encode) omits the tag for `Unspecified` rather
+/// than emitting an explicit zero, which round-trips absence faithfully.
+///
+/// `Unspecified` selects no clock, so [`has_wall`](Clock::has_wall) and
+/// [`has_mono`](Clock::has_mono) are both false for it and no timestamp field
+/// is laid out. A client that wants timestamps must request a real clock; the
+/// `irtt-client` configuration path rejects `Unspecified`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(i64)]
 pub enum Clock {
+    /// Wire default for an absent Clock tag. Never produced from an explicit
+    /// encoded value.
+    #[default]
+    Unspecified = 0,
     Wall = 1,
     Monotonic = 2,
-    #[default]
     Both = 3,
 }
 
@@ -201,6 +300,11 @@ impl Clock {
 impl TryFrom<i64> for Clock {
     type Error = ProtoError;
 
+    /// Converts an **explicitly encoded** Clock value.
+    ///
+    /// Zero is rejected: it is only valid as an absent tag, never as an encoded
+    /// one. [`Clock::Unspecified`] is therefore unreachable through this
+    /// conversion by design.
     fn try_from(value: i64) -> Result<Self> {
         match value {
             1 => Ok(Self::Wall),
@@ -241,6 +345,13 @@ mod tests {
         varint::encode_uvarint(9, &mut encoded);
         varint::encode_uvarint(value.len() as u64, &mut encoded);
         encoded.extend_from_slice(value);
+        encoded
+    }
+
+    fn encode_int(tag: u64, value: i64) -> Vec<u8> {
+        let mut encoded = Vec::new();
+        varint::encode_uvarint(tag, &mut encoded);
+        varint::encode_varint(value, &mut encoded);
         encoded
     }
 
@@ -452,6 +563,166 @@ mod tests {
                 value: 0,
             })
         );
+        assert_eq!(
+            Params::decode_with_presence(&encoded),
+            Err(ProtoError::InvalidEnum {
+                name: "Clock",
+                value: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_clock_values_one_to_three_are_accepted() {
+        for (value, expected) in [(1, Clock::Wall), (2, Clock::Monotonic), (3, Clock::Both)] {
+            let decoded = Params::decode_with_presence(&encode_int(7, value)).unwrap();
+            assert_eq!(decoded.params.clock, expected);
+            assert!(decoded.presence.clock);
+        }
+    }
+
+    #[test]
+    fn empty_payload_decodes_to_wire_defaults_with_nothing_present() {
+        let decoded = Params::decode_with_presence(&[]).unwrap();
+
+        assert_eq!(decoded.params, Params::default());
+        assert_eq!(decoded.params.protocol_version, 0);
+        assert_eq!(decoded.params.duration_ns, 0);
+        assert_eq!(decoded.params.interval_ns, 0);
+        assert_eq!(decoded.params.length, 0);
+        assert_eq!(decoded.params.dscp, 0);
+        assert_eq!(decoded.params.received_stats, ReceivedStats::None);
+        assert_eq!(decoded.params.stamp_at, StampAt::None);
+        // The wire default clock is zero, not `Both`.
+        assert_eq!(decoded.params.clock, Clock::Unspecified);
+        assert!(!decoded.params.clock.has_wall());
+        assert!(!decoded.params.clock.has_mono());
+        assert_eq!(decoded.params.server_fill, None);
+
+        assert_eq!(decoded.presence, ParamPresence::default());
+        assert_eq!(
+            decoded.presence,
+            ParamPresence {
+                protocol_version: false,
+                duration_ns: false,
+                interval_ns: false,
+                length: false,
+                received_stats: false,
+                stamp_at: false,
+                clock: false,
+                dscp: false,
+                server_fill: false,
+            }
+        );
+    }
+
+    #[test]
+    fn absent_and_explicitly_zero_parameters_share_a_value_but_not_a_presence() {
+        // Duration and Interval are the pair a server must tell apart: absent is
+        // accepted, explicitly zero is not.
+        let absent = Params::decode_with_presence(&encode_int(1, 1)).unwrap();
+        assert_eq!(absent.params.duration_ns, 0);
+        assert!(!absent.presence.duration_ns);
+        assert_eq!(absent.params.interval_ns, 0);
+        assert!(!absent.presence.interval_ns);
+        assert_eq!(absent.params.clock, Clock::Unspecified);
+        assert!(!absent.presence.clock);
+
+        let explicit_duration = Params::decode_with_presence(&encode_int(2, 0)).unwrap();
+        assert_eq!(explicit_duration.params.duration_ns, 0);
+        assert!(explicit_duration.presence.duration_ns);
+
+        let explicit_interval = Params::decode_with_presence(&encode_int(3, 0)).unwrap();
+        assert_eq!(explicit_interval.params.interval_ns, 0);
+        assert!(explicit_interval.presence.interval_ns);
+    }
+
+    #[test]
+    fn every_known_tag_reports_its_own_presence() {
+        let mut encoded = Vec::new();
+        for (tag, value) in [
+            (1, 1),
+            (2, 5),
+            (3, 6),
+            (4, 7),
+            (5, 3),
+            (6, 4),
+            (7, 3),
+            (8, 184),
+        ] {
+            encoded.extend_from_slice(&encode_int(tag, value));
+        }
+        encoded.extend_from_slice(&encode_server_fill_value(b"rand"));
+
+        let decoded = Params::decode_with_presence(&encoded).unwrap();
+        assert_eq!(
+            decoded.presence,
+            ParamPresence {
+                protocol_version: true,
+                duration_ns: true,
+                interval_ns: true,
+                length: true,
+                received_stats: true,
+                stamp_at: true,
+                clock: true,
+                dscp: true,
+                server_fill: true,
+            }
+        );
+    }
+
+    #[test]
+    fn unspecified_clock_is_encoded_by_omission() {
+        let params = Params {
+            protocol_version: 1,
+            clock: Clock::Unspecified,
+            ..Params::default()
+        };
+        let encoded = params.encode();
+
+        assert_eq!(encoded, encode_int(1, 1));
+        assert!(
+            !encoded.windows(2).any(|bytes| bytes[0] == 7),
+            "an unspecified clock must omit the tag rather than encode an explicit zero"
+        );
+        assert_round_trip(params);
+    }
+
+    #[test]
+    fn decode_and_decode_with_presence_agree() {
+        let mut payloads = vec![
+            Vec::new(),
+            encode_int(1, 1),
+            encode_int(2, 0),
+            encode_server_fill_value(b"rand"),
+        ];
+        payloads.push(
+            Params {
+                protocol_version: 1,
+                duration_ns: 3_000_000_000,
+                interval_ns: 1_000_000_000,
+                length: 1472,
+                received_stats: ReceivedStats::Both,
+                stamp_at: StampAt::Both,
+                clock: Clock::Both,
+                dscp: 184,
+                server_fill: Some(ServerFill {
+                    value: "rand".to_owned(),
+                }),
+            }
+            .encode(),
+        );
+        // Malformed payloads must fail identically through both entry points.
+        payloads.push(vec![1, 0x80]);
+        payloads.push(encode_int(7, 0));
+
+        for payload in payloads {
+            assert_eq!(
+                Params::decode(&payload),
+                Params::decode_with_presence(&payload).map(|decoded| decoded.params),
+                "decode and decode_with_presence disagreed on {payload:02x?}"
+            );
+        }
     }
 
     #[test]

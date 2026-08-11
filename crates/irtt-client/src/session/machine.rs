@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use irtt_proto::{
-    decode_echo_reply, echo_packet_len, encode_request, flags, EchoReply, OpenReply, Params,
+    decode_echo_reply, echo_packet_len, encode_request, flags, Clock, EchoReply, OpenReply, Params,
     RequestToEncode, ServerFill, TimestampFields, PROTOCOL_VERSION,
 };
 
@@ -987,6 +987,11 @@ fn validate_protocol_config(config: &ClientConfig) -> Result<(), ClientError> {
     if config.interval == Duration::ZERO {
         return Err(ClientError::InvalidConfig {
             reason: "interval must be greater than zero".to_owned(),
+        });
+    }
+    if config.clock == Clock::Unspecified {
+        return Err(ClientError::InvalidConfig {
+            reason: "clock must be wall, monotonic, or both".to_owned(),
         });
     }
     if config.dscp > MAX_DSCP_CODEPOINT {

@@ -39,7 +39,7 @@ For compatibility questions, the verified spec and black-box observations define
 
 ## Architecture
 
-Main boundary (`irtt-server` is planned, not yet implemented):
+Main boundary:
 
 > `irtt-proto` — wire semantics shared by client/server. `irtt-client` — client/session behavior. `irtt-server` — server/session behavior and Tokio runtime/orchestration. `irtt-stats` — statistics over client-facing events/results as currently designed. `irtt-cli` — presentation/orchestration.
 
@@ -49,7 +49,7 @@ Main boundary (`irtt-server` is planned, not yet implemented):
   - `AsyncClient`: optional Tokio low-level adapter.
   - `ManagedClientTask` / `ManagedClientHandle`: unified Tokio managed driver/control surface.
   - `BlockingManagedClient`: synchronous owner using a dedicated current-thread Tokio runtime.
-- `irtt-server`: planned; see "Server architecture (`irtt-server`)" below.
+- `irtt-server`: exists; see "Server architecture (`irtt-server`)" below.
 - `irtt-stats`: cumulative/rolling/finite statistics over client events. No wire/session state machine logic.
 - `irtt-cli`: argument parsing, managed orchestration, output, summaries, TUI, diagnostics, and exit behavior. Do not duplicate protocol/session state machines here.
 
@@ -57,7 +57,7 @@ Tokio must remain optional for `irtt-client`; default builds must remain runtime
 
 ### Server architecture (`irtt-server`)
 
-`irtt-server` is a planned first-class reusable server crate. It does not exist yet; this section describes the intended boundary for it, not an implemented API.
+`irtt-server` is a first-class reusable server crate. It currently contains the deterministic OPEN/session core — packet admission, authentication policy, open negotiation, the bounded session table and open reply construction. ECHO processing, client/server close and session lifetime remain unimplemented, as does the Tokio runtime; see `crates/irtt-server/AGENTS.md`. The rest of this section describes the boundary the crate is built to, including the parts not yet written.
 
 - It shares wire semantics with the client through `irtt-proto` and follows the same clean-room boundary.
 - It must **not** depend on `irtt-client` merely to reuse protocol behavior.
@@ -67,7 +67,7 @@ Tokio must remain optional for `irtt-client`; default builds must remain runtime
 - Runtime/server orchestration belongs around that core and may freely use Tokio for UDP sockets, `recv_from`/`send_to`, IPv4/IPv6 listeners, timers, session expiry, max-duration deadlines, shutdown, bounded control/config channels where useful, and `select!`-style orchestration.
 - The CLI server applet, when added, should remain thin orchestration/configuration over reusable `irtt-server`, not contain a second server state machine.
 - Resource policy: the server should use bounded session/resource policy. Upstream's observed lack of useful default session/per-peer bounds (see `IRTT_SERVER_PROTOCOL_SPEC.md`) is not an interoperability requirement and must not be reproduced merely for compatibility.
-- Testing: once a real `irtt-server` exists, prefer it for normal compliant fake-peer behavior where practical. Keep narrow adversarial/raw peers for intentionally malformed, ambiguous, or non-compliant wire behavior.
+- Testing: prefer `irtt-server` for normal compliant fake-peer behavior where practical, as far as its implemented behavior reaches. Keep narrow adversarial/raw peers for intentionally malformed, ambiguous, or non-compliant wire behavior.
 
 ## Engineering rules
 
