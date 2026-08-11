@@ -72,32 +72,53 @@ jobs:
             --locked \
             -- -D warnings
 
-  check:
-    name: cargo check
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
+  verify:
+    name: cargo ${{ matrix.task }} (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - task: check
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            musl: false
 
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
+          - task: test
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            musl: false
 
-      - name: Install Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
-        with:
-          cache-key: check
+          - task: check
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            musl: true
 
-      - name: Run check without default features
-        run: |
-          cargo check \
-            --workspace \
-            --no-default-features \
-            --locked
+          - task: test
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            musl: true
 
-  test:
-    name: cargo test
-    runs-on: ubuntu-latest
+          - task: check
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            musl: false
+
+          - task: test
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            musl: false
+
+          - task: check
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            musl: true
+
+          - task: test
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            musl: true
+
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 25
 
     steps:
@@ -106,24 +127,34 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install musl toolchain
+        if: matrix.musl
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends musl-tools
+
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache-key: test
+          target: ${{ matrix.target }}
+          cache-key: ${{ matrix.task }}-${{ matrix.target }}
 
-      - name: Run tests
+      - name: Run ${{ matrix.task }} with all features
         run: |
-          cargo test \
+          cargo ${{ matrix.task }} \
             --workspace \
             --all-targets \
             --all-features \
+            --target ${{ matrix.target }} \
             --locked
 
-      - name: Run tests without default features
+      - name: Run ${{ matrix.task }} without default features
         run: |
-          cargo test \
+          cargo ${{ matrix.task }} \
             --workspace \
+            --all-targets \
             --no-default-features \
+            --target ${{ matrix.target }} \
             --locked
 
   docs:
