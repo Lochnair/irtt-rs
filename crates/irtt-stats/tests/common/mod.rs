@@ -84,6 +84,22 @@ fn reply_with_rtt(seq: u32, raw_ms: u64, rtt: RttSample) -> ClientEvent {
     }
 }
 
+/// Builds a normal reply carrying exactly the supplied server received stats.
+pub fn reply_with_received_stats(
+    seq: u32,
+    raw_ms: u64,
+    count: Option<u32>,
+    window: Option<u64>,
+) -> ClientEvent {
+    let mut event = unadjusted_reply(seq, raw_ms);
+    let ClientEvent::EchoReply { received_stats, .. } = &mut event else {
+        unreachable!();
+    };
+    *received_stats =
+        (count.is_some() || window.is_some()).then_some(ReceivedStatsSample { count, window });
+    event
+}
+
 pub fn unadjusted_late_reply(seq: u32, raw_ms: u64) -> ClientEvent {
     late_reply_from(unadjusted_reply(seq, raw_ms))
 }

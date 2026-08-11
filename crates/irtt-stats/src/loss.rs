@@ -6,6 +6,11 @@ use crate::PacketCounts;
 /// Percentage fields are percentages from `0.0` to `100.0` in normal cases.
 /// Directional upstream and downstream loss can be negative when
 /// server-reported counts exceed local expectations.
+///
+/// The directional fields are derived from
+/// [`PacketCounts::server_packets_received`] and are `None` when the server
+/// reported no receive count. [`PacketCounts::server_received_window`] is never
+/// used to derive loss.
 pub struct LossStats {
     /// Locally inferred total lost packets.
     pub lost_packets: u64,
