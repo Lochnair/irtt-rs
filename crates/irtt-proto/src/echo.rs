@@ -13,8 +13,13 @@ use crate::{
 /// header.
 const MIDPOINT_COMPAT_EXTRA: usize = TIMESTAMP_SIZE;
 
+/// Whether the negotiation selects a midpoint timestamp from exactly one clock,
+/// which is the only case the upstream dual-field compatibility form applies to.
+///
+/// [`Clock::Unspecified`] selects no clock and therefore lays out no midpoint
+/// field at all, so it is not a single-clock negotiation.
 fn is_midpoint_single_clock(params: &Params) -> bool {
-    params.stamp_at == StampAt::Midpoint && !matches!(params.clock, Clock::Both)
+    params.stamp_at == StampAt::Midpoint && matches!(params.clock, Clock::Wall | Clock::Monotonic)
 }
 
 /// Total datagram length of the upstream dual-midpoint compatibility form.
@@ -135,7 +140,7 @@ pub fn decode_echo_reply(
         match params.clock {
             Clock::Wall => (Some(wall), None),
             Clock::Monotonic => (None, Some(mono)),
-            Clock::Both => {
+            Clock::Unspecified | Clock::Both => {
                 unreachable!("midpoint compat only applies to single-clock negotiations")
             }
         }

@@ -12,6 +12,12 @@
 //! performs no additional validation, so callers that build `Params` manually
 //! are responsible for validating those values before sending them.
 //!
+//! Parameters are optional on the wire, and an absent tag takes its wire
+//! default — zero for every integer field, and [`Clock::Unspecified`] for the
+//! clock. A receiver that must distinguish an omitted tag from one explicitly
+//! encoded as zero uses [`Params::decode_with_presence`], which runs the same
+//! parser and additionally reports a [`ParamPresence`].
+//!
 //! The crate also provides packet layout calculation, packet encoding and
 //! decoding, and optional HMAC placement, computation, and verification
 //! helpers.
@@ -51,7 +57,10 @@ pub use flags::*;
 pub use hmac::{compute_hmac, compute_hmac_in_place, verify_hmac, verify_packet_hmac};
 pub use layout::{echo_header_len, echo_packet_len, PacketLayout};
 pub use open::{decode_open_reply, encode_open_reply, OpenReply};
-pub use params::{Clock, Params, ReceivedStats, ServerFill, StampAt, MAX_SERVER_FILL_BYTES};
+pub use params::{
+    Clock, DecodedParams, ParamPresence, Params, ReceivedStats, ServerFill, StampAt,
+    MAX_SERVER_FILL_BYTES,
+};
 pub use request::{
     decode_request, encode_request, DecodedRequest, DecodedRequestKind, RequestToEncode,
 };

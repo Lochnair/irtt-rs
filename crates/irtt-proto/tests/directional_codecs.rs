@@ -413,7 +413,7 @@ fn midpoint_dual_field_reply_is_accepted_wherever_length_identifies_it() {
                 // The first wire field must not be mistaken for the
                 // negotiated monotonic value.
                 Clock::Monotonic => (None, Some(222)),
-                Clock::Both => unreachable!(),
+                Clock::Unspecified | Clock::Both => unreachable!(),
             };
             assert_eq!(
                 reply.timestamps.midpoint_wall, expected_wall,
@@ -463,7 +463,7 @@ fn midpoint_dual_field_reply_of_equal_length_is_accepted_but_not_correctable() {
                     assert_eq!(reply.timestamps.midpoint_wall, None);
                     assert_eq!(reply.timestamps.midpoint_mono, Some(111));
                 }
-                Clock::Both => unreachable!(),
+                Clock::Unspecified | Clock::Both => unreachable!(),
             }
         }
     }

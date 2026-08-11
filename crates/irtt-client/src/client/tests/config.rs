@@ -140,6 +140,16 @@ fn params_from_config_rejects_invalid_values() {
             "dscp",
         ),
         (
+            // The unspecified clock is the absent-tag wire default, not a
+            // client mode; a client that needs timestamps must name a clock.
+            "unspecified clock",
+            ClientConfig {
+                clock: Clock::Unspecified,
+                ..ClientConfig::default()
+            },
+            "clock must be wall, monotonic, or both",
+        ),
+        (
             "empty server fill",
             ClientConfig {
                 server_fill: Some("".to_owned()),

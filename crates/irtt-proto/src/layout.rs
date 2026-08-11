@@ -142,6 +142,7 @@ mod tests {
             ReceivedStats::Both => RECV_COUNT_SIZE + RECV_WINDOW_SIZE,
         };
         let clock_count = match clock {
+            Clock::Unspecified => 0,
             Clock::Wall | Clock::Monotonic => 1,
             Clock::Both => 2,
         };

@@ -121,6 +121,7 @@ fn clock_modes_drive_reply_event_clock_fields() {
                 assert_timing_fields(reply.server_timing, true, true, false, false, true, true);
                 assert_one_way_presence(reply.one_way, true, true);
             }
+            Clock::Unspecified => unreachable!("clients never request an unspecified clock"),
         }
         assert_processing_subtracted(reply);
     }

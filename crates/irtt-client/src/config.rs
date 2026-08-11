@@ -77,6 +77,10 @@ pub struct ClientConfig {
     /// Requested timestamp placement in echo replies.
     pub stamp_at: StampAt,
     /// Requested server clock sources for timestamp fields.
+    ///
+    /// [`Clock::Unspecified`] is the wire default meaning "no clock tag was
+    /// sent" and is not a client mode; opening a session with it is rejected.
+    /// Request [`Clock::Wall`], [`Clock::Monotonic`], or [`Clock::Both`].
     pub clock: Clock,
     /// Requested DSCP codepoint.
     ///
