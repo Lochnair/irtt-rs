@@ -1,0 +1,77 @@
+# `irtt-server` guidance
+
+Repository-wide guidance in the root `AGENTS.md` also applies here.
+
+## Where server behavior comes from
+
+Server wire behavior comes from the sanitized clean server documents, not from
+upstream implementation material:
+
+- `docs/protocol/IRTT_SERVER_PROTOCOL_SPEC.md`
+- `docs/protocol/test-vectors/SERVER_BEHAVIORAL_VECTORS.md`
+- `docs/protocol/BLACKBOX_VERIFICATION_REPORT.md`
+- `docs/protocol/IRTT_CLIENT_PROTOCOL_SPEC.md` for the shared wire format
+
+Never derive behavior from upstream `heistp/irtt` source or tests. If the clean
+material does not establish a semantic, state the ambiguity instead of guessing.
+
+## Boundaries
+
+- Protocol behavior comes from `irtt-proto`. `irtt-server` must **not** depend
+  on `irtt-client` to reuse wire logic; a needed primitive belongs in
+  `irtt-proto`, where both sides get it.
+- Do not reimplement magic validation, flag rules, HMAC placement, request
+  classification, token/header offsets or parameter parsing here.
+- No statistics, CLI or presentation concerns.
+- `SocketAddr` belongs here: endpoint identity is session state. It does not
+  belong in `irtt-proto`.
+
+## Core versus runtime
+
+- Deterministic protocol and session logic — admission, negotiation, the session
+  table, resource decisions, packet construction — belongs in the core.
+- Socket and runtime orchestration — `UdpSocket`, IPv4/IPv6 listeners,
+  `recv_from`/`send_to`, timers, expiry, shutdown, `select!`, socket options —
+  belongs around the core.
+- The server is intentionally **Tokio-native**. Tokio does not need to be
+  optional for this crate.
+- Do not add a blocking server, an alternate-runtime variant, a transport trait,
+  a runtime abstraction layer, or a mirrored client-style API family. There is
+  no product requirement for any of them, and `ServerCore` being public is not a
+  promise of runtime independence.
+
+## Rejection is silence
+
+Malformed, unauthenticated, unsupported and policy-refused input is discarded
+without a reply and without disturbing any live session. The protocol defines no
+error reply, no reset and no NACK. Reserve the error type for internal failures
+on the server's own side; an inbound `ProtoError` must never surface as a server
+failure. Hostile UDP must leave the server running.
+
+Do not let reply behavior reveal which stage rejected a datagram — in
+particular, an authentication failure must be indistinguishable from an unknown
+token.
+
+## Resource policy
+
+Total session and resource state must stay bounded. A single unauthenticated
+datagram creates a session and opens are never deduplicated, so an unbounded
+table is a liability. Upstream's observed absence of session and per-peer bounds
+is explicitly **not** a compatibility target and must not be reproduced.
+
+Keep fallible preparation before irreversible state mutation: a reply is
+prepared before a session is inserted, so an internal failure cannot leave a
+half-created session.
+
+## Testing
+
+- Drive the core with real packets built by the production encoders. Do not
+  maintain shadow encoders for well-formed wire data.
+- Hand-build packets only where the point is a payload a compliant encoder
+  cannot produce — truncated varints, out-of-range enums, corrupted MACs.
+- Token generation is the only nondeterministic part; tests inject a scripted
+  source so identity, collisions and allocation failure are assertable. Keep
+  that seam private.
+- As the server gains behavior, prefer it over fake peers for normal compliant
+  behavior in other crates' tests. Keep small raw/adversarial peers for
+  intentionally malformed or non-compliant wire behavior.

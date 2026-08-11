@@ -2,6 +2,7 @@
 members = [
     "crates/irtt-proto",
     "crates/irtt-client",
+    "crates/irtt-server",
     "crates/irtt-stats",
     "crates/irtt-cli",
 ]
@@ -18,6 +19,7 @@ readme = "README.md"
 [workspace.dependencies]
 irtt-proto = { version = "0.4.0", path = "crates/irtt-proto" }
 irtt-client = { version = "0.4.0", path = "crates/irtt-client" }
+irtt-server = { version = "0.4.0", path = "crates/irtt-server" }
 irtt-stats = { version = "0.4.0", path = "crates/irtt-stats" }
 
 [profile.release]

@@ -727,6 +727,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "irtt-server"
+version = "0.4.0"
+dependencies = [
+ "getrandom 0.4.3",
+ "irtt-proto",
+ "thiserror 2.0.20",
+]
+
+[[package]]
 name = "irtt-stats"
 version = "0.4.0"
 dependencies = [
