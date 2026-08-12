@@ -30,8 +30,8 @@ pub enum ProtoError {
     InvalidUtf8,
     #[error("invalid enum value {value} for {name}")]
     InvalidEnum { name: &'static str, value: i64 },
-    #[error("packet length must be non-negative, got {length}")]
-    NegativePacketLength { length: i64 },
+    #[error("packet length {length} cannot be represented as a buffer length")]
+    PacketLengthUnrepresentable { length: i64 },
     #[error("parameter {tag} length is too large: {length} bytes")]
     ParameterLengthTooLarge { tag: u64, length: u64 },
     #[error("open reply has zero token without close flag")]

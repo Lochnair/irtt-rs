@@ -235,7 +235,6 @@ impl SessionMachine {
                 | irtt_proto::ProtoError::VarintOverflow
                 | irtt_proto::ProtoError::InvalidUtf8
                 | irtt_proto::ProtoError::InvalidEnum { .. }
-                | irtt_proto::ProtoError::NegativePacketLength { .. }
                 | irtt_proto::ProtoError::ParameterLengthTooLarge { .. }
                 | irtt_proto::ProtoError::MalformedParams),
             ) => Err(ClientError::Protocol(error)),
@@ -824,6 +823,13 @@ impl SessionMachine {
     }
 }
 
+/// Sizes the receive buffer for the negotiated layout.
+///
+/// Fallible only because a negotiated length wider than `usize` cannot name a
+/// buffer at all. Negotiation already rejects a returned length that is
+/// negative or larger than this client requested, and the requested length is a
+/// `u32`, so the error is unreachable here in practice — it is propagated
+/// rather than asserted away so that no 64-bit assumption is baked in.
 pub(crate) fn recv_buffer_size(
     has_hmac: bool,
     negotiated: Option<&NegotiatedParams>,

@@ -60,6 +60,30 @@ Do not let reply behavior reveal which stage rejected a datagram — in
 particular, an authentication failure must be indistinguishable from an unknown
 token.
 
+## An acknowledged open must be executable
+
+Validate the **final, restricted** parameters before acknowledging an open, not
+just the requested ones. Once an open passes admission and negotiation, its
+effective parameters must be safe for the server to run.
+
+- Effective non-none `StampAt` with `Clock::Unspecified` is silently rejected.
+  Timestamps from no clock lay out no timestamp field, so the session could not
+  be run. Do **not** synthesize a clock and do **not** rewrite `StampAt` to
+  none: either answers with a session the client did not ask for. This is
+  `irtt-rs` policy for nonconforming input, chosen because the clean evidence
+  records the reference server accepting this combination and then failing on
+  the first echo. A conforming client always sends a clock when it selects
+  timestamps, so conforming traffic is unaffected.
+- `Clock::Unspecified` alone is valid — it is just an absent tag. Only the
+  combination is refused, and only an absent tag reaches it, since an explicit
+  zero Clock is already out of range for the decoder.
+- Run the check after negotiation, so that a later policy restricting `StampAt`
+  to none makes an omitted clock safe without this rule changing.
+- Negative `Length` stays an accepted negotiated value, returned unchanged in
+  the open reply and stored verbatim in the session. It needs no clamping to be
+  executable: `irtt-proto` floors actual echo packet sizing at the required
+  protocol field block, so a negative length behaves as zero does.
+
 ## Resource policy
 
 Total session and resource state must stay bounded. A single unauthenticated

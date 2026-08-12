@@ -1,4 +1,4 @@
-use irtt_proto::{verify_packet_hmac, Params};
+use irtt_proto::{verify_packet_hmac, Clock, Params, StampAt};
 
 use super::support::{
     client_params, core_with_tokens, expect_no_test_reply, no_test_request, open_request,
@@ -72,6 +72,30 @@ fn a_no_test_open_is_rejected_on_the_same_parameters_a_normal_open_is() {
 
     assert_eq!(core.handle_datagram(peer(), &request).unwrap(), None);
     assert_eq!(core.session_count(), 0);
+}
+
+#[test]
+fn a_no_test_open_selecting_timestamps_without_a_clock_is_silently_refused() {
+    // No-test exists to tell a client what the session would be, so it must not
+    // report a session that could not exist. The effective-parameter check runs
+    // before the no-test path branches off, so both open forms refuse the same
+    // incoherent timestamp request.
+    let tokens = ScriptedTokens::new([TOKEN_A]);
+    let mut core = core_with_tokens(ServerConfig::default(), tokens.clone());
+
+    let requested = Params {
+        clock: Clock::Unspecified,
+        stamp_at: StampAt::Both,
+        ..client_params()
+    };
+
+    assert_eq!(
+        core.handle_datagram(peer(), &no_test_request(&requested, None))
+            .expect("an unusable timestamp request is not a server error"),
+        None
+    );
+    assert_eq!(core.session_count(), 0);
+    assert_eq!(tokens.remaining(), 1, "no token may be drawn");
 }
 
 #[test]

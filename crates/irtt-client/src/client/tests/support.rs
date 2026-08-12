@@ -72,9 +72,10 @@ pub(super) fn open_reply(
     .unwrap()
 }
 
+/// Test params always name a representable length, so the platform
+/// representability check cannot fire here.
 pub(crate) fn echo_packet_len(hmac: bool, params: &Params) -> usize {
-    checked_echo_packet_len(hmac, params)
-        .expect("test params must have a non-negative packet length")
+    checked_echo_packet_len(hmac, params).expect("test params must have a representable length")
 }
 
 pub(super) fn echo_reply_packet(

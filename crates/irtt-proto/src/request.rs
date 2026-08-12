@@ -84,8 +84,10 @@ pub enum DecodedRequestKind<'a> {
 /// # Errors
 ///
 /// Returns [`ProtoError::PayloadTooLarge`] when an ECHO payload does not fit
-/// the negotiated length, and [`ProtoError::NegativePacketLength`] when the
-/// negotiated length is negative.
+/// the negotiated length, and [`ProtoError::PacketLengthUnrepresentable`] when
+/// the negotiated length is positive and wider than `usize`. A *negative*
+/// negotiated length is not an error: see [`echo_packet_len`], which floors it
+/// at the mandatory field block.
 pub fn encode_request(request: RequestToEncode<'_>, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
     match request {
         RequestToEncode::Open { params, no_test } => encode_open(params, no_test, hmac_key),

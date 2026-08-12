@@ -534,8 +534,7 @@ fn open_reply(flags: u8, token: u64, params: &Params, hmac_key: Option<&[u8]>) -
 }
 
 pub(super) fn test_echo_packet_len(hmac: bool, params: &Params) -> usize {
-    echo_packet_len(hmac, params)
-        .expect("managed runner test params must have a non-negative packet length")
+    echo_packet_len(hmac, params).expect("test params must have a representable length")
 }
 
 fn echo_reply_packet(

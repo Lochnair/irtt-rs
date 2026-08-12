@@ -305,6 +305,32 @@ fn echo_payload_is_copied_zero_filled_and_bounded_in_both_directions() {
     );
 }
 
+#[test]
+fn a_negative_negotiated_length_still_encodes_in_both_directions() {
+    // A server accepts a negative negotiated length during open and returns it
+    // unchanged, so a live session can hold one and must stay executable. There
+    // is no datagram shorter than none, so both directions fall back to the
+    // mandatory field block — header (4) + token (8) + sequence (4) — exactly
+    // as a zero length would.
+    let params = Params {
+        length: -4096,
+        ..Params::default()
+    };
+    assert_eq!(echo_packet_len(false, &params), Ok(16));
+
+    let request = encode_request(echo_request(&params, &[]), None)
+        .expect("a negative negotiated length must still encode a request");
+    assert_eq!(request.len(), 16);
+
+    let reply = encode_echo_reply(&echo_reply(&params, FLAG_REPLY), &params, None)
+        .expect("a negative negotiated length must still encode a reply");
+    assert_eq!(reply.len(), 16);
+    assert_eq!(
+        decode_echo_reply(&reply, &params, None).unwrap().token,
+        TOKEN
+    );
+}
+
 // ---------- Upstream midpoint ECHO-reply compatibility ----------
 //
 // Verified upstream irtt 0.9.1 behavior: for single-clock
