@@ -2,7 +2,7 @@ use irtt_proto::{Clock, Params, ReceivedStats, ServerFill, StampAt};
 
 use super::support::{
     client_params, core_with_tokens, expect_normal_open_reply, open_request,
-    open_request_with_raw_params, param_int, peer, ScriptedTokens, KEY,
+    open_request_with_raw_params, param_int, peer, unthrottled, ScriptedTokens, KEY,
 };
 use crate::{ServerConfig, DEFAULT_MAX_PACKET_LENGTH};
 
@@ -84,7 +84,11 @@ fn any_requested_protocol_version_is_accepted_and_answered_with_one() {
 
 #[test]
 fn an_empty_parameter_payload_is_answered_with_only_a_version() {
-    let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+    // The interval floor is disabled here so that the reply carries nothing but
+    // the version: with one configured, an absent Interval negotiates up to it
+    // and is encoded, which is interval policy rather than what this test is
+    // about.
+    let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
 
     let packet = core
         .handle_datagram(peer(), &open_request_with_raw_params(&[], None))
@@ -114,7 +118,7 @@ fn an_empty_parameter_payload_is_answered_with_only_a_version() {
 
 #[test]
 fn unknown_parameter_tags_are_ignored_and_not_reflected_in_the_reply() {
-    let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+    let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
 
     let mut payload = param_int(1, 1);
     payload.extend_from_slice(&param_int(42, 7));
@@ -187,12 +191,14 @@ fn selecting_timestamps_without_a_clock_is_silently_refused() {
 
 #[test]
 fn current_non_length_parameters_survive_negotiation_unchanged() {
-    // Duration, interval, statistics, timestamps, DSCP and server fill are the
-    // values a later restriction-policy slice will deliberately start changing.
-    // Pinning them now makes that a visible decision rather than an accident.
-    // Version and an oversized packet length are already restricted, and have
-    // their own tests; the length here is deliberately under the default
-    // maximum so that this test says nothing about the packet-length policy.
+    // Statistics, timestamps, DSCP and server fill are the values a later
+    // restriction-policy slice will deliberately start changing. Pinning them
+    // now makes that a visible decision rather than an accident. Version, an
+    // oversized packet length, the duration maximum and the interval floor and
+    // cap are already restricted and have their own tests; the length here is
+    // deliberately under the default maximum, and the configuration below
+    // leaves duration and interval unrestricted, so this test says nothing
+    // about either policy.
     //
     // This is about what *negotiation* rewrites, which is a separate question
     // from whether the core will acknowledge the result: an open whose
@@ -212,7 +218,9 @@ fn current_non_length_parameters_survive_negotiation_unchanged() {
         }),
     };
 
-    let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+    // No duration maximum is configured by default, and the interval floor is
+    // disabled, so a one-nanosecond interval is left where it was asked for.
+    let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
     let packet = core
         .handle_datagram(peer(), &open_request(&unrestricted, None))
         .unwrap()

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 /// Default bound on the number of simultaneously live sessions.
 ///
 /// This is `irtt-rs` resource policy, not an interoperability requirement. The
@@ -26,18 +28,46 @@ pub const DEFAULT_MAX_SESSIONS: usize = 1024;
 /// allocation bounded, not to predict fragmentation.
 pub const DEFAULT_MAX_PACKET_LENGTH: usize = 65_507;
 
+/// Default floor on the send interval a session may negotiate, and the cadence
+/// its reply allowance replenishes at.
+///
+/// This matches the reference server's default policy. It is policy on both
+/// sides: the server specification lists the minimum send interval among the
+/// reference server's freely changeable defaults, not among the values the wire
+/// format fixes.
+pub const DEFAULT_MIN_SEND_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Default number of echo requests a session may have answered before its
+/// allowance has to replenish.
+///
+/// This matches the reference server's default policy, and like it, the
+/// allowance is per session: one session's burst is not another's.
+pub const DEFAULT_BURST_ALLOWANCE: u32 = 5;
+
+/// Default idle lifetime of a session.
+///
+/// A session that goes this long without an echo request is released. This
+/// matches the reference server's default of one minute, but the deadline it
+/// measures is deliberately not upstream's: `irtt-rs` expires immediately at the
+/// deadline, applies it to sessions that have never carried an echo request, and
+/// emits no final reply. See [`ServerConfig::with_idle_timeout`].
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+
 /// Configuration for a [`ServerCore`](crate::ServerCore).
 ///
 /// Fields are private and set through consuming builder methods, so later
-/// slices can add configuration without breaking construction. Only the
-/// settings this OPEN/session slice actually uses exist yet; the remaining
-/// parameter restriction knobs, lifetime policy and rate limits arrive with the
-/// slices that implement them.
+/// slices can add configuration without breaking construction. The remaining
+/// parameter restriction knobs — the timestamp allowance, DSCP policy and the
+/// server-fill allow-list — arrive with the slices that implement them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     hmac_key: Option<Vec<u8>>,
     max_sessions: usize,
     max_packet_length: usize,
+    min_send_interval: Duration,
+    burst_allowance: u32,
+    idle_timeout: Duration,
+    max_test_duration: Option<Duration>,
 }
 
 impl ServerConfig {
@@ -90,6 +120,97 @@ impl ServerConfig {
         self
     }
 
+    /// Sets the floor on the send interval a session may negotiate, which is
+    /// also the cadence its reply allowance replenishes at.
+    ///
+    /// A requested interval below this is raised to it during negotiation, and
+    /// an absent Interval — which means the wire default of zero, not an
+    /// explicit zero, which is refused — is answered with it. The negotiated
+    /// value may still end up *below* this floor, because the idle-timeout cap
+    /// of [`with_idle_timeout`](Self::with_idle_timeout) is applied afterwards;
+    /// where that happens, the session's allowance replenishes at the shorter
+    /// negotiated interval instead, so this server never enforces a cadence
+    /// slower than the one it handed the client.
+    ///
+    /// [`Duration::ZERO`] disables both: no interval is raised, and an
+    /// otherwise admissible echo never waits for allowance. It does **not**
+    /// disable the burst allowance, which refuses everything when it is zero.
+    #[must_use]
+    pub fn with_min_send_interval(mut self, min_send_interval: Duration) -> Self {
+        self.min_send_interval = min_send_interval;
+        self
+    }
+
+    /// Sets how many echo requests a session may have answered before its
+    /// allowance has to replenish.
+    ///
+    /// The allowance is per session, starts full, is spent one unit per served
+    /// echo and refills at one unit per
+    /// [`min_send_interval`](Self::min_send_interval), never above this value.
+    /// An echo arriving with no allowance is dropped without a reply and
+    /// without advancing any reception statistic.
+    ///
+    /// Zero is accepted and means no allowance at all: every echo is
+    /// rate-limited, whatever the interval is set to. It is deliberately not a
+    /// synonym for unlimited.
+    #[must_use]
+    pub fn with_burst_allowance(mut self, burst_allowance: u32) -> Self {
+        self.burst_allowance = burst_allowance;
+        self
+    }
+
+    /// Sets how long a session may go without a served or rate-limited echo
+    /// request before it is released.
+    ///
+    /// The deadline runs from the open, not from the first echo, so a session
+    /// that never carries one still ages out. Release is silent — the protocol
+    /// defines no expiry notification — and immediate at the deadline.
+    ///
+    /// This additionally caps the negotiated send interval at a quarter of the
+    /// timeout, so a client sending at the interval it was given cannot idle
+    /// itself out.
+    ///
+    /// [`Duration::ZERO`] is accepted and is not a synonym for "never expire":
+    /// it releases a session the next time expiry is evaluated. There is
+    /// deliberately no unbounded setting.
+    #[must_use]
+    pub fn with_idle_timeout(mut self, idle_timeout: Duration) -> Self {
+        self.idle_timeout = idle_timeout;
+        self
+    }
+
+    /// Sets the maximum test duration a session may negotiate.
+    ///
+    /// A requested Duration above this is reduced to it, and a *continuous*
+    /// request — an absent Duration, meaning the wire default of zero — is
+    /// answered with it too, since restricting continuous mode to a finite test
+    /// is the whole point of configuring a maximum. An explicit zero Duration
+    /// is refused before negotiation and never reaches this.
+    ///
+    /// [`Duration::ZERO`] means *no maximum*, exactly as
+    /// [`without_max_test_duration`](Self::without_max_test_duration) does. A
+    /// finite maximum of zero could only be honored by negotiating a Duration of
+    /// zero, which on the wire means continuous — the opposite of a limit — so
+    /// rewriting a client's finite request into a continuous one is refused
+    /// rather than encoded.
+    #[must_use]
+    pub fn with_max_test_duration(mut self, max_test_duration: Duration) -> Self {
+        self.max_test_duration = (!max_test_duration.is_zero()).then_some(max_test_duration);
+        self
+    }
+
+    /// Removes any configured maximum test duration, which is the default.
+    ///
+    /// A session then negotiates the duration it asked for, including
+    /// continuous, and no server-initiated close is ever triggered by duration.
+    /// The session table bound and the idle timeout still apply, so this is not
+    /// an unbounded setting.
+    #[must_use]
+    pub fn without_max_test_duration(mut self) -> Self {
+        self.max_test_duration = None;
+        self
+    }
+
     /// The configured HMAC key, if this server authenticates.
     #[must_use]
     pub fn hmac_key(&self) -> Option<&[u8]> {
@@ -107,16 +228,56 @@ impl ServerConfig {
     pub fn max_packet_length(&self) -> usize {
         self.max_packet_length
     }
+
+    /// The floor on a negotiated send interval, and the allowance refill
+    /// cadence.
+    #[must_use]
+    pub fn min_send_interval(&self) -> Duration {
+        self.min_send_interval
+    }
+
+    /// How many echo requests a session may have answered before its allowance
+    /// has to replenish.
+    #[must_use]
+    pub fn burst_allowance(&self) -> u32 {
+        self.burst_allowance
+    }
+
+    /// How long a session may go without an echo request before it is released.
+    #[must_use]
+    pub fn idle_timeout(&self) -> Duration {
+        self.idle_timeout
+    }
+
+    /// The maximum test duration a session may negotiate, if one is configured.
+    ///
+    /// Never `Some(Duration::ZERO)`: a zero maximum is stored as `None`, since
+    /// a negotiated Duration of zero means continuous rather than instant.
+    #[must_use]
+    pub fn max_test_duration(&self) -> Option<Duration> {
+        self.max_test_duration
+    }
 }
 
 impl Default for ServerConfig {
     /// An unauthenticated server bounded to [`DEFAULT_MAX_SESSIONS`] sessions,
-    /// each negotiating at most [`DEFAULT_MAX_PACKET_LENGTH`] bytes per echo.
+    /// each negotiating at most [`DEFAULT_MAX_PACKET_LENGTH`] bytes per echo,
+    /// no faster than [`DEFAULT_MIN_SEND_INTERVAL`] with a burst of
+    /// [`DEFAULT_BURST_ALLOWANCE`], and released after
+    /// [`DEFAULT_IDLE_TIMEOUT`] without an echo request.
+    ///
+    /// No maximum test duration is configured, matching the reference server's
+    /// ordinary policy. A session is still bounded, by the table size and the
+    /// idle timeout.
     fn default() -> Self {
         Self {
             hmac_key: None,
             max_sessions: DEFAULT_MAX_SESSIONS,
             max_packet_length: DEFAULT_MAX_PACKET_LENGTH,
+            min_send_interval: DEFAULT_MIN_SEND_INTERVAL,
+            burst_allowance: DEFAULT_BURST_ALLOWANCE,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            max_test_duration: None,
         }
     }
 }

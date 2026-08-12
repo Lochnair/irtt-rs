@@ -2,6 +2,7 @@ use std::{
     collections::VecDeque,
     net::SocketAddr,
     sync::{Arc, Mutex},
+    time::Duration,
 };
 
 use irtt_proto::{
@@ -19,6 +20,22 @@ use crate::{
 
 pub(crate) const KEY: &[u8] = b"correctkey";
 pub(crate) const OTHER_KEY: &[u8] = b"wrongkey";
+
+/// A default configuration with the minimum send interval disabled.
+///
+/// One knob, two consequences, and tests about neither of them want both gone:
+/// no requested interval is raised during negotiation, and no otherwise
+/// admissible echo ever waits for rate allowance. That keeps a test about
+/// parameter pass-through, receive statistics or timestamps from silently
+/// becoming a test of interval policy — and, since these tests drive the core as
+/// fast as the machine will run, from being rate-limited by a floor they never
+/// meant to configure.
+///
+/// Tests that *are* about interval negotiation, rate limiting or lifetime build
+/// their configuration explicitly.
+pub(crate) fn unthrottled() -> ServerConfig {
+    ServerConfig::default().with_min_send_interval(Duration::ZERO)
+}
 
 pub(crate) fn peer() -> SocketAddr {
     "198.51.100.7:41234".parse().unwrap()
@@ -135,7 +152,7 @@ pub(crate) fn core_with_sources(
 /// Most behavior has to hold identically with and without authentication, so
 /// tests loop over both and build the core from the key.
 pub(crate) fn core_for(hmac_key: Option<&[u8]>, tokens: ScriptedTokens) -> ServerCore {
-    let mut config = ServerConfig::default();
+    let mut config = unthrottled();
     if let Some(key) = hmac_key {
         config = config.with_hmac_key(key);
     }

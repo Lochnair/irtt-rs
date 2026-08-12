@@ -1,11 +1,9 @@
 use irtt_proto::{Params, PROTOCOL_VERSION};
 
-use crate::config::ServerConfig;
+use crate::{clock::saturating_ns, config::ServerConfig};
 
 /// Produces the parameters the server returns in an open reply and will enforce
 /// for the session.
-///
-/// Two restrictions apply so far.
 ///
 /// **Protocol version is rewritten to [`PROTOCOL_VERSION`].** A server must
 /// return version 1 so that version-1 clients accept the session; any requested
@@ -21,11 +19,31 @@ use crate::config::ServerConfig;
 /// floors echo sizing at, so there is nothing to reduce and rewriting them would
 /// answer with a session the client did not ask for.
 ///
-/// Those two are the whole of the current policy. A server *may* reduce or
-/// replace requested parameters, and later policy slices will add the maximum
-/// test duration clamp,
-/// minimum interval, idle-timeout interval cap, timestamp allowance, DSCP policy
-/// and server-fill allow-list.
+/// **Duration is reduced to the configured maximum test duration**, when one is
+/// configured. A *continuous* request — Duration absent, which is the wire
+/// default of zero — is answered with the maximum as well, because restricting
+/// continuous mode to a finite test is exactly what configuring a maximum asks
+/// for; the client models that as an ordinary duration reduction. An explicit
+/// zero or negative Duration never reaches here, being refused during request
+/// admission, and a configured maximum is never zero, so a finite request can
+/// never be rewritten into a continuous session.
+///
+/// **Interval is raised to the configured minimum and then capped at a quarter
+/// of the idle timeout.** The floor bounds how fast a session may ask to be
+/// answered; the cap keeps a well-behaved client from idling itself out by
+/// sending at the very interval it was given. An absent Interval takes the floor
+/// like any other value below it, since absence means the wire default of zero
+/// rather than a refusal — an explicit zero is refused during request admission.
+///
+/// The two can disagree: a configured minimum above a quarter of the idle
+/// timeout ends with the cap winning, and the returned interval below the
+/// configured minimum. That is deliberate, and `rate` is where the consequence
+/// is settled — the session's allowance then replenishes at the *negotiated*
+/// interval, so this server never enforces a cadence slower than the one it just
+/// handed the client.
+///
+/// Later policy slices will add the timestamp allowance, DSCP policy and the
+/// server-fill allow-list.
 ///
 /// Negotiation is not by itself an acknowledgement: the core validates what this
 /// function returns and silently discards an open whose effective parameters it
@@ -44,6 +62,27 @@ pub(crate) fn negotiate_params(mut requested: Params, config: &ServerConfig) -> 
     let max_length = i64::try_from(config.max_packet_length()).unwrap_or(i64::MAX);
     if requested.length > max_length {
         requested.length = max_length;
+    }
+
+    if let Some(maximum) = config.max_test_duration() {
+        // Never zero — `with_max_test_duration` stores a zero maximum as no
+        // maximum — so this cannot turn a finite request into a continuous one.
+        let maximum = saturating_ns(maximum);
+        if requested.duration_ns == 0 || requested.duration_ns > maximum {
+            requested.duration_ns = maximum;
+        }
+    }
+
+    // Floor first, cap second. The order is what lets the cap produce a
+    // negotiated interval below the configured minimum, which is the case the
+    // rate limiter is written to honor rather than contradict.
+    let minimum = saturating_ns(config.min_send_interval());
+    if requested.interval_ns < minimum {
+        requested.interval_ns = minimum;
+    }
+    let idle_cap = saturating_ns(config.idle_timeout()) / 4;
+    if idle_cap > 0 && requested.interval_ns > idle_cap {
+        requested.interval_ns = idle_cap;
     }
 
     requested

@@ -53,6 +53,9 @@ mod token;
 #[cfg(test)]
 mod tests;
 
-pub use config::{ServerConfig, DEFAULT_MAX_PACKET_LENGTH, DEFAULT_MAX_SESSIONS};
+pub use config::{
+    ServerConfig, DEFAULT_BURST_ALLOWANCE, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_PACKET_LENGTH,
+    DEFAULT_MAX_SESSIONS, DEFAULT_MIN_SEND_INTERVAL,
+};
 pub use core::ServerCore;
 pub use error::ServerError;

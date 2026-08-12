@@ -125,11 +125,18 @@ fn wall_ns() -> i64 {
 
 /// A duration as nanoseconds, saturating rather than panicking.
 ///
+/// This is the crate's one [`Duration`] → wire-nanoseconds conversion, used for
+/// clock readings and for the configured intervals and deadlines that
+/// negotiation and lifetime policy compare against them. Everything on both
+/// sides is signed nanoseconds, so there is no second rule anywhere.
+///
 /// [`Duration`] counts nanoseconds in `u128` and reaches far beyond `i64`,
-/// which the wire field is. A host clock set past the year 2262 is a local
-/// misconfiguration; it must not become a panic that a remote peer can reach by
-/// sending an echo request.
-fn saturating_ns(duration: Duration) -> i64 {
+/// which the wire field is. A host clock set past the year 2262, or an operator
+/// configuring a millennium-long idle timeout, is a local matter; neither may
+/// become a panic that a remote peer can reach by sending a packet. Saturating
+/// loses nothing that could have been honored, since no wire interval or
+/// duration can express more than `i64::MAX` nanoseconds either.
+pub(crate) fn saturating_ns(duration: Duration) -> i64 {
     i64::try_from(duration.as_nanos()).unwrap_or(i64::MAX)
 }
 

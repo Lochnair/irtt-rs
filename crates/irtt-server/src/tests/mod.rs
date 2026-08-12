@@ -15,6 +15,7 @@ mod admission;
 mod close;
 mod echo;
 mod hmac;
+mod negotiation;
 mod no_test;
 mod open;
 mod params;

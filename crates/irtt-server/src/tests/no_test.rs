@@ -2,7 +2,7 @@ use irtt_proto::{verify_packet_hmac, Clock, Params, StampAt};
 
 use super::support::{
     client_params, core_with_tokens, expect_no_test_reply, no_test_request, open_request,
-    open_request_with_raw_params, param_int, peer, ScriptedTokens, KEY,
+    open_request_with_raw_params, param_int, peer, unthrottled, ScriptedTokens, KEY,
 };
 use crate::ServerConfig;
 
@@ -200,7 +200,9 @@ fn an_authenticated_no_test_reply_is_authenticated_and_still_creates_nothing() {
 
 #[test]
 fn an_empty_no_test_open_is_answered() {
-    let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+    // No interval floor, so the reply shows the wire defaults an empty payload
+    // decoded to rather than the timing policy negotiation would apply to them.
+    let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
 
     let mut request = open_request_with_raw_params(&[], None);
     request[3] |= irtt_proto::FLAG_CLOSE;
