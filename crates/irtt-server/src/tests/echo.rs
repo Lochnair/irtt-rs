@@ -595,6 +595,65 @@ fn only_the_negotiated_timestamps_are_emitted() {
 }
 
 #[test]
+fn a_backward_wall_step_never_reports_receive_after_send() {
+    // A reply's receive instant must not be later than its send instant, and
+    // the wall clock can be stepped backwards between the two readings by NTP,
+    // a hypervisor or an administrator. The pair settles on the later reading,
+    // and only the wall domain moves: the monotonic one was already ordered.
+    let mut core = core_with_sources(
+        ServerConfig::default(),
+        ScriptedTokens::new([TOKEN_A]),
+        ScriptedClock::new([sample(1_000, 10_000), sample(990, 10_300)]),
+    );
+    let params = echo_params(ReceivedStats::None, StampAt::Both, Clock::Both, 0);
+    let (token, negotiated) = open_negotiated(&mut core, peer(), &params, None);
+
+    let packet = core
+        .handle_datagram(peer(), &echo_request(token, 0, &negotiated, &[], None))
+        .unwrap()
+        .expect("a backward wall step must not stop the echo being answered");
+    let reply = expect_echo_reply(&packet, &negotiated, None);
+
+    assert_eq!(
+        reply.timestamps,
+        TimestampFields {
+            recv_wall: Some(990),
+            recv_mono: Some(10_000),
+            send_wall: Some(990),
+            send_mono: Some(10_300),
+            ..TimestampFields::default()
+        },
+        "the receive wall value is held back to the send reading, and only it"
+    );
+    assert!(reply.timestamps.recv_wall <= reply.timestamps.send_wall);
+    assert!(reply.timestamps.recv_mono <= reply.timestamps.send_mono);
+
+    // A midpoint drawn from the same stepped pair is ordered for the same
+    // reason: it is the mean of two values that are no longer inverted.
+    let mut core = core_with_sources(
+        ServerConfig::default(),
+        ScriptedTokens::new([TOKEN_A]),
+        ScriptedClock::new([sample(1_000, 10_000), sample(990, 10_300)]),
+    );
+    let params = echo_params(ReceivedStats::None, StampAt::Midpoint, Clock::Wall, 0);
+    let (token, negotiated) = open_negotiated(&mut core, peer(), &params, None);
+
+    let packet = core
+        .handle_datagram(peer(), &echo_request(token, 0, &negotiated, &[], None))
+        .unwrap()
+        .expect("a backward wall step must not stop the echo being answered");
+    let reply = expect_echo_reply(&packet, &negotiated, None);
+
+    assert_eq!(
+        reply.timestamps,
+        TimestampFields {
+            midpoint_wall: Some(990),
+            ..TimestampFields::default()
+        }
+    );
+}
+
+#[test]
 fn a_single_clock_midpoint_emits_exactly_one_field() {
     // A guard against reproducing upstream 0.9.1's dual-field midpoint, which
     // emits both midpoint fields whatever the negotiated clock. `irtt-proto`

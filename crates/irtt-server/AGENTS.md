@@ -131,6 +131,13 @@ effective parameters must be safe for the server to run.
   classified as an echo and the send instant just before the reply is built, so
   they bracket the server's own handling. The monotonic origin belongs to the
   clock source and is stable for its life.
+- A reply's receive instant is held back to its send instant where the wall
+  clock stepped backwards between the two readings, so the required ordering
+  holds. That correction is per reply and stateless on purpose: latching a
+  pre-step wall value across packets would keep reporting a time the host has
+  corrected away, which is the smoothing the specification forbids, and
+  anchoring the wall clock to the monotonic origin would drift and never pick up
+  a legitimate correction. The server reports its own wall clock honestly.
 - For a single-clock midpoint, `irtt-rs` emits the one negotiated field. It does
   not reproduce upstream 0.9.1's dual-field midpoint; `irtt-proto` still decodes
   that form from a peer.

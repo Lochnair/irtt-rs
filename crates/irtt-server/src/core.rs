@@ -421,7 +421,13 @@ struct EchoRequest {
 /// [`Clock::Unspecified`] selects no domain and so produces no field. It cannot
 /// be reached with a non-none `StampAt` on an acknowledged session, because
 /// that combination is refused at open; nothing here needs to repair it.
+///
+/// The pair is ordered before anything is built from it, because a reply's
+/// receive instant must not be later than its send instant and the wall clock
+/// can be stepped backwards between the two readings. See
+/// [`ClockSample::not_after`]; the correction is confined to this one reply.
 fn timestamp_fields(params: &Params, received: ClockSample, sent: ClockSample) -> TimestampFields {
+    let received = received.not_after(sent);
     let per_clock = |sample: ClockSample| {
         (
             params.clock.has_wall().then_some(sample.wall_ns),

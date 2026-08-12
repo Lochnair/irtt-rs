@@ -44,6 +44,28 @@ impl ClockSample {
             mono_ns: mean_ns(self.mono_ns, other.mono_ns),
         }
     }
+
+    /// This sample, held back in any domain where it runs ahead of `later`.
+    ///
+    /// A reply's receive instant must not be later than its send instant. The
+    /// monotonic domain gets that from its source, which only moves forward.
+    /// The wall clock does not: it can be stepped backwards between two
+    /// readings by NTP, a hypervisor or an administrator, which would otherwise
+    /// invert the pair.
+    ///
+    /// The *earlier* reading is the one that moves, so the pair settles on the
+    /// clock as it now stands rather than on a value the clock has already
+    /// disowned. Nothing is remembered between calls: a latch that carried a
+    /// pre-step value forward would keep reporting a wall time the host has
+    /// corrected away, which is the smoothing across packets the specification
+    /// forbids — and it would make one-way delays wrong for as long as the
+    /// latch held, rather than for one reply.
+    pub(crate) fn not_after(self, later: Self) -> Self {
+        Self {
+            wall_ns: self.wall_ns.min(later.wall_ns),
+            mono_ns: self.mono_ns.min(later.mono_ns),
+        }
+    }
 }
 
 /// A source of clock samples.
