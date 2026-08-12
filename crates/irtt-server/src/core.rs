@@ -7,11 +7,11 @@ use irtt_proto::{
 };
 
 use crate::{
-    clock::{ClockSample, ClockSource, SystemClock},
+    clock::{saturating_ns, ClockSample, ClockSource, SystemClock},
     config::ServerConfig,
     error::ServerError,
     negotiate::negotiate_params,
-    session::Session,
+    session::{RateDecision, Session},
     token::{OsTokenSource, TokenSource, TOKEN_ATTEMPTS},
 };
 
@@ -39,11 +39,12 @@ use crate::{
 ///
 /// # Scope
 ///
-/// This slice implements open handling, session creation, normal echo
-/// processing and client-initiated close. Rate limiting, session lifetime and
-/// expiry, server-initiated close, DSCP application and the server fill policy
-/// are separate slices, so every otherwise admissible echo is answered and no
-/// session ever ages out.
+/// This slice implements open handling, session creation and negotiation,
+/// normal echo processing, per-session rate limiting, idle expiry,
+/// maximum-duration close and client-initiated close. DSCP application and the
+/// full server fill policy are separate slices, as is the Tokio runtime — so
+/// expiry is evaluated when a datagram arrives rather than on a timer, and
+/// echo payloads are zero-filled.
 #[derive(Debug)]
 pub struct ServerCore {
     config: ServerConfig,
@@ -122,7 +123,14 @@ impl ServerCore {
     ///
     /// `Ok(None)` is not only a rejection, though. A close request that does
     /// release its session is answered with nothing as well, because protocol
-    /// version 1 defines no acknowledgement for one.
+    /// version 1 defines no acknowledgement for one — and so is an echo that
+    /// found its session's rate allowance spent, which advances no statistic
+    /// but does keep the session alive.
+    ///
+    /// Sessions whose idle deadline has passed are released before the request
+    /// is dispatched, so a request may find the session it names already gone,
+    /// and one request may release an unrelated session. Expiry is never
+    /// signalled; a client sees only silence.
     ///
     /// Authentication is checked before open parameters are decoded and before
     /// any session is looked up. That ordering is deliberate: a packet that
@@ -165,14 +173,55 @@ impl ServerCore {
             }
         }
 
+        // One monotonic instant per authenticated, structurally valid request,
+        // which is the request's whole lifecycle time: what expiry is judged
+        // against, what a new session's deadlines start from, and what the rate
+        // limiter and maximum-duration deadline read. An echo already has one —
+        // the instant its reply will report as the receive time — and taking a
+        // second would let a reply's timestamps disagree with the policy
+        // decisions made about the very same datagram.
+        let now_ns = match kind {
+            ClassifiedKind::Echo(ref echo) => echo.received_at.mono_ns,
+            _ => self.clock.sample().mono_ns,
+        };
+        self.release_expired_sessions(now_ns);
+
         match kind {
-            ClassifiedKind::Open { no_test, params } => self.handle_open(peer, no_test, params),
+            ClassifiedKind::Open { no_test, params } => {
+                self.handle_open(peer, no_test, params, now_ns)
+            }
             ClassifiedKind::Close { token } => {
                 self.handle_close(peer, token);
                 Ok(None)
             }
             ClassifiedKind::Echo(echo) => self.handle_echo(peer, echo),
         }
+    }
+
+    /// Drops every session whose idle deadline has passed, as of `now_ns`.
+    ///
+    /// Expiry is *logical* — a session is expired the instant its deadline
+    /// passes — but reclamation here is *packet-driven*, because this slice has
+    /// no runtime and so no timer. An expired session may therefore stay
+    /// resident until the next authenticated, structurally valid request causes
+    /// this sweep. Nothing observable turns on the difference: total state is
+    /// already bounded by [`max_sessions`](ServerConfig::max_sessions), the
+    /// sweep runs before a new open is admitted so a stale session cannot deny
+    /// capacity to a live one, and while no traffic arrives at all there is
+    /// no peer to observe anything. The Tokio slice may add scheduled sweeps.
+    ///
+    /// The sweep is global and runs before the request is dispatched, so a
+    /// request touching one session can release another. That is deliberate:
+    /// expiry is a resource decision about the table, not a side effect of what
+    /// the current datagram happens to name. It also means a *no-test* open —
+    /// which creates nothing of its own — reclaims expired sessions like any
+    /// other open, where the reference server was observed not to. Both are
+    /// upstream policy the clean specification declines to require, and a
+    /// client cannot tell the difference: expiry is never signalled.
+    fn release_expired_sessions(&mut self, now_ns: i64) {
+        let idle_timeout_ns = saturating_ns(self.config.idle_timeout());
+        self.sessions
+            .retain(|_, session| !session.is_idle_expired(now_ns, idle_timeout_ns));
     }
 
     /// Pairs a structurally decoded request with the clock sample an echo
@@ -206,9 +255,10 @@ impl ServerCore {
     /// discard: the datagram must not be longer than
     /// [`max_packet_length`](ServerConfig::max_packet_length), its token must
     /// name a live session, and it must have arrived from that session's own
-    /// endpoint. Authentication was already settled by the caller. A request
-    /// failing any of these leaves the receive state — of this session and of
-    /// every other — exactly where it was.
+    /// endpoint. Authentication was already settled by the caller, as was idle
+    /// expiry — a request reaching here found its session still alive. A
+    /// request failing any of these leaves the receive state — of this session
+    /// and of every other — exactly where it was.
     ///
     /// Only the token and the sequence number mean anything. The request's own
     /// length is judged against the configured maximum and then forgotten: it
@@ -216,9 +266,24 @@ impl ServerCore {
     /// reply, which is laid out and sized from the session's negotiated
     /// parameters alone.
     ///
-    /// The next receive state is computed but not committed until the reply has
+    /// **Rate allowance is judged after admission and before the
+    /// maximum-duration deadline.** That order is the observed one and it
+    /// matters: a post-deadline echo with no allowance is simply dropped, and
+    /// the close it would have carried is not lost but handed to the next echo
+    /// that is served. A rate-limited request refreshes the session's idle
+    /// deadline — the one drop class the clean evidence records doing so — and
+    /// changes nothing else.
+    ///
+    /// **The maximum-duration close is an ordinary reply with the Close flag
+    /// added**, never a standalone packet: protocol version 1 has no other
+    /// in-band mechanism. It reports the triggering request in its statistics
+    /// exactly as any reply would, and the session is released once it has
+    /// encoded, so every later request is dropped as an unknown token.
+    ///
+    /// Every state transition is computed but not committed until the reply has
     /// been encoded, so a reply this server failed to build cannot leave a
-    /// session claiming to have answered a request it never did.
+    /// session claiming to have answered a request it never did — or, for a
+    /// close, leave the session released with no reply carrying the flag.
     fn handle_echo(
         &mut self,
         peer: SocketAddr,
@@ -239,7 +304,29 @@ impl ServerCore {
             return Ok(None);
         }
 
+        let now_ns = request.received_at.mono_ns;
+        let next_rate = match session.rate_state().charge(now_ns) {
+            RateDecision::Limited { next } => {
+                // Silence, and no statistic moves — but the session lives on,
+                // and its idle deadline moves with it.
+                let next_lifetime = session.lifetime_state().refreshed(now_ns);
+                session.commit_rate_state(next);
+                session.commit_lifetime_state(next_lifetime);
+                return Ok(None);
+            }
+            RateDecision::Allowed { next } => next,
+        };
+
+        // Only a session that has already served an echo has a deadline at all,
+        // so this can never fire on the request that starts the test.
+        let closing = self.config.max_test_duration().is_some_and(|maximum| {
+            session
+                .lifetime_state()
+                .max_duration_reached(now_ns, saturating_ns(maximum))
+        });
+
         let next = session.receive_state().accepted(request.sequence);
+        let next_lifetime = session.lifetime_state().served(now_ns);
         // The departure side, sampled as late as the core can: after admission
         // and the transition, immediately before the reply is built. There is
         // no socket here, so this is the core's departure instant rather than a
@@ -248,11 +335,12 @@ impl ServerCore {
         let sent_at = self.clock.sample();
         let params = session.params();
         let reply = EchoReply {
-            // Reply only. Open must be clear or upstream clients abort, and
-            // Close belongs to the server-initiated close slice. The
-            // authentication flag and field are the encoder's, decided by the
-            // key it is given.
-            flags: FLAG_REPLY,
+            // Open must be clear or upstream clients abort. Close is set only
+            // for the maximum-duration limit, which is the sole trigger this
+            // server has. The authentication flag and field are the encoder's,
+            // decided by the key it is given — a close-flagged reply is
+            // authenticated by exactly the same path as any other.
+            flags: FLAG_REPLY | if closing { FLAG_CLOSE } else { 0 },
             // Both are copied through unchanged: no token is allocated for an
             // echo, and no sequence number is normalized or range-checked.
             token: request.token,
@@ -270,16 +358,34 @@ impl ServerCore {
         let packet = encode_echo_reply(&reply, params, self.config.hmac_key())
             .map_err(|source| ServerError::ReplyEncoding { source })?;
 
-        // The last fallible step is behind us, so the transition can be made.
-        session.commit_receive_state(next);
+        // The last fallible step is behind us, so the transitions can be made.
+        if closing {
+            // The reply already carries the state this request produced, so
+            // there is nothing worth committing into a session about to go. A
+            // failure above would have left it live and untouched instead.
+            self.sessions.remove(&request.token);
+        } else {
+            session.commit_rate_state(next_rate);
+            session.commit_receive_state(next);
+            session.commit_lifetime_state(next_lifetime);
+        }
         Ok(Some(packet))
     }
 
+    /// Negotiates an open request and, unless it is a no-test one, creates the
+    /// session it asks for.
+    ///
+    /// `now_ns` is the request's lifecycle instant, which becomes the new
+    /// session's idle origin: a session starts aging the moment it exists, not
+    /// when it first carries an echo, so one whose client never returns is
+    /// still reclaimed. Expired sessions were already swept, so the capacity
+    /// bound below is judged against sessions that are genuinely live.
     fn handle_open(
         &mut self,
         peer: SocketAddr,
         no_test: bool,
         encoded_params: &[u8],
+        now_ns: i64,
     ) -> Result<Option<Vec<u8>>, ServerError> {
         // The parameter decoder already rejects a truncated tag or value, a
         // varint overflow, an out-of-range stats/stamp-at/clock enum, and a
@@ -325,8 +431,10 @@ impl ServerCore {
 
         // The reply is encoded before its params move into the session, so
         // nothing is cloned to keep both.
-        self.sessions
-            .insert(token, Session::new(peer, reply.params));
+        self.sessions.insert(
+            token,
+            Session::new(peer, reply.params, &self.config, now_ns),
+        );
         Ok(Some(packet))
     }
 

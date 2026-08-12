@@ -6,14 +6,14 @@
 //! # Structure
 //!
 //! [`ServerCore`] is the deterministic protocol and session engine: packet
-//! admission, authentication policy, open negotiation, the session table,
-//! echo receive state, resource decisions and reply construction. It performs
-//! no I/O; the clock its echo timestamps come from is a private injected seam,
-//! not a runtime abstraction, so the engine stays testable. Socket and
-//! runtime orchestration — the UDP listener, address handling, timers, expiry
-//! and shutdown — will live around it and is intentionally Tokio-native. There
-//! is no blocking or alternate-runtime counterpart and no transport
-//! abstraction.
+//! admission, authentication policy, open negotiation, the session table, echo
+//! receive state, rate and lifetime policy, resource decisions and reply
+//! construction. It performs no I/O; the clock its timestamps and deadlines
+//! come from is a private injected seam, not a runtime abstraction, so the
+//! engine stays testable. Socket and runtime orchestration — the UDP listener,
+//! address handling, timers, scheduled sweeps and shutdown — will live around
+//! it and is intentionally Tokio-native. There is no blocking or
+//! alternate-runtime counterpart and no transport abstraction.
 //!
 //! # Rejection is silence
 //!
@@ -27,19 +27,23 @@
 //!
 //! Total session state is bounded (see [`DEFAULT_MAX_SESSIONS`]), and so is the
 //! echo datagram a single session can negotiate (see
-//! [`DEFAULT_MAX_PACKET_LENGTH`]). A single unauthenticated datagram creates a
-//! session and opens are never deduplicated, so neither an unbounded table nor a
-//! remotely chosen buffer size is a compatibility feature. Upstream's observed
-//! lack of session bounds, and its unlimited default packet length, are
-//! explicitly not compatibility targets.
+//! [`DEFAULT_MAX_PACKET_LENGTH`]), the rate one session is answered at (see
+//! [`DEFAULT_MIN_SEND_INTERVAL`] and [`DEFAULT_BURST_ALLOWANCE`]) and how long
+//! one lives without traffic (see [`DEFAULT_IDLE_TIMEOUT`]). A single
+//! unauthenticated datagram creates a session and opens are never deduplicated,
+//! so neither an unbounded table nor a remotely chosen buffer size is a
+//! compatibility feature. Upstream's observed lack of session bounds, its
+//! unlimited default packet length, and its never expiring a session that has
+//! not carried an echo request are explicitly not compatibility targets: an
+//! `irtt-rs` session ages from the moment it is opened.
 //!
 //! # Current scope
 //!
-//! Open handling, session creation, normal echo processing and
-//! client-initiated close. Rate limiting, session lifetime and expiry,
-//! server-initiated close, DSCP application, the server fill policy and the
-//! Tokio runtime are separate slices: every otherwise admissible echo is
-//! answered, and a session lives until its client closes it.
+//! Open handling and negotiation, session creation, normal echo processing,
+//! per-session rate limiting, idle expiry and the maximum-duration
+//! server-initiated close. DSCP application, the full server fill policy and
+//! the Tokio runtime are separate slices: echo payloads are zero-filled, and
+//! expiry is evaluated when a datagram arrives rather than on a timer.
 #![forbid(unsafe_code)]
 
 mod clock;
@@ -53,6 +57,9 @@ mod token;
 #[cfg(test)]
 mod tests;
 
-pub use config::{ServerConfig, DEFAULT_MAX_PACKET_LENGTH, DEFAULT_MAX_SESSIONS};
+pub use config::{
+    ServerConfig, DEFAULT_BURST_ALLOWANCE, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_PACKET_LENGTH,
+    DEFAULT_MAX_SESSIONS, DEFAULT_MIN_SEND_INTERVAL,
+};
 pub use core::ServerCore;
 pub use error::ServerError;

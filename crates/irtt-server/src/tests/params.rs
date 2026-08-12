@@ -2,7 +2,7 @@ use irtt_proto::{Clock, Params, ReceivedStats, ServerFill, StampAt};
 
 use super::support::{
     core_with_tokens, expect_normal_open_reply, open_request, open_request_with_raw_params,
-    param_int, param_server_fill, peer, ScriptedTokens,
+    param_int, param_server_fill, peer, unthrottled, ScriptedTokens,
 };
 use crate::ServerConfig;
 
@@ -70,7 +70,12 @@ fn malformed_or_out_of_range_parameters_are_dropped_without_a_session() {
 fn absent_duration_interval_and_clock_are_accepted_as_wire_defaults() {
     // The whole reason the decoder reports presence: an omitted tag and one
     // explicitly encoded as zero share a value but not a verdict.
-    let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+    //
+    // The interval floor is disabled so that the accepted wire default is
+    // visible in the reply. An absent Interval is a value like any other to
+    // negotiation, and the default floor would raise it; that is interval
+    // policy, and `negotiation` tests it.
+    let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
 
     let packet = core
         .handle_datagram(
@@ -138,7 +143,10 @@ fn valid_optional_parameter_values_survive_unchanged() {
             },
         ),
     ] {
-        let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+        // No interval floor: these rows are about which *values* survive
+        // decoding and negotiation, not about the timing policy applied to
+        // them.
+        let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
 
         let packet = core
             .handle_datagram(peer(), &open_request(&requested, None))
