@@ -1,8 +1,8 @@
 use std::{collections::HashMap, net::SocketAddr};
 
 use irtt_proto::{
-    decode_request, encode_open_reply, verify_packet_hmac, DecodedParams, DecodedRequestKind,
-    OpenReply, Params, FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY,
+    decode_request, encode_open_reply, verify_packet_hmac, Clock, DecodedParams,
+    DecodedRequestKind, OpenReply, Params, StampAt, FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY,
 };
 
 use crate::{
@@ -95,8 +95,9 @@ impl ServerCore {
     /// datagram is discarded when it is structurally invalid, carries the reply
     /// flag, disagrees with this server's authentication configuration, fails
     /// authentication, carries a malformed or out-of-range open parameter
-    /// payload, would exceed the session bound, or is a request kind this slice
-    /// does not implement. None of that mutates any live session.
+    /// payload, negotiates to parameters the server could not execute, would
+    /// exceed the session bound, or is a request kind this slice does not
+    /// implement. None of that mutates any live session.
     ///
     /// `Ok(None)` is not only a rejection, though. A close request that does
     /// release its session is answered with nothing as well, because protocol
@@ -161,6 +162,11 @@ impl ServerCore {
             return Ok(None);
         }
         let params = negotiate_params(decoded.params, &self.config);
+        // Deliberately after negotiation, and before either open path: what has
+        // to be executable is the effective session, not the request.
+        if !negotiated_params_are_admissible(&params) {
+            return Ok(None);
+        }
 
         if no_test {
             // No-test validates parameters without running a test: same
@@ -284,6 +290,11 @@ fn same_endpoint(session: SocketAddr, peer: SocketAddr) -> bool {
 
 /// Applies the open parameter rules the decoder cannot express.
 ///
+/// This judges the *request*, before negotiation, which is why it takes the
+/// decoded form with its presence flags. Whether the resulting session is
+/// coherent is a separate question, asked after negotiation by
+/// [`negotiated_params_are_admissible`].
+///
 /// Duration and Interval are accepted when absent, taking the wire default
 /// zero, and rejected when explicitly present and not positive. The presence
 /// distinction is why the decoder reports it: testing the value alone would
@@ -300,4 +311,36 @@ fn open_params_are_admissible(decoded: &DecodedParams) -> bool {
     let admissible = |present: bool, value: i64| !present || value > 0;
     admissible(decoded.presence.duration_ns, decoded.params.duration_ns)
         && admissible(decoded.presence.interval_ns, decoded.params.interval_ns)
+}
+
+/// Whether the *effective* parameters describe a session this server could
+/// actually run.
+///
+/// This is the last gate before an open is acknowledged, and it asks a
+/// different question from [`open_params_are_admissible`]: not whether the
+/// request was well formed, but whether the parameters negotiation settled on
+/// are coherent. It therefore runs on the negotiated params, after
+/// [`negotiate_params`], and covers the no-test path too — a no-test open
+/// exists to tell a client what the session would be, so it must not report a
+/// session that could not exist.
+///
+/// One rule so far: **selecting timestamps requires a specified clock.** A
+/// non-none `stamp_at` with [`Clock::Unspecified`] asks for timestamp fields
+/// from no clock at all, which lays out no timestamp field and leaves the
+/// session with a request the server cannot honor.
+///
+/// [`Clock::Unspecified`] means the Clock tag was absent — an explicit zero is
+/// already out of range for the decoder — so this cannot be reached by a
+/// conforming client, which sends a clock whenever it selects timestamps. The
+/// combination is silently rejected rather than repaired: synthesizing a clock
+/// would answer with a session the client never asked for, and rewriting
+/// `stamp_at` to none would silently drop the measurement it did ask for.
+/// Neither is the server's to decide.
+///
+/// The check is deliberately *after* negotiation so that a later policy slice
+/// restricting timestamps can restrict `stamp_at` to [`StampAt::None`], at
+/// which point an absent clock is safe and this predicate holds without
+/// changing.
+fn negotiated_params_are_admissible(params: &Params) -> bool {
+    params.stamp_at == StampAt::None || params.clock != Clock::Unspecified
 }

@@ -18,6 +18,12 @@ use crate::config::ServerConfig;
 /// timestamp allowance, DSCP policy and server-fill allow-list. This function
 /// is where they belong, which is why the configuration is threaded through
 /// even though no knob reads it yet.
+///
+/// Negotiation rewriting nothing but the version does not mean every open is
+/// answered: the core validates what this function returns and silently
+/// discards an open whose effective parameters it could not execute. That is a
+/// separate step on purpose — this function decides what the session *would*
+/// be, and the core decides whether that session can exist.
 pub(crate) fn negotiate_params(mut requested: Params, _config: &ServerConfig) -> Params {
     requested.protocol_version = PROTOCOL_VERSION;
     requested
