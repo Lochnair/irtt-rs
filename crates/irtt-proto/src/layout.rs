@@ -122,10 +122,17 @@ pub fn echo_header_len(hmac: bool, params: &Params) -> usize {
 /// can genuinely carry one, and there is no datagram shorter than none — it
 /// therefore requests no space beyond the mandatory field block, exactly as
 /// zero does.
+///
+/// Only the negative end is bounded. An absurdly large positive length is
+/// returned as asked, and encoding a packet that size fails in the allocator
+/// rather than here — on a 64-bit target every positive `i64` converts, so that
+/// has always been true of a length beyond addressable memory. Capping a
+/// negotiated length to something a UDP datagram can actually be belongs with
+/// the deferred maximum-packet-length policy, which would apply long before
+/// this conversion.
 pub fn echo_packet_len(hmac: bool, params: &Params) -> usize {
-    // Saturating rather than wrapping: on a target whose `usize` is narrower
-    // than the requested length, the largest representable packet is the
-    // closest honest answer, and the encoder's own limits reject it from there.
+    // Saturating keeps the same answer on a target whose `usize` is narrower
+    // than the length: still unallocatable, just unrepresentable sooner.
     let requested = usize::try_from(params.length.max(0)).unwrap_or(usize::MAX);
     echo_header_len(hmac, params).max(requested)
 }
