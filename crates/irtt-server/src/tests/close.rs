@@ -6,6 +6,8 @@
 //! authentication — is the same silence with the session left live, so these
 //! tests assert the table as well as the reply.
 
+use std::net::{SocketAddr, SocketAddrV6};
+
 use irtt_proto::{encode_request, RequestToEncode};
 
 use super::support::{
@@ -121,6 +123,36 @@ fn a_close_from_any_other_endpoint_leaves_the_session_live() {
         // the request itself was never the reason for the silence.
         assert_eq!(core.handle_datagram(bound, &close).unwrap(), None);
         assert_eq!(core.session_count(), 0);
+    }
+}
+
+#[test]
+fn ipv6_flow_information_is_not_part_of_endpoint_identity() {
+    // Identity is family, address, port and scope. The flow label is routing
+    // metadata that may vary within one flow, so letting `SocketAddrV6`
+    // equality decide would strand a session its own client could never close.
+    let ip = "2001:db8::1".parse().unwrap();
+    let unlabeled = SocketAddr::V6(SocketAddrV6::new(ip, 2112, 0, 0));
+    let labeled = SocketAddr::V6(SocketAddrV6::new(ip, 2112, 0x000f_1234, 0));
+    assert_ne!(
+        unlabeled, labeled,
+        "the two must differ only in flow information"
+    );
+
+    for (bound, closing) in [(unlabeled, labeled), (labeled, unlabeled)] {
+        let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+        let token = open_session(&mut core, bound, None);
+
+        assert_eq!(
+            core.handle_datagram(closing, &close_request(token, None))
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            core.session_count(),
+            0,
+            "a close from {closing} must release the session opened from {bound}"
+        );
     }
 }
 

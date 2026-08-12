@@ -213,7 +213,7 @@ impl ServerCore {
     fn handle_close(&mut self, peer: SocketAddr, token: u64) {
         let owns_session = self
             .session(token)
-            .is_some_and(|session| session.peer() == peer);
+            .is_some_and(|session| same_endpoint(session.peer(), peer));
         if owns_session {
             self.sessions.remove(&token);
         }
@@ -240,6 +240,29 @@ impl ServerCore {
         Err(ServerError::TokenExhausted {
             attempts: TOKEN_ATTEMPTS,
         })
+    }
+}
+
+/// Whether two source endpoints identify the same session endpoint.
+///
+/// Identity is the address family, the IP address, the UDP source port and —
+/// for IPv6 — the scope identifier. That is the whole list, so this is not
+/// simply `==`: [`SocketAddrV6`] equality also covers the flow label, which
+/// identifies no endpoint. It is routing metadata that a sender or a forwarding
+/// path may legitimately vary within one flow, and a receiver reports it only
+/// when asked to, so admitting it into identity could strand a session that its
+/// own client can then never close. It grants nothing in exchange: the token,
+/// address, port and scope are what an off-path attacker would have to guess.
+///
+/// [`SocketAddrV6`]: std::net::SocketAddrV6
+fn same_endpoint(session: SocketAddr, peer: SocketAddr) -> bool {
+    match (session, peer) {
+        (SocketAddr::V6(session), SocketAddr::V6(peer)) => {
+            session.ip() == peer.ip()
+                && session.port() == peer.port()
+                && session.scope_id() == peer.scope_id()
+        }
+        (session, peer) => session == peer,
     }
 }
 
