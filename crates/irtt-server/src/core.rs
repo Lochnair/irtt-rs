@@ -25,7 +25,7 @@ use crate::{
 /// reply's timestamps come from — both of which are private injected seams, so
 /// the whole engine stays deterministically testable.
 ///
-/// The Tokio runtime slice will wrap it directly:
+/// The Tokio runtime wraps it directly:
 ///
 /// ```text
 /// recv_from -> core.handle_datagram(peer, packet) -> Some(reply) -> send_to
@@ -39,12 +39,13 @@ use crate::{
 ///
 /// # Scope
 ///
-/// This slice implements open handling, session creation and negotiation,
+/// The core implements open handling, session creation and negotiation,
 /// normal echo processing, per-session rate limiting, idle expiry,
 /// maximum-duration close and client-initiated close. DSCP application and the
-/// full server fill policy are separate slices, as is the Tokio runtime — so
-/// expiry is evaluated when a datagram arrives rather than on a timer, and
-/// echo payloads are zero-filled.
+/// full server fill policy are separate slices, and echo payloads are
+/// zero-filled. Incoming authenticated requests enforce logical expiry exactly;
+/// the runtime also calls a private maintenance hook to reclaim idle sessions
+/// when no traffic arrives.
 #[derive(Debug)]
 pub struct ServerCore {
     config: ServerConfig,
@@ -198,17 +199,23 @@ impl ServerCore {
         }
     }
 
+    /// Reclaims sessions whose idle deadline has passed.
+    ///
+    /// The Tokio runtime calls this for physical background reclamation. Every
+    /// authenticated structurally valid datagram still performs the same sweep
+    /// before dispatch, so the timer cadence never weakens logical expiry.
+    pub(crate) fn maintain(&mut self) {
+        let now_ns = self.clock.sample().mono_ns;
+        self.release_expired_sessions(now_ns);
+    }
+
     /// Drops every session whose idle deadline has passed, as of `now_ns`.
     ///
     /// Expiry is *logical* — a session is expired the instant its deadline
-    /// passes — but reclamation here is *packet-driven*, because this slice has
-    /// no runtime and so no timer. An expired session may therefore stay
-    /// resident until the next authenticated, structurally valid request causes
-    /// this sweep. Nothing observable turns on the difference: total state is
-    /// already bounded by [`max_sessions`](ServerConfig::max_sessions), the
-    /// sweep runs before a new open is admitted so a stale session cannot deny
-    /// capacity to a live one, and while no traffic arrives at all there is
-    /// no peer to observe anything. The Tokio slice may add scheduled sweeps.
+    /// passes. Authenticated, structurally valid requests run this sweep before
+    /// dispatch, while the runtime's maintenance timer also invokes it for
+    /// physical reclamation when no traffic arrives. The table remains bounded,
+    /// and a stale session cannot deny capacity to a live one.
     ///
     /// The sweep is global and runs before the request is dispatched, so a
     /// request touching one session can release another. That is deliberate:

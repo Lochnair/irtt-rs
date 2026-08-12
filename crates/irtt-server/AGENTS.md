@@ -43,6 +43,19 @@ material does not establish a semantic, state the ambiguity instead of guessing.
   belongs around the core.
 - The server is intentionally **Tokio-native**. Tokio does not need to be
   optional for this crate.
+- `Server` owns exactly one Tokio `UdpSocket` and one `ServerCore`. Run protocol
+  processing sequentially in that one task: do not spawn per datagram, put the
+  core behind a lock, or start an internal detached task.
+- The runtime must remain a thin `recv_from` -> `handle_datagram` -> optional
+  `send_to` loop. Do not duplicate protocol parsing or encoding around the core.
+- A receive failure or core failure may terminate `Server::run`; a per-packet
+  send failure (including a short send) drops only that reply and must not stop
+  the listener. Core state is not rolled back after a transport send failure.
+- Runtime maintenance calls the core's expiry hook. It must not inspect session
+  internals or grow a second expiry rule.
+- Explicit-address binds are the source-address-safe supported path. A wildcard
+  bind on a multi-homed host remains subject to kernel source-address selection
+  until packet-info handling is implemented.
 - Do not add a blocking server, an alternate-runtime variant, a transport trait,
   a runtime abstraction layer, or a mirrored client-style API family. There is
   no product requirement for any of them, and `ServerCore` being public is not a
