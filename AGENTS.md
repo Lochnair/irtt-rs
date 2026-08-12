@@ -57,7 +57,7 @@ Tokio must remain optional for `irtt-client`; default builds must remain runtime
 
 ### Server architecture (`irtt-server`)
 
-`irtt-server` is a first-class reusable server crate. It currently contains the deterministic OPEN/session core — packet admission, authentication policy, open negotiation, the bounded session table, open reply construction and client-initiated close. ECHO processing, server-initiated close and session lifetime remain unimplemented, as does the Tokio runtime; see `crates/irtt-server/AGENTS.md`. The rest of this section describes the boundary the crate is built to, including the parts not yet written.
+`irtt-server` is a first-class reusable server crate. It currently contains the deterministic OPEN/ECHO/session core — packet admission, authentication policy, open negotiation, the bounded session table, open reply construction, echo processing with its per-session receive state and timestamps, and client-initiated close. Rate limiting, session lifetime, server-initiated close, DSCP application and the server fill policy remain unimplemented, as does the Tokio runtime; see `crates/irtt-server/AGENTS.md`. The rest of this section describes the boundary the crate is built to, including the parts not yet written.
 
 - It shares wire semantics with the client through `irtt-proto` and follows the same clean-room boundary.
 - It must **not** depend on `irtt-client` merely to reuse protocol behavior.

@@ -1,11 +1,13 @@
 use std::{collections::HashMap, net::SocketAddr};
 
 use irtt_proto::{
-    decode_request, echo_packet_len, encode_open_reply, verify_packet_hmac, Clock, DecodedParams,
-    DecodedRequestKind, OpenReply, Params, StampAt, FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY,
+    decode_request, echo_packet_len, encode_echo_reply, encode_open_reply, verify_packet_hmac,
+    Clock, DecodedParams, DecodedRequestKind, EchoReply, OpenReply, Params, StampAt,
+    TimestampFields, FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY,
 };
 
 use crate::{
+    clock::{ClockSample, ClockSource, SystemClock},
     config::ServerConfig,
     error::ServerError,
     negotiate::negotiate_params,
@@ -16,10 +18,12 @@ use crate::{
 /// The deterministic protocol and session engine of the server.
 ///
 /// `ServerCore` owns admission, negotiation, the session table and reply
-/// construction. It performs no I/O and keeps no clock: a caller hands it a
-/// source endpoint and the bytes of one received datagram, and gets back the
-/// bytes to send to that endpoint, or nothing. Everything it does is a pure
-/// function of its state and that input, except for drawing session tokens.
+/// construction. It performs no I/O: a caller hands it a source endpoint and
+/// the bytes of one received datagram, and gets back the bytes to send to that
+/// endpoint, or nothing. Everything it does is a pure function of its state and
+/// that input, except for drawing session tokens and sampling the clock an echo
+/// reply's timestamps come from — both of which are private injected seams, so
+/// the whole engine stays deterministically testable.
 ///
 /// The Tokio runtime slice will wrap it directly:
 ///
@@ -35,29 +39,45 @@ use crate::{
 ///
 /// # Scope
 ///
-/// This slice implements open handling, session creation and client-initiated
-/// close. Echo requests are structurally recognized and then deliberately
-/// ignored — no reply, no session mutation — until their own slice.
+/// This slice implements open handling, session creation, normal echo
+/// processing and client-initiated close. Rate limiting, session lifetime and
+/// expiry, server-initiated close, DSCP application and the server fill policy
+/// are separate slices, so every otherwise admissible echo is answered and no
+/// session ever ages out.
 #[derive(Debug)]
 pub struct ServerCore {
     config: ServerConfig,
     sessions: HashMap<u64, Session>,
     tokens: Box<dyn TokenSource>,
+    clock: Box<dyn ClockSource>,
 }
 
 impl ServerCore {
     /// Creates a server core drawing session tokens from the operating system's
-    /// random source.
+    /// random source and timestamps from the system clock.
     #[must_use]
     pub fn new(config: ServerConfig) -> Self {
         Self::with_token_source(config, Box::new(OsTokenSource))
     }
 
+    /// A core with a chosen token source and the production clock, which is
+    /// what tests that care about session identity but not about timestamp
+    /// values want.
     pub(crate) fn with_token_source(config: ServerConfig, tokens: Box<dyn TokenSource>) -> Self {
+        Self::with_sources(config, tokens, Box::new(SystemClock::new()))
+    }
+
+    /// A core with both nondeterministic sources chosen.
+    pub(crate) fn with_sources(
+        config: ServerConfig,
+        tokens: Box<dyn TokenSource>,
+        clock: Box<dyn ClockSource>,
+    ) -> Self {
         Self {
             config,
             sessions: HashMap::new(),
             tokens,
+            clock,
         }
     }
 
@@ -96,17 +116,19 @@ impl ServerCore {
     /// flag, disagrees with this server's authentication configuration, fails
     /// authentication, carries a malformed or out-of-range open parameter
     /// payload, negotiates to parameters the server could not execute, would
-    /// exceed the session bound, or is a request kind this slice does not
-    /// implement. None of that mutates any live session.
+    /// exceed the session bound, is longer than the configured maximum packet
+    /// length, or names no live session from the endpoint that opened it. None
+    /// of that mutates any live session.
     ///
     /// `Ok(None)` is not only a rejection, though. A close request that does
     /// release its session is answered with nothing as well, because protocol
     /// version 1 defines no acknowledgement for one.
     ///
-    /// Authentication is checked before open parameters are decoded. That
-    /// ordering is deliberate: a packet that fails authentication is discarded
-    /// without parsing untrusted parameter data, and no reply behavior may
-    /// reveal which stage rejected it.
+    /// Authentication is checked before open parameters are decoded and before
+    /// any session is looked up. That ordering is deliberate: a packet that
+    /// fails authentication is discarded without parsing untrusted parameter
+    /// data or consulting the session table, and no reply behavior may reveal
+    /// which stage rejected it.
     ///
     /// # Errors
     ///
@@ -122,6 +144,16 @@ impl ServerCore {
         let Ok(request) = decode_request(packet) else {
             return Ok(None);
         };
+        // An echo's arrival instant is sampled the moment the datagram is known
+        // to be one, so that everything the reply's receive timestamp should
+        // bracket — authentication, the session lookup, the receive-state
+        // transition and encoding — happens after it. A datagram rejected later
+        // has consumed one clock sample and nothing else; sampling is not
+        // protocol state, and it is a strictly better trade than looking a
+        // session up before authentication to discover whether it even wanted
+        // timestamps.
+        let kind = self.classify(&request.kind, packet.len());
+
         // The HMAC flag must agree with this server's configuration in both
         // directions of mismatch, and the MAC itself is verified separately.
         if request.hmac_present != self.config.hmac_key().is_some() {
@@ -133,20 +165,114 @@ impl ServerCore {
             }
         }
 
-        match request.kind {
-            DecodedRequestKind::Open { no_test, params } => self.handle_open(peer, no_test, params),
-            DecodedRequestKind::Close { token } => {
+        match kind {
+            ClassifiedKind::Open { no_test, params } => self.handle_open(peer, no_test, params),
+            ClassifiedKind::Close { token } => {
                 self.handle_close(peer, token);
                 Ok(None)
             }
-            // Not implemented in this slice. An echo must not advance receive
-            // state until the slice that implements it; emitting a placeholder
-            // reply now would be worse than silence. That slice must admit an
-            // echo by its received datagram length against
-            // `max_packet_length` before it touches any receive state; adding
-            // that branch now would only be dead code guarding nothing.
-            DecodedRequestKind::Echo { .. } => Ok(None),
+            ClassifiedKind::Echo(echo) => self.handle_echo(peer, echo),
         }
+    }
+
+    /// Pairs a structurally decoded request with the clock sample an echo
+    /// needs, leaving every other kind untouched.
+    fn classify<'a>(
+        &mut self,
+        kind: &DecodedRequestKind<'a>,
+        datagram_len: usize,
+    ) -> ClassifiedKind<'a> {
+        match *kind {
+            DecodedRequestKind::Open { no_test, params } => {
+                ClassifiedKind::Open { no_test, params }
+            }
+            DecodedRequestKind::Close { token } => ClassifiedKind::Close { token },
+            // Everything after the sequence number is opaque, so the tail is
+            // read no further than its length.
+            DecodedRequestKind::Echo {
+                token, sequence, ..
+            } => ClassifiedKind::Echo(EchoRequest {
+                token,
+                sequence,
+                datagram_len,
+                received_at: self.clock.sample(),
+            }),
+        }
+    }
+
+    /// Answers an echo request that names one of this server's sessions.
+    ///
+    /// Admission runs before any state moves, and each step is a silent
+    /// discard: the datagram must not be longer than
+    /// [`max_packet_length`](ServerConfig::max_packet_length), its token must
+    /// name a live session, and it must have arrived from that session's own
+    /// endpoint. Authentication was already settled by the caller. A request
+    /// failing any of these leaves the receive state — of this session and of
+    /// every other — exactly where it was.
+    ///
+    /// Only the token and the sequence number mean anything. The request's own
+    /// length is judged against the configured maximum and then forgotten: it
+    /// does not have to equal the negotiated length, and it never sizes the
+    /// reply, which is laid out and sized from the session's negotiated
+    /// parameters alone.
+    ///
+    /// The next receive state is computed but not committed until the reply has
+    /// been encoded, so a reply this server failed to build cannot leave a
+    /// session claiming to have answered a request it never did.
+    fn handle_echo(
+        &mut self,
+        peer: SocketAddr,
+        request: EchoRequest,
+    ) -> Result<Option<Vec<u8>>, ServerError> {
+        // Resource policy, applied to the length actually received. This is
+        // `irtt-rs` policy rather than upstream-mechanism emulation: there is
+        // no interface-MTU effective length here, just the datagram the caller
+        // handed over. The comparison is strict — a request of exactly the
+        // maximum is served.
+        if request.datagram_len > self.config.max_packet_length() {
+            return Ok(None);
+        }
+        let Some(session) = self.sessions.get_mut(&request.token) else {
+            return Ok(None);
+        };
+        if !same_endpoint(session.peer(), peer) {
+            return Ok(None);
+        }
+
+        let next = session.receive_state().accepted(request.sequence);
+        // The departure side, sampled as late as the core can: after admission
+        // and the transition, immediately before the reply is built. There is
+        // no socket here, so this is the core's departure instant rather than a
+        // kernel transmission time; the runtime slice does not need to rewrite
+        // it.
+        let sent_at = self.clock.sample();
+        let params = session.params();
+        let reply = EchoReply {
+            // Reply only. Open must be clear or upstream clients abort, and
+            // Close belongs to the server-initiated close slice. The
+            // authentication flag and field are the encoder's, decided by the
+            // key it is given.
+            flags: FLAG_REPLY,
+            // Both are copied through unchanged: no token is allocated for an
+            // echo, and no sequence number is normalized or range-checked.
+            token: request.token,
+            sequence: request.sequence,
+            recv_count: params.received_stats.has_count().then_some(next.count),
+            recv_window: params.received_stats.has_window().then_some(next.window),
+            timestamps: timestamp_fields(params, request.received_at, sent_at),
+            // No payload bytes of our own: the encoder zero-fills the whole
+            // region between the field block and the negotiated length. That is
+            // the initial safe fill policy — payload bytes carry no protocol
+            // meaning, and zeroes cannot disclose residue from another request
+            // or another client. Request payload bytes never reach a reply.
+            payload: Vec::new(),
+        };
+        let packet = encode_echo_reply(&reply, params, self.config.hmac_key())
+            .map_err(|source| ServerError::ReplyEncoding { source })?;
+
+        // The last fallible step is behind us, so the transition can be made.
+        session.commit_receive_state(next);
+        Ok(Some(packet))
     }
 
     fn handle_open(
@@ -252,6 +378,80 @@ impl ServerCore {
     }
 }
 
+/// A structurally decoded request kind, with an echo's arrival instant already
+/// sampled.
+///
+/// This mirrors [`DecodedRequestKind`] rather than replacing it: the decoder
+/// classifies the packet, and this records what the core had to capture at that
+/// moment. Keeping the two apart is what lets the clock be read before
+/// authentication without any handler having to ask whether a sample exists.
+enum ClassifiedKind<'a> {
+    Open { no_test: bool, params: &'a [u8] },
+    Close { token: u64 },
+    Echo(EchoRequest),
+}
+
+/// The whole of what an echo request means to this server.
+///
+/// Everything after the sequence number is opaque, so nothing beyond these
+/// fields is carried forward. `datagram_len` is the length the datagram
+/// actually arrived with, which the configured maximum judges; it is not
+/// required to match the negotiated length, and it never sizes the reply.
+#[derive(Debug, Clone, Copy)]
+struct EchoRequest {
+    token: u64,
+    sequence: u32,
+    datagram_len: usize,
+    received_at: ClockSample,
+}
+
+/// Builds the timestamp fields a session negotiated, and only those.
+///
+/// [`StampAt`] selects which instants are reported and [`Clock`] selects which
+/// domains, exactly as the reply layout does, so a field this returns as `Some`
+/// is a field the encoder has a slot for. A midpoint is the per-domain mean of
+/// the two instants.
+///
+/// A single-clock midpoint therefore produces exactly one midpoint field. That
+/// is the conforming representation; upstream 0.9.1's habit of emitting both
+/// midpoint fields regardless of the negotiated clock is a defect this server
+/// deliberately does not reproduce. `irtt-proto` still *decodes* that form, so
+/// interoperating with a peer that sends it is unaffected.
+///
+/// [`Clock::Unspecified`] selects no domain and so produces no field. It cannot
+/// be reached with a non-none `StampAt` on an acknowledged session, because
+/// that combination is refused at open; nothing here needs to repair it.
+///
+/// The pair is ordered before anything is built from it, because a reply's
+/// receive instant must not be later than its send instant and the wall clock
+/// can be stepped backwards between the two readings. See
+/// [`ClockSample::not_after`]; the correction is confined to this one reply.
+fn timestamp_fields(params: &Params, received: ClockSample, sent: ClockSample) -> TimestampFields {
+    let received = received.not_after(sent);
+    let per_clock = |sample: ClockSample| {
+        (
+            params.clock.has_wall().then_some(sample.wall_ns),
+            params.clock.has_mono().then_some(sample.mono_ns),
+        )
+    };
+    let absent = (None, None);
+    let (recv, midpoint, send) = match params.stamp_at {
+        StampAt::None => (absent, absent, absent),
+        StampAt::Receive => (per_clock(received), absent, absent),
+        StampAt::Send => (absent, absent, per_clock(sent)),
+        StampAt::Both => (per_clock(received), absent, per_clock(sent)),
+        StampAt::Midpoint => (absent, per_clock(received.midpoint(sent)), absent),
+    };
+    TimestampFields {
+        recv_wall: recv.0,
+        recv_mono: recv.1,
+        midpoint_wall: midpoint.0,
+        midpoint_mono: midpoint.1,
+        send_wall: send.0,
+        send_mono: send.1,
+    }
+}
+
 /// Whether two source endpoints identify the same session endpoint.
 ///
 /// The address family, the IP address and the UDP source port are established
@@ -352,7 +552,7 @@ fn open_params_are_admissible(decoded: &DecodedParams) -> bool {
 /// open rather than acknowledged and then found unserviceable.
 ///
 /// The size comes from [`echo_packet_len`], the one packet-size authority, so
-/// this cannot drift from what the echo slice will actually encode. Its
+/// this cannot drift from what an echo reply actually encodes. Its
 /// unrepresentable-length error is a rejection here, not a [`ServerError`]: a
 /// pathological requested length is remote input, not an internal failure. The
 /// default policy makes it unreachable for an acknowledged session anyway, since
