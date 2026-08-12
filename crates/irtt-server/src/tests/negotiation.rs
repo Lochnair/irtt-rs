@@ -118,6 +118,17 @@ fn a_negotiated_interval_is_capped_at_a_quarter_of_the_idle_timeout() {
         negotiated(config, &requesting(3_000_000_000, 5_000_000_000)).interval_ns,
         2_000_000_000
     );
+
+    // A timeout whose quarter is past what the wire can express caps nothing,
+    // because no representable interval reaches it. The quarter is taken before
+    // the conversion to nanoseconds for exactly this reason: saturating first
+    // would put the cap at a quarter of `i64::MAX` and reduce a long interval
+    // the configured timeout never meant to touch.
+    let absurd = ServerConfig::default().with_idle_timeout(Duration::MAX);
+    assert_eq!(
+        negotiated(absurd, &requesting(3_000_000_000, i64::MAX)).interval_ns,
+        i64::MAX
+    );
 }
 
 #[test]

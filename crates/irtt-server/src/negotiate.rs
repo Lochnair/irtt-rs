@@ -80,7 +80,13 @@ pub(crate) fn negotiate_params(mut requested: Params, config: &ServerConfig) -> 
     if requested.interval_ns < minimum {
         requested.interval_ns = minimum;
     }
-    let idle_cap = saturating_ns(config.idle_timeout()) / 4;
+    // Divided as a `Duration`, before the conversion rather than after it. The
+    // two agree for every timeout `i64` nanoseconds can hold, but saturating
+    // first would cap an absurdly long timeout's quarter at `i64::MAX / 4` —
+    // reducing intervals the configured cap never meant to reach — where
+    // dividing first leaves every representable interval alone, which is what a
+    // timeout beyond the wire's range should do.
+    let idle_cap = saturating_ns(config.idle_timeout() / 4);
     if idle_cap > 0 && requested.interval_ns > idle_cap {
         requested.interval_ns = idle_cap;
     }
