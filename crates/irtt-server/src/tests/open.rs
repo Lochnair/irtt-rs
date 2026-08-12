@@ -2,9 +2,9 @@ use irtt_proto::{Clock, Params, ReceivedStats, ServerFill, StampAt};
 
 use super::support::{
     client_params, core_with_tokens, expect_normal_open_reply, open_request,
-    open_request_with_raw_params, param_int, peer, ScriptedTokens,
+    open_request_with_raw_params, param_int, peer, ScriptedTokens, KEY,
 };
-use crate::ServerConfig;
+use crate::{ServerConfig, DEFAULT_MAX_PACKET_LENGTH};
 
 const TOKEN_A: u64 = 0x7896_b6ab_8771_5213;
 
@@ -186,10 +186,13 @@ fn selecting_timestamps_without_a_clock_is_silently_refused() {
 }
 
 #[test]
-fn negotiation_restricts_nothing_but_the_protocol_version() {
-    // These are the values a later restriction-policy slice will deliberately
-    // start changing. Pinning them now makes that a visible decision rather
-    // than an accident.
+fn current_non_length_parameters_survive_negotiation_unchanged() {
+    // Duration, interval, statistics, timestamps, DSCP and server fill are the
+    // values a later restriction-policy slice will deliberately start changing.
+    // Pinning them now makes that a visible decision rather than an accident.
+    // Version and an oversized packet length are already restricted, and have
+    // their own tests; the length here is deliberately under the default
+    // maximum so that this test says nothing about the packet-length policy.
     //
     // This is about what *negotiation* rewrites, which is a separate question
     // from whether the core will acknowledge the result: an open whose
@@ -199,7 +202,7 @@ fn negotiation_restricts_nothing_but_the_protocol_version() {
         protocol_version: 2,
         duration_ns: 3_600_000_000_000,
         interval_ns: 1,
-        length: 65_535,
+        length: 1472,
         received_stats: ReceivedStats::Window,
         stamp_at: StampAt::Midpoint,
         clock: Clock::Monotonic,
@@ -226,15 +229,144 @@ fn negotiation_restricts_nothing_but_the_protocol_version() {
 }
 
 #[test]
+fn a_positive_length_above_the_configured_maximum_is_reduced_to_it() {
+    // The reduced value is what the client is told and what the session holds,
+    // because it is what the server will actually emit. Both have to agree: an
+    // upstream client treats a reply shorter than the negotiated length as
+    // fatal, so an honest reduction at open is the only serviceable answer.
+    let tokens = ScriptedTokens::new([TOKEN_A]);
+    let mut core = core_with_tokens(
+        ServerConfig::default().with_max_packet_length(64),
+        tokens.clone(),
+    );
+    let requested = Params {
+        length: 1000,
+        ..client_params()
+    };
+
+    let packet = core
+        .handle_datagram(peer(), &open_request(&requested, None))
+        .unwrap()
+        .expect("a reducible length must still be answered");
+
+    let reply = expect_normal_open_reply(&packet, None);
+    assert_eq!(reply.params.length, 64);
+    assert_eq!(core.session_count(), 1);
+    assert_eq!(tokens.remaining(), 0, "one token was consumed");
+    let session = core.session(TOKEN_A).expect("the session must be live");
+    assert_eq!(
+        session.params().length,
+        64,
+        "the session must enforce the reduced length"
+    );
+}
+
+#[test]
+fn the_default_maximum_reduces_an_absurd_requested_length() {
+    // The largest length the wire can carry is representable as a `usize` on a
+    // 64-bit target, so packet sizing would happily have turned it into an
+    // allocation; the configured maximum is what stops it. Restriction happens
+    // during negotiation, before any sizing, so this holds on a 32-bit target
+    // too — the request never reaches a conversion that could fail.
+    let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+    let requested = Params {
+        length: i64::MAX,
+        ..client_params()
+    };
+
+    let packet = core
+        .handle_datagram(peer(), &open_request(&requested, None))
+        .unwrap()
+        .expect("an absurd length is reduced, not refused");
+
+    let reply = expect_normal_open_reply(&packet, None);
+    assert_eq!(reply.params.length, DEFAULT_MAX_PACKET_LENGTH as i64);
+    let session = core.session(TOKEN_A).expect("the session must be live");
+    assert_eq!(session.params().length, DEFAULT_MAX_PACKET_LENGTH as i64);
+}
+
+#[test]
+fn an_open_whose_echo_field_block_exceeds_the_maximum_is_silently_refused() {
+    // Length itself satisfies the policy — zero asks for nothing beyond the
+    // mandatory fields — but the received-statistics fields alone make the
+    // smallest compliant echo reply larger than 20 bytes. Capping the Length
+    // parameter is therefore not enough on its own: this session could never be
+    // answered, so it is never acknowledged.
+    let requested = Params {
+        protocol_version: 1,
+        length: 0,
+        received_stats: ReceivedStats::Both,
+        stamp_at: StampAt::None,
+        clock: Clock::Unspecified,
+        ..Params::default()
+    };
+    let tokens = ScriptedTokens::new([TOKEN_A]);
+    let mut core = core_with_tokens(
+        ServerConfig::default().with_max_packet_length(20),
+        tokens.clone(),
+    );
+
+    assert_eq!(
+        core.handle_datagram(peer(), &open_request(&requested, None))
+            .expect("an unservable packet size is not a server error"),
+        None
+    );
+    assert_eq!(core.session_count(), 0);
+    assert_eq!(tokens.remaining(), 1, "no token may be drawn");
+}
+
+#[test]
+fn authentication_counts_toward_the_executable_echo_size() {
+    // An authentication field adds 16 bytes to the mandatory echo block, so a
+    // maximum between the two floors admits the same minimal session on an
+    // unauthenticated server and refuses it on an authenticated one. The sizes
+    // themselves come from `irtt_proto`; what this pins is that the server asks
+    // about its own authentication mode rather than assuming the smaller floor.
+    let minimal = Params {
+        protocol_version: 1,
+        ..Params::default()
+    };
+
+    let tokens = ScriptedTokens::new([TOKEN_A]);
+    let mut authenticated = core_with_tokens(
+        ServerConfig::default()
+            .with_hmac_key(KEY)
+            .with_max_packet_length(31),
+        tokens.clone(),
+    );
+    assert_eq!(
+        authenticated
+            .handle_datagram(peer(), &open_request(&minimal, Some(KEY)))
+            .expect("an unservable packet size is not a server error"),
+        None
+    );
+    assert_eq!(authenticated.session_count(), 0);
+    assert_eq!(tokens.remaining(), 1, "no token may be drawn");
+
+    let mut unauthenticated = core_with_tokens(
+        ServerConfig::default().with_max_packet_length(31),
+        ScriptedTokens::new([TOKEN_A]),
+    );
+    let packet = unauthenticated
+        .handle_datagram(peer(), &open_request(&minimal, None))
+        .unwrap()
+        .expect("the same session fits without an authentication field");
+    expect_normal_open_reply(&packet, None);
+    assert_eq!(unauthenticated.session_count(), 1);
+}
+
+#[test]
 fn negative_and_out_of_range_length_and_dscp_survive_negotiation() {
-    // Length and DSCP are accepted as decoded in this slice, including values a
-    // socket could never carry. Restricting a DSCP the server cannot apply is a
-    // later policy decision, not an admission rule.
+    // These lengths are all at or below the default maximum, and DSCP is
+    // accepted as decoded in this slice, including values a socket could never
+    // carry. Restricting a DSCP the server cannot apply is a later policy
+    // decision, not an admission rule.
     //
     // A negative length in particular stays negative in both the reply and the
-    // stored session. It does not need clamping here to be executable: echo
-    // packet sizing in `irtt-proto` floors it at the required field block, so
-    // the session this creates can be run as negotiated.
+    // stored session; the packet-length policy reduces oversized *positive*
+    // lengths and touches nothing else. It does not need clamping here to be
+    // executable: echo packet sizing in `irtt-proto` floors it at the required
+    // field block, so the session this creates can be run as negotiated.
     for (length, dscp) in [(-1, -1), (0, 0), (1472, 184), (-4096, 512)] {
         let requested = Params {
             protocol_version: 1,

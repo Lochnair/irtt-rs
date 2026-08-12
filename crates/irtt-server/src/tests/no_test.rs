@@ -99,6 +99,51 @@ fn a_no_test_open_selecting_timestamps_without_a_clock_is_silently_refused() {
 }
 
 #[test]
+fn a_no_test_open_reports_the_reduced_packet_length() {
+    // No-test answers what the session *would* be, so it has to report the same
+    // reduced length a session-creating open would enforce — while still
+    // creating nothing and drawing no token.
+    let tokens = ScriptedTokens::new([TOKEN_A]);
+    let mut core = core_with_tokens(
+        ServerConfig::default().with_max_packet_length(64),
+        tokens.clone(),
+    );
+    let requested = Params {
+        length: 1000,
+        ..client_params()
+    };
+
+    let packet = core
+        .handle_datagram(peer(), &no_test_request(&requested, None))
+        .unwrap()
+        .expect("a reducible length must still be answered");
+
+    assert_eq!(expect_no_test_reply(&packet, None).params.length, 64);
+    assert_eq!(core.session_count(), 0);
+    assert_eq!(tokens.remaining(), 1, "no-test must not draw a token");
+}
+
+#[test]
+fn a_no_test_open_is_refused_when_its_echo_field_block_exceeds_the_maximum() {
+    // A maximum below the mandatory echo block describes a session that could
+    // not exist at all, so no-test must not report one. Both open forms run the
+    // same effective-parameter check before no-test branches off.
+    let tokens = ScriptedTokens::new([TOKEN_A]);
+    let mut core = core_with_tokens(
+        ServerConfig::default().with_max_packet_length(0),
+        tokens.clone(),
+    );
+
+    assert_eq!(
+        core.handle_datagram(peer(), &no_test_request(&client_params(), None))
+            .expect("an unservable packet size is not a server error"),
+        None
+    );
+    assert_eq!(core.session_count(), 0);
+    assert_eq!(tokens.remaining(), 1, "no token may be drawn");
+}
+
+#[test]
 fn a_no_test_open_is_still_answered_when_no_session_could_be_created() {
     // No-test consumes no capacity, so it must keep working exactly where a
     // session-creating open would be refused.

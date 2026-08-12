@@ -83,13 +83,42 @@ effective parameters must be safe for the server to run.
   the open reply and stored verbatim in the session. It needs no clamping to be
   executable: `irtt-proto` floors actual echo packet sizing at the required
   protocol field block, so a negative length behaves as zero does.
+- A session's echo datagram must fit `ServerConfig::max_packet_length`, whose
+  default is 65,507 bytes. That is `irtt-rs` resource policy, not an
+  interoperability requirement: it is the largest IPv4 UDP payload, a
+  conservative cross-family ceiling that bounds one session's echo buffer to
+  roughly 64 KiB and that no normal client exceeds. It is **not** an MTU, not an
+  upstream default, and says nothing about what a path will carry. Upstream's
+  unlimited default is not a compatibility target.
+- A requested positive `Length` above the configured maximum is reduced to it
+  during negotiation, so the reply is honest about what the server will emit.
+  Zero and negative values are left exactly as requested.
+- Capping the parameter is not sufficient. After negotiation, the mandatory echo
+  field block must itself fit the configured maximum or the open is silently
+  refused — statistics and timestamp fields, and authentication's 16 bytes, can
+  exceed a small maximum on their own. Ask `irtt_proto::echo_packet_len` with
+  this server's actual HMAC mode rather than growing a second packet-size rule
+  here; an unrepresentable length from it is a request rejection, not a
+  `ServerError`.
+- Zero is a valid maximum and is not a synonym for unlimited: it refuses every
+  session, and no-test opens with it, since both are validated against the same
+  effective session.
+- The echo slice must reuse this same configured maximum to admit inbound echo
+  request datagrams by their received length, before any receive state is
+  mutated.
 
 ## Resource policy
 
 Total session and resource state must stay bounded. A single unauthenticated
-datagram creates a session and opens are never deduplicated, so an unbounded
-table is a liability. Upstream's observed absence of session and per-peer bounds
-is explicitly **not** a compatibility target and must not be reproduced.
+datagram creates a session and opens are never deduplicated, so neither an
+unbounded table nor a remotely chosen packet buffer is defensible. Upstream's
+observed absence of session and per-peer bounds, and its unlimited default
+packet length, are explicitly **not** compatibility targets and must not be
+reproduced.
+
+Configured bounds are trusted local policy: an operator may deliberately set an
+absurd `max_sessions` or `max_packet_length`, and that is their choice. The
+defaults are what must stay bounded, and no bound gets an unlimited setting.
 
 Keep fallible preparation before irreversible state mutation: a reply is
 prepared before a session is inserted, so an internal failure cannot leave a
