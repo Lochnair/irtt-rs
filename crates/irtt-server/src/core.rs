@@ -245,14 +245,30 @@ impl ServerCore {
 
 /// Whether two source endpoints identify the same session endpoint.
 ///
-/// Identity is the address family, the IP address, the UDP source port and —
-/// for IPv6 — the scope identifier. That is the whole list, so this is not
-/// simply `==`: [`SocketAddrV6`] equality also covers the flow label, which
-/// identifies no endpoint. It is routing metadata that a sender or a forwarding
-/// path may legitimately vary within one flow, and a receiver reports it only
-/// when asked to, so admitting it into identity could strand a session that its
-/// own client can then never close. It grants nothing in exchange: the token,
-/// address, port and scope are what an off-path attacker would have to guess.
+/// The address family, the IP address and the UDP source port are established
+/// identity components: a request from a different port, address or family is
+/// dropped and leaves its session live.
+///
+/// The remaining two fields of [`SocketAddrV6`] are decided here rather than
+/// observed, which is why this is not simply `==`.
+///
+/// The flow label is excluded. It identifies no endpoint — it is routing
+/// metadata a sender or forwarding path may legitimately vary within one flow,
+/// and a receiver reports it only when asked to — so admitting it could strand
+/// a session its own client can then never close. It grants nothing in
+/// exchange: the token, address, port and scope are what an off-path attacker
+/// would have to guess.
+///
+/// The scope identifier is included, and that is **`irtt-rs` policy, not
+/// verified compatibility behavior**. The server specification lists the IPv6
+/// zone as an identity component, but its remaining-unknowns section records
+/// that multi-zone behavior could not be tested on a single-host platform, so
+/// no evidence settles how a reference server compares scoped addresses. Two
+/// peers reachable at the same link-local address in different zones are
+/// genuinely different peers, so treating the zone as identity is the
+/// conservative reading: the failure it prevents is one peer closing another's
+/// session, while the failure it risks is a scoped client having to reopen.
+/// Revisit if evidence ever settles the question.
 ///
 /// [`SocketAddrV6`]: std::net::SocketAddrV6
 fn same_endpoint(session: SocketAddr, peer: SocketAddr) -> bool {

@@ -91,8 +91,11 @@ fn an_echo_after_a_close_is_a_stale_token() {
 
 #[test]
 fn a_close_from_any_other_endpoint_leaves_the_session_live() {
-    // Endpoint identity is exact: family, address, UDP source port and IPv6
-    // scope all count. Possessing the token is not authority to close.
+    // Possessing the token is not authority to close. The first four pairs
+    // differ in an established identity component; the last differs only in
+    // IPv6 zone, which is `irtt-rs` policy rather than observed behavior — see
+    // `same_endpoint`. It is pinned so the choice cannot drift silently, not
+    // because evidence settled it.
     for (bound, foreign) in [
         ("198.51.100.7:41234", "198.51.100.7:41235"),
         ("198.51.100.7:41234", "198.51.100.9:41234"),
