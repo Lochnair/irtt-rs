@@ -144,9 +144,78 @@ effective parameters must be safe for the server to run.
 - Reply payload bytes are zero, which is the initial safe fill policy: payload
   carries no protocol meaning, and a server must never emit residue from another
   request or client. Request payload bytes never reach a reply.
-- Rate limiting, idle expiry, maximum duration, server-initiated close, DSCP
-  socket application and the full `ServerFill` policy are later slices. Do not
-  add placeholder session fields for them.
+- DSCP socket application and the full `ServerFill` policy are later slices. Do
+  not add placeholder session fields for them.
+
+## Rate, lifetime and server-initiated close
+
+Defaults: minimum send interval 10 ms, burst allowance 5, idle timeout 60 s, no
+maximum test duration. All four are per-server configuration, and the burst
+allowance is per session.
+
+Negotiation applies the interval floor first and the (idle timeout ÷ 4) cap
+second, so a configured minimum above a quarter of the timeout ends with the cap
+winning and the returned interval below that minimum. A configured maximum test
+duration reduces a longer requested Duration and also replaces a *continuous*
+request (an absent Duration), because restricting continuous mode to a finite
+test is what configuring a maximum means. A zero configured maximum is stored as
+no maximum: Duration zero on the wire means continuous, so a finite maximum of
+zero could only be expressed by making a client's finite test endless.
+
+Several choices below deliberately differ from the reference server's observed
+behavior. Each is **`irtt-rs` project policy**, taken where the clean evidence
+records upstream behavior as policy rather than an interoperability requirement.
+Do not rewrite the protocol evidence to match them.
+
+- **The refill interval is the shorter of the configured minimum and the
+  negotiated interval.** The specification records upstream replenishing on the
+  configured minimum regardless, so its own idle cap can hand a client a 2 s
+  interval while the limiter enforces 5 s and rate-limits a fully conforming
+  client. A server must not enforce a cadence it did not advertise. Ordinary
+  configurations are unaffected: a 10 ms minimum against a 1 s negotiated
+  interval still refills every 10 ms.
+- **Zero means two different things and neither is "unlimited".** A zero minimum
+  send interval is no time-based throttling; a zero burst allowance is no
+  allowance at all, so every echo is rate-limited.
+- **A rate-limited echo refreshes the idle deadline and advances no statistic.**
+  This one *is* observed behavior — the only tested drop class that refreshes —
+  and is kept deliberately.
+- **The idle deadline runs from the open**, not from the first echo request. A
+  session that never carries one still ages out; upstream's never-expiring
+  unused session is a resource leak the specification recommends against.
+- **Expiry is immediate and silent at the configured deadline.** No five-second
+  additive grace, no final lazy-release reply to the first echo that finds an
+  expired session, and no request-class-dependent "who consumed it" behavior.
+  The only interoperability constraint is negative — expiry must never be
+  signalled — and silence satisfies it. A zero idle timeout expires a session at
+  the next evaluation; it is not "never expire".
+- **Expiry is packet-driven until the runtime exists.** Logical expiry is
+  timestamp-based, but reclamation happens in a global sweep run after
+  authentication and before dispatch, so an expired session may stay resident
+  until the next authenticated, structurally valid request. Nothing observable
+  turns on it: the table is already bounded, and the sweep runs before capacity
+  is judged, so a stale session cannot deny an open. Because the sweep is global
+  it also runs for a no-test open, where upstream was observed not to reclaim.
+  Do not add a public timer or tick abstraction for this; the Tokio slice may add
+  scheduled sweeps.
+- **The maximum-duration deadline is `first served echo + maximum + 2 s`.** The
+  origin is measured behavior: neither the open, nor a rejected first echo, nor a
+  rate-limited one starts it. The two-second grace matches the measured upstream
+  margin and is a fixed internal constant, not a configuration knob.
+- **Rate allowance is judged before the maximum-duration close.** A
+  deadline-crossing echo with no allowance is dropped silently and the close is
+  carried by the next echo that is served. Other rejected classes likewise do not
+  trigger or defer it — the specification records that case as untested, so this
+  is the deterministic reading rather than an observed one.
+- **A server close is an ordinary echo reply with `FLAG_CLOSE` added**, carrying
+  the triggering request's sequence number, statistics, timestamps and
+  authentication. There is no standalone close packet in protocol version 1. The
+  session is released once that reply has encoded, so every later request is an
+  unknown token.
+
+Every state transition — receive, rate and lifetime — is computed purely and
+committed only after the reply has encoded, so an encoding failure leaves the
+session exactly as it was and releases nothing.
 
 ## Resource policy
 
@@ -174,7 +243,18 @@ half-created session.
 - Token generation and clock sampling are the only nondeterministic parts; tests
   inject a scripted source for each, so identity, collisions, allocation failure
   and timestamp values are all assertable. Keep both seams private, and keep
-  timestamp tests free of sleeps, tolerances and real wall-clock assertions.
+  timestamp, rate and lifetime tests free of sleeps, tolerances and real
+  wall-clock assertions.
+- Two clock fakes, for two different questions. A scripted clock returns a fixed
+  list of samples and is for tests that assert individual timestamp *readings*; a
+  hand-moved clock stands still until the test moves it, and is for rate and
+  lifetime tests, which care when a datagram arrived and not how many times the
+  core read the clock on the way. Prefer the latter for anything about deadlines.
+- Assert rate and lifetime behavior from replies: which datagrams came back, the
+  count and window they reported, and `session_count`. The token bucket is a
+  black-box inference about the reference server, not a protocol requirement, so
+  do not add accessors for allowance, activity instants or the maximum-duration
+  origin.
 - As the server gains behavior, prefer it over fake peers for normal compliant
   behavior in other crates' tests. Keep small raw/adversarial peers for
   intentionally malformed or non-compliant wire behavior.

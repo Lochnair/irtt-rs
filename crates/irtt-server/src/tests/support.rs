@@ -94,8 +94,13 @@ impl TokenSource for ScriptedTokens {
 ///
 /// Running the script dry is a test bug, not a wrap-around: a test that asserts
 /// timestamps must know exactly which sample each field came from. The core
-/// takes one sample when it classifies a datagram as an echo, and a second when
-/// an admitted echo is about to be answered.
+/// takes one sample per authenticated request — when it classifies a datagram as
+/// an echo, or after authenticating an open or close — and one more when an
+/// admitted echo is about to be answered.
+///
+/// Tests about lifetime and rate want [`ManualClock`] instead: they care about
+/// *when* a datagram arrives, not about how many times the core reads the clock
+/// on the way.
 #[derive(Debug, Clone)]
 pub(crate) struct ScriptedClock {
     samples: Arc<Mutex<VecDeque<ClockSample>>>,
@@ -131,6 +136,47 @@ pub(crate) fn sample(wall_ns: i64, mono_ns: i64) -> ClockSample {
     ClockSample { wall_ns, mono_ns }
 }
 
+/// A clock standing still at an instant the test moves by hand.
+///
+/// Lifetime and rate behavior is a question of when a datagram arrives, so these
+/// tests set the time, send a packet, and set it again — with no sleeps, no
+/// tolerances and nothing riding on how many times the core reads the clock.
+/// [`ScriptedClock`] remains for the timestamp tests, where every individual
+/// reading is the point.
+///
+/// Both domains read the same value. Lifetime decisions are monotonic-only by
+/// design, and no test here asserts a wall timestamp, so keeping the pair equal
+/// makes the readings obviously ordered.
+#[derive(Debug, Clone)]
+pub(crate) struct ManualClock {
+    now_ns: Arc<Mutex<i64>>,
+}
+
+impl ManualClock {
+    pub(crate) fn at(now_ns: i64) -> Self {
+        Self {
+            now_ns: Arc::new(Mutex::new(now_ns)),
+        }
+    }
+
+    /// Moves the clock to an exact instant. Deliberately absolute: a test that
+    /// pins a deadline reads better stating the instant than accumulating
+    /// offsets.
+    pub(crate) fn set(&self, now_ns: i64) {
+        *self.now_ns.lock().unwrap() = now_ns;
+    }
+}
+
+impl ClockSource for ManualClock {
+    fn sample(&mut self) -> ClockSample {
+        let now_ns = *self.now_ns.lock().unwrap();
+        ClockSample {
+            wall_ns: now_ns,
+            mono_ns: now_ns,
+        }
+    }
+}
+
 /// A core with deterministic tokens, so session identity is assertable. Its
 /// clock is the production one, which is fine for everything that does not
 /// assert timestamp values.
@@ -138,11 +184,12 @@ pub(crate) fn core_with_tokens(config: ServerConfig, tokens: ScriptedTokens) -> 
     ServerCore::with_token_source(config, Box::new(tokens))
 }
 
-/// A core with both nondeterministic sources scripted, for timestamp tests.
+/// A core with both nondeterministic sources chosen, for timestamp, rate and
+/// lifetime tests.
 pub(crate) fn core_with_sources(
     config: ServerConfig,
     tokens: ScriptedTokens,
-    clock: ScriptedClock,
+    clock: impl ClockSource + 'static,
 ) -> ServerCore {
     ServerCore::with_sources(config, Box::new(tokens), Box::new(clock))
 }
@@ -157,6 +204,40 @@ pub(crate) fn core_for(hmac_key: Option<&[u8]>, tokens: ScriptedTokens) -> Serve
         config = config.with_hmac_key(key);
     }
     core_with_tokens(config, tokens)
+}
+
+/// A core whose clock the test moves by hand, with one session already open.
+///
+/// The clock starts at monotonic zero and the session is opened there, so every
+/// instant a rate or lifetime test names reads as an offset from the open.
+pub(crate) fn manual_core(
+    config: ServerConfig,
+    requested: &Params,
+    tokens: ScriptedTokens,
+    hmac_key: Option<&[u8]>,
+) -> (ServerCore, ManualClock, u64, Params) {
+    let clock = ManualClock::at(0);
+    let mut core = core_with_sources(config, tokens, clock.clone());
+    let (token, negotiated) = open_negotiated(&mut core, peer(), requested, hmac_key);
+    (core, clock, token, negotiated)
+}
+
+/// Sends one echo as it would arrive at monotonic instant `at_ns`.
+pub(crate) fn echo_at(
+    core: &mut ServerCore,
+    clock: &ManualClock,
+    at_ns: i64,
+    token: u64,
+    sequence: u32,
+    params: &Params,
+    hmac_key: Option<&[u8]>,
+) -> Option<Vec<u8>> {
+    clock.set(at_ns);
+    core.handle_datagram(
+        peer(),
+        &echo_request(token, sequence, params, &[], hmac_key),
+    )
+    .expect("a rejected or rate-limited echo is not an internal error")
 }
 
 /// Opens one ordinary session from `endpoint` and returns its token.
@@ -243,6 +324,24 @@ pub(crate) fn expect_echo_reply(
     // slice.
     let expected = FLAG_REPLY | if hmac_key.is_some() { FLAG_HMAC } else { 0 };
     assert_eq!(reply.flags, expected, "echo reply flags");
+    reply
+}
+
+/// Decodes a server-initiated close: an ordinary echo reply carrying Close.
+///
+/// The flags are compared exactly, so Open is pinned clear — a reply with it set
+/// makes an upstream client abort — and the reply is decoded and its MAC checked
+/// by the same path as any other, which is the point: the close is not a
+/// separate packet kind.
+pub(crate) fn expect_closing_echo_reply(
+    packet: &[u8],
+    params: &Params,
+    hmac_key: Option<&[u8]>,
+) -> EchoReply {
+    let reply =
+        decode_echo_reply(packet, params, hmac_key).expect("a closing echo reply must decode");
+    let expected = FLAG_REPLY | FLAG_CLOSE | if hmac_key.is_some() { FLAG_HMAC } else { 0 };
+    assert_eq!(reply.flags, expected, "closing echo reply flags");
     reply
 }
 

@@ -20,12 +20,23 @@ use irtt_proto::{
 
 use super::support::{
     core_for, core_with_sources, core_with_tokens, echo_params, echo_request, expect_echo_reply,
-    open_negotiated, other_peer, peer, sample, ScriptedClock, ScriptedTokens, KEY, OTHER_KEY,
+    open_negotiated, other_peer, peer, sample, unthrottled, ScriptedClock, ScriptedTokens, KEY,
+    OTHER_KEY,
 };
-use crate::ServerConfig;
+use crate::{clock::ClockSample, ServerConfig};
 
 const TOKEN_A: u64 = 0x0102_0304_0506_0708;
 const UNKNOWN_TOKEN: u64 = 0x2122_2324_2526_2728;
+
+/// The lifecycle instant an open consumes before any echo is sent.
+///
+/// The core reads the clock once per authenticated request, to judge idle expiry
+/// and to start the new session's deadlines. It is earlier than every echo
+/// sample below, as a real monotonic reading would be, and no reply ever carries
+/// it: an open reply has no timestamp fields.
+fn open_sample() -> ClockSample {
+    sample(900, 9_000)
+}
 
 /// Params selecting no optional field at all, so the echo layout is the
 /// mandatory field block and nothing else.
@@ -48,10 +59,13 @@ fn counting_params(length: i64) -> Params {
     )
 }
 
-/// Opens one session on a default core and returns the core, the token and the
-/// negotiated params.
+/// Opens one session and returns the core, the token and the negotiated params.
+///
+/// Rate limiting is disabled: these tests drive a whole vector of echoes at once
+/// against the production clock, and what they are about is the reply, not the
+/// allowance. `rate` covers the limiter.
 fn session_with(params: &Params) -> (crate::ServerCore, u64, Params) {
-    let mut core = core_with_tokens(ServerConfig::default(), ScriptedTokens::new([TOKEN_A]));
+    let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
     let (token, negotiated) = open_negotiated(&mut core, peer(), params, None);
     (core, token, negotiated)
 }
@@ -558,7 +572,7 @@ fn only_the_negotiated_timestamps_are_emitted() {
             },
         ),
     ] {
-        let clock_source = ScriptedClock::new([received, sent]);
+        let clock_source = ScriptedClock::new([open_sample(), received, sent]);
         let mut core = core_with_sources(
             ServerConfig::default(),
             ScriptedTokens::new([TOKEN_A]),
@@ -569,7 +583,7 @@ fn only_the_negotiated_timestamps_are_emitted() {
         assert_eq!(
             clock_source.remaining(),
             2,
-            "an open must not consume a clock sample"
+            "an open consumes exactly its own lifecycle sample"
         );
 
         let packet = core
@@ -603,7 +617,7 @@ fn a_backward_wall_step_never_reports_receive_after_send() {
     let mut core = core_with_sources(
         ServerConfig::default(),
         ScriptedTokens::new([TOKEN_A]),
-        ScriptedClock::new([sample(1_000, 10_000), sample(990, 10_300)]),
+        ScriptedClock::new([open_sample(), sample(1_000, 10_000), sample(990, 10_300)]),
     );
     let params = echo_params(ReceivedStats::None, StampAt::Both, Clock::Both, 0);
     let (token, negotiated) = open_negotiated(&mut core, peer(), &params, None);
@@ -633,7 +647,7 @@ fn a_backward_wall_step_never_reports_receive_after_send() {
     let mut core = core_with_sources(
         ServerConfig::default(),
         ScriptedTokens::new([TOKEN_A]),
-        ScriptedClock::new([sample(1_000, 10_000), sample(990, 10_300)]),
+        ScriptedClock::new([open_sample(), sample(1_000, 10_000), sample(990, 10_300)]),
     );
     let params = echo_params(ReceivedStats::None, StampAt::Midpoint, Clock::Wall, 0);
     let (token, negotiated) = open_negotiated(&mut core, peer(), &params, None);
@@ -678,7 +692,7 @@ fn a_single_clock_midpoint_emits_exactly_one_field() {
         let mut core = core_with_sources(
             ServerConfig::default(),
             ScriptedTokens::new([TOKEN_A]),
-            ScriptedClock::new([sample(1_000, 10_000), sample(1_200, 10_300)]),
+            ScriptedClock::new([open_sample(), sample(1_000, 10_000), sample(1_200, 10_300)]),
         );
         let params = echo_params(ReceivedStats::None, StampAt::Midpoint, clock, 0);
         let (token, negotiated) = open_negotiated(&mut core, peer(), &params, None);
