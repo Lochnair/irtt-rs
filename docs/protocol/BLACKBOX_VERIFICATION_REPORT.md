@@ -693,15 +693,18 @@ The upstream count is six.)*
 A post-open request is bound to a session by its token **and** by an exact match
 on the source address, source port, and address family.
 
+The identity trials below used live, non-expired sessions. Finding S-21 records
+the separately observed expired-session release case.
+
 | Case | Result |
 |------|--------|
 | Correct token, original endpoint | Served |
-| Correct token, different source port | **Dropped, no reply; session intact** |
+| Correct token, different source port | **Dropped, no reply; the live session remained usable from its original endpoint** |
 | Correct token, other address family's listener on the same port | Dropped |
 | Unknown token | Dropped |
 | Zero token | Dropped |
 | Token of a closed session | Dropped |
-| **Close** bearing a valid token from a foreign source port | **Dropped; session not closed** |
+| **Close** bearing a valid token from a foreign source port | **Dropped; does not close an otherwise live session** |
 
 Endpoint binding protects the close path as well as the echo path. A capture is
 in `captures/server-session-identity.pcapng`.
@@ -751,8 +754,9 @@ produced 5 replies with counts 1–5, and three later requests continued 6–8.
 ## Finding S-4: Server-initiated close exists and is triggered by the duration limit
 
 Resolves client-spec open question 19.3. A server with a maximum test duration
-answers the first echo request past its hard deadline with a complete echo reply
-carrying flags `0x06` (Reply|Close), and removes the session at that moment.
+answers the first otherwise-serviceable echo request past its hard deadline with
+a complete echo reply carrying flags `0x06` (Reply|Close), and removes the
+session at that moment.
 
 | Configured maximum duration | Close flag observed at |
 |---|---|
@@ -760,7 +764,8 @@ carrying flags `0x06` (Reply|Close), and removes the session at that moment.
 | 2 s | 4.06 s / 4.10 s after the first echo |
 
 The deadline is the maximum duration plus a 2-second grace, measured from the
-session's first echo request — not from open. Capture:
+session's first **served** echo — not from open. A deadline-crossing echo that is
+itself rate-limited is dropped; the next served echo carries Close. Capture:
 `captures/server-close.pcapng`, frame 36.
 
 Driving an upstream 0.9.1 client against a server that sets the flag mid-test:
@@ -871,8 +876,9 @@ consecutive failing probes and served the next valid request normally.
 ## Finding S-11: Idle expiry has a 5-second grace, and never-used sessions do not expire
 
 With a 2-second idle timeout, the boundary was measured between 6.9 s and 7.1 s,
-i.e. timeout + 5 s. The first request past the deadline is still answered and
-the session is released while handling it; only the next request is dropped.
+i.e. timeout + 5 s. A post-deadline echo that would otherwise be served is
+answered and releases the session while handling it; only the next request is
+dropped.
 
 A session that has never carried an echo request does not expire at all: opened
 and left idle for 9 seconds under a 2-second timeout, it was served normally.
@@ -1181,3 +1187,521 @@ disregards it loses nothing normative.
 **Classification:** SERVER SPEC CORRECTION (server spec Sections 9.2, 11.3.1,
 21.1, 21.2, 23.4, 24) **and** CLIENT SPEC CORRECTION (client spec Sections 8.5,
 19.14).
+
+---
+
+# Part IV — Server Deep-Dive Black-Box Pass (2026-08-12)
+
+A further black-box pass over the server, aimed at behavior that only a
+non-conforming peer can reach: parameter presence, the lifetime boundaries, the
+drop classes, reply sizing, and IP marking. It resolves several statements that
+earlier parts left thin, and it records one previously undocumented upstream
+robustness defect that is reachable from two unauthenticated datagrams.
+
+## Part IV Method and Environment
+
+**Builds exercised**, all unmodified, all run as ordinary server processes with
+documented command-line options only:
+
+| Build | Role in this part |
+|-------|-------------------|
+| **0.9.1 release** | the baseline; every unqualified statement refers to it |
+| **0.9.0 release** | reproduction check |
+| **development tree, six upstream commits past the 0.9.1 tag** | reproduction check; post-release work, not part of any release |
+
+**Platform:** macOS Darwin 25.5.0 arm64. Loopback except where an Ethernet or
+tunnel interface is named.
+
+**Instrument.** An independent raw-UDP harness sharing no code with any IRTT
+implementation. It performs the open negotiation itself, emits exact request
+bytes, and records exact reply bytes and monotonic arrival times. For IP marking
+it reads the received TOS / traffic-class byte from the kernel.
+
+**Server provenance.** Each server under test is an unmodified build of the
+revision named in the table above — the 0.9.0 release, the 0.9.1 release, or the
+development tree six upstream commits past the 0.9.1 tag. No source change,
+patch, instrumentation or test hook was applied to any of them, and each was run
+as an ordinary server process configured only through documented command-line
+options.
+
+**What counts as evidence here.** Request bytes, reply bytes, the presence or
+absence of a reply, the reply's IP header marking, arrival times, and whether a
+server process was still serving afterwards. Timing boundaries were established
+by sweeping probe offsets, not by reading any value out of anything. Where a
+result depends on the tested host — interface MTUs, the maximum outbound datagram
+size, socket handling of out-of-range values — it is labelled host-specific below
+and in the specification.
+
+**Repeatability.** Timing boundaries were swept at 50 ms spacing with three
+repetitions per configured value. Behavioral results are single-shot unless a
+repetition count is given.
+
+## Finding S-19: An open whose restricted StampAt remains non-none without a Clock is accepted, then fatal
+
+The most serious result of this pass.
+
+When timestamp restriction leaves the restricted (effective) `StampAt` non-none,
+an open request carrying `StampAt` = 1, 2, 3 or 4 and **no Clock tag at all** is
+accepted: the server returns an ordinary session-creating reply with a valid
+non-zero token, and the reply carries no Clock parameter — none is synthesized.
+The **first** echo request on that session receives no reply and the server
+process terminates. On a wildcard bind, the listener for the other address family
+dies with it, so unrelated sessions stop being served at the same moment.
+
+```
+C -> S  14a75b01 05 06 06 06 04 00
+        open; ReceivedStats=3, StampAt=3 (both), Length=0, no Clock tag
+S -> C  14a75b03 7ca44127b2cd7eab 01 02 05 06 06 06
+        open reply; non-zero token, ProtocolVersion 1, ReceivedStats 3,
+        StampAt 3 — no Clock parameter
+C -> S  14a75b00 7ca44127b2cd7eab 00000000
+        first echo, sequence 0  ->  no reply; server no longer serving
+```
+
+| Input | Outcome |
+|-------|---------|
+| Requested StampAt 1 / 2 / 3 / 4, Clock tag absent; restricted StampAt remains non-none | open accepted, first echo fatal |
+| Requested StampAt 0, Clock tag absent | open accepted, serves normally, no timestamps |
+| StampAt 3, **explicit `Clock = 0`** | **open dropped** — no reply, no session |
+| Requested StampAt 1 / 2 / 3 / 4, Clock tag absent; no-timestamp policy restricts StampAt to none | open accepted, serves normally, no timestamps |
+| Requested StampAt 1 / 2 / 3 / 4, Clock tag absent; single-timestamp policy leaves restricted StampAt non-none | open accepted, first echo still fatal |
+
+Reproduced for all four non-none StampAt values on **0.9.0, 0.9.1 and the
+development build**. Capture: `captures/server-clock-absent.pcapng` (3 packets).
+
+The absent-versus-explicit-zero contrast is the load-bearing part: the two inputs
+differ by one encoded tag and produce opposite outcomes, so parameter *presence*
+is externally meaningful in this upstream behavior. An implementation that
+chooses to reproduce those distinct outcomes needs request validation that can
+distinguish the two forms; this observation does not prescribe a clean server's
+representation or policy for adversarial inputs.
+
+Nothing here describes why the server stops. That is not observable from the
+wire, it is not stated, and no conclusion in this report depends on it.
+
+**Classification:** SERVER-ONLY NEW INFORMATION — upstream robustness defect
+(server spec Sections 7.2, 22.5, 24.3; vectors Section 4.7).
+
+## Finding S-20: A rate-limited request is the only tested drop class that keeps a session alive
+
+For each drop class: open a session, send one echo, inject the packet under test,
+send another echo, and read the second reply's count and window. Separate timing
+trials established whether the injected packet moved the expiry boundary.
+
+Every class tested advanced neither the received count nor the received window.
+They divide on the second question:
+
+| Injected packet | Extends the observed idle lifetime |
+|-----------------|------------------------------------|
+| Bad magic, invalid flag bits, Reply/Open flag on a data packet | no |
+| Unknown token, zero token | no |
+| Valid token from a foreign source endpoint | no (but see S-21) |
+| Truncated echo, oversized echo | no |
+| Bad, missing, zeroed or truncated MAC | no |
+| **Request arriving with no rate allowance left** | **yes** |
+
+The rate-limit result was separated from its alternatives three ways rather than
+asserted from one trial: a session fed *only* too-fast requests outlived its idle
+deadline; a session fed the same cadence of oversized requests expired on
+schedule; and a silent session expired on schedule. A two-probe method was used
+at the boundary so that "still alive" is distinguished from "expired but not yet
+touched" — the distinction S-21 turns on. Reproduced on all three builds.
+
+This is a statement about how long the session kept being served. What a server
+records when it declines a request is not observable and is not claimed.
+
+**Classification:** SERVER-ONLY NEW INFORMATION; strengthens the previously
+unelaborated statement in server spec Section 18.2 (now Sections 9.3, 18.2;
+vectors Section 8.2).
+
+## Finding S-21: The first packet to release an expired session determines whether a final reply is emitted
+
+Part II established that a post-deadline echo that would otherwise be served is
+answered and releases the session while handling it. This pass establishes that
+a packet which would normally be dropped can instead release the session without
+receiving a reply, so no later request receives a final reply.
+
+Both trials are in one capture, `captures/server-expiry-consumption.pcapng`
+(14 packets), with a 3-second idle timeout — an 8-second effective boundary:
+
+| Trial | Sequence | Client's first post-deadline echo |
+|-------|----------|-----------------------------------|
+| Control | nothing between the deadline and the client's request | **answered** (count 2); the next one dropped |
+| Test | an echo bearing the correct token from a **foreign source port** arrived 0.3 s earlier, just past the same deadline | **no reply**, and none for the one after it |
+
+The foreign-endpoint packet was dropped, as such a packet is at any time, and it
+released the session without receiving a reply. Whether it advanced the session's
+received count before the release is **not** observable here: no reply was ever
+emitted for that session again, so no statistic carries the answer. Finding S-1's
+result that a foreign-endpoint packet is not counted was measured on a **live**
+session, where a later reply exposed the count, and it does not transfer to this
+expired-session path. The same
+release-without-a-final-reply outcome was produced by a truncated echo, an
+oversized echo, a close from a foreign endpoint, and a burst of unrelated
+ordinary opens.
+
+Two scope limits are stated deliberately. These are the classes that were tested,
+and the effect is not claimed for every possible packet. And nothing here
+describes the order in which a server performs any internal step: what was
+observed is that the session was gone when the legitimate request arrived, and
+that in the control, with no intervening packet, it was not.
+
+Separately, a burst of unrelated **ordinary opens** released an expired session
+with no packet bearing its token involved at all, while a burst of **no-test**
+opens did not — consistent with a no-test open creating no session.
+
+**Classification:** SERVER-ONLY NEW INFORMATION (server spec Sections 16, 18.2;
+vectors Section 8.3).
+
+## Finding S-22: Both lifetime margins are fixed additive constants
+
+Part II measured the idle grace at one timeout and the maximum-duration grace at
+two maxima. Sweeping both across several configured values shows each margin is a
+fixed addition, not a proportion, and not an artifact of when the session began.
+
+Idle session-release sweep, with gaps measured from the last accepted echo. Each
+probe used a first otherwise-serviceable echo after the gap and an immediate
+follow-up; the boundary is inferred from whether that follow-up was dropped.
+
+| Configured idle timeout | Longest gap with follow-up served | Shortest gap with follow-up dropped |
+|-------------------------|----------------------------------|------------------------------------|
+| 500 ms | 5.45 s | 5.50 s |
+| 2 s | 6.95 s | 7.00 s |
+| 4 s | 8.95 s | 9.00 s |
+
+At and beyond the observed release boundary, the first otherwise-serviceable
+post-gap echo may still receive a final lazy-release reply; the immediate
+follow-up is then dropped. These values are not first-request rejection
+thresholds.
+
+Maximum duration, offsets measured from the first **served** echo:
+
+| Configured maximum duration | Last offset answered normally | First offset carrying Close |
+|-----------------------------|-------------------------------|-----------------------------|
+| 500 ms | 2.45 s | 2.50 s |
+| 1 s | 2.95 s | 3.00 s |
+| 3 s | 4.95 s | 5.00 s |
+
+Across the settings swept — idle timeouts of 500 ms, 2 s and 4 s, and maximum
+durations of 500 ms, 1 s and 3 s — both margins held at five seconds and two
+seconds respectively, to within the 50 ms probe spacing, and reproduced on all
+three builds. The idle boundary did not shift with when the session was opened.
+
+Each margin rests on three measured points. That is enough to rule out a margin
+proportional to the configured value over the range tested, and it is what the
+"additive" description means here. It does not establish the margin for every
+configurable value: a threshold, a cap, or different behavior at much larger or
+much smaller settings would not have shown up in these sweeps and remains
+untested.
+
+These are measured properties of the tested builds, stated with their tolerance.
+They are upstream policy, not protocol constants, and no requirement in either
+specification depends on either figure.
+
+**Classification:** SERVER-ONLY NEW INFORMATION; strengthens Findings S-4 and
+S-11 (server spec Sections 15.2, 18.2, 19; vectors Sections 3.2, 8.1).
+
+## Finding S-23: Maximum duration starts at the first served echo and closes on the first later served echo
+
+The boundary sweep establishes two distinct points. The **origin** is the first
+echo request that is actually **served**. The **trigger** is the first echo after
+the resulting deadline that would otherwise be served.
+
+| Case | Result |
+|------|--------|
+| Session opened 5 s before its first echo | deadline unchanged — the open does not start the clock |
+| First request oversized, dropped by the maximum-length policy | clock not started; a later served echo starts it |
+| First request from a foreign source endpoint, dropped | clock not started; a later served echo starts it |
+| Echo that crosses the deadline | full normal reply with Close set, and **counted** in the statistics it reports |
+| Deadline-crossing echo that is itself rate-limited | dropped; the **next served** echo carries the Close flag |
+| Client's next echo, and its close, after the flag | both unanswered — the token is released |
+
+Two drop classes were tested in the first-request position — oversized and
+foreign-endpoint — and neither started the clock. That is the extent of the
+result: the remaining drop classes were not exercised in that position, and no
+general "any dropped request" rule is claimed. The rate-limit row is a different
+question, about a request crossing an already-running deadline rather than one
+that would start it.
+
+The close-flagged reply itself is in `captures/server-close.pcapng`, frame 36,
+from Part II; the boundary sweep is a timing measurement with no capture of its
+own.
+
+**Classification:** SERVER-ONLY NEW INFORMATION; refines Finding S-4 (server spec
+Section 15.2; vectors Section 3.2).
+
+## Finding S-24: Repeated tags — last valid wins; invalid cases are limited
+
+A tag may appear more than once in one open payload. Among individually valid
+occurrences the **last** takes effect; this was confirmed for ProtocolVersion,
+Duration, Interval, Length, ReceivedStats, StampAt, Clock, DSCP and ServerFill.
+
+| Payload | Result |
+|---------|--------|
+| Duration 1 s, then 2 s | Duration 2 s |
+| Duration 2 s, then 1 s | Duration 1 s |
+| Clock 1, then 3 | Clock 3 |
+| Clock 3, then 4 (out of range) | **no reply** |
+| Duration 1 s, then 0 (invalid) | **no reply** |
+| Duration 0 (invalid), then 1 s | **no reply** |
+| ServerFill `rand`, then a 33-character string | **no reply** |
+
+**Invalid repeated values were tested more narrowly.** An invalid Duration zero
+occurrence was dropped in both tested positions: valid then invalid, and invalid
+then valid. The Clock and ServerFill rows each tested an invalid second occurrence
+and were also dropped. The opposite ordering was not tested for Clock or
+ServerFill, and invalid duplicate occurrences were not tested for
+ProtocolVersion, Interval, Length, ReceivedStats, StampAt or DSCP. These results
+therefore do not establish a parser-wide, position-independent invalid-duplicate
+rule for every parameter.
+
+No conforming client emits a repeated tag; the result is recorded because a
+decoder that stops at the first occurrence, or validates only the occurrence it
+keeps, can diverge on the measured adversarial inputs.
+
+Unknown tags were re-tested at 0, 10, 11, 100, 127, 128, 1000 and 2³². Each was
+ignored with the rest of the payload still parsed, and an open carrying only
+unknown tags created an ordinary default session. The value of an unknown tag is
+consumed as a varint; no length-prefixed or string-shaped value form was accepted
+for one.
+
+Finally, a rejected open did not poison the next open: after each malformed
+payload — incomplete trailing varint, tag with no value, length-prefixed string
+running past the buffer, varint overflow — a well-formed open from the same
+endpoint immediately afterwards was served normally. This establishes no
+persistent externally visible effect on the following request; it does not
+establish whether hidden accounting or temporary state exists.
+
+**Classification:** SERVER-ONLY NEW INFORMATION (server spec Section 7.2; vectors
+Section 4.6).
+
+## Finding S-25: Reply sizing — negative lengths, the MTU cap, and the fatal ceiling
+
+Three separate results that are easy to conflate.
+
+**A negative Length is accepted and produces a minimum-size reply.** It is
+returned in the open reply as sent. Echo replies for such a session are the size
+of the field block the negotiated parameters imply — the ordinary rule of server
+spec Section 9.2 applied to a negotiated length below that block. There is no
+negative-size concept on the wire.
+
+**On the two interfaces where the cap was reachable, the emitted reply is capped
+at the bind interface's MTU.** Re-measured across three interfaces of one host:
+
+| Bind interface (MTU) | negotiate 1500 | 1501 | 2000 | 8000 |
+|----------------------|----------------|------|------|------|
+| loopback (16384) | 1500 | 1501 | 2000 | 8000 |
+| ethernet (1500) | 1500 | **1500** | **1500** | **1500** |
+| tunnel (1280) | **1280** | **1280** | **1280** | **1280** |
+
+On the 1500-byte and 1280-byte interfaces the cap is byte-exact — a negotiated
+1281 produces 1280 — and the open reply still returns the requested value
+unclamped, which is the Part II Finding S-14 result confirmed on one further
+interface.
+
+The loopback row is weaker evidence and is **not** an observation of a
+16384-byte cap. It shows only that lengths up to 8000 were emitted unclamped. The
+loopback cap cannot be approached on this host, because a reply beyond roughly
+9300 bytes ends the server process before any such length is reached — see the
+next result. **Host-specific:** these are this host's interface MTUs.
+
+**A length the host cannot transmit terminates the process.** On the same host,
+whose maximum outbound datagram size is 9216 bytes, replies up to 9216 bytes were
+sent normally and negotiated lengths producing replies from roughly 9300 bytes
+upward failed on the first echo and ended the server. With a wildcard bind, a
+fatal send on the IPv4 listener took the healthy IPv6 listener down with it —
+sessions on a different address family, unrelated to the offending one, stopped
+being served at the same instant. **Host-specific:** 9216 is this host's outbound
+datagram limit, not a protocol figure.
+
+On the tested host, this failure was reachable in configurations whose effective
+reply cap exceeded the host's outbound datagram ceiling, including the tested
+loopback and wildcard cases. The tested 1500- and 1280-byte interface-bound
+listeners could not reach it because their reply caps were lower. Jumbo interfaces
+and other platforms were not tested.
+
+**Classification:** SERVER-ONLY NEW INFORMATION; strengthens Findings S-14 and
+S-15 (server spec Sections 7.3, 9.2, 22.1, 23.5).
+
+## Finding S-26: Over-MTU requests show an interface-MTU effective length boundary
+
+Bound to an interface with a 1500-byte MTU, a 3000-byte request was dropped with
+a configured maximum of 1499 and accepted with a maximum of 1500. On a 1280-byte
+tunnel the same decision knee was at 1280. The observed maximum-length decision
+therefore behaved as though its comparison length was capped at the tested
+interface boundary. Separately, the policy was strict at the ordinary tested
+sizes: with a maximum of 1000, a 1000-byte request was answered and a 1001-byte
+request was dropped.
+
+> **Black-box inference.** Receive-path truncation before the maximum-length
+> decision is one explanation consistent with the 1499/1500 and 1279/1280
+> boundaries, but the experiments cannot distinguish it from another mechanism
+> that yields the same effective comparison length.
+
+**Host-specific and environment-specific.** This is an observation on the
+tested host and interfaces, not a wire rule. It does not prescribe a clean
+server's receive strategy or maximum-length policy. Negotiated Length is not by
+itself a valid receive-buffer upper bound, because mandatory protocol structure
+can require a larger datagram.
+
+**No capture accompanies this finding.** The capture taken during the experiment
+was recorded on loopback with no maximum-length policy configured, and there all
+three oversized requests were answered normally at the negotiated length; it
+demonstrates neither the effective boundary nor a policy drop, and the behavior it does
+show is already covered by server spec Section 5.5 and vectors Section 5.4. It
+was reviewed and not admitted. The textual result above is the evidence.
+
+**Classification:** SERVER-ONLY NEW INFORMATION, environment-specific (server spec
+Section 9.4).
+
+## Finding S-27: DSCP marking is per session, with unmarked opens and marked closes
+
+Four sessions were opened on one listener negotiating 46, 8, 0 and 184, then
+driven in three interleaved rounds. Every reply's IP header was read from the
+kernel. Capture: `captures/server-dscp-interleaved.pcapng` (32 packets).
+
+| Session | Requested | Open reply TOS | Echo reply TOS, rounds 1–3 |
+|---------|-----------|----------------|-----------------------------|
+| 1 | 46 | **0x00** | 0x2e, 0x2e, 0x2e |
+| 2 | 8 | **0x00** | 0x08, 0x08, 0x08 |
+| 3 | not requested | **0x00** | 0x00, 0x00, 0x00 |
+| 4 | 184 | **0x00** | 0xb8, 0xb8, 0xb8 |
+
+For each of these sessions, whose negotiated values are in `0..=255`, every echo
+reply carried its own session's value verbatim; no reply carried another session's
+value in any round, and every open reply was unmarked. Negative and out-of-range
+values are addressed separately below.
+
+**Server-initiated close replies: measured, but not shown by any admitted
+capture.** The DSCP experiment recorded that a close-flagged echo reply carries
+the same in-range session mark as an ordinary one. Neither admitted capture
+demonstrates it, and a reader checking them will find nothing that does: the
+interleaved capture above contains no close-flagged reply at all, and
+`captures/server-close.pcapng` — which does contain one, at frame 36 — is TOS 0
+throughout, because that session negotiated no DSCP. The result therefore rests
+on the measurement, not on capture evidence, and the earlier wording that
+explained it as "an ordinary marked echo reply that also sets the Close flag" has
+been dropped: that phrasing argued from the flag rather than reporting what was
+observed. A capture of a close-flagged reply on a session with a nonzero
+negotiated DSCP would settle it directly and was not taken.
+
+**On a listener that has already sent marked replies, an open reply is still
+unmarked — evidenced separately.** This capture does not show that ordering: its
+four open exchanges are frames 1–8 and its first marked echo reply is frame 10,
+so no open reply in it follows a marked one. The ordering is instead established
+by `captures/dscp-values.pcapng` from Part I, where one listener serves two
+sessions in sequence: frame 4 is a marked echo reply (TOS `0x08`) and frame 7 is
+the next session's open reply, unmarked, on the same port. The two pieces of
+evidence are cited separately rather than merged.
+
+Observed negative and out-of-range DSCP handling is host-specific, not protocol
+behavior: a requested −1 appeared as TOS 255 on IPv4 and as traffic class 0 on
+IPv6. A value of 256 or above was negotiated and echoed back, but no echo reply
+was observed for that session while the server continued serving its other
+sessions. The black-box result does not identify whether the absence arose while
+applying the marking, during transmission, or at another stage.
+
+**Classification:** SERVER-ONLY NEW INFORMATION; extends Findings B and C of
+Part I (server spec Section 20; vectors Sections 10.1–10.3).
+
+## Finding S-28: The default fill phase is continuous across the tested listeners
+
+Finding S-16 recorded that the default fill pattern's phase is not reset per
+packet or per session and carries over between sessions on one listener. It also
+carries over between **listeners**: in the tested configuration — one server
+bound to both an IPv4 and an IPv6 listener — successive echo replies drawn from a
+session on each continued the same repeating pattern without resetting.
+
+That is the scope of the result: phase continuity across the sessions tested and
+across those two listeners. It is not established that a single stream is shared
+by every session of a process in every configuration, and nothing here describes
+how the bytes are produced.
+
+**No recommendation is drawn from it.** The default fill is a fixed, public
+pattern, so phase continuity across sessions discloses nothing about another
+peer's traffic — unlike the no-fill mode of Finding S-16's second paragraph and
+server spec Section 13.4, which is a real disclosure risk and carries its own
+requirement there. A compatible server may reset the phase, continue it, or
+derive the payload some other way. Those choices can produce different payload
+bytes, making the phase policy observable in a packet capture, but they are
+interoperability-equivalent because a conforming client cannot depend on payload
+phase. No fill-state arrangement is prescribed.
+
+**Classification:** SERVER-ONLY NEW INFORMATION; extends Finding S-16 (server spec
+Section 13.3).
+
+## Part IV Version Comparison
+
+Every result in this part was checked against the 0.9.0 release and the tested
+development build wherever a reproduction check was meaningful. All of the
+following were **identical** on all three builds:
+
+| Behavior | 0.9.0 | 0.9.1 | development build |
+|----------|-------|-------|-------------------|
+| Open whose restricted StampAt remains non-none and has no Clock is accepted, first echo fatal (S-19) | yes | yes | yes |
+| Idle boundary at timeout + 5 s (S-22) | yes | yes | yes |
+| Maximum-duration close at maximum + 2 s (S-23) | yes | yes | yes |
+| A rate-limited request keeps the session alive (S-20) | yes | yes | yes |
+| Interface-MTU effective length boundary (S-26) | yes | yes | yes |
+| Burst allowance behavior | yes | yes | yes |
+| Fill phase continuous across the tested listeners (S-28) | yes | yes | yes |
+
+No new version difference was found. The single known wire-visible difference
+between these builds remains the single-clock midpoint layout of Findings S-7 and
+S-18, which this pass re-observed unchanged and which is not restated here.
+
+## Part IV Captures Created
+
+| File | Packets | Contents |
+|------|---------|----------|
+| `captures/server-clock-absent.pcapng` | 3 | An open selecting timestamps with no Clock tag is answered with a token and no Clock parameter; the first echo is the last packet in the exchange |
+| `captures/server-expiry-consumption.pcapng` | 14 | Control versus foreign-endpoint-first, in one file: whether the packet that releases an expired session emits a final reply |
+| `captures/server-dscp-interleaved.pcapng` | 32 | Four interleaved sessions with distinct DSCP values over three rounds; no cross-session leakage; unmarked open replies |
+
+Each was container-rewritten to the convention already used for the captures of
+Parts I–III — packet records and the rewriting tool's version string only, with
+no capture comment, host, user, interface or filter metadata and no filesystem
+path. Packet bytes and per-frame timestamps were verified identical before and
+after, and the packet counts above are unchanged from the originals.
+
+Two further captures from this pass were **not** admitted. One was materially
+redundant with `captures/server-close.pcapng`, which already shows the
+close-flagged reply, the trigger being counted, and the following packet
+unanswered; a single-maximum capture cannot evidence the additive-margin result,
+which is the new part. The other is described under Finding S-26. In both cases
+the textual result is the evidence, which is the better trade.
+
+## Part IV Client Spec Change Applied
+
+| Section | Change | Class |
+|---------|--------|-------|
+| 19.3 | Maximum-duration deadline origin is the first echo request that is **served**; the close trigger is the first later echo that would otherwise be served. The two tested first-request drops do not start the clock, and a deadline-crossing rate-limited echo does not carry Close. The 2-second margin is additive across configured maxima | **CLARIFICATION** |
+
+The client specification and the server specification are both compatibility
+baselines, so the lifecycle rule is stated the same way in each. The earlier
+client-side measurements are unaffected — the first request was served in those
+runs — and no client behavior depends on the distinction, since a conforming
+client stops sending at the negotiated duration and never reaches the deadline.
+
+## Part IV Summary
+
+- New upstream robustness defect documented: **S-19**, an accepted open that is
+  fatal on its first echo, reachable in the default configuration from two
+  unauthenticated datagrams, present in all three builds.
+- Statements strengthened from thin or single-point evidence: the idle grace and
+  maximum-duration grace (**S-22**), the maximum-duration origin (**S-23**), the
+  rate-limit/idle interaction (**S-20**), the reply-length cap (**S-25**), and the
+  fill-phase scope (**S-28**).
+- New parser-edge results: repeated tags and unknown-tag value encoding
+  (**S-24**), and the presence-versus-explicit-zero distinction that **S-19**
+  turns on.
+- No result contradicted any statement in Parts I–III. **S-23** narrows the
+  origin recorded in Finding S-4 from "the first echo request" to "the first
+  echo request that is served"; the earlier measurement is unaffected, because
+  the first request was served in that experiment.
+- Host-specific figures — interface MTUs, the 9216-byte outbound datagram limit,
+  the effective-length decision knees, and the socket handling of out-of-range DSCP — are
+  labelled as such wherever they appear and are not protocol constants.
+- Nothing in this part rests on anything but observed request bytes, reply bytes,
+  reply presence, IP header markings, timings, and whether the server was still
+  serving afterwards.

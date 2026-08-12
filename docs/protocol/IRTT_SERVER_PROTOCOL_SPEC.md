@@ -1,7 +1,7 @@
 # IRTT-Compatible Server Protocol Specification
 
-**Version:** 1.1-verified
-**Date:** 2026-08-11
+**Version:** 1.2-verified
+**Date:** 2026-08-12
 **Compatibility baseline:** IRTT 0.9.1, protocol version 1
 **Verification platform:** macOS Darwin 25.5.0 arm64
 
@@ -28,16 +28,22 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHOULD", "SHOULD NOT",
 "RECOMMENDED", "MAY", and "OPTIONAL" are to be interpreted as interoperability
 requirements, consistent with RFC 2119.
 
-Five distinct levels of statement are used throughout, and they are not
+Six distinct levels of statement are used throughout, and they are not
 interchangeable. Nothing in one level implies anything at another.
 
 | Marker | Meaning |
 |--------|---------|
 | **Protocol requirement** | Required for interoperability with existing clients. Stated with MUST / MUST NOT / SHOULD. Every one rests on observed behavior. |
-| **Upstream 0.9.1 behavior** | What the reference server was observed to do on the wire. A compatible implementation is **not** obliged to reproduce it unless a separate protocol requirement says so. |
+| **Upstream 0.9.1 behavior** | What the reference server was observed to do on the wire. A compatible implementation is **not** obliged to reproduce it unless a separate protocol requirement says so. Includes the observed robustness defects of Section 22, which a compatible implementation specifically should **not** reproduce. |
+| **Black-box inference** | A conclusion or explanatory hypothesis drawn from several observations rather than directly observed on the wire. Always labelled as an inference and accompanied by its supporting observations. It may describe a mechanism consistent with the evidence, but does not assert that mechanism as measured fact. Never load-bearing: no requirement depends on one. |
 | **Server policy** | A configurable or arbitrary choice of the reference server, including its defaults. A compatible implementation may choose differently, and in several cases should. |
-| **Robustness recommendation** | Advice for the clean implementation's own resilience or safety. It is **not** an interoperability requirement and no existing client can observe whether it was followed. |
+| **Robustness recommendation** | Advice for the clean implementation's own resilience or safety. It is **not** an interoperability requirement. Its consequences may nevertheless be externally observable, particularly when malformed or adversarial traffic affects unrelated conforming sessions. |
 | **Source-assisted historical conclusion** | A judgement about upstream's release history reached with contaminated-side access to upstream material. Never load-bearing: no requirement in this document depends on one. Used once, in Section 11.3.1. |
+
+Several statements are additionally marked **host-specific** or
+**environment-specific**. Those record what one tested host and its interfaces
+did. They are never protocol constants, and the figures in them must not be
+compiled into an implementation.
 
 Where the reference server's own behavior would be a poor choice for a new
 implementation — an unbounded resource policy, a fatal reaction to a single
@@ -181,8 +187,7 @@ produces these accept/discard decisions is conformant, whatever order it
 evaluates them in.
 
 **Discard conditions.** Each of the following was independently observed to
-cause the datagram to be **silently discarded**, with no reply of any kind and
-no change to the state of any live session:
+cause the datagram to be **silently discarded**, with no reply of any kind:
 
 | Condition | Notes |
 |-----------|-------|
@@ -193,11 +198,19 @@ no change to the state of any live session:
 | Authentication mismatch of any kind | Section 14; includes the flag/key mismatch in either direction |
 | A non-open datagram too short to carry the token | |
 | A non-open datagram whose token matches no live session | Section 8 |
-| A non-open datagram whose token matches a session bound to a different source endpoint | Section 8; the session itself is unaffected |
+| A non-open datagram whose token matches a session bound to a different source endpoint | Section 8; see also the expired-session case in Section 18.2 |
 | An echo datagram too short to carry the sequence number | |
 | An echo datagram exceeding a configured maximum packet length | Section 9.4, server policy |
 | An echo datagram arriving with no rate allowance left | Section 9.3, server policy |
 | An open datagram whose parameter payload is malformed or out of range | Section 7.2 |
+
+**Tested externally visible effects.** Every tested discarded echo left the
+reported reception count and received window unchanged. A rate-limited request
+is the known exception to any broader claim that a discard has no externally
+observable session effect: it extends the observed idle lifetime. Section 9.3
+contains the detailed comparison. No general claim about hidden state, or about
+the effects of every discard class at an expiry boundary, is made here; Section
+18.2 records the tested expired-session release cases.
 
 **Protocol requirement.** Every rejection is a **silent discard**. The protocol
 defines no error reply, no reset, and no NACK. A client distinguishes "rejected"
@@ -331,9 +344,12 @@ A server parses the whole parameter payload. Observed acceptance rules:
 | Duration present and ≤ 0 | **Dropped, no reply** |
 | Interval present and ≤ 0 | **Dropped, no reply** |
 | Duration or Interval absent (implicitly 0) | Accepted |
-| ReceivedStats outside 0–3 | **Dropped, no reply** |
-| StampAt outside 0–4 | **Dropped, no reply** |
-| Clock outside 1–3 | **Dropped, no reply** |
+| ReceivedStats outside 0–3, or negative | **Dropped, no reply** |
+| StampAt outside 0–4, or negative | **Dropped, no reply** |
+| Clock outside 1–3, **including an explicit 0** | **Dropped, no reply** |
+| Clock **absent** with requested StampAt = none | Accepted; no timestamps are emitted |
+| Clock **absent** with requested StampAt ≠ none, where restriction leaves StampAt non-none | The **open** is answered normally, with a valid token. The session it creates is not usable: the first echo request on it is fatal to the tested upstream server. See Section 22.5 |
+| Clock **absent** with requested StampAt ≠ none, where restriction changes StampAt to none | Accepted; the session serves normally without timestamps. Observed with the no-timestamp server policy (Sections 11.4 and 22.5). |
 | Length any value, including negative | Accepted (see Section 7.3) |
 | DSCP any value, including negative or > 255 | Accepted (see Section 7.3) |
 | ServerFill string longer than 32 bytes | **Dropped, no reply** |
@@ -349,6 +365,74 @@ contrary to the design of the authenticated mode.
 parameter payloads. A payload of over 200 bytes composed of unknown tags was
 accepted and answered normally. Any such limit in an implementation is a local
 buffer-sizing choice, not a protocol rule.
+
+**Wire fact and upstream 0.9.1 behavior.** The two Clock rows above are the
+sharpest instance of a general point: an *omitted* tag and an explicitly encoded
+`0` are distinct encodings, and upstream produces distinct outcomes for them.
+An explicit `Clock = 0` is out of range and the open is dropped; an omitted Clock
+is accepted.
+
+**Compatibility consequence.** An implementation that chooses to reproduce
+those distinct upstream outcomes needs enough information during request
+validation to distinguish the two forms.
+
+**Clean policy.** A clean server MAY intentionally map otherwise distinct
+adversarial forms to the same compatible, safe outcome when no conforming client
+depends on the distinction. This does not prescribe any decoded representation
+or require retaining presence after validation.
+
+The two directions differ, and the distinction must not be over-applied. In a
+**request**, a present zero is an ordinary encoding a client may send: `Length =
+0` and `DSCP = 0` are both accepted, and `Clock = 0` is rejected precisely
+*because* it is present carrying that value. In an **open reply**, a parameter
+whose restricted value is zero is omitted entirely (Section 7.4), so a server
+never emits a present-as-zero form — which is why a client reconstructs an absent
+parameter as zero when reading a reply. An implementation reproducing the
+upstream request outcomes must not treat an omitted request parameter as an
+explicit zero during validation.
+
+**Upstream 0.9.1 behavior — repeated occurrences of a known tag.** A parameter
+tag may appear more than once in one payload. Among occurrences that are each
+individually valid, the **last** one takes effect; this was measured for
+ProtocolVersion, Duration, Interval, Length, ReceivedStats, StampAt, Clock, DSCP
+and ServerFill.
+
+**Invalid repeated values were tested more narrowly.** For Duration, an invalid
+zero occurrence caused the open to be dropped in both tested positions: valid
+then invalid, and invalid then valid. For Clock and ServerFill, an invalid second
+occurrence also caused the open to be dropped. The opposite ordering was not
+tested for Clock or ServerFill, and invalid duplicate occurrences were not tested
+for ProtocolVersion, Interval, Length, ReceivedStats, StampAt or DSCP. The
+evidence therefore does not establish a parser-wide, position-independent
+invalid-duplicate rule for every parameter. See the vectors file, Section 4.6.
+
+**Protocol requirement.** None: no conforming client emits a repeated tag. A
+compatible server MAY resolve repeats however it likes. The behavior is recorded
+because a decoder that stops at the first occurrence, or that validates only the
+occurrence it keeps, can diverge from the measured upstream outcomes on these
+adversarial inputs.
+
+**Upstream 0.9.1 behavior — unknown tags.** The value of an unknown tag is
+consumed as a varint and discarded. Tag numbers 0, 10, 11, 100, 127, 128, 1000
+and 2³² were each tested and each ignored, with the remainder of the payload
+still parsed and the open answered normally; an open carrying *only* unknown tags
+creates an ordinary default session. No length-prefixed or string-shaped value
+form was accepted for an unknown tag.
+
+> **Black-box inference, not an observation.** Because the only value encoding
+> accepted for an unknown tag is a varint, an unknown tag cannot carry a byte
+> string, and the wire format therefore offers no general extension channel for
+> structured values. That is a conclusion drawn from the encodings tested above,
+> not a documented property, and this specification does not define an extension
+> mechanism.
+
+**Upstream 0.9.1 behavior — a rejected open does not poison the next open.**
+After each tested malformed payload was dropped — incomplete trailing varint, a
+tag with no value, a length-prefixed string running past the end of the buffer,
+or a varint overflow — a well-formed open sent immediately afterwards from the
+same endpoint was accepted and served normally. The experiment establishes no
+persistent externally visible parser or session effect on the following request;
+it does not establish whether any hidden accounting or temporary state exists.
 
 ### 7.3 Server Restriction of Parameters
 
@@ -386,7 +470,23 @@ client aborts; idle timeout 4 s produces no reduction at all for a 1 s request.
 enforced minimum remains the larger. A fully conforming client then sends at the
 negotiated interval and is rate-limited (Section 9.3). Observed with a 5 s
 minimum interval and an 8 s idle timeout: negotiated interval 2 s, but only the
-first request in each 5 s window was answered.
+first request in each 5 s window was answered. The floor is applied before the
+cap, so the returned interval can also fall *below* a configured minimum:
+measured with a 5 s minimum interval and a 4 s idle timeout, the returned
+interval was 1 s. Further boundary rows are in the vectors file, Section 4.4.
+
+**Upstream 0.9.1 behavior — a negative Length.** A negative Length is accepted
+during negotiation and returned in the open reply as the value the client sent.
+There is no negative-size concept on the wire: echo replies for such a session
+are the size of the field block the negotiated parameters imply, which is what
+the ordinary reply-length rule of Section 9.2 produces for any negotiated length
+at or below that block. Clamping happens at the reply, not at the negotiation.
+
+**No requirement follows from this.** That upstream accepts a negative Length
+does not make acceptance an interoperability requirement, and this specification
+does not decide whether a clean server should accept, clamp or reject one. No
+conforming client emits a negative Length, and a client that did would compare
+the returned value against what it requested in the ordinary way.
 
 ### 7.4 Open Reply
 
@@ -491,12 +591,12 @@ Observed outcomes:
 | Case | Result |
 |------|--------|
 | Correct token, original endpoint | Served normally |
-| Correct token, **different source port**, same IP | **Dropped, no reply.** Session left intact and still usable from the original port |
+| Correct token, **different source port**, same IP | **Dropped, no reply.** For a live, non-expired session, it remains usable from the original port; see Section 18.2 for the separately observed expired-session release case. |
 | Correct token, different address family | **Dropped, no reply** (different listener, unknown token there) |
 | Unknown token | **Dropped, no reply** |
 | Zero token | **Dropped, no reply** (treated as any other unknown token) |
 | Token of a session already closed | **Dropped, no reply** |
-| **Close** request bearing a valid token from a foreign source port | **Dropped**; the session is **not** closed |
+| **Close** request bearing a valid token from a foreign source port | **Dropped**; it does not close an otherwise live, non-expired session. Section 18.2 covers the separately observed expired-session release case. |
 
 The last row matters: endpoint binding protects the close path as well as the
 echo path. A capture of these cases is in
@@ -606,10 +706,39 @@ produced 1500-byte replies, while the open reply still reported the requested
 value. Upstream clients treat a reply shorter than the negotiated length as a
 fatal error, so this configuration fails on the first echo. See Section 22.
 
+Re-measured across three interfaces of one host:
+
+| Bind interface (MTU) | 1500 | 1501 | 2000 | 8000 |
+|----------------------|------|------|------|------|
+| loopback (16384) | 1500 | 1501 | 2000 | 8000 |
+| ethernet (1500) | 1500 | **1500** | **1500** | **1500** |
+| tunnel (1280) | **1280** | **1280** | **1280** | **1280** |
+
+On the **1500-byte and 1280-byte** interfaces the cap was that interface's MTU
+exactly, byte for byte — a negotiated 1281 produced 1280 — and a negotiated
+length at or below the MTU was emitted in full.
+
+The loopback row establishes something weaker, and is not evidence of an exact
+16384-byte cap. All it shows is that lengths up to 8000 were emitted unclamped.
+The cap could not be approached there: on this host a reply beyond roughly 9300
+bytes ends the server process (Section 22.1), well below the loopback MTU, so no
+observation of that boundary is possible on this configuration.
+
+This is a property of the tested host and its interfaces, not a wire constant.
+Whether the cap is always the listener interface's MTU on other platforms remains
+open; see Section 23.5. Note also that the tested loopback and wildcard
+configurations allowed a negotiated length to exceed what this host will actually
+transmit — the hazard of Section 22.1.
+
 ### 9.3 Rate Limiting
 
-**Server policy.** The reference server enforces the negotiated minimum send
-interval with a token-bucket allowance:
+**Server policy.** The tested upstream rate limiter replenishes reply allowance
+using the configured minimum send interval. This may differ from the interval
+returned during negotiation when the idle-timeout restriction of Section 7.3
+reduces the negotiated value below that configured minimum.
+
+**Black-box inference.** The observed burst and replenishment behavior is
+consistent with a token-bucket allowance:
 
 - a burst allowance of *N* requests is available immediately (default N = 5);
 - allowance is replenished at one request per configured minimum interval and
@@ -623,7 +752,61 @@ were all answered. With a burst of 1, a blast of 4 produced 1 reply.
 **Protocol requirement.** A rate-limited request MUST NOT be answered and MUST
 NOT affect the reception statistics (Section 10). Measured: the received count
 advanced 1, 2, 3, 4, 5 across the accepted burst and continued 6, 7, 8 for the
-later requests — dropped requests were not counted.
+later requests — dropped requests were not counted. Neither the count nor the
+received window advances for a rate-limited request.
+
+**Upstream 0.9.1 behavior — a rate-limited request still counts as activity for
+idle expiry.** This was the only tested drop class that did. A rate-limited request
+receives no reply and advances neither statistic, yet it extends the session's
+observed idle lifetime exactly as a served request would. Every other drop class
+tested leaves the idle deadline where it was:
+
+| Injected packet | Counted / window advanced | Extends the observed idle lifetime |
+|-----------------|---------------------------|------------------------------------|
+| Bad magic | no | no |
+| Invalid flag bits | no | no |
+| Reply or Open flag on a data packet | no | no |
+| Unknown token, or a zero token | no | no |
+| Valid token from a foreign source endpoint | no | no — but see Section 18.2 |
+| Echo truncated before the sequence number | no | no |
+| Request over the configured maximum length | no | no |
+| Bad, missing or zeroed authentication | no | no |
+| **Request with no rate allowance left** | **no** | **YES** |
+
+The rate-limit row was established three ways against each other, and reproduced
+on the 0.9.0 release, the 0.9.1 release and the tested post-0.9.1 development
+build: a session fed *only* too-fast requests outlived its idle deadline; the
+same cadence of oversized requests did not; and a silent session expired on time.
+
+This is a statement about the session's externally observable lifetime, and about
+nothing else. What a server updates internally when it declines a request, and
+whether a lifetime is tracked as a timestamp, a deadline or anything else, is not
+observable and is not described here.
+
+**Compatibility significance — black-box inference.** The earlier rationale
+that a conforming client can never observe this behavior is false. Section 7.3
+records a configuration where the interval returned to the client is shorter than
+the configured minimum interval used by the tested limiter: when the configured
+minimum exceeds (idle timeout ÷ 4), the negotiated interval is the smaller value
+while reply allowance still replenishes on the larger configured interval. A
+client that sends at the interval it was given can therefore itself be
+rate-limited.
+
+Consequently, counting rate-limited requests as idle activity is not
+categorically unobservable. Combining that documented restriction interaction
+with the directly measured idle-refresh behavior above suggests configurations
+where liveness depends on whether rate-limited requests count as activity. That
+combined liveness consequence was not independently measured as one experiment,
+so this specification does not assign it an unconditional RFC 2119
+interoperability requirement. It records the interaction for later
+implementation-policy work; a clean server may, for example, avoid negotiating a
+cadence inconsistent with the limiter it actually enforces.
+
+Separately, the same behavior matters in the opposite direction: a peer that
+floods a session fast enough to be rate-limited can keep it serving past its
+otherwise observed idle deadline without receiving a reply. That is a
+consideration for the bounded resource policy of Section 18.3 rather than a
+compatibility rule.
 
 ### 9.4 Maximum Request Length
 
@@ -639,6 +822,29 @@ If the configured maximum is below the minimum echo field block, **every** echo
 request is dropped while opens still succeed. Measured with a maximum of 10: the
 session opened, negotiated a length of 10, and every 16-byte echo request was
 dropped.
+
+The comparison is strict and is made against the length the server **received**.
+Measured with a maximum of 1000: a 1000-byte request was answered and a 1001-byte
+request was dropped.
+
+**Environment-specific observation — an over-MTU request shows an
+interface-MTU effective length boundary.** On the tested host, a 3000-byte
+request sent to a 1500-byte-MTU interface was dropped with a configured maximum
+of 1499 and accepted with a maximum of 1500. On a 1280-byte tunnel interface the
+same decision knee appeared at 1280. In these experiments, the maximum-length
+decision therefore behaved as though its comparison length was capped at the
+tested interface boundary.
+
+> **Black-box inference.** Receive-path truncation before the maximum-length
+> decision is one explanation consistent with this observation, but the
+> experiment cannot distinguish it from receiving the full datagram and
+> normalizing or capping the comparison length, or from another mechanism that
+> yields the same effective boundary.
+
+This is an observation on the tested host and interfaces, not a wire rule. It
+does not constrain a clean implementation's receive strategy or maximum-length
+policy. Negotiated Length is not by itself a valid receive-buffer upper bound,
+because mandatory protocol structure can require a larger datagram.
 
 ---
 
@@ -1132,9 +1338,30 @@ seq 3 payload: 74 74 69 72 74 74 69
 
 and across separate sessions on the same listener, the phase carried over.
 
+**The continuity extends across listeners, not only across sessions on one
+listener.** In the tested configuration — one server bound to both an IPv4 and an
+IPv6 listener — successive echo replies drawn from a session on each continued
+the same repeating pattern without resetting. So the observable phase is
+continuous across the sessions tested and across those two listeners.
+
+That is the extent of what was measured. It is not established here that a single
+stream is shared by *every* session of a process in every configuration, and no
+claim is made about how any implementation produces the bytes.
+
 **Protocol requirement.** A client MUST NOT assume a reply payload begins at the
 start of the fill pattern, and MUST NOT use payload bytes for any protocol
 purpose. A compatible server MAY reset the phase per packet.
+
+**No recommendation follows from the phase observation alone.** The default fill
+is a fixed, public pattern, so its phase carrying across sessions discloses
+nothing about another peer's traffic — unlike the no-fill mode of Section 13.4,
+which is a genuine disclosure risk and carries its own requirement there. A
+compatible server may reset the phase per packet, continue it, or derive the
+payload some other way. The resulting payload bytes can differ, making the
+phase policy observable in a packet capture, but the difference has no protocol
+significance: these choices are interoperability-equivalent because a
+conforming client cannot depend on payload phase. This specification prescribes
+no particular arrangement of fill state.
 
 ### 13.4 No Fill
 
@@ -1251,7 +1478,7 @@ and no payload.
 | Trailing bytes after the token | Accepted; session removed |
 | Repeated close with the same token | Dropped as an unknown token; no reply |
 | Echo after close | Dropped as an unknown token; no reply |
-| Close from a foreign source port | Dropped; session **not** removed |
+| Close from a foreign source port | Dropped; does not remove an otherwise live, non-expired session. See Section 18.2 for the separately observed expired-session release case. |
 | Close bearing an unknown or zero token | Dropped; no reply |
 
 **Protocol requirement.** A server MUST accept the close request and release the
@@ -1294,10 +1521,16 @@ duration hard limit:
 - when a maximum test duration is configured, the server clamps the negotiated
   duration to it during negotiation;
 - it additionally enforces a hard deadline of **maximum duration + 2 seconds**,
-  measured from the **first echo request** of the session;
-- the first echo request arriving after that deadline is answered with a normal,
-  complete echo reply — correct sequence number, token, statistics and
-  timestamps — with the Close flag additionally set;
+  measured from the session's **first echo request that is actually served**;
+- the first echo request arriving after that deadline **that would otherwise be
+  served** is answered with a normal, complete echo reply — correct sequence
+  number, token, statistics and timestamps — with the Close flag additionally
+  set;
+- in the one tested dropped-trigger case, a deadline-crossing echo that was
+  rate-limited was silently dropped without Close. The session remained usable,
+  and the next served echo carried Close;
+- the corresponding behavior for other independently dropped post-deadline
+  request classes was not tested and is not specified here;
 - the session is removed at the same time, so every later request is dropped as
   an unknown token.
 
@@ -1305,6 +1538,43 @@ Measured: maximum duration 1 s → close flag on the reply at 3.01 s after the
 first echo; maximum duration 2 s → close flag at 4.06 s and again at 4.1 s in a
 separate run. Captured in `captures/server-close.pcapng` (frame 36 carries
 flags `0x06`).
+
+Re-measured as a boundary sweep, the 2-second margin is additive across the
+configured maximum rather than proportional to it. Offsets are measured from the
+first served echo:
+
+| Configured maximum duration | Last offset still answered normally | First offset carrying Close |
+|-----------------------------|-------------------------------------|-----------------------------|
+| 500 ms | 2.45 s | 2.50 s |
+| 1 s | 2.95 s | 3.00 s |
+| 3 s | 4.95 s | 5.00 s |
+
+Four further properties of the trigger were measured, and each is externally
+visible:
+
+- **The clock starts at the first *served* echo, not at open and not at the first
+  echo that merely arrives.** Opening a session five seconds before its first
+  echo did not move the deadline. Two drop classes were tested as the first
+  request and neither started the clock: an **oversized** first request, and a
+  first request from a **foreign source endpoint**. In both cases a later served
+  echo became the origin instead. Whether the other drop classes of Section 5.4
+  behave the same way was not tested, and no general rule about them is stated
+  here.
+- **The triggering echo is included in the reception statistics it reports.** The
+  close-flagged reply carries the count and window that request produced, exactly
+  as an ordinary reply would.
+- **A request that would trigger the close but is itself rate-limited is simply
+  dropped.** The close is not lost: it is carried by the next echo that is served
+  once the rate allowance refills.
+- **The token is unusable from that reply onward.** The client's next echo, and
+  the close request it sends in response to the flag, both go unanswered.
+
+The close-flagged reply itself is captured in `captures/server-close.pcapng`,
+frame 36; the sweep above is a timing measurement and has no capture of its own.
+The margin is a property of the tested builds, stated with a measurement
+tolerance of one probe interval (50 ms in the sweep above). It is upstream
+policy, not a protocol constant, and none of the protocol requirements below
+depends on its value.
 
 A conforming client never reaches this deadline, because it stops sending at the
 negotiated duration. The mechanism exists to bound sessions from clients that
@@ -1356,6 +1626,7 @@ token**, and the fully restricted parameter payload.
 | Subsequent close with the zero token | Dropped, no reply |
 | With authentication | Reply is authenticated normally; flags `0x0F` |
 | Cleanup required | None |
+| Effect on *other* sessions' expiry | **None observed.** A burst of no-test opens did not release an unrelated expired session, while a burst of ordinary opens did (Section 18.2) |
 
 **Protocol requirement.** A server MUST NOT create a usable session for a
 no-test open, and MUST return a zero token. The Close flag in the reply here
@@ -1367,8 +1638,10 @@ specification, Sections 6.2 and 8.3.
 
 ## 17. Malformed, Unexpected and Adversarial Packets
 
-Compact reference table. "Session effect: none" means the referenced session (if
-any) is left fully usable.
+Compact reference table. For rows whose session state is **live**, "Session
+effect: none" means the referenced session remains usable. The separately
+observed expired-session release cases are scoped to the **expired** row and
+Section 18.2.
 
 | Request condition | Session state | Auth state | Server response | Session effect |
 |---|---|---|---|---|
@@ -1399,8 +1672,8 @@ any) is left fully usable.
 | Echo shorter than the negotiated length | live | ok | **reply at negotiated length** | normal |
 | Echo with a duplicate sequence number | live | ok | **reply** | count +1, window unchanged |
 | Echo with a lower sequence number than the last | live | ok | **reply** | count +1, window reset to `0x1` |
-| Echo after the maximum-duration deadline | live | ok | **reply with Close flag** | session removed |
-| Echo after idle expiry deadline | expired | ok | **reply** (served once) | session removed |
+| Otherwise-serviceable echo after the maximum-duration deadline | live | ok | **normal echo reply with Close flag** | request counted; session removed (a rate-limited trigger is dropped; see Section 15.2) |
+| Otherwise-serviceable echo that is the first tested packet to touch an expired session | expired | ok | **reply** (served once), then session removed | see Section 18.2 for normally dropped packets that can release it first |
 | Any request on a closed / expired session | gone | ok | drop | none |
 | Close with trailing bytes | live | ok | **accepted**; no reply, as for any close | session removed |
 | Echo-shaped datagram with the Open flag set, otherwise admissible | — | ok | treated as an **open**; the token bytes are parsed as parameters | new session if those bytes parse |
@@ -1439,7 +1712,7 @@ default **1 minute**, with `0` meaning "never expire".
 
 **Observed behavior**, measured with a 2-second idle timeout:
 
-| Gap since the previous accepted echo | First request after the gap | The request after that |
+| Gap since the previous accepted echo | First otherwise-serviceable echo after the gap | Immediate follow-up |
 |---|---|---|
 | 5.0 s | answered | answered |
 | 6.5 s | answered | answered |
@@ -1450,14 +1723,96 @@ default **1 minute**, with `0` meaning "never expire".
 
 Two things follow, and both are externally observable:
 
-1. **The effective expiry deadline is the configured idle timeout plus a
+1. **The observed idle release boundary is the configured idle timeout plus a
    5-second grace period.** Measured boundary between 6.9 s and 7.1 s for a
    2-second timeout.
-2. **The first request that arrives after the deadline is still answered**, and
-   the session is torn down as part of handling it. Only the *next* request is
-   dropped. A compatible implementation MAY drop the first post-deadline request
-   instead; clients cannot depend on either behavior, because from their side
-   the deadline coincides with an unresponsive server.
+2. **In observed upstream behavior, the first otherwise-serviceable echo that
+   reaches an expired session receives a final reply.** The immediate follow-up
+   is then dropped, which is how release is observed externally.
+
+   The qualification matters, and the paragraphs below are where it comes from.
+   A final post-deadline reply is emitted only if the packet that first triggers
+   the expired session's release is itself an otherwise-serviceable echo. If a
+   packet that would normally be dropped — a foreign-endpoint echo, a truncated
+   or oversized one — reaches the expired session first, it may release the
+   session without receiving a reply; no later request then receives that final
+   reply.
+
+**The grace is a fixed additive margin, not a proportion of the timeout.** A
+boundary sweep across three configured timeouts, three repetitions each, located
+the observed session-release boundary at timeout + 5 s in every case, to within
+the 50 ms probe spacing. Each probe used a first otherwise-serviceable echo after
+the gap and an immediate follow-up:
+
+| Configured idle timeout | Longest gap with follow-up served | Shortest gap with follow-up dropped |
+|-------------------------|----------------------------------|------------------------------------|
+| 500 ms | 5.45 s | 5.50 s |
+| 2 s | 6.95 s | 7.00 s |
+| 4 s | 8.95 s | 9.00 s |
+
+At and beyond this boundary, the first otherwise-serviceable post-gap echo may
+still receive upstream's final lazy-release reply; the immediate follow-up is
+then dropped. These values are therefore not thresholds at which the first
+post-gap echo is rejected.
+
+The same boundary was observed on the 0.9.0 release, the 0.9.1 release and the
+tested post-0.9.1 development build. Because the extra margin is the same five
+seconds at every timeout, it is not proportional to the timeout, and the boundary
+did not shift with when the session was opened. Nothing here describes how a
+server notices that a session has expired; only when it stops serving one is
+observable, and only that is stated.
+
+**Expiry is observable as a lazy release.** A final post-deadline reply is
+emitted only when the packet that first triggers the expired session's release is
+itself otherwise serviceable; it is not reserved for a later request from the
+session's client. Measured against a control in the same capture
+(`captures/server-expiry-consumption.pcapng`):
+
+- **Control.** A session left idle past its deadline answered the client's next
+  echo, then dropped the one after it.
+- **Released by a foreign endpoint.** A second session, otherwise identical, was
+  touched just past its deadline by an echo bearing its token from a *different
+  source port*. That packet was dropped as a foreign-endpoint request, as it
+  would be at any time — but it released the session without a reply. The
+  legitimate client's own post-deadline echo, arriving 0.3 s later, then received
+  **no reply at all**, and neither did the one after it; no final reply remained.
+
+The same effect was produced by a truncated echo, an oversized echo, a close
+request from a foreign endpoint, and a burst of unrelated ordinary opens arriving
+before the legitimate client's post-deadline request.
+
+Two limits on how far this generalises. First, these are the request classes that
+were tested; this specification does not claim that *every* packet touching an
+expired token has the effect, only these. Second, it says nothing about the order
+in which a server performs any internal step — what is observable is that the
+session was gone by the time the legitimate request arrived, and that in the
+control, with no intervening packet, it was not.
+
+**A burst of ordinary opens released an expired session; a burst of no-test opens
+did not.** A burst of normal open requests was observed to release an unrelated
+expired session, so a session can also stop being served without any packet
+bearing its token arriving at all. A burst of no-test opens (Section 16) had no
+such effect — consistent with a no-test open creating no session of its own.
+
+Only the burst was tested. Whether a **single** ordinary open is enough, or
+whether the effect depends on a count, a rate, or some other property of the
+batch, was not measured and is not claimed here.
+
+> **Black-box inference.** Taken together, these observations are consistent with
+> expiry being evaluated when a session is looked up and, additionally, when a new
+> session is created, rather than by a scheduled removal that a client could
+> observe as a distinct event. That is an inference from the timing and packet
+> outcomes above, not a directly measured description of the mechanism, and no
+> requirement in this document depends on it.
+
+**Compatibility significance.** The lazy-release behavior is externally
+observable. A conforming client may encounter it after a sufficiently long
+mid-test client-to-server path interruption and observe whether the first
+otherwise-serviceable echo after recovery receives a reply.
+
+**Clean policy remains open.** Whether a clean server reproduces upstream lazy
+release or expires immediately is a separate implementation decision. The
+current evidence does not introduce a new RFC 2119 requirement for that choice.
 
 **Upstream 0.9.1 behavior — a session that has never carried an echo request
 never expires.** The idle clock starts at the first echo request, not at open.
@@ -1476,7 +1831,8 @@ them resident indefinitely as upstream does.
 
 Requests dropped for rate limiting still refresh the idle clock, so a client
 sending faster than the allowance keeps its session alive without receiving
-replies.
+replies. Section 9.3 records the full drop-class comparison establishing this,
+and that no other tested drop class has the same effect.
 
 ### 18.3 Resource Limits
 
@@ -1538,9 +1894,9 @@ implementation.
 | Default minimum send interval | 10 ms | policy |
 | Default burst allowance | 5 requests | policy |
 | Default idle timeout | 1 minute | policy |
-| Idle-expiry grace beyond the timeout | 5 seconds (measured) | policy |
+| Idle-expiry grace beyond the timeout | 5 seconds, additive (measured at timeouts of 500 ms, 2 s and 4 s) | policy |
 | Maximum negotiable interval | idle timeout ÷ 4 (measured) | policy |
-| Maximum-duration grace | 2 seconds (measured) | policy |
+| Maximum-duration grace | 2 seconds, additive, from the first served echo (measured at maxima of 500 ms, 1 s and 3 s) | policy |
 | Default maximum test duration | unlimited | policy |
 | Default maximum packet length | unlimited | policy |
 | Default fill pattern | repeating `69 72 74 74` | policy |
@@ -1558,11 +1914,11 @@ would produce a smaller interval makes the server unusable by those clients.
 
 **Protocol requirement — what the wire parameter is.** The DSCP parameter
 (tag 8) carries the **raw IP TOS / Traffic Class byte**, with a useful range of
-**0–255**. It is not a 6-bit codepoint. A server applies the negotiated value
-directly as the TOS / Traffic Class byte of its echo replies, and a compatible
-implementation MUST encode and interpret it the same way. The common Expedited
-Forwarding marking is therefore **0xb8 (184)** on the wire, not 46. Verified by
-capture; see `BLACKBOX_VERIFICATION_REPORT.md` Finding B and
+**0–255**. It is not a 6-bit codepoint. For negotiated values in that range, a
+server applies the value directly as the TOS / Traffic Class byte of its echo
+replies, and a compatible implementation MUST encode and interpret it the same
+way. The common Expedited Forwarding marking is therefore **0xb8 (184)** on the
+wire, not 46. Verified by capture; see `BLACKBOX_VERIFICATION_REPORT.md` Finding B and
 `captures/dscp-session.pcapng`.
 
 > **Out of scope: user-facing DSCP notation.** Whether an implementation's
@@ -1573,27 +1929,107 @@ capture; see `BLACKBOX_VERIFICATION_REPORT.md` Finding B and
 > upstream wire behavior, and it does not belong in this specification.
 
 **Server policy.** When DSCP is permitted and supported on the socket, the server
-applies the negotiated value to its echo replies. When DSCP is disallowed, the
-negotiated value is forced to 0 and returned as absent from the parameter
+applies an in-range negotiated value to its echo replies. When DSCP is disallowed,
+the negotiated value is forced to 0 and returned as absent from the parameter
 payload.
 
-**Observed range handling.** The negotiated value is **not** range-checked
-during negotiation. Values 0–255 are applied normally. A value above 255 is
-accepted and echoed back in the open reply, but then every echo reply for that
-session fails to send and is dropped — the client sees a session that opens and
-then answers nothing.
+**Observed range handling on the tested host.** Values in `0..=255` were applied
+normally. A value of 256 or above was accepted and echoed back in the open reply,
+but no echo replies were observed for that session. Other sessions continued to
+be served normally throughout.
+
+The black-box observation does not identify whether the absence arose while
+applying the requested socket marking, during transmission, or at another stage.
+It is distinct from the non-transient outbound reply send failure of Sections 6.3
+and 22.1, whose observed result is process termination.
+
+**Observed marking scope, measured on interleaved sessions.** Four sessions were
+opened on one listener negotiating 46, 8, 0 and 184, and then driven in three
+interleaved rounds of one echo each. Every echo reply carried its own session's
+value as the TOS byte, verbatim, in all three rounds, and no reply carried
+another session's value. The marking therefore follows the session, not the
+listener or the most recent negotiation. Captured in
+`captures/server-dscp-interleaved.pcapng`.
+
+**Observed marking of the other packet kinds.**
+
+| Packet | Marking |
+|--------|---------|
+| Open reply | **Always unmarked** (TOS 0) |
+| Echo reply | The session's negotiated value, verbatim for values in `0..=255` (see the out-of-range observations below) |
+| Server-initiated close (Section 15.2) | Measured to carry the same session marking for values in `0..=255`. No admitted capture shows this — see the note below |
+| Client-initiated close | No reply is sent at all (Section 15.1) |
+
+An unmarked open reply is not merely the state of a freshly started listener: in
+`captures/dscp-values.pcapng` a listener that had already emitted a marked echo
+reply answered a subsequent open on the same port with TOS 0 (frame 4 carries
+TOS `0x08`; the open reply at frame 7 is unmarked). The interleaved capture above
+does not show this ordering — all four of its open exchanges precede its first
+marked echo reply — so the two are cited separately.
+
+**The close-reply row rests on a measurement, not on a capture.** No capture in
+`captures/` shows a close-flagged reply on a session with a nonzero negotiated
+DSCP. The interleaved capture contains no close-flagged reply, and
+`captures/server-close.pcapng`, which does contain one at frame 36, is TOS 0
+throughout because that session negotiated no DSCP. Treat the row as the observed
+result it is, and not as a deduction from the Close flag being "just a flag on an
+ordinary echo reply" — nothing here rules out a marking difference on that path
+beyond the measurement itself. A capture of a marked session reaching its
+maximum-duration deadline would settle it and was not taken.
+
+**Observed handling of negative and out-of-range DSCP values on the tested host.**
+A negative value behaved differently by address family. One negative value was
+measured with its emitted marking recorded: a negotiated **−1** appeared on the
+wire as **TOS 255** on IPv4, while the same negotiation on IPv6 produced a
+traffic class of **0**. A value of 256 or above produced the no-reply result
+described above.
+
+A single negative data point does not identify the transformation. Taking the low
+byte of the value's two's-complement representation — equivalently, the value
+modulo 256 — and a special case for this input both predict TOS 255, and no
+experiment distinguishes them. Plain clamping into `0..=255` is the one candidate
+the observation does rule out: it would have emitted 0. This specification
+records the observed mapping only and does not name a rule.
+
+**This is platform behavior, not protocol behavior.** The observed handling of
+negative and out-of-range values is host-specific, and a compatible server is
+under no obligation to reproduce it. Do not read the v4/v6 difference as a wire
+rule.
 
 **Robustness recommendation (clean implementation).** Reject or clamp DSCP
-values outside 0–255 during negotiation rather than accepting a value that cannot
-be applied, so that the value returned in the open reply is one the server will
-honour.
+values outside `0..=255` during negotiation rather than accepting a negotiated
+value that leads to an observed no-reply session, so that the value returned in
+the open reply is one the server will reliably honour. Which of the two —
+rejection or clamping — and how the clean server exposes the value are decisions
+for the implementing project, not settled here.
 
-DSCP is applied to echo replies only; open and close packets are unmarked (see
-the client specification, Section 10.8).
+**What "close packets are unmarked" does and does not mean.** The client
+specification, Section 10.8, records that open and close packets carry TOS 0.
+That statement is about **standalone** open and close datagrams — the client's
+open request, the server's open reply, and the client's close request — and it
+holds: each was observed unmarked regardless of the negotiated value.
+
+It does **not** cover a server-initiated close, because there is no standalone
+close datagram in that direction. A server signals close by setting the Close
+flag on an ordinary echo reply (Section 15.2), and that reply carries the
+session's in-range negotiated marking like every other echo reply. A server must
+not clear the marking merely because the Close flag is set, and a clean
+implementation should not read "close packets are unmarked" as applying to it.
 
 ---
 
 ## 21. Version Differences
+
+Only one wire-visible difference between the tested builds has been found, and it
+is the subject of Section 21.1. The behaviors most likely to be mistaken for
+version-specific quirks were re-measured against all three builds — the 0.9.0
+release, the 0.9.1 release and the tested post-0.9.1 development tree — and were
+**identical** on each: the accepted-then-fatal open of Section 22.5; the idle
+boundary at timeout + 5 s; the maximum-duration close at maximum + 2 s; a
+rate-limited request refreshing the idle lifetime; the interface-MTU effective
+length boundary; the burst allowance; and fill-phase continuity across the tested
+listeners. Where a later section names a single build, that is because only that
+build was measured for the statement in question.
 
 ### 21.1 0.9.0 → 0.9.1
 
@@ -1678,9 +2114,18 @@ reproduce. They are listed because each is reachable from ordinary client
 traffic, so a clean server has to decide what to do instead.
 
 Everything in this section is an **observation plus a robustness
-recommendation**. None of it is an interoperability requirement: no conforming
-client can tell which choice a server made, because in every case the visible
-effect is either silence or an ordinary reply.
+recommendation**. None of it is an interoperability requirement, in the specific
+sense that no conforming client can *provoke* any of these outcomes: reaching
+them takes traffic a conforming client does not send, and a server that avoids
+them is fully compatible with every existing client.
+
+That is not the same as saying the consequences are invisible. Several of these
+hazards end the server process, and Sections 22.1 and 22.5 record unrelated
+conforming clients on the same process losing their sessions at that moment. Those
+clients plainly observe the outcome — they just cannot cause it, and from their
+side it is indistinguishable from the server going away for any other reason. The
+classification rests on what a conforming client can trigger and on nothing being
+required of the wire, not on a claim that the effects cannot be seen.
 
 ### 22.1 Oversized Reply Terminates the Server
 
@@ -1691,12 +2136,30 @@ process exits. Observed on a host whose maximum outbound datagram size was
 9216 bytes: a session negotiating 15000 bytes killed the server on its first
 echo reply, and all subsequent clients received nothing.
 
+Re-measured on the same host, the boundary sits at that maximum: negotiated
+lengths producing replies of up to 9216 bytes were sent normally, and lengths
+producing replies from roughly 9300 bytes upward were fatal on the first echo.
+Those figures are that host's outbound datagram limit and its interface MTUs;
+they are **not** protocol constants, and no clean implementation should encode
+them. On the tested host, this failure was reachable in configurations whose
+effective reply cap exceeded the host's outbound datagram ceiling, including the
+tested loopback and wildcard cases. The tested 1500- and 1280-byte interface-bound
+listeners could not reach it because their reply caps were lower. Jumbo interfaces
+and other platforms were not tested (Section 23.5).
+
+**The blast radius is the whole process, not the session or the listener.** With
+a wildcard bind, a fatal send on the IPv4 listener terminated the process and
+took the healthy IPv6 listener down with it — sessions with no relationship to
+the offending one, on a different address family, stopped being served at the
+same instant.
+
 The default configuration places no upper bound on the negotiated length, so
 this is reachable without any malformed packet.
 
 **Robustness recommendation (restated from Section 6.3).** Treat a per-packet
 send failure as a per-packet event rather than a fatal one, and refuse to
-negotiate a length the server cannot transmit.
+negotiate a length the server cannot transmit. A failure encountered while
+serving one session should not stop unrelated sessions or unrelated listeners.
 
 ### 22.2 Zero-Length Fill Pattern Terminates the Server
 
@@ -1728,6 +2191,76 @@ See Section 13.4. A no-fill mode that emits uninitialized buffer content can
 leak bytes from other clients' traffic. The requirement not to emit another
 peer's data is stated in Section 13.4; it is a security property of the
 implementation rather than a wire-compatibility rule.
+
+### 22.5 An Accepted Open With No Clock Parameter Is Fatal On Its First Echo
+
+**Observed upstream robustness defect.** This is the most severe of the hazards
+recorded here: it is reachable in the default configuration, from two
+unauthenticated datagrams, by a peer that never sends anything malformed.
+
+When the server's restricted (effective) StampAt remains non-none, an open
+request whose requested StampAt is Send, Receive, Both or Midpoint and which
+**omits the Clock parameter entirely** is accepted:
+
+- the open reply is an ordinary session-creating reply, with a valid non-zero
+  token and the restricted parameters;
+- the reply carries **no** Clock parameter, and no Clock value is synthesized
+  into it;
+- the **first echo request** on that session receives **no reply**, and the
+  server process terminates. Every other session on that process, including
+  sessions on the other address family's listener, stops being served at the same
+  moment.
+
+Reproduced for all four non-none StampAt values, and on the 0.9.0 release, the
+0.9.1 release and the tested post-0.9.1 development build alike. Captured in
+`captures/server-clock-absent.pcapng`: the open is answered with a token and no
+Clock parameter, and the single echo request that follows is the last packet in
+the exchange.
+
+**Absence and an explicit zero are different inputs, and only absence reaches
+this state.** An open encoding `Clock = 0` explicitly is out of range and is
+dropped during negotiation — no reply, no session, no fatal path (Section 7.2).
+It is the *omission* of the field, not a zero value, that produces a session that
+is accepted and then fatal. A decoder that folds a missing tag into a zero value
+cannot represent the difference and would reject the case upstream accepts, or
+accept the case upstream rejects, depending on which way it folds.
+
+**Server policy determines whether the fatal effective state exists.** A server
+configured to provide no timestamps at all restricts a requested non-none
+StampAt to none (Section 11.4) and answers this absent-Clock session normally,
+without timestamps. A server restricted to a *single* timestamp leaves the
+restricted (effective) StampAt non-none and does **not** prevent the fault.
+
+**Compatibility classification.** A conforming client cannot itself trigger this
+defect through conforming negotiation, because conforming clients always send
+Clock. If another peer triggers the resulting process-wide failure, however,
+unrelated conforming clients can observe that their server disappeared and their
+sessions stopped receiving replies. Reproducing the crash is not an
+interoperability requirement: compatibility does not require reproducing a
+robustness defect that only a nonconforming or adversarial request can trigger.
+The behavior is recorded because a clean implementation has to decide what to do
+instead.
+
+**Robustness recommendation (clean implementation).** A set of session parameters
+the server has already accepted at open should never be able to produce a fatal
+condition when the first echo arrives; whatever else it does, a clean server
+should survive this exchange with its listeners intact.
+
+RFC 2119 keywords are deliberately **not** used here. In this document those
+keywords mark interoperability requirements, and this is a robustness
+recommendation rather than one. The strength of the advice is a matter for the
+implementing project, which may well choose to treat it as a hard internal rule;
+that decision belongs in the project's own guidance, not in an interoperability
+specification.
+
+**The specific policy is deliberately left open.** Rejecting the open, treating
+the absent Clock as a defined default, restricting StampAt to none for such a
+session, or some other resolution are all consistent with the recommendation
+above, and each has different consequences for clients and for the
+parameter-presence model. This specification does not choose among them; that is
+a decision for the `irtt-rs` implementation work, to be made and recorded there.
+What this section establishes is the observed upstream behavior, plus a
+recommendation that any choice should satisfy.
 
 ---
 
@@ -1807,12 +2340,20 @@ inspected, what was attempted, and what evidence would settle it.
   does it vary with how the platform reports interface MTUs?
 - **Why it matters:** It determines the largest length a server can honestly
   negotiate.
-- **Evidence inspected:** Measured on one host: replies capped at exactly the
-  bind interface's MTU (1500 on an Ethernet interface); loopback with a
-  16384-byte MTU was masked by a smaller maximum outbound datagram size.
-- **Attempted:** Two interfaces with different MTUs on one host.
+- **Evidence inspected:** Measured on one host across three interfaces —
+  loopback (16384), Ethernet (1500) and a tunnel (1280). On the **Ethernet and
+  tunnel** interfaces the reply was capped at exactly that interface's MTU, byte
+  for byte (1281 → 1280), and a negotiated length at or below the MTU was emitted
+  in full. The **loopback** interface shows only that lengths up to 8000 were
+  emitted unclamped: its cap cannot be approached on this host, because a reply
+  beyond roughly 9300 bytes ends the server process first (Section 22.1), so no
+  16384-byte boundary was observed and none is claimed.
+- **Attempted:** Three interfaces with different MTUs on one host.
 - **Would resolve it:** The same measurement on Linux and Windows hosts with
-  jumbo-frame and tunnel interfaces.
+  jumbo-frame and tunnel interfaces. The exact-cap result rests on two interfaces
+  of one host and says nothing about how another platform reports interface MTUs;
+  a host whose maximum outbound datagram size exceeds its loopback MTU would also
+  settle whether the rule holds for a large-MTU interface.
 
 ### 23.6 Whether any trigger other than the duration limit sets Close on a reply
 
@@ -1865,7 +2406,9 @@ in Section 24.3 and are deliberately not mixed in.
 6. Return a zero token and the Close flag for a no-test open, and create no
    session for it.
 7. Bind each session to its token **and** its source endpoint, and drop packets
-   that fail either check without disturbing the session.
+   that fail either check. For a live, non-expired session, that drop leaves the
+   session usable from its bound endpoint; see Section 18.2 for the separately
+   observed expired-session release behavior.
 8. Echo the token and sequence number unchanged in every echo reply.
 9. Emit the negotiated fields in the specified order, and pad to the negotiated
    length. For StampAt = Midpoint this means the fields the negotiated Clock
@@ -1898,21 +2441,28 @@ in Section 24.3 and are deliberately not mixed in.
 
 ### 24.3 Robustness recommendations for the clean implementation
 
-Not interoperability requirements. No conforming client can observe whether these
-were followed; they are here because each addresses a behavior observed upstream
-that a new implementation should not copy.
+Not standalone interoperability requirements. They are here because each
+addresses a behavior observed upstream that a new implementation should not
+copy. Particular failures, including a process-wide failure caused by another
+peer, can be observable to a conforming client; these recommendations do not
+choose the clean implementation's specific policy.
 
-1. Treat a per-packet send failure as a per-packet event, not a fatal one
-   (Sections 6.3, 22.1).
+1. Treat a per-packet send failure as a per-packet event, not a fatal one, and
+   keep a failure while serving one session from stopping unrelated sessions or
+   unrelated listeners (Sections 6.3, 22.1).
 2. Operate under a bounded session-resource policy, and expire sessions that have
    never carried an echo request (Sections 7.6, 18.2, 18.3). The specific limits
    and eviction policy are a clean-project decision.
 3. Validate a fill descriptor before use, and reject a zero-length pattern
    (Section 22.2).
-4. Reject or clamp DSCP values the socket cannot carry, during negotiation
-   (Section 20).
+4. Reject or clamp DSCP values outside `0..=255` during negotiation to avoid
+   accepting a value that leads to an observed no-reply session (Section 20).
 5. Clamp the negotiated length to what the server can actually transmit
    (Sections 22.1, 22.3).
+6. Never let a set of session parameters the server accepted at open produce a
+   fatal condition on a later request (Section 22.5). Which resolution to adopt
+   for an open that selects timestamps without a clock is deliberately left to
+   the implementation work.
 
 ---
 
