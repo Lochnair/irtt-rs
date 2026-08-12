@@ -773,11 +773,20 @@ The following configuration parameters affect protocol behavior:
   produce the wire byte) or the raw 0–255 byte is a presentation decision for
   that project, to be made and implemented separately. It is not a protocol
   fact and this specification does not prescribe it.
-- **Protocol:** The server echoes packets with the negotiated DSCP value.
-  The server MAY disallow DSCP and reset it to 0.
+- **Protocol:** For negotiated values in `0..=255`, the server echoes packets
+  with that DSCP value. The server MAY disallow DSCP and reset it to 0.
+  Negative and out-of-range handling is host-specific; see
+  `IRTT_SERVER_PROTOCOL_SPEC.md` Section 20.
 - **Observed behavior:** DSCP/TOS is applied only to echo request and echo
   reply packets. Open and close packets use TOS=0 regardless of the
   negotiated DSCP value. [**Verified 2026-04-28** — Finding C.]
+- **Scope of the previous bullet (clarified 2026-08-12).** "Open and close
+  packets" means **standalone** datagrams: the open request, the open reply, and
+  the client's close request. A **server-initiated close** is not one of them —
+  it is an ordinary echo reply that additionally sets the Close flag, and it
+  carries the session's in-range negotiated marking like any other echo reply. A
+  client must not expect such a reply to arrive unmarked. See
+  `IRTT_SERVER_PROTOCOL_SPEC.md` Sections 15.2 and 20.
 
 ### 10.9 Open Timeouts
 
@@ -1518,12 +1527,29 @@ maximum default is 76 bytes (both+both+both+HMAC).
 **Status:** Verified 2026-08-11, irtt 0.9.1, macOS arm64.
 
 **Result:** Yes. A server that enforces a maximum test duration answers the
-first echo request arriving after its hard deadline (the configured maximum
-duration plus a 2-second grace, measured from the session's first echo request)
-with a complete, ordinary echo reply that additionally has the Close flag set,
-and removes the session at the same moment. Measured: a 1-second maximum
-produced a close-flagged reply 3.01 s after the first echo; a 2-second maximum
-produced one at 4.06 s.
+first otherwise-serviceable echo request after its hard deadline with a complete,
+ordinary echo reply that
+additionally has the Close flag set, and removes the session at the same moment.
+The deadline is the configured maximum duration plus a 2-second grace, measured
+from the session's first echo request that is actually **served**. Measured: a
+1-second maximum produced a close-flagged reply 3.01 s after the first echo; a
+2-second maximum produced one at 4.06 s.
+
+*Refined 2026-08-12.* This entry previously said the deadline was measured from
+the session's first echo request, and that the first request after the deadline
+carries the flag. A later boundary sweep narrowed both ends. For the **origin**,
+a request that is dropped — the two classes tested were exceeding the maximum
+length and arriving from a foreign source endpoint — does not start the clock,
+and a later served echo does. For the **trigger**, a deadline-crossing request
+that was rate-limited did not carry the flag; the next served echo did. The
+corresponding behavior for other independently dropped post-deadline request
+classes was not tested and is not specified here. The earlier measurements above
+are unaffected, because their first request was served and their triggering
+request was too. The same sweep showed the 2-second margin to be additive
+across configured maxima of 500 ms, 1 s and 3 s. See
+`IRTT_SERVER_PROTOCOL_SPEC.md` Section 15.2 and
+`BLACKBOX_VERIFICATION_REPORT.md` Finding S-23; nothing a client does depends on
+the distinction, since a conforming client never reaches the deadline.
 
 A conforming client never reaches this deadline, because it stops sending at the
 negotiated duration. The mechanism exists to bound sessions from clients that

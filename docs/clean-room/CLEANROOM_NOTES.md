@@ -297,8 +297,9 @@ Two upstream robustness defects are recorded in the server specification
 reachable from ordinary client traffic and a clean implementation has to decide
 what to do instead. They are stated as observed outcomes plus **robustness
 recommendations for the clean implementation** — explicitly not as
-interoperability requirements, since no conforming client can observe which
-choice a server made — with no description of the internal cause.
+interoperability requirements. A conforming client cannot trigger the
+absent-Clock defect through conforming negotiation, but can observe a
+process-wide outage if another peer triggers it; no internal cause is described.
 
 ### Server-Pass Sanitization Audit
 
@@ -463,15 +464,17 @@ and removed.
 
 ### Statement classification
 
-The outgoing documents now separate five kinds of statement and never conflate
+The outgoing documents now separate six kinds of statement and never conflate
 them: interoperability requirement; black-box observed upstream behavior;
-upstream policy or default; robustness recommendation for the clean
-implementation; and source-assisted historical conclusion.
+black-box inference; upstream policy or default; robustness recommendation for
+the clean implementation; and source-assisted historical conclusion.
 
 Specific reclassifications made in this pass:
 
 - Surviving a failed reply send is a **robustness recommendation**, not a
-  protocol MUST. No conforming client can observe which choice a server made.
+  protocol MUST. A process-wide failure can be visible to unrelated conforming
+  clients, but that does not make a particular clean resilience policy an
+  interoperability requirement.
 - Upstream's absence of session and per-peer bounds is **observed policy**, and
   the documents now say explicitly that it is not something a compatible server
   should reproduce. The clean server is expected to be bounded; the shape of that
@@ -610,3 +613,243 @@ macOS Finder metadata file previously listed here is no longer present; the
 exclusion still stands, since Finder can recreate one at any time. Re-verified
 2026-08-11: the dotted directory is the only ignored entry under `docs/`, and no
 Finder metadata file exists anywhere in the outgoing tree.
+
+---
+
+## Server Deep-Dive Airlock (2026-08-12)
+
+This section records **provenance and boundary discipline** for the material added
+on 2026-08-12. It is not implementation archaeology, and it deliberately contains
+no detail about what the contaminated-side work looked at.
+
+### What happened outside this repository
+
+A further source-assisted research phase on the upstream server took place in a
+separate contaminated workspace, outside this repository and outside `docs/`. As
+in the earlier passes, that workspace held upstream source, upstream tests,
+upstream history, source-assisted analysis, purpose-built harnesses, build trees,
+binaries, raw result files, server logs, and black-box packet evidence. The
+overwhelming majority of it is not admissible here and did not cross.
+
+### What was admitted, and what the airlock agent was allowed to see
+
+The transfer was performed by an agent working in this clean repository under an
+explicit airlock restriction. Its **entire** permitted view of the contaminated
+workspace was:
+
+1. a single sanitizer-candidate report of **independently black-box-verified**
+   findings — written to be transferable without upstream source access, and
+   containing no source snippets, filenames, function or type names, or internal
+   structure; and
+2. the black-box packet captures that report referenced, for the purposes of
+   confirming the packet-level evidence, checking container metadata, and copying
+   suitable files into the clean evidence set.
+
+The agent was explicitly **prohibited** from inspecting, and did not inspect:
+
+- the source-assisted findings report;
+- the unresolved/source question matrix;
+- the contaminated workspace's own README;
+- upstream source, upstream tests, or upstream git history;
+- any upstream checkout;
+- the research build trees and harnesses;
+- raw result files;
+- server logs.
+
+It was further prohibited from searching the contaminated workspace at large. No
+recursive search, and no history or blame inspection, was performed there; the
+only accesses were direct reads of the two authorized items above. No raw result
+file was opened at all — the authorized report's own text proved sufficient for
+every statement transferred, so the narrowest available boundary was kept.
+
+### What the boundary cost, deliberately
+
+Several items in the authorized report were **not** transferred, and the reasons
+are worth recording because they are the boundary doing its job:
+
+- An account of the order in which the server reports rejection reasons, taken
+  from the server's own diagnostic output. Even though that output is externally
+  emitted, it describes internal check ordering, and the clean specification had
+  already deliberately replaced its admission narrative with a table of discard
+  conditions plus the two precedence relationships that were verified on the
+  wire. Re-importing an ordering narrative would have undone that work.
+- A statement that a session is removed before its close-flagged reply is sent.
+  That is internal ordering; only its externally visible consequence crossed, and
+  that consequence was already recorded.
+- A generalisation about which flag combinations are dropped on a data packet
+  carrying a live token. The clean documents already carry a **more precise**
+  account of the same behavior, and the broader statement would have weakened it.
+- An inference that the wire format offers no general extension channel. It
+  crossed only as an explicitly labelled inference, alongside the byte encodings
+  actually tested, rather than as a property of the format.
+
+Where the authorized report was insufficient to support a clean statement, the
+statement was not made and the ambiguity was left standing. Nothing was resolved
+by consulting anything else.
+
+### Classification discipline
+
+Every new statement was classified before it was written, and the classification
+appears in the text: observed upstream behavior, black-box inference, upstream
+policy, protocol requirement, robustness recommendation for the clean
+implementation, or remaining unknown. The server specification's statement-level
+table was extended with the inference level and with the host-specific marking
+that several of these results require.
+
+Two boundaries were held particularly deliberately:
+
+- **An upstream defect was not promoted to a protocol requirement.** The most
+  significant finding of this pass is an open request that upstream accepts and
+  then faults on. It is recorded as an observed robustness defect with a
+  must-not-crash recommendation for the clean server, and the documents state
+  explicitly that reproducing the fault is not an interoperability requirement.
+- **No implementation policy was chosen.** The documents record what upstream
+  does about an open that selects timestamps without a clock, about a negative
+  Length, about out-of-range DSCP values, and about payload fill — and in
+  each case say that the clean project's choice is a decision for the
+  implementation work, not one this evidence settles. Those decisions remain open.
+
+Host-specific figures — interface MTUs, the tested host's maximum outbound
+datagram size, interface-MTU effective-length decision knees, and platform
+handling of out-of-range DSCP values — are labelled as host-specific wherever
+they appear, so that none is mistaken for a protocol constant or compiled into an
+implementation.
+
+### Captures admitted
+
+Three captures crossed, each because it materially supports a finding that is new
+to the clean documents:
+
+| File | Packets | What it proves |
+|------|---------|----------------|
+| `../protocol/captures/server-clock-absent.pcapng` | 3 | An open selecting timestamps with no Clock tag is answered with a token and no Clock parameter, and the first echo is the last packet in the exchange |
+| `../protocol/captures/server-expiry-consumption.pcapng` | 14 | Control and foreign-endpoint-first test: whether the first tested packet to reach an expired session emits a reply |
+| `../protocol/captures/server-dscp-interleaved.pcapng` | 32 | Four interleaved sessions with distinct DSCP values over three rounds, no cross-session leakage, unmarked open replies |
+
+Each was reviewed before copying and rewritten into the container convention
+already used here: packet records and the rewriting tool's own version string
+only, with no capture comment, no section or interface description, no host, user
+or machine identification, no capture filter, and no filesystem path. Packet
+bytes and per-frame timestamps were **not** altered — for each file the full
+frame hexdump and the per-frame epoch timestamps were verified identical before
+and after, and the packet counts above are unchanged from the originals. The
+copied files were re-inspected afterwards and contain no string other than the
+rewriting tool's version.
+
+Two further captures were reviewed and **not** admitted: one materially redundant
+with a capture already present, and one that on inspection did not demonstrate
+the behavior it was associated with. In both cases the textual result was kept
+instead, which is the preferred trade — a textual black-box result is better than
+an unnecessary addition to the evidence set. The reasoning is recorded in the
+verification report rather than only here.
+
+### Review corrections applied before merge
+
+Review of the airlock commit found several places where the wording claimed more
+than the admitted evidence supports. Each was narrowed to the observation, using
+the clean evidence set only — no contaminated material was consulted to resolve
+any of them:
+
+- The reply-length cap is stated as byte-exact only for the two interfaces where
+  that was measurable. The loopback row shows lengths up to 8000 emitted
+  unclamped and nothing about a 16384-byte boundary, which this host cannot reach
+  because a reply beyond roughly 9300 bytes ends the server first.
+- The interleaved DSCP capture is described as the three rounds it contains, and
+  the separate observation that an open reply is unmarked on a listener that has
+  already sent marked replies is attributed to the capture that actually shows it
+  — an existing capture from the first pass — rather than to the new one, whose
+  open exchanges all precede its first marked reply.
+- The fill-phase result is scoped to continuity across the sessions tested and
+  across the tested IPv4 and IPv6 listeners, rather than asserting one stream
+  shared by every session of a process. The recommendation previously drawn from
+  it was **removed**: the default fill is a fixed public pattern, so its phase
+  carrying across sessions discloses nothing about another peer, and the
+  observation does not justify prescribing per-session fill state. The genuine
+  no-cross-peer-data invariant was already stated for the no-fill mode and is
+  untouched.
+- The must-not-crash advice no longer uses RFC 2119 keywords, which this document
+  reserves for interoperability requirements. It is a robustness recommendation,
+  and how strictly the implementing project binds itself to it belongs in that
+  project's own guidance.
+- The presence-versus-zero rule is scoped to the reply direction. Requests do
+  carry present zeros — `Length = 0` and `DSCP = 0` are accepted, and `Clock = 0`
+  is rejected precisely because it is present.
+- The admission-table row for an open with no Clock now says the **open** is
+  answered normally, not the session, which is what the evidence shows.
+- The maximum-duration origin refinement was carried into the client
+  specification as well, since both documents are compatibility baselines and
+  would otherwise state the lifecycle rule differently.
+
+A second review round found five further places where the first correction pass
+had left an inconsistency behind, and these were fixed the same way:
+
+- The must-not-crash advice is called a **recommendation** everywhere, including
+  in the paragraph that follows it and in the behavioral vector, so that dropping
+  the RFC 2119 keywords was not undone two sentences later.
+- The remaining-unknown entry on reply-length capping was brought into line with
+  the corrected §9.2: exact only for the Ethernet and tunnel interfaces, with the
+  loopback trial recorded as a lower bound.
+- The maximum-duration origin is stated for the **two** drop classes actually
+  tested in the first-request position — oversized and foreign-endpoint — instead
+  of generalising to any dropped request. Corrected in the specification, the
+  vector and the verification report together.
+- The "first post-deadline request is still answered" rule is qualified to a
+  request that would otherwise be served, since the same subsection then shows a
+  foreign-endpoint packet being dropped while still consuming the release.
+- "Close packets are unmarked" is scoped to standalone datagrams. A
+  server-initiated close is an echo reply carrying the session's marking, and
+  both specifications now say so rather than leaving the two statements to
+  contradict each other.
+
+A final documentation-only review correction restricted the maximum-duration
+dropped-trigger result to the directly tested rate-limit case and corrected
+fill alternatives as observable but interoperability-equivalent. It used no new
+evidence or contaminated material.
+
+None of these corrections required new evidence, and none changed a
+classification from observation to requirement or the reverse.
+
+No binaries, source, harnesses, build trees, server logs, result files or
+research directories crossed.
+
+### Clean-Room Compliance Checklist (Deep-Dive Airlock)
+
+- [x] Source-assisted findings report never opened.
+- [x] Unresolved/source question matrix never opened.
+- [x] Upstream source, tests and history never opened.
+- [x] Research build trees and harnesses never opened.
+- [x] Raw result files never opened.
+- [x] Server logs never opened.
+- [x] No recursive search, log or blame inspection performed in the contaminated
+      workspace.
+- [x] Only independently black-box-verified evidence transferred.
+- [x] Every transferred statement classified, with observation separated from
+      inference and from recommendation.
+- [x] Upstream defects recorded as defects, not as protocol requirements.
+- [x] Host-specific figures labelled as host-specific.
+- [x] Clean implementation policy decisions left open for the implementation work.
+- [x] Captures metadata-reviewed, container-rewritten, and verified
+      byte-identical in packet data and timestamps.
+- [x] No production code changed by the airlock work.
+
+### 2026-08-12 — PR #76 final review wording cleanup
+
+An interrupted prior agent's local maximum-duration and rate-limit corrections
+were reviewed rather than discarded: the maximum-duration trigger clarification
+was retained, while the rate-limit interaction was kept as a black-box inference
+rather than promoted to unsupported RFC 2119 language. Using clean evidence only,
+this review also removed the false request-length invariant, scoped normal DSCP
+marking to `0..=255`, and clarified that a dropped first post-expiry packet can
+release the session before any final reply is emitted. No contaminated material
+was consulted.
+
+### 2026-08-12 — PR #76 black-box claim review correction
+
+The latest review found a blanket discard-state claim that conflicted with the
+observed rate-limit idle refresh, stale compact maximum-duration and idle-expiry
+summaries, and an over-prescriptive parameter-presence statement. It also found
+two black-box observations expressed as internal mechanism claims: pre-policy
+receive truncation and a rejected OPEN leaving no internal state; configured and
+negotiated limiter intervals had likewise been conflated. The wording now states
+observable results or explicit inference only. No contaminated material was
+consulted, no new evidence was added, and no implementation policy was chosen.

@@ -2,7 +2,7 @@
 
 **Source:** Black-box observation of an upstream IRTT **0.9.1 release** server on
 macOS Darwin 25.5.0 arm64, driven by a raw UDP harness.
-**Date:** 2026-08-11
+**Date:** 2026-08-12
 **Companion to:** `../IRTT_SERVER_PROTOCOL_SPEC.md`
 
 These vectors are stated as **input → observed output**. They describe what a
@@ -10,10 +10,12 @@ server was seen to emit for a given request sequence. They do not describe how
 any implementation produces those bytes.
 
 Unless a row says otherwise, the server under test is the unmodified upstream
-0.9.1 release. Two other builds appear only in Section 5.2.3, each named
-explicitly: the 0.9.0 release, and a build of the upstream development tree six
-upstream commits past the 0.9.1 tag. Results from those builds never stand in for
-0.9.1.
+0.9.1 release. Two other builds appear where they are named explicitly: the 0.9.0
+release, and a build of the upstream development tree six upstream commits past
+the 0.9.1 tag. Results from those builds never stand in for 0.9.1. Section 5.2.3
+is a version *comparison*, where the three builds differ; elsewhere the other two
+builds are named only to record that a 0.9.1 result reproduced on them unchanged
+(Sections 3.2, 4.7, 8.1, 8.2).
 
 Addresses in the accompanying captures are loopback only. Session tokens are
 server-assigned random values and differ per run; where a token appears below it
@@ -264,6 +266,38 @@ session:
 
 The deadline is the configured maximum duration plus a 2-second grace period.
 
+Boundary sweep, probes spaced 50 ms, offsets measured from the first **served**
+echo of the session:
+
+| configured maximum duration | last offset answered normally | first offset carrying Close |
+|-----------------------------|-------------------------------|-----------------------------|
+| 500 ms | 2.45 s | 2.50 s |
+| 1 s | 2.95 s | 3.00 s |
+| 3 s | 4.95 s | 5.00 s |
+
+The 2-second margin is additive across the configured maximum, not proportional
+to it. Reproduced on the 0.9.0 release, the 0.9.1 release and the tested
+post-0.9.1 development build.
+
+What starts and what carries the deadline:
+
+| case | result |
+|------|--------|
+| Session opened 5 s before its first echo | deadline unchanged — the open does not start it |
+| First request oversized (dropped by the maximum-length policy) | clock **not** started; a later served echo starts it |
+| First request from a foreign source endpoint (dropped) | clock **not** started; a later served echo starts it |
+| Echo that crosses the deadline | full normal reply with Close set; **counted** in the received count and window it reports |
+| Echo that crosses the deadline but is itself rate-limited | dropped, no reply; the **next served** echo carries the Close flag |
+| Client's next echo after the close-flagged reply | no reply — token released |
+| Client's close request after the close-flagged reply | no reply — token released |
+
+Two drop classes were tested as the session's first request — an oversized
+request and one from a foreign source endpoint — and neither started the
+deadline; a later served echo became the origin instead. The other drop classes
+of Section 9 were not tested in that position, and this vector makes no claim
+about them. The rate-limit row above concerns a request that crosses an
+already-running deadline, not one that would start it.
+
 ### 3.3 Observed upstream client reaction to a close-flagged reply
 
 Driving an upstream 0.9.1 client against a server that sets the Close flag from
@@ -360,6 +394,20 @@ Requesting a 2 s interval against a 4 s idle timeout produces a reduction to
 exactly 1 s: rejected in strict mode as an ordinary restriction, accepted in
 loose mode.
 
+Boundary rows with a configured **minimum** interval as well. The requested
+interval is raised to the minimum first and capped to (idle timeout ÷ 4)
+afterwards, so the returned value can end up below the configured minimum:
+
+| server minimum interval | server idle timeout | requested | negotiated |
+|-------------------------|---------------------|-----------|------------|
+| 100 ms | 1 min | 10 ms | 100 ms — raised to the minimum |
+| 100 ms | 1 min | 100 ms | 100 ms — unchanged |
+| 100 ms | 1 min | 60 s | 15 s — capped at timeout ÷ 4 |
+| **5 s** | **4 s** | 10 ms | **1 s** — the cap wins, below the configured minimum |
+| 5 s | 0 (disabled) | 10 ms | 5 s — no cap applies |
+| 0 | 4 ns | 10 ms | 1 ns |
+| 0 | 1 ns | 10 ms | **absent from the reply** — the cap is 0, and a restricted value of zero is omitted |
+
 ### 4.5 Timestamp allowance
 
 Requested StampAt → negotiated StampAt, by server timestamp allowance:
@@ -371,6 +419,68 @@ Requested StampAt → negotiated StampAt, by server timestamp allowance:
 | 2 (receive) | 2 | 2 | 0 |
 | 3 (both) | 3 | **4** | 0 |
 | 4 (midpoint) | 4 | 4 | 0 |
+
+### 4.6 Repeated occurrences of a known tag
+
+One open request per row, carrying the listed occurrences of a single tag.
+
+| parameter payload | result |
+|-------------------|--------|
+| Duration 1 s, then Duration 2 s | open reply, **Duration 2 s** |
+| Duration 2 s, then Duration 1 s | open reply, **Duration 1 s** |
+| Clock 1, then Clock 3 | open reply, **Clock 3** |
+| Clock 3, then Clock 4 (out of range) | **no reply** |
+| Duration 1 s, then Duration 0 (invalid) | **no reply** |
+| Duration 0 (invalid), then Duration 1 s | **no reply** |
+| ServerFill `rand`, then a 33-character string (invalid) | **no reply** |
+
+Among valid duplicates, the **last** occurrence wins for every known tag tested:
+ProtocolVersion, Duration, Interval, Length, ReceivedStats, StampAt, Clock, DSCP
+and ServerFill. Duration was additionally tested with an invalid occurrence in
+both orders, and both requests were dropped. Clock and ServerFill were tested
+with an invalid second occurrence, which was also dropped. The untested invalid
+orders and parameters are not generalized here.
+
+### 4.7 Absent Clock with a non-none restricted StampAt — upstream-defect vector
+
+Capture: `../captures/server-clock-absent.pcapng`. Default-configuration server.
+This vector records an **upstream robustness defect** (server specification
+Section 22.5) when timestamp restriction leaves the requested non-none StampAt
+non-none. It is a must-not-crash recommendation for a clean implementation, not
+a behavior to reproduce.
+
+| frame | direction | bytes | note |
+|-------|-----------|-------|------|
+| 1 | C → S | `14a75b01 05 06 06 06 04 00` | open; ReceivedStats = 3, StampAt = 3 (both), Length = 0, **no Clock tag** |
+| 2 | S → C | `14a75b03 7ca44127b2cd7eab 01 02 05 06 06 06` | open reply, non-zero token, ProtocolVersion 1, ReceivedStats 3, StampAt 3 — **no Clock parameter** |
+| 3 | C → S | `14a75b00 7ca44127b2cd7eab 00000000` | first echo, sequence 0 |
+
+Frame 3 is the last packet in the capture. It receives no reply, and the server
+process terminates; every other session on that process, on either address
+family, stops being served at the same moment.
+
+| variation | result |
+|-----------|--------|
+| Requested StampAt 1 (send), no Clock; restricted StampAt non-none | open accepted, first echo fatal |
+| Requested StampAt 2 (receive), no Clock; restricted StampAt non-none | open accepted, first echo fatal |
+| Requested StampAt 3 (both), no Clock; restricted StampAt non-none | open accepted, first echo fatal |
+| Requested StampAt 4 (midpoint), no Clock; restricted StampAt non-none | open accepted, first echo fatal |
+| Requested StampAt 0 (none), no Clock | open accepted, session serves normally with no timestamps |
+| **StampAt 3, explicit `Clock = 0`** | **open dropped, no reply, no session** — see Section 4.2 |
+| Requested StampAt 1 / 2 / 3 / 4, no Clock; no-timestamp policy restricts StampAt to none | open accepted, session serves normally with no timestamps |
+| Requested StampAt 1 / 2 / 3 / 4, no Clock; single-timestamp policy leaves restricted StampAt non-none | open accepted, first echo fatal |
+
+The last two rows are scoped to requested non-none, absent-Clock cases only:
+fatality depends on the server's restricted (effective) StampAt remaining
+non-none. The `StampAt 0` row is served normally whatever the server's timestamp
+policy, and the explicit `Clock = 0` row is rejected during negotiation before
+any policy applies; neither becomes fatal under either configuration.
+
+Reproduced on the 0.9.0 release, the 0.9.1 release and the tested post-0.9.1
+development build.
+
+The last four rows are the point of the vector: an omitted Clock and an explicit
+`Clock = 0` are different inputs with opposite upstream outcomes.
 
 ---
 
@@ -709,8 +819,10 @@ start the idle clock, wait, then two echoes back to back.
 | 7.5 s | answered | **dropped** |
 | 9.0 s | answered | **dropped** |
 
-Deadline = idle timeout + 5 s. The first request past the deadline is still
-answered, and the session is released while handling it.
+Observed session-release boundary = idle timeout + 5 s. The first
+otherwise-serviceable request past that boundary is still answered once by
+upstream, and the immediate follow-up is dropped. Section 8.3 shows what happens
+when a packet that would be dropped anyway touches the token first.
 
 **A session that has never carried an echo request does not expire.** With the
 same 2-second timeout, a session left completely idle for 9 seconds after open
@@ -718,6 +830,98 @@ was served normally on its first echo request.
 
 With the idle timeout disabled, a session idle for 9 seconds was served normally
 and remained usable.
+
+### 8.1 The grace is additive across configured timeouts
+
+Session-release boundary sweep, probes spaced 50 ms, three repetitions per row,
+gaps measured from the last accepted echo. Each probe used a first
+otherwise-serviceable echo after the gap and an immediate follow-up; the boundary
+is inferred from whether that follow-up was dropped:
+
+| configured idle timeout | longest gap with follow-up served | shortest gap with follow-up dropped |
+|-------------------------|----------------------------------|------------------------------------|
+| 500 ms | 5.45 s | 5.50 s |
+| 2 s | 6.95 s | 7.00 s |
+| 4 s | 8.95 s | 9.00 s |
+
+Every row sits at timeout + 5 s to within the probe spacing. At and beyond the
+observed release boundary, the first otherwise-serviceable post-gap echo may
+still receive a final lazy-release reply; the immediate follow-up is then
+dropped. The margin is the same five seconds at each timeout, so it is additive
+rather than proportional, and the boundary did not move with when the session
+was opened. Reproduced on the 0.9.0 release, the 0.9.1 release and the tested
+post-0.9.1 development build.
+
+### 8.2 Which drop classes keep a session alive
+
+Per row: open a session, send one echo (count 1), inject the listed packet, then
+send another echo. The second echo's count shows whether the injected packet was
+counted; separate timing trials show whether it moved the expiry boundary.
+
+| injected packet | counted / window advanced | extends the idle lifetime |
+|-----------------|---------------------------|---------------------------|
+| bad magic | no | no |
+| invalid flag bits | no | no |
+| Reply or Open flag on a data packet | no | no |
+| unknown token, or a zero token | no | no |
+| valid token from a foreign source endpoint | no | no — but see 8.3 |
+| echo truncated before the sequence number | no | no |
+| request over the configured maximum length | no | no |
+| bad, missing or zeroed MAC | no | no |
+| **request with no rate allowance left** | **no** | **yes** |
+
+The rate-limit row was separated from the alternatives three ways: a session fed
+only too-fast requests outlived its idle deadline; the same cadence of oversized
+requests did not; and a silent session expired on schedule. Reproduced on all
+three builds. It is the only tested drop class that keeps a session alive.
+
+### 8.3 The first packet to release an expired session determines whether a final reply is emitted
+
+Capture: `../captures/server-expiry-consumption.pcapng`. Server idle timeout 3 s,
+so the effective boundary is 8 s after the last accepted echo. Both trials are in
+the one capture, which is why it is worth keeping: the control and the test differ
+by a single injected packet.
+
+Control — session on port 49865, token `fff56ec42eb8caaa`:
+
+| frame | t | direction | packet | observed |
+|-------|---|-----------|--------|----------|
+| 3 | 0.00 s | C → S | echo seq 0 | reply, count 1 |
+| 5 | 8.00 s | C → S | echo seq 1 — first past the deadline | **reply**, count 2 |
+| 7 | 8.00 s | C → S | echo seq 2 | **no reply** — session released |
+
+Test — session on port 53237, token `9e27590dbb016eb9`, opened at 8.70 s:
+
+| frame | t | direction | packet | observed |
+|-------|---|-----------|--------|----------|
+| 10 | 8.70 s | C → S | echo seq 0 | reply, count 1 |
+| 12 | 16.71 s | **X → S** | echo seq 9, correct token, **foreign source port 64688** | no reply — foreign endpoint, as at any time |
+| 13 | 17.02 s | C → S | echo seq 1 — the client's first past the deadline | **no reply** |
+| 14 | 17.72 s | C → S | echo seq 2 | no reply |
+
+Frame 13 is the result. In the control the equivalent request was answered; here
+the foreign-endpoint packet at frame 12 arrived 0.3 s earlier, just past the same
+deadline, and the session was already gone. The foreign packet was itself dropped
+and released the session without receiving a reply, so no later request received a
+final reply. Whether it advanced the received count first cannot be read from this
+trial — the session emitted no further reply, so no statistic reports it. The
+not-counted result of Section 2 was measured on a live session, where a later
+reply exposed the count, and does not carry over to this path.
+
+The same effect was produced by a truncated echo, an oversized echo, a close
+request from a foreign endpoint, and a burst of unrelated ordinary opens arriving
+before the legitimate client's post-deadline request. These are the classes that
+were tested; the effect is not claimed for every possible packet.
+
+| injected before the client's post-deadline request | client's post-deadline request |
+|----------------------------------------------------|--------------------------------|
+| nothing (control) | **answered**, then the next one dropped |
+| echo from a foreign source endpoint | **unanswered** |
+| truncated echo | **unanswered** |
+| oversized echo | **unanswered** |
+| close from a foreign source endpoint | **unanswered** |
+| burst of unrelated ordinary opens | **unanswered** |
+| burst of unrelated **no-test** opens | **answered** — no-test opens create no session and reclaim none |
 
 ---
 
@@ -768,15 +972,74 @@ therefore 184 (0xb8) in this table, not 46.
 | 46 | 46 | delivered |
 | 184 | 184 | delivered |
 | 255 | 255 | delivered |
-| 256 | 256 | **all dropped** |
-| 300 | 300 | **all dropped** |
+| 256 | 256 | **no ECHO reply observed** |
+| 300 | 300 | **no ECHO reply observed** |
 | −5 | −5 | delivered |
 
 With DSCP disallowed by server policy, every requested value is returned as
 absent (0) and replies are delivered normally.
 
-A value the server cannot apply to its socket is still accepted during
-negotiation; the session then opens successfully and answers nothing.
+An out-of-range value is still accepted during negotiation; for values of 256 or
+above the session opens successfully but no ECHO reply was observed. Only that
+session is affected — the server kept serving its other sessions throughout.
+
+### 10.1 Interleaved sessions do not leak marks
+
+Capture: `../captures/server-dscp-interleaved.pcapng`. Four sessions opened
+back to back on one listener, then driven in three interleaved rounds of one echo
+each. The TOS byte column is the value read from the reply's IP header.
+
+| session (source port) | requested DSCP | open reply TOS | echo reply TOS, rounds 1–3 |
+|-----------------------|----------------|----------------|-----------------------------|
+| 62913 | 46 | **0x00** | 0x2e, 0x2e, 0x2e |
+| 52559 | 8 | **0x00** | 0x08, 0x08, 0x08 |
+| 57975 | not requested | **0x00** | 0x00, 0x00, 0x00 |
+| 64688 | 184 | **0x00** | 0xb8, 0xb8, 0xb8 |
+
+For each session in this capture, whose negotiated value is in `0..=255`, every
+echo reply carries its own session's value verbatim; no reply carried another
+session's value in any round. All four open replies are unmarked.
+
+Note what this capture does **not** show: its four open exchanges are frames 1–8
+and its first marked echo reply is frame 10, so no open reply here follows a
+marked reply. For that ordering see Section 10.2.
+
+### 10.2 Marking of the other packet kinds
+
+| packet | marking |
+|--------|---------|
+| open reply | always TOS 0, whatever the session negotiated |
+| echo reply | the session's negotiated value, verbatim for values in `0..=255` (see Section 10.3 for other values) |
+| server-initiated close reply (Section 3.2) | measured to carry the same session marking for values in `0..=255`; no capture in this set shows it — the close-flagged reply in `../captures/server-close.pcapng` is from a session that negotiated no DSCP, and is TOS 0 |
+| client-initiated close | no reply is sent at all |
+
+An open reply is unmarked even on a listener that has already sent marked
+replies. From `../captures/dscp-values.pcapng`, one listener serving two
+sessions in sequence:
+
+| frame | packet | TOS |
+|-------|--------|-----|
+| 3 | echo request, session 1 (DSCP 8) | `0x08` |
+| 4 | echo reply, session 1 | `0x08` |
+| 5 | close, session 1 | `0x00` |
+| 6 | open request, session 2 | `0x00` |
+| **7** | **open reply, session 2** | **`0x00`** |
+| 8 | echo request, session 2 (DSCP 32) | `0x20` |
+| 9 | echo reply, session 2 | `0x20` |
+
+Frame 7 is the point: it follows the marked reply of frame 4 on the same
+listener and is still unmarked.
+
+### 10.3 Observed handling of negative and out-of-range DSCP values
+
+| requested DSCP | address family | observed |
+|----------------|----------------|----------|
+| −1 | IPv4 | wire TOS **255** — the only negative value whose emitted marking was recorded; the transformation is not identified |
+| −1 | IPv6 | traffic class **0** |
+| 256 and above | either | negotiated and echoed back; no ECHO reply observed for that session |
+
+The v4/v6 difference was observed on the tested host, not established as a wire
+rule, and a compatible server is under no obligation to reproduce it.
 
 ---
 
@@ -788,6 +1051,9 @@ negotiation; the session then opens successfully and answers nothing.
 | `../captures/server-close-lifecycle.pcapng` | Client-initiated close, repeated close, and an echo after close — none answered |
 | `../captures/server-close.pcapng` | Server-initiated close via the maximum-duration limit; frame 36 carries flags `0x06` |
 | `../captures/server-session-identity.pcapng` | Foreign-source-port echo and close, unknown token, and the original endpoint continuing to be served |
+| `../captures/server-clock-absent.pcapng` | An open selecting timestamps but omitting the Clock tag is answered with a token and no Clock parameter; the first echo is the last packet in the exchange (Section 4.7) |
+| `../captures/server-expiry-consumption.pcapng` | Control versus foreign-endpoint-first: whether the packet that releases an expired session emits a final reply (Section 8.3) |
+| `../captures/server-dscp-interleaved.pcapng` | Four interleaved sessions with distinct DSCP values, three rounds each, no cross-session leakage, unmarked open replies (Section 10.1) |
 
 All captures are loopback traffic with the server on a fixed port and the client
 on an ephemeral port.
@@ -799,3 +1065,7 @@ no capture filter string, and no filesystem path — only the packet records and
 the rewriting tool's own version string. Packet bytes and timestamps were **not**
 altered: for each file, the full frame hexdump and the per-frame epoch timestamps
 were verified byte-identical before and after the rewrite.
+
+The three captures added on 2026-08-12 were rewritten and verified the same way,
+and their packet counts are 3, 14 and 32 respectively, unchanged from the
+originals.
