@@ -450,21 +450,34 @@ fn encoded_requests_decode_back_to_their_sender_side_identity() {
 }
 
 #[test]
-fn echo_encoding_rejects_a_negative_negotiated_length() {
+fn echo_encoding_floors_a_negative_negotiated_length_at_the_field_block() {
+    // A negative negotiated length is accepted during open and echoed back
+    // unchanged, so a real session can carry one. It must therefore stay
+    // encodable: it asks for no space beyond the mandatory fields.
     let params = Params {
         length: -1,
         ..Params::default()
     };
+    let packet = encode_request(
+        RequestToEncode::Echo {
+            token: TOKEN,
+            sequence: SEQUENCE,
+            params: &params,
+            payload: &[],
+        },
+        None,
+    )
+    .expect("a negative negotiated length must still encode");
+
+    // header (4) + token (8) + sequence (4).
+    assert_eq!(packet.len(), 16);
+    let request = decode_request(&packet).unwrap();
     assert_eq!(
-        encode_request(
-            RequestToEncode::Echo {
-                token: TOKEN,
-                sequence: SEQUENCE,
-                params: &params,
-                payload: &[],
-            },
-            None,
-        ),
-        Err(ProtoError::NegativePacketLength { length: -1 })
+        request.kind,
+        DecodedRequestKind::Echo {
+            token: TOKEN,
+            sequence: SEQUENCE,
+            tail: &[],
+        }
     );
 }

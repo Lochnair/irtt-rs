@@ -235,7 +235,6 @@ impl SessionMachine {
                 | irtt_proto::ProtoError::VarintOverflow
                 | irtt_proto::ProtoError::InvalidUtf8
                 | irtt_proto::ProtoError::InvalidEnum { .. }
-                | irtt_proto::ProtoError::NegativePacketLength { .. }
                 | irtt_proto::ProtoError::ParameterLengthTooLarge { .. }
                 | irtt_proto::ProtoError::MalformedParams),
             ) => Err(ClientError::Protocol(error)),
@@ -824,16 +823,13 @@ impl SessionMachine {
     }
 }
 
-pub(crate) fn recv_buffer_size(
-    has_hmac: bool,
-    negotiated: Option<&NegotiatedParams>,
-) -> Result<usize, ClientError> {
-    Ok(match negotiated {
-        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)?
+pub(crate) fn recv_buffer_size(has_hmac: bool, negotiated: Option<&NegotiatedParams>) -> usize {
+    match negotiated {
+        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)
             .saturating_add(1)
             .max(MIN_RECV_BUFFER_SIZE),
         None => MIN_RECV_BUFFER_SIZE,
-    })
+    }
 }
 
 pub(crate) fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {

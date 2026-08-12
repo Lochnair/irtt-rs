@@ -1,8 +1,8 @@
 use super::*;
+pub(crate) use irtt_proto::echo_packet_len;
 use irtt_proto::{
-    echo_packet_len as checked_echo_packet_len, encode_echo_reply, encode_open_reply,
-    flags::FLAG_OPEN, flags::FLAG_REPLY, layout::PacketLayout, Clock, EchoReply, OpenReply,
-    ReceivedStats, StampAt,
+    encode_echo_reply, encode_open_reply, flags::FLAG_OPEN, flags::FLAG_REPLY,
+    layout::PacketLayout, Clock, EchoReply, OpenReply, ReceivedStats, StampAt,
 };
 use std::{
     net::UdpSocket,
@@ -70,11 +70,6 @@ pub(super) fn open_reply(
         hmac_key,
     )
     .unwrap()
-}
-
-pub(crate) fn echo_packet_len(hmac: bool, params: &Params) -> usize {
-    checked_echo_packet_len(hmac, params)
-        .expect("test params must have a non-negative packet length")
 }
 
 pub(super) fn echo_reply_packet(

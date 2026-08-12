@@ -778,7 +778,7 @@ fn start_synchronized_peer_close_server(
         );
         assert_eq!(
             packet.len(),
-            echo_packet_len(false, &params).unwrap(),
+            echo_packet_len(false, &params),
             "expected a complete echo probe before synchronized peer-close reply"
         );
         let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());
@@ -829,7 +829,7 @@ fn start_gated_peer_close_server(
         }
         assert_eq!(
             packet.len(),
-            echo_packet_len(false, &params).unwrap(),
+            echo_packet_len(false, &params),
             "expected a complete echo probe before peer-close reply"
         );
         let seq = u32::from_le_bytes(packet[12..16].try_into().unwrap());

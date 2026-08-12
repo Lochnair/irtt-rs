@@ -1,7 +1,7 @@
 use crate::{
     params::{Params, StampAt},
-    ProtoError, Result, HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE,
-    TIMESTAMP_SIZE, TOKEN_SIZE,
+    HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE,
+    TOKEN_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -111,13 +111,23 @@ pub fn echo_header_len(hmac: bool, params: &Params) -> usize {
     PacketLayout::echo(hmac, params).header_len()
 }
 
-pub fn echo_packet_len(hmac: bool, params: &Params) -> Result<usize> {
-    let header_len = echo_header_len(hmac, params);
-    let requested =
-        usize::try_from(params.length).map_err(|_| ProtoError::NegativePacketLength {
-            length: params.length,
-        })?;
-    Ok(header_len.max(requested))
+/// The datagram length of an ECHO request or reply under `params`.
+///
+/// The negotiated length is a floor a peer asks for, never a ceiling: a packet
+/// can never be shorter than the field block its negotiated layout requires, so
+/// the result is `max(header, requested)`.
+///
+/// A negative negotiated length is a legitimate input rather than an encoder
+/// error. It is accepted during open and echoed back unchanged, so a session
+/// can genuinely carry one, and there is no datagram shorter than none — it
+/// therefore requests no space beyond the mandatory field block, exactly as
+/// zero does.
+pub fn echo_packet_len(hmac: bool, params: &Params) -> usize {
+    // Saturating rather than wrapping: on a target whose `usize` is narrower
+    // than the requested length, the largest representable packet is the
+    // closest honest answer, and the encoder's own limits reject it from there.
+    let requested = usize::try_from(params.length.max(0)).unwrap_or(usize::MAX);
+    echo_header_len(hmac, params).max(requested)
 }
 
 #[cfg(test)]
@@ -278,32 +288,18 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_length_never_smaller_than_header() {
+    fn negotiated_length_is_floored_at_the_required_field_block() {
+        // The 60-byte header of this layout is the floor. A negative negotiated
+        // length is not an error: it asks for nothing beyond the mandatory
+        // fields, exactly as zero does.
         let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
-        p.length = 20;
-        assert_eq!(echo_packet_len(false, &p).unwrap(), 60);
-        p.length = 92;
-        assert_eq!(echo_packet_len(false, &p).unwrap(), 92);
-    }
-
-    #[test]
-    fn checked_packet_len_rejects_negative_requested_length() {
-        let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
-        p.length = -1;
-
-        assert_eq!(
-            echo_packet_len(false, &p),
-            Err(ProtoError::NegativePacketLength { length: -1 })
-        );
-    }
-
-    #[test]
-    fn checked_packet_len_preserves_non_negative_header_floor() {
-        let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
-        p.length = 0;
-        assert_eq!(echo_packet_len(false, &p), Ok(60));
-
-        p.length = 92;
-        assert_eq!(echo_packet_len(false, &p), Ok(92));
+        for (length, expected) in [(-4096, 60), (-1, 60), (0, 60), (20, 60), (92, 92)] {
+            p.length = length;
+            assert_eq!(
+                echo_packet_len(false, &p),
+                expected,
+                "unexpected packet length for negotiated length {length}"
+            );
+        }
     }
 }

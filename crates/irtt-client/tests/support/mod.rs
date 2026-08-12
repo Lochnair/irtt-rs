@@ -12,12 +12,13 @@ use std::{
 
 use irtt_client::{Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, SocketConfig};
 use irtt_proto::{
-    compute_hmac_in_place, decode_request, echo_packet_len, encode_echo_reply, encode_open_reply,
-    flags, verify_packet_hmac, Clock, DecodedRequest, DecodedRequestKind, EchoReply, OpenReply,
+    compute_hmac_in_place, decode_request, encode_echo_reply, encode_open_reply, flags,
+    verify_packet_hmac, Clock, DecodedRequest, DecodedRequestKind, EchoReply, OpenReply,
     PacketLayout, Params, ProtoError, ReceivedStats, ServerFill, StampAt, TimestampFields,
     HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
 };
 
+pub(super) use irtt_proto::echo_packet_len as test_echo_packet_len;
 pub use real_irtt::RealIrtServer;
 
 const HMAC_OFFSET: usize = 4;
@@ -531,11 +532,6 @@ fn open_reply(flags: u8, token: u64, params: &Params, hmac_key: Option<&[u8]>) -
         hmac_key,
     )
     .unwrap()
-}
-
-pub(super) fn test_echo_packet_len(hmac: bool, params: &Params) -> usize {
-    echo_packet_len(hmac, params)
-        .expect("managed runner test params must have a non-negative packet length")
 }
 
 fn echo_reply_packet(

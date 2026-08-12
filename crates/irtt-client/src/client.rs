@@ -131,7 +131,7 @@ impl Client {
             schedule: None,
             socket,
             remote,
-            recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
+            recv_buffer: vec![0_u8; recv_buffer_size(false, None)],
             applied_traffic_class: None,
             #[cfg(test)]
             test_hooks: ClientTestHooks::default(),
@@ -530,10 +530,7 @@ impl Client {
             Ok(schedule) => schedule,
             Err(primary) => return Err(Box::new(PreparedClientOpenFailure { primary, machine })),
         };
-        let recv_buffer_len = match recv_buffer_size(self.runtime.has_hmac(), Some(negotiated)) {
-            Ok(size) => size,
-            Err(primary) => return Err(Box::new(PreparedClientOpenFailure { primary, machine })),
-        };
+        let recv_buffer_len = recv_buffer_size(self.runtime.has_hmac(), Some(negotiated));
         #[cfg(test)]
         let recv_buffer_len = self
             .test_hooks
