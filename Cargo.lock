@@ -731,6 +731,7 @@ name = "irtt-server"
 version = "0.4.0"
 dependencies = [
  "getrandom 0.4.3",
+ "irtt-client",
  "irtt-proto",
  "thiserror 2.0.20",
  "tokio",
