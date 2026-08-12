@@ -8,6 +8,7 @@
 //! Tokens come from a scripted source so session identity, collisions and
 //! allocation failure are all assertable.
 
+mod close;
 mod hmac;
 mod no_test;
 mod open;

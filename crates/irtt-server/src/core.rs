@@ -35,9 +35,9 @@ use crate::{
 ///
 /// # Scope
 ///
-/// This slice implements open handling and session creation. Echo and close
-/// requests are structurally recognized and then deliberately ignored — no
-/// reply, no session mutation — until their own slices.
+/// This slice implements open handling, session creation and client-initiated
+/// close. Echo requests are structurally recognized and then deliberately
+/// ignored — no reply, no session mutation — until their own slice.
 #[derive(Debug)]
 pub struct ServerCore {
     config: ServerConfig,
@@ -81,11 +81,8 @@ impl ServerCore {
     ///
     /// This is a lookup by token alone and is therefore *not* an admission
     /// check: a request is bound to a session only when the token matches and
-    /// it arrived from the session's exact endpoint.
-    //
-    // Called only by tests until echo and close processing arrive, which is
-    // what a token lookup is for.
-    #[allow(dead_code)]
+    /// it arrived from the session's exact endpoint. Callers pair it with an
+    /// endpoint comparison, as close handling does.
     pub(crate) fn session(&self, token: u64) -> Option<&Session> {
         self.sessions.get(&token)
     }
@@ -100,6 +97,10 @@ impl ServerCore {
     /// authentication, carries a malformed or out-of-range open parameter
     /// payload, would exceed the session bound, or is a request kind this slice
     /// does not implement. None of that mutates any live session.
+    ///
+    /// `Ok(None)` is not only a rejection, though. A close request that does
+    /// release its session is answered with nothing as well, because protocol
+    /// version 1 defines no acknowledgement for one.
     ///
     /// Authentication is checked before open parameters are decoded. That
     /// ordering is deliberate: a packet that fails authentication is discarded
@@ -133,11 +134,14 @@ impl ServerCore {
 
         match request.kind {
             DecodedRequestKind::Open { no_test, params } => self.handle_open(peer, no_test, params),
-            // Not implemented in this slice. A close must not remove a session
-            // and an echo must not advance receive state until the slices that
-            // implement those behaviors; emitting a placeholder reply now would
-            // be worse than silence.
-            DecodedRequestKind::Close { .. } | DecodedRequestKind::Echo { .. } => Ok(None),
+            DecodedRequestKind::Close { token } => {
+                self.handle_close(peer, token);
+                Ok(None)
+            }
+            // Not implemented in this slice. An echo must not advance receive
+            // state until the slice that implements it; emitting a placeholder
+            // reply now would be worse than silence.
+            DecodedRequestKind::Echo { .. } => Ok(None),
         }
     }
 
@@ -189,6 +193,30 @@ impl ServerCore {
         self.sessions
             .insert(token, Session::new(peer, reply.params));
         Ok(Some(packet))
+    }
+
+    /// Releases the session a close request names, if that request owns one.
+    ///
+    /// A close is bound to a session only when the token matches *and* the
+    /// datagram arrived from that session's exact endpoint, so holding a token
+    /// is not by itself authority to tear the session down: a close from a
+    /// foreign endpoint leaves it live, and one close cannot take down a
+    /// sibling session that the same peer opened separately. A token that is
+    /// unknown, already closed, or zero — zero is reserved for no-test replies
+    /// and never issued — matches nothing and leaves the table untouched.
+    ///
+    /// Nothing is sent either way, which is why this returns no reply to
+    /// encode. Protocol version 1 defines no acknowledgement for a client
+    /// close, so a delivered close is indistinguishable to the client from a
+    /// lost one, and the freed capacity is immediately reusable because the
+    /// session table is the only record of it.
+    fn handle_close(&mut self, peer: SocketAddr, token: u64) {
+        let owns_session = self
+            .session(token)
+            .is_some_and(|session| session.peer() == peer);
+        if owns_session {
+            self.sessions.remove(&token);
+        }
     }
 
     /// Encodes a reply this server constructed. Any failure here is internal.

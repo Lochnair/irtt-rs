@@ -29,15 +29,9 @@ impl Session {
     ///
     /// A session is bound to this endpoint, not merely to its address: address
     /// family, address, UDP source port and — for IPv6 — the scope identifier
-    /// all form part of its identity. Echo and close processing, once
-    /// implemented, must require both a token match and an exact endpoint match
-    /// before touching a session.
-    //
-    // Read only by tests until then. The endpoint has to be captured at open
-    // time — it is not recoverable later — so this slice stores state whose
-    // production consumer is the next one, and the tests prove it is stored
-    // exactly.
-    #[allow(dead_code)]
+    /// all form part of its identity. Close processing requires both a token
+    /// match and an exact endpoint match before removing a session, and echo
+    /// processing will require the same.
     pub(crate) fn peer(&self) -> SocketAddr {
         self.peer
     }
