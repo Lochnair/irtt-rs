@@ -7,7 +7,9 @@
 //!
 //! [`ServerCore`] is the deterministic protocol and session engine: packet
 //! admission, authentication policy, open negotiation, the session table,
-//! resource decisions and reply construction. It performs no I/O. Socket and
+//! echo receive state, resource decisions and reply construction. It performs
+//! no I/O; the clock its echo timestamps come from is a private injected seam,
+//! not a runtime abstraction, so the engine stays testable. Socket and
 //! runtime orchestration — the UDP listener, address handling, timers, expiry
 //! and shutdown — will live around it and is intentionally Tokio-native. There
 //! is no blocking or alternate-runtime counterpart and no transport
@@ -33,12 +35,14 @@
 //!
 //! # Current scope
 //!
-//! Open handling, session creation and client-initiated close. Echo
-//! processing, server-initiated close, session lifetime and expiry, and the
-//! Tokio runtime are separate slices; a structurally valid echo request is
-//! currently accepted by the admission boundary and then ignored.
+//! Open handling, session creation, normal echo processing and
+//! client-initiated close. Rate limiting, session lifetime and expiry,
+//! server-initiated close, DSCP application, the server fill policy and the
+//! Tokio runtime are separate slices: every otherwise admissible echo is
+//! answered, and a session lives until its client closes it.
 #![forbid(unsafe_code)]
 
+mod clock;
 mod config;
 mod core;
 mod error;

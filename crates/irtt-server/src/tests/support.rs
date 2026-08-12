@@ -5,11 +5,17 @@ use std::{
 };
 
 use irtt_proto::{
-    decode_open_reply, encode_request, varint, OpenReply, PacketLayout, Params, RequestToEncode,
-    FLAG_CLOSE, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY,
+    decode_echo_reply, decode_open_reply, encode_request, varint, EchoReply, OpenReply,
+    PacketLayout, Params, RequestToEncode, FLAG_CLOSE, FLAG_HMAC, FLAG_OPEN, FLAG_REPLY,
 };
 
-use crate::{core::ServerCore, error::ServerError, token::TokenSource, ServerConfig};
+use crate::{
+    clock::{ClockSample, ClockSource},
+    core::ServerCore,
+    error::ServerError,
+    token::TokenSource,
+    ServerConfig,
+};
 
 pub(crate) const KEY: &[u8] = b"correctkey";
 pub(crate) const OTHER_KEY: &[u8] = b"wrongkey";
@@ -67,9 +73,61 @@ impl TokenSource for ScriptedTokens {
     }
 }
 
-/// A core with deterministic tokens, so session identity is assertable.
+/// A clock handing out a fixed script of samples, then failing loudly.
+///
+/// Running the script dry is a test bug, not a wrap-around: a test that asserts
+/// timestamps must know exactly which sample each field came from. The core
+/// takes one sample when it classifies a datagram as an echo, and a second when
+/// an admitted echo is about to be answered.
+#[derive(Debug, Clone)]
+pub(crate) struct ScriptedClock {
+    samples: Arc<Mutex<VecDeque<ClockSample>>>,
+}
+
+impl ScriptedClock {
+    pub(crate) fn new<I>(samples: I) -> Self
+    where
+        I: IntoIterator<Item = ClockSample>,
+    {
+        Self {
+            samples: Arc::new(Mutex::new(samples.into_iter().collect())),
+        }
+    }
+
+    /// How many scripted samples are still unused.
+    pub(crate) fn remaining(&self) -> usize {
+        self.samples.lock().unwrap().len()
+    }
+}
+
+impl ClockSource for ScriptedClock {
+    fn sample(&mut self) -> ClockSample {
+        self.samples
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the scripted clock ran out: script one sample per echo received, and one more per echo answered")
+    }
+}
+
+pub(crate) fn sample(wall_ns: i64, mono_ns: i64) -> ClockSample {
+    ClockSample { wall_ns, mono_ns }
+}
+
+/// A core with deterministic tokens, so session identity is assertable. Its
+/// clock is the production one, which is fine for everything that does not
+/// assert timestamp values.
 pub(crate) fn core_with_tokens(config: ServerConfig, tokens: ScriptedTokens) -> ServerCore {
     ServerCore::with_token_source(config, Box::new(tokens))
+}
+
+/// A core with both nondeterministic sources scripted, for timestamp tests.
+pub(crate) fn core_with_sources(
+    config: ServerConfig,
+    tokens: ScriptedTokens,
+    clock: ScriptedClock,
+) -> ServerCore {
+    ServerCore::with_sources(config, Box::new(tokens), Box::new(clock))
 }
 
 /// An otherwise default core that authenticates iff `hmac_key` is set.
@@ -95,6 +153,80 @@ pub(crate) fn open_session(
         .unwrap()
         .expect("the session-creating open must be answered");
     expect_normal_open_reply(&packet, hmac_key).token
+}
+
+/// Opens one session carrying `params` and returns its token together with the
+/// parameters the server negotiated for it.
+///
+/// Echo tests need both: the token addresses the session, and the negotiated
+/// params are what the reply is laid out from and what decoding it requires.
+pub(crate) fn open_negotiated(
+    core: &mut ServerCore,
+    endpoint: SocketAddr,
+    params: &Params,
+    hmac_key: Option<&[u8]>,
+) -> (u64, Params) {
+    let packet = core
+        .handle_datagram(endpoint, &open_request(params, hmac_key))
+        .unwrap()
+        .expect("the session-creating open must be answered");
+    let reply = expect_normal_open_reply(&packet, hmac_key);
+    (reply.token, reply.params)
+}
+
+/// Params requesting exactly the echo layout a test cares about, with the
+/// duration and interval a well-behaved client sends.
+pub(crate) fn echo_params(
+    received_stats: irtt_proto::ReceivedStats,
+    stamp_at: irtt_proto::StampAt,
+    clock: irtt_proto::Clock,
+    length: i64,
+) -> Params {
+    Params {
+        received_stats,
+        stamp_at,
+        clock,
+        length,
+        ..client_params()
+    }
+}
+
+/// Encodes an echo request. `params` supplies only the *request's* own sizing;
+/// it is deliberately a separate argument from the session's negotiated params
+/// so tests can send requests shorter and longer than the session negotiated.
+pub(crate) fn echo_request(
+    token: u64,
+    sequence: u32,
+    params: &Params,
+    payload: &[u8],
+    hmac_key: Option<&[u8]>,
+) -> Vec<u8> {
+    encode_request(
+        RequestToEncode::Echo {
+            token,
+            sequence,
+            params,
+            payload,
+        },
+        hmac_key,
+    )
+    .unwrap()
+}
+
+/// Decodes an echo reply the server produced and checks the flags every reply
+/// must carry. Decoding verifies the MAC against `hmac_key` on the way.
+pub(crate) fn expect_echo_reply(
+    packet: &[u8],
+    params: &Params,
+    hmac_key: Option<&[u8]>,
+) -> EchoReply {
+    let reply = decode_echo_reply(packet, params, hmac_key).expect("server echo reply must decode");
+    // Exact equality, so Open and Close are pinned clear as well: Open makes an
+    // upstream client abort, and Close belongs to the server-initiated close
+    // slice.
+    let expected = FLAG_REPLY | if hmac_key.is_some() { FLAG_HMAC } else { 0 };
+    assert_eq!(reply.flags, expected, "echo reply flags");
+    reply
 }
 
 /// Encodes a normal open request carrying `params`.

@@ -71,8 +71,8 @@ impl ServerConfig {
     /// reduced to it during negotiation, and an open whose mandatory echo field
     /// block would not fit is silently refused, since the server could not emit
     /// a compliant reply for it. Authentication counts toward that field block.
-    /// The echo slice will additionally use this limit to admit inbound echo
-    /// request datagrams by their received length.
+    /// The same limit additionally admits inbound echo request datagrams by
+    /// their received length, before any receive state moves.
     ///
     /// The value is trusted local configuration, like
     /// [`with_max_sessions`](Self::with_max_sessions): an operator may

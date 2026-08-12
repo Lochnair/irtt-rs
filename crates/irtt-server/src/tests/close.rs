@@ -63,8 +63,8 @@ fn a_repeated_close_is_a_stale_token_and_changes_nothing() {
 
 #[test]
 fn an_echo_after_a_close_is_a_stale_token() {
-    // Echo processing does not exist yet; the point here is that the token is
-    // gone, so the request has no session to reach even once it does.
+    // The same request would have been answered a moment earlier: releasing the
+    // session takes its token with it, so there is nothing left to reach.
     for hmac_key in [None, Some(KEY)] {
         let mut core = core_for(hmac_key, ScriptedTokens::new([TOKEN_A]));
         let token = open_session(&mut core, peer(), hmac_key);

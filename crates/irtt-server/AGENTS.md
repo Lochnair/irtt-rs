@@ -103,9 +103,43 @@ effective parameters must be safe for the server to run.
 - Zero is a valid maximum and is not a synonym for unlimited: it refuses every
   session, and no-test opens with it, since both are validated against the same
   effective session.
-- The echo slice must reuse this same configured maximum to admit inbound echo
-  request datagrams by their received length, before any receive state is
-  mutated.
+- Echo request admission reuses this same configured maximum, comparing it
+  against the received datagram length before any receive state is mutated.
+
+## Echo processing
+
+- An accepted echo owns per-session `ReceiveState` — count, window and the
+  previous accepted sequence number. Admission order is authentication, then
+  received datagram length against the configured maximum, then token, then
+  endpoint; a request failing any of them mutates nothing, in this session or
+  any other.
+- The count and window transitions follow the clean specification's Section 10
+  and the Section 1 vectors, including the parts that read as defects: a
+  duplicate advances the count and leaves the window alone, and a late,
+  reordered or far-gap request resets the window to `0x1` rather than setting a
+  historical bit, because the distance is unsigned. Do not replace this with a
+  conventional selective-acknowledgement bitmap. Reference the vectors rather
+  than restating the tables here.
+- Only the token and sequence number mean anything in a request. The tail is
+  opaque, and the request's length never sizes the reply — layout and length
+  come from the session's negotiated params through `irtt-proto` alone.
+- The transition is pure and is committed only after the reply has encoded, so
+  an internal encoding failure cannot leave a session claiming to have answered
+  a request it never did.
+- Clock sampling is a private injected seam, like token generation, not a
+  runtime abstraction: the receive instant is taken as soon as a datagram is
+  classified as an echo and the send instant just before the reply is built, so
+  they bracket the server's own handling. The monotonic origin belongs to the
+  clock source and is stable for its life.
+- For a single-clock midpoint, `irtt-rs` emits the one negotiated field. It does
+  not reproduce upstream 0.9.1's dual-field midpoint; `irtt-proto` still decodes
+  that form from a peer.
+- Reply payload bytes are zero, which is the initial safe fill policy: payload
+  carries no protocol meaning, and a server must never emit residue from another
+  request or client. Request payload bytes never reach a reply.
+- Rate limiting, idle expiry, maximum duration, server-initiated close, DSCP
+  socket application and the full `ServerFill` policy are later slices. Do not
+  add placeholder session fields for them.
 
 ## Resource policy
 
@@ -130,9 +164,10 @@ half-created session.
   maintain shadow encoders for well-formed wire data.
 - Hand-build packets only where the point is a payload a compliant encoder
   cannot produce — truncated varints, out-of-range enums, corrupted MACs.
-- Token generation is the only nondeterministic part; tests inject a scripted
-  source so identity, collisions and allocation failure are assertable. Keep
-  that seam private.
+- Token generation and clock sampling are the only nondeterministic parts; tests
+  inject a scripted source for each, so identity, collisions, allocation failure
+  and timestamp values are all assertable. Keep both seams private, and keep
+  timestamp tests free of sleeps, tolerances and real wall-clock assertions.
 - As the server gains behavior, prefer it over fake peers for normal compliant
   behavior in other crates' tests. Keep small raw/adversarial peers for
   intentionally malformed or non-compliant wire behavior.
