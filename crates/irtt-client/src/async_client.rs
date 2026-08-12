@@ -246,7 +246,7 @@ impl AsyncClient {
             machine,
             schedule: None,
             remote,
-            recv_buffer: vec![0_u8; recv_buffer_size(false, None)],
+            recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
             applied_traffic_class: None,
             prepared_open: Some(prepared_open),
             prepared_probe: None,
@@ -820,7 +820,12 @@ impl AsyncClient {
                 return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }));
             }
         };
-        let recv_buffer_len = recv_buffer_size(self.machine.has_hmac(), Some(negotiated));
+        let recv_buffer_len = match recv_buffer_size(self.machine.has_hmac(), Some(negotiated)) {
+            Ok(size) => size,
+            Err(primary) => {
+                return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }));
+            }
+        };
         let negotiated_traffic_class = match u8::try_from(negotiated.params.dscp) {
             Ok(traffic_class) => traffic_class,
             Err(_) => {

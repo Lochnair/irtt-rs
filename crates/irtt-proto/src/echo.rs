@@ -66,7 +66,7 @@ pub fn encode_echo_reply(
     hmac_key: Option<&[u8]>,
 ) -> Result<Vec<u8>> {
     let layout = PacketLayout::echo(hmac_key.is_some(), params);
-    let len = echo_packet_len(hmac_key.is_some(), params);
+    let len = echo_packet_len(hmac_key.is_some(), params)?;
     let payload_offset = layout.header_len();
     let available_payload_len = len.saturating_sub(payload_offset);
     if reply.payload.len() > available_payload_len {
@@ -186,7 +186,7 @@ fn validate_echo_length(packet: &[u8], params: &Params, layout: PacketLayout) ->
             actual: packet.len(),
         });
     }
-    let expected_len = echo_packet_len(layout.hmac, params);
+    let expected_len = echo_packet_len(layout.hmac, params)?;
     if packet.len() == expected_len {
         return Ok(false);
     }
@@ -396,7 +396,7 @@ mod tests {
         };
         params.received_stats = ReceivedStats::Both;
         let layout = PacketLayout::echo(true, &params);
-        let mut packet = Vec::with_capacity(echo_packet_len(true, &params));
+        let mut packet = Vec::with_capacity(echo_packet_len(true, &params).unwrap());
         write_header(&mut packet, FLAG_REPLY | FLAG_HMAC);
         packet.extend_from_slice(&[0; HMAC_SIZE]);
         packet.extend_from_slice(&0x7896_b6ab_8771_5213u64.to_le_bytes());

@@ -1,7 +1,7 @@
 use crate::{
     params::{Params, StampAt},
-    HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE, TIMESTAMP_SIZE,
-    TOKEN_SIZE,
+    ProtoError, Result, HEADER_SIZE, HMAC_SIZE, RECV_COUNT_SIZE, RECV_WINDOW_SIZE, SEQ_SIZE,
+    TIMESTAMP_SIZE, TOKEN_SIZE,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,18 +123,30 @@ pub fn echo_header_len(hmac: bool, params: &Params) -> usize {
 /// therefore requests no space beyond the mandatory field block, exactly as
 /// zero does.
 ///
-/// Only the negative end is bounded. An absurdly large positive length is
-/// returned as asked, and encoding a packet that size fails in the allocator
-/// rather than here — on a 64-bit target every positive `i64` converts, so that
-/// has always been true of a length beyond addressable memory. Capping a
-/// negotiated length to something a UDP datagram can actually be belongs with
-/// the deferred maximum-packet-length policy, which would apply long before
-/// this conversion.
-pub fn echo_packet_len(hmac: bool, params: &Params) -> usize {
-    // Saturating keeps the same answer on a target whose `usize` is narrower
-    // than the length: still unallocatable, just unrepresentable sooner.
-    let requested = usize::try_from(params.length.max(0)).unwrap_or(usize::MAX);
-    echo_header_len(hmac, params).max(requested)
+/// # Errors
+///
+/// Returns [`ProtoError::PacketLengthUnrepresentable`] for a positive length
+/// this platform's `usize` cannot hold. That is a representability check, not a
+/// size policy: a wire value that cannot even name a local buffer must not be
+/// converted into one that can, because the result is handed to an allocator.
+/// It is unreachable on a 64-bit target, where every positive `i64` converts,
+/// and is the reason this returns a [`Result`] at all.
+///
+/// A ceiling on what a negotiated length may legitimately *be* — an MTU, a
+/// resource bound, a maximum packet size — is deliberately not here. That is
+/// server and runtime policy, and it belongs where the negotiation happens.
+pub fn echo_packet_len(hmac: bool, params: &Params) -> Result<usize> {
+    let header_len = echo_header_len(hmac, params);
+    let requested = if params.length <= 0 {
+        // No datagram is shorter than none, so a negative length asks for
+        // nothing beyond the mandatory field block, exactly as zero does.
+        0
+    } else {
+        usize::try_from(params.length).map_err(|_| ProtoError::PacketLengthUnrepresentable {
+            length: params.length,
+        })?
+    };
+    Ok(header_len.max(requested))
 }
 
 #[cfg(test)]
@@ -304,9 +316,26 @@ mod tests {
             p.length = length;
             assert_eq!(
                 echo_packet_len(false, &p),
-                expected,
+                Ok(expected),
                 "unexpected packet length for negotiated length {length}"
             );
         }
+    }
+
+    /// A positive length wider than `usize` must stay an error rather than
+    /// becoming a saturated buffer size. Only reachable where `usize` is
+    /// narrower than `i64`; on a 64-bit target every positive `i64` converts.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn a_length_wider_than_usize_is_rejected_rather_than_saturated() {
+        let mut p = params(ReceivedStats::Both, StampAt::Both, Clock::Both);
+        p.length = 5_000_000_000;
+
+        assert_eq!(
+            echo_packet_len(false, &p),
+            Err(ProtoError::PacketLengthUnrepresentable {
+                length: 5_000_000_000
+            })
+        );
     }
 }

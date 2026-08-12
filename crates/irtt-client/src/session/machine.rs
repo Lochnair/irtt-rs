@@ -823,13 +823,23 @@ impl SessionMachine {
     }
 }
 
-pub(crate) fn recv_buffer_size(has_hmac: bool, negotiated: Option<&NegotiatedParams>) -> usize {
-    match negotiated {
-        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)
+/// Sizes the receive buffer for the negotiated layout.
+///
+/// Fallible only because a negotiated length wider than `usize` cannot name a
+/// buffer at all. Negotiation already rejects a returned length that is
+/// negative or larger than this client requested, and the requested length is a
+/// `u32`, so the error is unreachable here in practice — it is propagated
+/// rather than asserted away so that no 64-bit assumption is baked in.
+pub(crate) fn recv_buffer_size(
+    has_hmac: bool,
+    negotiated: Option<&NegotiatedParams>,
+) -> Result<usize, ClientError> {
+    Ok(match negotiated {
+        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)?
             .saturating_add(1)
             .max(MIN_RECV_BUFFER_SIZE),
         None => MIN_RECV_BUFFER_SIZE,
-    }
+    })
 }
 
 pub(crate) fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {

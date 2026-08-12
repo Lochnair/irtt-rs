@@ -316,7 +316,7 @@ fn a_negative_negotiated_length_still_encodes_in_both_directions() {
         length: -4096,
         ..Params::default()
     };
-    assert_eq!(echo_packet_len(false, &params), 16);
+    assert_eq!(echo_packet_len(false, &params), Ok(16));
 
     let request = encode_request(echo_request(&params, &[]), None)
         .expect("a negative negotiated length must still encode a request");
@@ -372,7 +372,7 @@ fn midpoint_params(clock: Clock, payload_space: usize) -> Params {
 
 fn midpoint_compat_len(params: &Params, hmac: bool) -> usize {
     let compat_header = PacketLayout::echo(hmac, params).header_len() + 8;
-    compat_header.max(echo_packet_len(hmac, params))
+    compat_header.max(echo_packet_len(hmac, params).unwrap())
 }
 
 /// Hand-builds upstream's dual-midpoint ECHO reply: both midpoint fields on
@@ -425,7 +425,7 @@ fn midpoint_dual_field_reply_is_accepted_wherever_length_identifies_it() {
     for (payload_space, expected_extra) in [(0, 8), (1, 7), (4, 4), (7, 1)] {
         for clock in [Clock::Wall, Clock::Monotonic] {
             let params = midpoint_params(clock, payload_space);
-            let normal_len = echo_packet_len(false, &params);
+            let normal_len = echo_packet_len(false, &params).unwrap();
             let packet = build_midpoint_dual_field_reply(&params, FLAG_REPLY, 3, (111, 222), None);
             assert_eq!(
                 packet.len(),
@@ -464,7 +464,7 @@ fn midpoint_dual_field_reply_of_equal_length_is_accepted_but_not_correctable() {
     for payload_space in [8, 64] {
         for clock in [Clock::Wall, Clock::Monotonic] {
             let params = midpoint_params(clock, payload_space);
-            let normal_len = echo_packet_len(false, &params);
+            let normal_len = echo_packet_len(false, &params).unwrap();
             let packet = build_midpoint_dual_field_reply(&params, FLAG_REPLY, 4, (111, 222), None);
             assert_eq!(
                 packet.len(),
@@ -517,7 +517,7 @@ fn midpoint_dual_field_reply_authenticates_over_full_packet() {
 fn only_the_exact_compat_length_is_accepted_as_an_extension() {
     let params = midpoint_params(Clock::Wall, 0);
     let packet = build_midpoint_dual_field_reply(&params, FLAG_REPLY, 1, (10, 20), None);
-    let expected_len = echo_packet_len(false, &params);
+    let expected_len = echo_packet_len(false, &params).unwrap();
     assert_eq!(packet.len(), expected_len + 8);
 
     // Every other length around the compatibility size stays rejected,
