@@ -25,6 +25,14 @@ material does not establish a semantic, state the ambiguity instead of guessing.
 - No statistics, CLI or presentation concerns.
 - `SocketAddr` belongs here: endpoint identity is session state. It does not
   belong in `irtt-proto`.
+- Endpoint identity is compared field by field, not with `SocketAddr` equality.
+  Family, address and port are established components. The IPv6 flow label is
+  excluded because it identifies no endpoint; the IPv6 zone is included as a
+  deliberate project policy, because the specification records multi-zone
+  behavior as untested and two peers sharing a link-local address in different
+  zones are genuinely different peers. Reuse that one comparison rather than
+  writing a second identity rule, and keep both choices labelled as policy
+  rather than as verified compatibility.
 
 ## Core versus runtime
 

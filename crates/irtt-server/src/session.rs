@@ -27,17 +27,17 @@ impl Session {
 
     /// The exact source endpoint the open request arrived from.
     ///
-    /// A session is bound to this endpoint, not merely to its address: address
-    /// family, address, UDP source port and — for IPv6 — the scope identifier
-    /// all form part of its identity. Echo and close processing, once
-    /// implemented, must require both a token match and an exact endpoint match
-    /// before touching a session.
-    //
-    // Read only by tests until then. The endpoint has to be captured at open
-    // time — it is not recoverable later — so this slice stores state whose
-    // production consumer is the next one, and the tests prove it is stored
-    // exactly.
-    #[allow(dead_code)]
+    /// A session is bound to this endpoint, not merely to its address: the
+    /// address family, the address and the UDP source port all form part of its
+    /// identity, as — by `irtt-rs` policy rather than observed behavior — does
+    /// the IPv6 scope identifier. Close processing requires both a token match
+    /// and an endpoint match before removing a session, and echo processing
+    /// will require the same; `same_endpoint` in `core` is where the comparison
+    /// and its reasoning live.
+    ///
+    /// The address is stored exactly as received, including the flow label that
+    /// identity ignores, so a reply goes back to the endpoint the request
+    /// actually came from.
     pub(crate) fn peer(&self) -> SocketAddr {
         self.peer
     }

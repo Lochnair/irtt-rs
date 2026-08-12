@@ -31,10 +31,10 @@
 //!
 //! # Current scope
 //!
-//! Open handling and session creation only. Echo processing, client-initiated
-//! close, session lifetime and expiry, and the Tokio runtime are separate
-//! slices; structurally valid echo and close requests are currently accepted by
-//! the admission boundary and then ignored.
+//! Open handling, session creation and client-initiated close. Echo
+//! processing, server-initiated close, session lifetime and expiry, and the
+//! Tokio runtime are separate slices; a structurally valid echo request is
+//! currently accepted by the admission boundary and then ignored.
 #![forbid(unsafe_code)]
 
 mod config;

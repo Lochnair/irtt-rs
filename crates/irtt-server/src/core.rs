@@ -35,9 +35,9 @@ use crate::{
 ///
 /// # Scope
 ///
-/// This slice implements open handling and session creation. Echo and close
-/// requests are structurally recognized and then deliberately ignored — no
-/// reply, no session mutation — until their own slices.
+/// This slice implements open handling, session creation and client-initiated
+/// close. Echo requests are structurally recognized and then deliberately
+/// ignored — no reply, no session mutation — until their own slice.
 #[derive(Debug)]
 pub struct ServerCore {
     config: ServerConfig,
@@ -81,11 +81,8 @@ impl ServerCore {
     ///
     /// This is a lookup by token alone and is therefore *not* an admission
     /// check: a request is bound to a session only when the token matches and
-    /// it arrived from the session's exact endpoint.
-    //
-    // Called only by tests until echo and close processing arrive, which is
-    // what a token lookup is for.
-    #[allow(dead_code)]
+    /// it arrived from the session's exact endpoint. Callers pair it with an
+    /// endpoint comparison, as close handling does.
     pub(crate) fn session(&self, token: u64) -> Option<&Session> {
         self.sessions.get(&token)
     }
@@ -100,6 +97,10 @@ impl ServerCore {
     /// authentication, carries a malformed or out-of-range open parameter
     /// payload, would exceed the session bound, or is a request kind this slice
     /// does not implement. None of that mutates any live session.
+    ///
+    /// `Ok(None)` is not only a rejection, though. A close request that does
+    /// release its session is answered with nothing as well, because protocol
+    /// version 1 defines no acknowledgement for one.
     ///
     /// Authentication is checked before open parameters are decoded. That
     /// ordering is deliberate: a packet that fails authentication is discarded
@@ -133,11 +134,14 @@ impl ServerCore {
 
         match request.kind {
             DecodedRequestKind::Open { no_test, params } => self.handle_open(peer, no_test, params),
-            // Not implemented in this slice. A close must not remove a session
-            // and an echo must not advance receive state until the slices that
-            // implement those behaviors; emitting a placeholder reply now would
-            // be worse than silence.
-            DecodedRequestKind::Close { .. } | DecodedRequestKind::Echo { .. } => Ok(None),
+            DecodedRequestKind::Close { token } => {
+                self.handle_close(peer, token);
+                Ok(None)
+            }
+            // Not implemented in this slice. An echo must not advance receive
+            // state until the slice that implements it; emitting a placeholder
+            // reply now would be worse than silence.
+            DecodedRequestKind::Echo { .. } => Ok(None),
         }
     }
 
@@ -191,6 +195,30 @@ impl ServerCore {
         Ok(Some(packet))
     }
 
+    /// Releases the session a close request names, if that request owns one.
+    ///
+    /// A close is bound to a session only when the token matches *and* the
+    /// datagram arrived from that session's exact endpoint, so holding a token
+    /// is not by itself authority to tear the session down: a close from a
+    /// foreign endpoint leaves it live, and one close cannot take down a
+    /// sibling session that the same peer opened separately. A token that is
+    /// unknown, already closed, or zero — zero is reserved for no-test replies
+    /// and never issued — matches nothing and leaves the table untouched.
+    ///
+    /// Nothing is sent either way, which is why this returns no reply to
+    /// encode. Protocol version 1 defines no acknowledgement for a client
+    /// close, so a delivered close is indistinguishable to the client from a
+    /// lost one, and the freed capacity is immediately reusable because the
+    /// session table is the only record of it.
+    fn handle_close(&mut self, peer: SocketAddr, token: u64) {
+        let owns_session = self
+            .session(token)
+            .is_some_and(|session| same_endpoint(session.peer(), peer));
+        if owns_session {
+            self.sessions.remove(&token);
+        }
+    }
+
     /// Encodes a reply this server constructed. Any failure here is internal.
     fn encode_reply(&self, reply: &OpenReply) -> Result<Vec<u8>, ServerError> {
         encode_open_reply(reply, self.config.hmac_key())
@@ -212,6 +240,45 @@ impl ServerCore {
         Err(ServerError::TokenExhausted {
             attempts: TOKEN_ATTEMPTS,
         })
+    }
+}
+
+/// Whether two source endpoints identify the same session endpoint.
+///
+/// The address family, the IP address and the UDP source port are established
+/// identity components: a request from a different port, address or family is
+/// dropped and leaves its session live.
+///
+/// The remaining two fields of [`SocketAddrV6`] are decided here rather than
+/// observed, which is why this is not simply `==`.
+///
+/// The flow label is excluded. It identifies no endpoint — it is routing
+/// metadata a sender or forwarding path may legitimately vary within one flow,
+/// and a receiver reports it only when asked to — so admitting it could strand
+/// a session its own client can then never close. It grants nothing in
+/// exchange: the token, address, port and scope are what an off-path attacker
+/// would have to guess.
+///
+/// The scope identifier is included, and that is **`irtt-rs` policy, not
+/// verified compatibility behavior**. The server specification lists the IPv6
+/// zone as an identity component, but its remaining-unknowns section records
+/// that multi-zone behavior could not be tested on a single-host platform, so
+/// no evidence settles how a reference server compares scoped addresses. Two
+/// peers reachable at the same link-local address in different zones are
+/// genuinely different peers, so treating the zone as identity is the
+/// conservative reading: the failure it prevents is one peer closing another's
+/// session, while the failure it risks is a scoped client having to reopen.
+/// Revisit if evidence ever settles the question.
+///
+/// [`SocketAddrV6`]: std::net::SocketAddrV6
+fn same_endpoint(session: SocketAddr, peer: SocketAddr) -> bool {
+    match (session, peer) {
+        (SocketAddr::V6(session), SocketAddr::V6(peer)) => {
+            session.ip() == peer.ip()
+                && session.port() == peer.port()
+                && session.scope_id() == peer.scope_id()
+        }
+        (session, peer) => session == peer,
     }
 }
 

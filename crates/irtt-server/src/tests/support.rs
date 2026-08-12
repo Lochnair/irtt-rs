@@ -72,6 +72,31 @@ pub(crate) fn core_with_tokens(config: ServerConfig, tokens: ScriptedTokens) -> 
     ServerCore::with_token_source(config, Box::new(tokens))
 }
 
+/// An otherwise default core that authenticates iff `hmac_key` is set.
+///
+/// Most behavior has to hold identically with and without authentication, so
+/// tests loop over both and build the core from the key.
+pub(crate) fn core_for(hmac_key: Option<&[u8]>, tokens: ScriptedTokens) -> ServerCore {
+    let mut config = ServerConfig::default();
+    if let Some(key) = hmac_key {
+        config = config.with_hmac_key(key);
+    }
+    core_with_tokens(config, tokens)
+}
+
+/// Opens one ordinary session from `endpoint` and returns its token.
+pub(crate) fn open_session(
+    core: &mut ServerCore,
+    endpoint: SocketAddr,
+    hmac_key: Option<&[u8]>,
+) -> u64 {
+    let packet = core
+        .handle_datagram(endpoint, &open_request(&client_params(), hmac_key))
+        .unwrap()
+        .expect("the session-creating open must be answered");
+    expect_normal_open_reply(&packet, hmac_key).token
+}
+
 /// Encodes a normal open request carrying `params`.
 pub(crate) fn open_request(params: &Params, hmac_key: Option<&[u8]>) -> Vec<u8> {
     encode_request(
@@ -94,6 +119,29 @@ pub(crate) fn no_test_request(params: &Params, hmac_key: Option<&[u8]>) -> Vec<u
         hmac_key,
     )
     .unwrap()
+}
+
+/// Encodes a close request for `token`.
+pub(crate) fn close_request(token: u64, hmac_key: Option<&[u8]>) -> Vec<u8> {
+    encode_request(RequestToEncode::Close { token }, hmac_key).unwrap()
+}
+
+/// Encodes a close request carrying arbitrary bytes after the token.
+///
+/// The decoder tolerates them, and this is the shape that proves it. The MAC
+/// covers the whole datagram, so it is recomputed over the final form rather
+/// than left behind by the encoder's shorter packet.
+pub(crate) fn close_request_with_trailing(
+    token: u64,
+    trailing: &[u8],
+    hmac_key: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut packet = close_request(token, hmac_key);
+    packet.extend_from_slice(trailing);
+    if let Some(key) = hmac_key {
+        irtt_proto::compute_hmac_in_place(key, &mut packet, hmac_field_offset()).unwrap();
+    }
+    packet
 }
 
 /// Builds an open request around a raw parameter payload.
