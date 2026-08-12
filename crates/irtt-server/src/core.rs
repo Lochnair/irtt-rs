@@ -1,7 +1,7 @@
 use std::{collections::HashMap, net::SocketAddr};
 
 use irtt_proto::{
-    decode_request, encode_open_reply, verify_packet_hmac, Clock, DecodedParams,
+    decode_request, echo_packet_len, encode_open_reply, verify_packet_hmac, Clock, DecodedParams,
     DecodedRequestKind, OpenReply, Params, StampAt, FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY,
 };
 
@@ -141,7 +141,10 @@ impl ServerCore {
             }
             // Not implemented in this slice. An echo must not advance receive
             // state until the slice that implements it; emitting a placeholder
-            // reply now would be worse than silence.
+            // reply now would be worse than silence. That slice must admit an
+            // echo by its received datagram length against
+            // `max_packet_length` before it touches any receive state; adding
+            // that branch now would only be dead code guarding nothing.
             DecodedRequestKind::Echo { .. } => Ok(None),
         }
     }
@@ -164,7 +167,7 @@ impl ServerCore {
         let params = negotiate_params(decoded.params, &self.config);
         // Deliberately after negotiation, and before either open path: what has
         // to be executable is the effective session, not the request.
-        if !negotiated_params_are_admissible(&params) {
+        if !negotiated_params_are_admissible(&params, &self.config) {
             return Ok(None);
         }
 
@@ -324,10 +327,12 @@ fn open_params_are_admissible(decoded: &DecodedParams) -> bool {
 /// exists to tell a client what the session would be, so it must not report a
 /// session that could not exist.
 ///
-/// One rule so far: **selecting timestamps requires a specified clock.** A
-/// non-none `stamp_at` with [`Clock::Unspecified`] asks for timestamp fields
-/// from no clock at all, which lays out no timestamp field and leaves the
-/// session with a request the server cannot honor.
+/// Two rules so far.
+///
+/// **Selecting timestamps requires a specified clock.** A non-none `stamp_at`
+/// with [`Clock::Unspecified`] asks for timestamp fields from no clock at all,
+/// which lays out no timestamp field and leaves the session with a request the
+/// server cannot honor.
 ///
 /// [`Clock::Unspecified`] means the Clock tag was absent — an explicit zero is
 /// already out of range for the decoder — so this cannot be reached by a
@@ -337,10 +342,32 @@ fn open_params_are_admissible(decoded: &DecodedParams) -> bool {
 /// `stamp_at` to none would silently drop the measurement it did ask for.
 /// Neither is the server's to decide.
 ///
+/// **The session's echo datagram must fit
+/// [`max_packet_length`](ServerConfig::max_packet_length).** Negotiation already
+/// reduced an oversized Length, but that only bounds what the *parameter* asks
+/// for: the mandatory field block grows with the received statistics, the
+/// timestamps and — by 16 bytes — authentication, and can exceed the configured
+/// maximum on its own. A session whose smallest compliant reply is already too
+/// large is one the server could never answer an echo for, so it is refused at
+/// open rather than acknowledged and then found unserviceable.
+///
+/// The size comes from [`echo_packet_len`], the one packet-size authority, so
+/// this cannot drift from what the echo slice will actually encode. Its
+/// unrepresentable-length error is a rejection here, not a [`ServerError`]: a
+/// pathological requested length is remote input, not an internal failure. The
+/// default policy makes it unreachable for an acknowledged session anyway, since
+/// negotiation has already reduced the length to a representable maximum.
+///
 /// The check is deliberately *after* negotiation so that a later policy slice
 /// restricting timestamps can restrict `stamp_at` to [`StampAt::None`], at
 /// which point an absent clock is safe and this predicate holds without
 /// changing.
-fn negotiated_params_are_admissible(params: &Params) -> bool {
-    params.stamp_at == StampAt::None || params.clock != Clock::Unspecified
+///
+/// [`ServerError`]: crate::ServerError
+fn negotiated_params_are_admissible(params: &Params, config: &ServerConfig) -> bool {
+    if params.stamp_at != StampAt::None && params.clock == Clock::Unspecified {
+        return false;
+    }
+    echo_packet_len(config.hmac_key().is_some(), params)
+        .is_ok_and(|len| len <= config.max_packet_length())
 }

@@ -23,11 +23,13 @@
 //!
 //! # Resource policy
 //!
-//! Total session state is bounded (see [`DEFAULT_MAX_SESSIONS`]). A single
-//! unauthenticated datagram creates a session and opens are never deduplicated,
-//! so an unbounded table is a liability rather than a compatibility feature.
-//! Upstream's observed lack of session bounds is explicitly not a compatibility
-//! target.
+//! Total session state is bounded (see [`DEFAULT_MAX_SESSIONS`]), and so is the
+//! echo datagram a single session can negotiate (see
+//! [`DEFAULT_MAX_PACKET_LENGTH`]). A single unauthenticated datagram creates a
+//! session and opens are never deduplicated, so neither an unbounded table nor a
+//! remotely chosen buffer size is a compatibility feature. Upstream's observed
+//! lack of session bounds, and its unlimited default packet length, are
+//! explicitly not compatibility targets.
 //!
 //! # Current scope
 //!
@@ -47,6 +49,6 @@ mod token;
 #[cfg(test)]
 mod tests;
 
-pub use config::{ServerConfig, DEFAULT_MAX_SESSIONS};
+pub use config::{ServerConfig, DEFAULT_MAX_PACKET_LENGTH, DEFAULT_MAX_SESSIONS};
 pub use core::ServerCore;
 pub use error::ServerError;
