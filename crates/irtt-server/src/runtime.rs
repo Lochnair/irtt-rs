@@ -62,9 +62,10 @@ impl Server {
     /// Serves datagrams until `shutdown` completes.
     ///
     /// Graceful shutdown sends no session-close packets and leaves no hidden
-    /// receive task behind. Per-packet send failures and short sends drop only
-    /// that reply; receive failures and internal core failures terminate the
-    /// loop with an error.
+    /// receive task behind, even while a reply send is waiting for socket
+    /// writability. Per-packet send failures and short sends drop only that
+    /// reply; receive failures and internal core failures terminate the loop
+    /// with an error.
     pub async fn run<F>(&mut self, shutdown: F) -> Result<(), ServerRuntimeError>
     where
         F: Future<Output = ()>,
@@ -89,7 +90,15 @@ impl Server {
                     }
 
                     if let Some(reply) = self.core.handle_datagram(peer, &self.recv_buffer[..len])? {
-                        let sent = self.socket.send_to(&reply, peer).await;
+                        let send = self.socket.send_to(&reply, peer);
+                        tokio::pin!(send);
+                        let sent = loop {
+                            tokio::select! {
+                                _ = &mut shutdown => return Ok(()),
+                                _ = maintenance.tick() => self.core.maintain(),
+                                sent = &mut send => break sent,
+                            }
+                        };
                         if !matches!(sent, Ok(len) if len == reply.len()) {
                             continue;
                         }
