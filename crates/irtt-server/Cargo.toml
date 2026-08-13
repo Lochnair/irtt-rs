@@ -14,8 +14,9 @@ categories = ["network-programming"]
 [dependencies]
 irtt-proto.workspace = true
 getrandom = "0.4.3"
+socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
 
 [dev-dependencies]
-irtt-client = { workspace = true, features = ["tokio"] }
+irtt-client = { workspace = true, features = ["ancillary", "tokio"] }

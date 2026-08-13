@@ -718,9 +718,10 @@ fn same_endpoint(session: SocketAddr, peer: SocketAddr) -> bool {
 /// Every other known parameter is already validated or deliberately
 /// unrestricted here. Protocol version is accepted at any value and rewritten
 /// during negotiation. Length and DSCP are accepted as decoded, including zero,
-/// negative and out-of-byte-range values; a later slice may restrict a DSCP it
-/// cannot actually apply to the socket. Unknown tags were ignored by the
-/// decoder and are not reflected in the reply.
+/// negative and out-of-byte-range values; a DSCP the socket could never carry
+/// is negotiated unchanged and transported unmarked instead of being refused
+/// (see [`transport_traffic_class`]). Unknown tags were ignored by the decoder
+/// and are not reflected in the reply.
 fn open_params_are_admissible(decoded: &DecodedParams) -> bool {
     let admissible = |present: bool, value: i64| !present || value > 0;
     admissible(decoded.presence.duration_ns, decoded.params.duration_ns)

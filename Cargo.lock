@@ -735,6 +735,7 @@ dependencies = [
  "getrandom 0.4.3",
  "irtt-client",
  "irtt-proto",
+ "socket2",
  "thiserror 2.0.20",
  "tokio",
 ]

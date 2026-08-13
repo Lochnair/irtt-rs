@@ -43,9 +43,10 @@
 //!
 //! Open handling and negotiation, session creation, normal echo processing,
 //! per-session rate limiting, idle expiry, the maximum-duration
-//! server-initiated close and Tokio UDP orchestration. DSCP application, the
-//! full server fill policy, wildcard-bind destination-address metadata and the
-//! CLI server applet remain separate slices. Echo payloads are zero-filled.
+//! server-initiated close, the negotiated per-session reply traffic class and
+//! Tokio UDP orchestration. The full server fill policy and wildcard-bind
+//! destination-address metadata remain separate slices. Echo payloads are
+//! zero-filled.
 #![forbid(unsafe_code)]
 
 mod clock;
@@ -55,6 +56,7 @@ mod error;
 mod negotiate;
 mod runtime;
 mod session;
+mod socket_options;
 mod token;
 
 #[cfg(test)]

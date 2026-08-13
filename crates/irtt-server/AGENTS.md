@@ -157,8 +157,49 @@ effective parameters must be safe for the server to run.
 - Reply payload bytes are zero, which is the initial safe fill policy: payload
   carries no protocol meaning, and a server must never emit residue from another
   request or client. Request payload bytes never reach a reply.
-- DSCP socket application and the full `ServerFill` policy are later slices. Do
-  not add placeholder session fields for them.
+- The full `ServerFill` policy is a later slice. Do not add placeholder session
+  fields for it.
+
+## Reply traffic class
+
+The core hands each reply out as an `OutboundDatagram`: the bytes plus the
+transport policy sending them requires. The runtime must not rediscover that
+policy by decoding the outgoing packet, inspecting the inbound token, reaching
+into a `Session` or keeping its own token-to-marking map — the core is where
+session policy lives.
+
+- `traffic_class` is the **raw 8-bit IPv4 TOS / IPv6 Traffic Class byte**, which
+  is what the DSCP protocol parameter carries. The six-bit codepoint is
+  `traffic_class >> 2` and the low two bits are ECN. Never shift, mask or round
+  it inside the server.
+- Open and no-test replies always request class zero, whatever the session
+  negotiates. That is observed behavior, not a simplification.
+- An echo reply requests the session's negotiated byte, and a server-close echo
+  reply keeps it: the close is an ordinary reply with a flag added, not a
+  special packet.
+- A negotiated integer outside `0..=255` stays in `Params` — returned and stored
+  exactly as requested — but is transported unmarked. This is **`irtt-rs`
+  policy**: the clean evidence records the reference host's handling of such
+  values as platform-specific and explicitly not a compatibility requirement, so
+  there is nothing to reproduce, and a malformed-but-accepted session should
+  stay usable rather than be given a marking nobody asked for. Do not add
+  negotiation-time rejection, clamping or wrapping for it.
+- The runtime applies a class before **every** send. Zero must be applied as
+  explicitly as a nonzero value: skipping the call would send an open reply, or
+  an unmarked session's reply, under whichever marking the previous reply left
+  on the shared socket. There is no restore-to-zero-after-send step, and no
+  cached "current value" to elide the call — the next reply is authoritative.
+- **Sequential send ownership is what makes a socket-wide setting race-free.**
+  One task owns the socket and no other sends from it, including while a send is
+  suspended. Do not introduce concurrent sends without replacing this with
+  per-packet control messages.
+- Applying the class and sending are both per-packet transport steps: a failure
+  of either drops that one reply and the listener keeps serving. A class that
+  could not be applied means the reply is not sent at all, because sending it
+  would put it on the wire under the previous reply's marking.
+- The option itself comes from `socket2`'s safe API, chosen by the listener's
+  bound address family rather than the peer's. The crate forbids unsafe code;
+  there is no raw `setsockopt` and no `sendmsg`/`cmsg` machinery.
 
 ## Rate, lifetime and server-initiated close
 

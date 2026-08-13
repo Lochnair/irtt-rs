@@ -304,6 +304,7 @@ The client, event stream, machine-readable output, multi-target execution, local
 
 The server library and the server applet are implemented: open negotiation,
 session state, echo processing, per-session rate limiting, idle expiry, the
-maximum-duration close, and HMAC authentication. DSCP application, the full
+maximum-duration close, HMAC authentication, and the negotiated per-session
+reply traffic class, which is applied on sockets that support it. The full
 server fill policy, per-packet source-address selection for wildcard binds on
 multi-homed hosts, and multiple listeners in one process are not implemented.

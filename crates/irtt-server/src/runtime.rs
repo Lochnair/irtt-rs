@@ -2,10 +2,11 @@
 
 use std::{future::Future, io, net::SocketAddr, time::Duration};
 
+use socket2::SockRef;
 use thiserror::Error;
 use tokio::{net::UdpSocket, time::MissedTickBehavior};
 
-use crate::{ServerConfig, ServerCore, ServerError};
+use crate::{socket_options::set_reply_traffic_class, ServerConfig, ServerCore, ServerError};
 
 /// Fixed transport receive capacity.
 ///
@@ -21,6 +22,14 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 /// process it, and sends the optional reply from the same socket. No
 /// per-datagram tasks or locks are involved.
 ///
+/// **That sequential ownership is what makes the reply traffic class correct.**
+/// The class is a socket-wide setting, and every reply explicitly applies its
+/// own — zero included — immediately before its send, so the reply about to go
+/// out is always the one that set it. Nothing else sends from this socket, not
+/// even while a send is suspended, so no reply can inherit another session's
+/// marking. Adding a concurrent sender would break that and require per-packet
+/// control messages instead.
+///
 /// Bind an explicit local address when reply source-address identity matters.
 /// Wildcard binds rely on the kernel's source-address choice; destination
 /// packet metadata and per-packet source selection are not yet implemented for
@@ -30,6 +39,11 @@ pub struct Server {
     socket: UdpSocket,
     core: ServerCore,
     recv_buffer: Vec<u8>,
+    /// The listener's own address family, which selects the IPv4 TOS or IPv6
+    /// Traffic Class option. `None` only if the bound address could not be
+    /// queried at construction, in which case the send path asks again rather
+    /// than guessing a family.
+    listener_is_ipv4: Option<bool>,
 }
 
 impl Server {
@@ -45,11 +59,28 @@ impl Server {
     /// Wraps an already prepared Tokio UDP socket in a server.
     #[must_use]
     pub fn from_socket(socket: UdpSocket, config: ServerConfig) -> Self {
+        let listener_is_ipv4 = socket.local_addr().ok().map(|addr| addr.is_ipv4());
         Self {
             socket,
             core: ServerCore::new(config),
             recv_buffer: vec![0; RECEIVE_BUFFER_LEN],
+            listener_is_ipv4,
         }
+    }
+
+    /// Applies one reply's raw traffic class to the listener socket.
+    ///
+    /// This runs before *every* send, and zero is applied as deliberately as
+    /// any other value: a listener serves many sessions from one socket, so
+    /// skipping the call for an unmarked reply — an open reply, or a session
+    /// that negotiated nothing — would send it under whichever marking the
+    /// previous reply left behind.
+    fn apply_reply_traffic_class(&self, traffic_class: u8) -> io::Result<()> {
+        let is_ipv4 = match self.listener_is_ipv4 {
+            Some(is_ipv4) => is_ipv4,
+            None => self.socket.local_addr()?.is_ipv4(),
+        };
+        set_reply_traffic_class(SockRef::from(&self.socket), is_ipv4, traffic_class)
     }
 
     /// Returns the local endpoint selected for the listener.
@@ -64,8 +95,13 @@ impl Server {
     /// Graceful shutdown sends no session-close packets and leaves no hidden
     /// receive task behind, even while a reply send is waiting for socket
     /// writability. Per-packet send failures and short sends drop only that
-    /// reply; receive failures and internal core failures terminate the loop
-    /// with an error.
+    /// reply, and so does a failure to apply that reply's traffic class —
+    /// preparing one packet is not a reason to stop serving every other
+    /// session, and the next reply makes its own independent attempt. Receive
+    /// failures and internal core failures terminate the loop with an error.
+    ///
+    /// A reply whose class could not be applied is never sent anyway: sending it
+    /// would put it on the wire under the previous reply's marking.
     pub async fn run<F>(&mut self, shutdown: F) -> Result<(), ServerRuntimeError>
     where
         F: Future<Output = ()>,
@@ -90,6 +126,9 @@ impl Server {
                     }
 
                     if let Some(reply) = self.core.handle_datagram(peer, &self.recv_buffer[..len])? {
+                        if self.apply_reply_traffic_class(reply.traffic_class()).is_err() {
+                            continue;
+                        }
                         let send = self.socket.send_to(reply.bytes(), peer);
                         tokio::pin!(send);
                         let sent = loop {
