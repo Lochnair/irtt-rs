@@ -2,10 +2,11 @@
 
 use std::{future::Future, io, net::SocketAddr, time::Duration};
 
+use socket2::SockRef;
 use thiserror::Error;
 use tokio::{net::UdpSocket, time::MissedTickBehavior};
 
-use crate::{ServerConfig, ServerCore, ServerError};
+use crate::{socket_options::set_reply_traffic_class, ServerConfig, ServerCore, ServerError};
 
 /// Fixed transport receive capacity.
 ///
@@ -21,6 +22,14 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 /// process it, and sends the optional reply from the same socket. No
 /// per-datagram tasks or locks are involved.
 ///
+/// **That sequential ownership is what makes the reply traffic class correct.**
+/// The class is a socket-wide setting, and every reply explicitly applies its
+/// own — zero included — immediately before its send, so the reply about to go
+/// out is always the one that set it. Nothing else sends from this socket, not
+/// even while a send is suspended, so no reply can inherit another session's
+/// marking. Adding a concurrent sender would break that and require per-packet
+/// control messages instead.
+///
 /// Bind an explicit local address when reply source-address identity matters.
 /// Wildcard binds rely on the kernel's source-address choice; destination
 /// packet metadata and per-packet source selection are not yet implemented for
@@ -30,6 +39,19 @@ pub struct Server {
     socket: UdpSocket,
     core: ServerCore,
     recv_buffer: Vec<u8>,
+    /// The listener's own address family, which selects the IPv4 TOS or IPv6
+    /// Traffic Class option. `None` only if the bound address could not be
+    /// queried at construction, in which case the send path asks again rather
+    /// than guessing a family.
+    listener_is_ipv4: Option<bool>,
+    /// Whether this server has ever successfully applied a nonzero traffic
+    /// class to the socket.
+    ///
+    /// This is not a cache and never elides a call — the class is applied
+    /// before every send regardless. It is consulted only when applying one
+    /// *fails*, to tell "the socket may be carrying a marking of ours" from
+    /// "it cannot be carrying one".
+    socket_is_marked: bool,
 }
 
 impl Server {
@@ -45,11 +67,48 @@ impl Server {
     /// Wraps an already prepared Tokio UDP socket in a server.
     #[must_use]
     pub fn from_socket(socket: UdpSocket, config: ServerConfig) -> Self {
+        let listener_is_ipv4 = socket.local_addr().ok().map(|addr| addr.is_ipv4());
         Self {
             socket,
             core: ServerCore::new(config),
             recv_buffer: vec![0; RECEIVE_BUFFER_LEN],
+            listener_is_ipv4,
+            socket_is_marked: false,
         }
+    }
+
+    /// Applies one reply's raw traffic class to the listener socket, and
+    /// reports whether that reply may be sent.
+    ///
+    /// The class is applied before *every* send, and zero as deliberately as
+    /// any other value: a listener serves many sessions from one socket, so
+    /// skipping the call for an unmarked reply — an open reply, or a session
+    /// that negotiated nothing — would send it under whichever marking the
+    /// previous reply left behind.
+    ///
+    /// When the option cannot be applied, [`may_send_unappliable`] decides. A
+    /// marking this server asked for and did not get must never be replaced by
+    /// silently sending under the previous one, so those replies are dropped;
+    /// but a host that refuses the option outright — some Windows builds do not
+    /// support `IP_TOS`, and a few targets have no safe setter at all — must
+    /// still be able to run a server, and it can, because a socket this server
+    /// has never marked has no marking of ours to clear.
+    fn prepare_reply_traffic_class(&mut self, traffic_class: u8) -> bool {
+        match self.apply_reply_traffic_class(traffic_class) {
+            Ok(()) => {
+                self.socket_is_marked = traffic_class != 0;
+                true
+            }
+            Err(_) => may_send_unappliable(traffic_class, self.socket_is_marked),
+        }
+    }
+
+    fn apply_reply_traffic_class(&self, traffic_class: u8) -> io::Result<()> {
+        let is_ipv4 = match self.listener_is_ipv4 {
+            Some(is_ipv4) => is_ipv4,
+            None => self.socket.local_addr()?.is_ipv4(),
+        };
+        set_reply_traffic_class(SockRef::from(&self.socket), is_ipv4, traffic_class)
     }
 
     /// Returns the local endpoint selected for the listener.
@@ -64,8 +123,16 @@ impl Server {
     /// Graceful shutdown sends no session-close packets and leaves no hidden
     /// receive task behind, even while a reply send is waiting for socket
     /// writability. Per-packet send failures and short sends drop only that
-    /// reply; receive failures and internal core failures terminate the loop
-    /// with an error.
+    /// reply, and so does a failure to apply a marking that reply needed —
+    /// preparing one packet is not a reason to stop serving every other
+    /// session, and the next reply makes its own independent attempt. Receive
+    /// failures and internal core failures terminate the loop with an error.
+    ///
+    /// A reply whose marking could not be applied is not sent instead: sending
+    /// it would put it on the wire under the previous reply's marking. An
+    /// *unmarked* reply on a socket this server has never marked is the one
+    /// exception, so a host that does not support the option at all — some
+    /// Windows builds do not support `IP_TOS` — still runs a working server.
     pub async fn run<F>(&mut self, shutdown: F) -> Result<(), ServerRuntimeError>
     where
         F: Future<Output = ()>,
@@ -90,7 +157,10 @@ impl Server {
                     }
 
                     if let Some(reply) = self.core.handle_datagram(peer, &self.recv_buffer[..len])? {
-                        let send = self.socket.send_to(&reply, peer);
+                        if !self.prepare_reply_traffic_class(reply.traffic_class()) {
+                            continue;
+                        }
+                        let send = self.socket.send_to(reply.bytes(), peer);
                         tokio::pin!(send);
                         let sent = loop {
                             tokio::select! {
@@ -99,7 +169,7 @@ impl Server {
                                 sent = &mut send => break sent,
                             }
                         };
-                        if !matches!(sent, Ok(len) if len == reply.len()) {
+                        if !matches!(sent, Ok(len) if len == reply.bytes().len()) {
                             continue;
                         }
                     }
@@ -107,6 +177,21 @@ impl Server {
             }
         }
     }
+}
+
+/// Whether a reply may still be sent after its traffic class could not be
+/// applied.
+///
+/// Only an unmarked reply on a socket this server has never successfully marked
+/// qualifies. Both halves matter: a reply that wanted a marking must not go out
+/// without one, and once this server has put a nonzero class on the socket, a
+/// failure to clear it means the socket may still be carrying it.
+///
+/// A socket handed to [`Server::from_socket`] pre-marked by its creator is
+/// outside what this can know; explicit marking is the server's own to manage
+/// from a fresh listener.
+fn may_send_unappliable(traffic_class: u8, socket_is_marked: bool) -> bool {
+    traffic_class == 0 && !socket_is_marked
 }
 
 /// Failure to create or run a Tokio UDP server.
@@ -283,5 +368,34 @@ mod tests {
 
     fn unthrottled() -> ServerConfig {
         ServerConfig::default().with_min_send_interval(Duration::ZERO)
+    }
+
+    /// The rule that decides what an unappliable traffic class means, which no
+    /// normal interface can reach: it needs a host that refuses the socket
+    /// option, and the hosts these tests run on do not.
+    #[test]
+    fn only_an_unmarked_reply_on_a_never_marked_socket_survives_an_apply_failure() {
+        for (traffic_class, socket_is_marked, sendable, why) in [
+            (
+                0,
+                false,
+                true,
+                "no marking wanted, and none of ours to clear",
+            ),
+            (0, true, false, "our own marking may still be on the socket"),
+            (
+                0xb8,
+                false,
+                false,
+                "a marking that was wanted but not applied",
+            ),
+            (0xb8, true, false, "and likewise over a marking already set"),
+        ] {
+            assert_eq!(
+                may_send_unappliable(traffic_class, socket_is_marked),
+                sendable,
+                "{why}"
+            );
+        }
     }
 }

@@ -10,11 +10,12 @@
 //! receive state, rate and lifetime policy, resource decisions and reply
 //! construction. It performs no I/O; the clock its timestamps and deadlines
 //! come from is a private injected seam, not a runtime abstraction, so the
-//! engine stays testable. [`Server`] owns one Tokio UDP listener and one core,
-//! and provides sequential receive, reply, scheduled expiry maintenance and
-//! caller-controlled shutdown. The crate is intentionally Tokio-native; there
-//! is no blocking or alternate-runtime counterpart and no transport
-//! abstraction.
+//! engine stays testable. Each reply it produces is an [`OutboundDatagram`]:
+//! the packet and the raw traffic class it must be sent with. [`Server`] owns
+//! one Tokio UDP listener and one core, and provides sequential receive, reply,
+//! scheduled expiry maintenance and caller-controlled shutdown. The crate is
+//! intentionally Tokio-native; there is no blocking or alternate-runtime
+//! counterpart and no transport abstraction.
 //!
 //! # Rejection is silence
 //!
@@ -42,9 +43,10 @@
 //!
 //! Open handling and negotiation, session creation, normal echo processing,
 //! per-session rate limiting, idle expiry, the maximum-duration
-//! server-initiated close and Tokio UDP orchestration. DSCP application, the
-//! full server fill policy, wildcard-bind destination-address metadata and the
-//! CLI server applet remain separate slices. Echo payloads are zero-filled.
+//! server-initiated close, the negotiated per-session reply traffic class and
+//! Tokio UDP orchestration. The full server fill policy and wildcard-bind
+//! destination-address metadata remain separate slices. Echo payloads are
+//! zero-filled.
 #![forbid(unsafe_code)]
 
 mod clock;
@@ -54,6 +56,7 @@ mod error;
 mod negotiate;
 mod runtime;
 mod session;
+mod socket_options;
 mod token;
 
 #[cfg(test)]
@@ -63,6 +66,6 @@ pub use config::{
     ServerConfig, DEFAULT_BURST_ALLOWANCE, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_PACKET_LENGTH,
     DEFAULT_MAX_SESSIONS, DEFAULT_MIN_SEND_INTERVAL,
 };
-pub use core::ServerCore;
+pub use core::{OutboundDatagram, ServerCore};
 pub use error::ServerError;
 pub use runtime::{Server, ServerRuntimeError};

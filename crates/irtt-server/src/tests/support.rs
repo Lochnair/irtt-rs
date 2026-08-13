@@ -12,7 +12,7 @@ use irtt_proto::{
 
 use crate::{
     clock::{ClockSample, ClockSource},
-    core::ServerCore,
+    core::{OutboundDatagram, ServerCore},
     error::ServerError,
     token::TokenSource,
     ServerConfig,
@@ -231,7 +231,7 @@ pub(crate) fn echo_at(
     sequence: u32,
     params: &Params,
     hmac_key: Option<&[u8]>,
-) -> Option<Vec<u8>> {
+) -> Option<OutboundDatagram> {
     clock.set(at_ns);
     core.handle_datagram(
         peer(),
@@ -314,11 +314,12 @@ pub(crate) fn echo_request(
 /// Decodes an echo reply the server produced and checks the flags every reply
 /// must carry. Decoding verifies the MAC against `hmac_key` on the way.
 pub(crate) fn expect_echo_reply(
-    packet: &[u8],
+    packet: impl AsRef<[u8]>,
     params: &Params,
     hmac_key: Option<&[u8]>,
 ) -> EchoReply {
-    let reply = decode_echo_reply(packet, params, hmac_key).expect("server echo reply must decode");
+    let reply = decode_echo_reply(packet.as_ref(), params, hmac_key)
+        .expect("server echo reply must decode");
     // Exact equality, so Open and Close are pinned clear as well: Open makes an
     // upstream client abort, and Close belongs to the server-initiated close
     // slice.
@@ -334,12 +335,12 @@ pub(crate) fn expect_echo_reply(
 /// by the same path as any other, which is the point: the close is not a
 /// separate packet kind.
 pub(crate) fn expect_closing_echo_reply(
-    packet: &[u8],
+    packet: impl AsRef<[u8]>,
     params: &Params,
     hmac_key: Option<&[u8]>,
 ) -> EchoReply {
-    let reply =
-        decode_echo_reply(packet, params, hmac_key).expect("a closing echo reply must decode");
+    let reply = decode_echo_reply(packet.as_ref(), params, hmac_key)
+        .expect("a closing echo reply must decode");
     let expected = FLAG_REPLY | FLAG_CLOSE | if hmac_key.is_some() { FLAG_HMAC } else { 0 };
     assert_eq!(reply.flags, expected, "closing echo reply flags");
     reply
@@ -452,11 +453,14 @@ pub(crate) fn client_params() -> Params {
 }
 
 /// Decodes a reply the server produced, checking it against the server's key.
-pub(crate) fn decode_reply(packet: &[u8], hmac_key: Option<&[u8]>) -> OpenReply {
-    decode_open_reply(packet, hmac_key).expect("server reply must decode")
+pub(crate) fn decode_reply(packet: impl AsRef<[u8]>, hmac_key: Option<&[u8]>) -> OpenReply {
+    decode_open_reply(packet.as_ref(), hmac_key).expect("server reply must decode")
 }
 
-pub(crate) fn expect_normal_open_reply(packet: &[u8], hmac_key: Option<&[u8]>) -> OpenReply {
+pub(crate) fn expect_normal_open_reply(
+    packet: impl AsRef<[u8]>,
+    hmac_key: Option<&[u8]>,
+) -> OpenReply {
     let reply = decode_reply(packet, hmac_key);
     let expected = FLAG_OPEN | FLAG_REPLY | if hmac_key.is_some() { FLAG_HMAC } else { 0 };
     assert_eq!(reply.flags, expected, "normal open reply flags");
@@ -465,7 +469,7 @@ pub(crate) fn expect_normal_open_reply(packet: &[u8], hmac_key: Option<&[u8]>) -
     reply
 }
 
-pub(crate) fn expect_no_test_reply(packet: &[u8], hmac_key: Option<&[u8]>) -> OpenReply {
+pub(crate) fn expect_no_test_reply(packet: impl AsRef<[u8]>, hmac_key: Option<&[u8]>) -> OpenReply {
     let reply = decode_reply(packet, hmac_key);
     let expected =
         FLAG_OPEN | FLAG_REPLY | FLAG_CLOSE | if hmac_key.is_some() { FLAG_HMAC } else { 0 };

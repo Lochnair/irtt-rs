@@ -98,7 +98,7 @@ fn an_empty_parameter_payload_is_answered_with_only_a_version() {
     // header (4) + token (8) + ProtocolVersion=1 (2). Every other parameter
     // negotiates to its wire-default zero and is omitted entirely, which is
     // only reachable if absent parameters really did decode as zero.
-    assert_eq!(packet.len(), 14);
+    assert_eq!(packet.bytes().len(), 14);
 
     let reply = expect_normal_open_reply(&packet, None);
     assert_eq!(
@@ -139,7 +139,7 @@ fn unknown_parameter_tags_are_ignored_and_not_reflected_in_the_reply() {
     );
     // The reply is the same 14 bytes an empty payload produces: no unknown tag
     // was copied through.
-    assert_eq!(packet.len(), 14);
+    assert_eq!(packet.bytes().len(), 14);
     assert_eq!(core.session_count(), 1);
 }
 
@@ -366,9 +366,9 @@ fn authentication_counts_toward_the_executable_echo_size() {
 #[test]
 fn negative_and_out_of_range_length_and_dscp_survive_negotiation() {
     // These lengths are all at or below the default maximum, and DSCP is
-    // accepted as decoded in this slice, including values a socket could never
-    // carry. Restricting a DSCP the server cannot apply is a later policy
-    // decision, not an admission rule.
+    // accepted as decoded, including values a socket could never carry:
+    // negotiation restricts neither, and a value that is not a byte is simply
+    // transported unmarked (see `traffic_class`).
     //
     // A negative length in particular stays negative in both the reply and the
     // stored session; the packet-length policy reduces oversized *positive*

@@ -194,7 +194,7 @@ fn an_authenticated_no_test_reply_is_authenticated_and_still_creates_nothing() {
         .expect("an authenticated no-test open must be answered");
 
     expect_no_test_reply(&packet, Some(KEY));
-    verify_packet_hmac(KEY, &packet).expect("the no-test reply must carry a valid MAC");
+    verify_packet_hmac(KEY, packet.bytes()).expect("the no-test reply must carry a valid MAC");
     assert_eq!(core.session_count(), 0);
 }
 
