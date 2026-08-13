@@ -1,6 +1,11 @@
 //! Tokio UDP orchestration around [`ServerCore`](crate::ServerCore).
 
-use std::{future::Future, io, net::SocketAddr, time::Duration};
+use std::{
+    future::Future,
+    io,
+    net::{IpAddr, SocketAddr},
+    time::Duration,
+};
 
 use socket2::SockRef;
 use thiserror::Error;
@@ -104,7 +109,7 @@ impl Server {
         let addr = socket
             .local_addr()
             .map_err(|source| ServerRuntimeError::LocalAddr { source })?;
-        let select_reply_source = addr.ip().is_unspecified();
+        let select_reply_source = is_wildcard(addr);
 
         if select_reply_source {
             if !socket_io::SUPPORTED {
@@ -239,6 +244,30 @@ impl Server {
                     }
                 }
             }
+        }
+    }
+}
+
+/// Whether a bound address names no particular local address, and so owes every
+/// reply an explicitly selected source.
+///
+/// `0.0.0.0` and `[::]` are the obvious forms. The third is the IPv4-mapped
+/// unspecified address, `[::ffff:0.0.0.0]`: Linux accepts it as an IPv4 wildcard
+/// bind and reports it back verbatim from `getsockname`, so asking
+/// `is_unspecified` alone would take a working wildcard listener for an explicit
+/// one and answer its requests from whatever source the routing table picked.
+/// (macOS normalizes that bind to `[::]` and never reaches the second test.)
+///
+/// A mapped address that names an actual host address — `[::ffff:127.0.0.1]` —
+/// is explicit, and stays on the plain path.
+fn is_wildcard(addr: SocketAddr) -> bool {
+    match addr.ip() {
+        IpAddr::V4(address) => address.is_unspecified(),
+        IpAddr::V6(address) => {
+            address.is_unspecified()
+                || address
+                    .to_ipv4_mapped()
+                    .is_some_and(|mapped| mapped.is_unspecified())
         }
     }
 }
@@ -477,6 +506,32 @@ mod tests {
 
     fn unthrottled() -> ServerConfig {
         ServerConfig::default().with_min_send_interval(Duration::ZERO)
+    }
+
+    /// Which bound addresses owe their replies a selected source.
+    ///
+    /// The IPv4-mapped unspecified address is the one that is not obvious, and
+    /// it is not hypothetical: Linux accepts `[::ffff:0.0.0.0]` as an IPv4
+    /// wildcard bind and reports it back unchanged, so missing it would leave a
+    /// working wildcard listener on the plain send path. A mapped address
+    /// naming a real host address is explicit and must stay there.
+    #[test]
+    fn a_bound_address_naming_no_particular_local_address_is_a_wildcard() {
+        for (addr, wildcard) in [
+            ("0.0.0.0:2112", true),
+            ("[::]:2112", true),
+            ("[::ffff:0.0.0.0]:2112", true),
+            ("127.0.0.1:2112", false),
+            ("192.0.2.10:2112", false),
+            ("[::1]:2112", false),
+            ("[::ffff:127.0.0.1]:2112", false),
+        ] {
+            assert_eq!(
+                is_wildcard(addr.parse().unwrap()),
+                wildcard,
+                "{addr} classified wrongly"
+            );
+        }
     }
 
     /// The rule that decides what an unappliable traffic class means, which no

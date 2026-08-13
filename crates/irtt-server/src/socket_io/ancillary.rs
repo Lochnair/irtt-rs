@@ -23,7 +23,7 @@
 
 use std::{
     io::{self, IoSlice, IoSliceMut},
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV6},
     os::fd::AsRawFd,
 };
 
@@ -218,6 +218,13 @@ fn send_once(
                 },
                 ipi6_ifindex: interface_index,
             };
+            // The destination has to be stated in the same family the control
+            // message is: an IPv6 source with an `AF_INET` destination is a
+            // rejected send, not a mixed-family one. The two can disagree —
+            // macOS reports an IPv4 peer for a listener bound to the IPv4-mapped
+            // wildcard while still delivering IPv6 packet info for it — and the
+            // peer identity the core sees stays exactly as it was received.
+            let destination = SockaddrStorage::from(as_ipv6_endpoint(peer));
             sendmsg(
                 socket.as_raw_fd(),
                 &iov,
@@ -229,6 +236,18 @@ fn send_once(
     };
 
     Ok(sent)
+}
+
+/// The same endpoint expressed in IPv6, mapping an IPv4 peer.
+///
+/// A datagram sent to an IPv4-mapped destination from an `AF_INET6` socket goes
+/// out as ordinary IPv4 to that address; this changes how the endpoint is
+/// spelled for one `sendmsg`, not what reaches the client.
+fn as_ipv6_endpoint(peer: SocketAddr) -> SocketAddrV6 {
+    match peer {
+        SocketAddr::V6(peer) => peer,
+        SocketAddr::V4(peer) => SocketAddrV6::new(peer.ip().to_ipv6_mapped(), peer.port(), 0, 0),
+    }
 }
 
 /// `IP_PKTINFO` on a send reads only `ipi_spec_dst`, the source address, and

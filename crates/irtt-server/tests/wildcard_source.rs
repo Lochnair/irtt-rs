@@ -72,6 +72,43 @@ async fn a_wildcard_ipv4_listener_replies_from_the_requested_address() {
 }
 
 #[tokio::test(flavor = "current_thread")]
+async fn an_ipv4_mapped_wildcard_listener_replies_from_the_requested_address() {
+    // `[::ffff:0.0.0.0]` is a wildcard that does not look like one. Linux
+    // accepts it as an IPv4 wildcard bind and `getsockname` reports it back
+    // unchanged, so a listener that only recognized `0.0.0.0` and `[::]` would
+    // take this for an explicit address and answer from a routing-selected
+    // source. macOS normalizes the bind to `[::]`, where this is simply the
+    // IPv6 wildcard case again.
+    timeout(Duration::from_secs(5), async {
+        let server = match Server::bind("[::ffff:0.0.0.0]:0".parse().unwrap(), unthrottled()).await
+        {
+            Ok(server) => server,
+            // FreeBSD refuses a mapped bind under its default `IPV6_V6ONLY`.
+            Err(ServerRuntimeError::Bind { source, .. }) if is_family_unavailable(&source) => {
+                eprintln!("skipping IPv4-mapped wildcard test: the bind is unavailable here");
+                return;
+            }
+            Err(error) => panic!("unexpected IPv4-mapped wildcard bind failure: {error}"),
+        };
+        let port = server.local_addr().unwrap().port();
+        let target = SocketAddr::from((secondary_ipv4_loopback(), port));
+        let running = spawn(server);
+
+        let mut client = connected_client(target).await;
+        assert_started(&mut client, target).await;
+        echo_once(&mut client).await;
+        assert!(matches!(
+            client.close().await.unwrap().as_slice(),
+            [ClientEvent::SessionClosed { .. }]
+        ));
+
+        running.stop().await;
+    })
+    .await
+    .expect("the IPv4-mapped wildcard test exceeded its bounded runtime");
+}
+
+#[tokio::test(flavor = "current_thread")]
 async fn a_wildcard_ipv6_listener_replies_from_the_requested_address() {
     timeout(Duration::from_secs(5), async {
         if !ipv6_loopback_available() {
