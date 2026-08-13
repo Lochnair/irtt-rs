@@ -18,7 +18,7 @@ use super::support::{
     core_with_sources, echo_at, echo_params, echo_request, expect_echo_reply, manual_core,
     open_negotiated, other_peer, peer, ManualClock, ScriptedTokens,
 };
-use crate::ServerConfig;
+use crate::{OutboundDatagram, ServerConfig};
 
 const TOKEN_A: u64 = 0x0102_0304_0506_0708;
 const TOKEN_B: u64 = 0x1112_1314_1516_1718;
@@ -41,9 +41,9 @@ fn params_at(interval_ns: i64) -> Params {
 }
 
 /// The received count a reply reported, or `None` if there was no reply.
-fn count_of(packet: Option<Vec<u8>>, params: &Params) -> Option<u32> {
-    let packet = packet?;
-    expect_echo_reply(&packet, params, None).recv_count
+fn count_of(reply: Option<OutboundDatagram>, params: &Params) -> Option<u32> {
+    let reply = reply?;
+    expect_echo_reply(reply, params, None).recv_count
 }
 
 #[test]

@@ -22,7 +22,7 @@ use super::support::{
     expect_closing_echo_reply, expect_echo_reply, expect_no_test_reply, manual_core,
     no_test_request, open_request, other_peer, peer, ManualClock, ScriptedTokens, KEY,
 };
-use crate::ServerConfig;
+use crate::{OutboundDatagram, ServerConfig};
 
 const TOKEN_A: u64 = 0x0102_0304_0506_0708;
 const TOKEN_B: u64 = 0x1112_1314_1516_1718;
@@ -50,9 +50,9 @@ fn idle_after(idle: Duration) -> ServerConfig {
         .with_min_send_interval(Duration::ZERO)
 }
 
-fn count_of(packet: Option<Vec<u8>>, params: &Params) -> Option<u32> {
-    let packet = packet?;
-    expect_echo_reply(&packet, params, None).recv_count
+fn count_of(reply: Option<OutboundDatagram>, params: &Params) -> Option<u32> {
+    let reply = reply?;
+    expect_echo_reply(reply, params, None).recv_count
 }
 
 #[test]
@@ -451,9 +451,14 @@ fn the_first_echo_past_the_maximum_duration_carries_close_and_ends_the_session()
     );
     assert!(reply.payload.is_empty());
     assert_eq!(
-        packet.len(),
+        packet.bytes().len(),
         irtt_proto::echo_packet_len(false, &negotiated).unwrap(),
         "the negotiated layout, unchanged by the flag"
+    );
+    assert_eq!(
+        i64::from(packet.traffic_class()),
+        negotiated.dscp,
+        "a server close is an echo reply and keeps the session's marking"
     );
 
     // The token is unusable from that reply onward.
@@ -595,6 +600,7 @@ fn an_authenticated_session_closes_through_the_ordinary_reply_path() {
     // together.
     let reply = expect_closing_echo_reply(&packet, &negotiated, Some(KEY));
     assert_eq!(reply.recv_count, Some(2));
-    irtt_proto::verify_packet_hmac(KEY, &packet).expect("the close-flagged reply is authenticated");
+    irtt_proto::verify_packet_hmac(KEY, packet.bytes())
+        .expect("the close-flagged reply is authenticated");
     assert_eq!(core.session_count(), 0);
 }

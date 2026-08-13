@@ -32,6 +32,11 @@ use crate::{
 ///                                                 -> None        -> send nothing
 /// ```
 ///
+/// A reply is an [`OutboundDatagram`]: the bytes to send plus the transport
+/// policy that sending them requires. The core is where session policy lives, so
+/// it hands that policy out with the packet rather than leaving the runtime to
+/// rediscover it from the session table or from the packet it is about to send.
+///
 /// It is public as a low-level engine for a pre-1.0 crate, not as a promise of
 /// runtime independence. The server is intentionally Tokio-native; this is not
 /// a transport abstraction, and there is no blocking or alternate-runtime
@@ -41,11 +46,12 @@ use crate::{
 ///
 /// The core implements open handling, session creation and negotiation,
 /// normal echo processing, per-session rate limiting, idle expiry,
-/// maximum-duration close and client-initiated close. DSCP application and the
-/// full server fill policy are separate slices, and echo payloads are
-/// zero-filled. Incoming authenticated requests enforce logical expiry exactly;
-/// the runtime also calls a private maintenance hook to reclaim idle sessions
-/// when no traffic arrives.
+/// maximum-duration close and client-initiated close. It decides the traffic
+/// class each reply is to be sent with; actually applying it to a socket is the
+/// runtime's job. The full server fill policy is a separate slice, and echo
+/// payloads are zero-filled. Incoming authenticated requests enforce logical
+/// expiry exactly; the runtime also calls a private maintenance hook to reclaim
+/// idle sessions when no traffic arrives.
 #[derive(Debug)]
 pub struct ServerCore {
     config: ServerConfig,
@@ -111,6 +117,14 @@ impl ServerCore {
 
     /// Handles one received datagram, returning the reply to send, if any.
     ///
+    /// A reply is an [`OutboundDatagram`]: the encoded packet and the raw
+    /// traffic class it must be sent with. Open and no-test replies are always
+    /// unmarked, and an echo reply — including one carrying the
+    /// maximum-duration close — takes its session's negotiated class. The
+    /// runtime applies that class to the socket before sending; nothing here
+    /// touches a socket, and a class this core hands out is a request, not a
+    /// promise that the host can honor it.
+    ///
     /// `Ok(None)` means "answer nothing". The protocol defines no error reply,
     /// no reset and no NACK, so every rejection is a silent discard and a
     /// client distinguishes "rejected" from "lost" only by timing out. A
@@ -149,7 +163,7 @@ impl ServerCore {
         &mut self,
         peer: SocketAddr,
         packet: &[u8],
-    ) -> Result<Option<Vec<u8>>, ServerError> {
+    ) -> Result<Option<OutboundDatagram>, ServerError> {
         let Ok(request) = decode_request(packet) else {
             return Ok(None);
         };
@@ -295,7 +309,7 @@ impl ServerCore {
         &mut self,
         peer: SocketAddr,
         request: EchoRequest,
-    ) -> Result<Option<Vec<u8>>, ServerError> {
+    ) -> Result<Option<OutboundDatagram>, ServerError> {
         // Resource policy, applied to the length actually received. This is
         // `irtt-rs` policy rather than upstream-mechanism emulation: there is
         // no interface-MTU effective length here, just the datagram the caller
@@ -341,6 +355,10 @@ impl ServerCore {
         // it.
         let sent_at = self.clock.sample();
         let params = session.params();
+        // Read before the session can be released below: a maximum-duration
+        // close is an ordinary echo reply and carries the session's marking like
+        // any other.
+        let traffic_class = transport_traffic_class(params);
         let reply = EchoReply {
             // Open must be clear or upstream clients abort. Close is set only
             // for the maximum-duration limit, which is the sole trigger this
@@ -376,7 +394,7 @@ impl ServerCore {
             session.commit_receive_state(next);
             session.commit_lifetime_state(next_lifetime);
         }
-        Ok(Some(packet))
+        Ok(Some(OutboundDatagram::new(packet, traffic_class)))
     }
 
     /// Negotiates an open request and, unless it is a no-test one, creates the
@@ -393,7 +411,7 @@ impl ServerCore {
         no_test: bool,
         encoded_params: &[u8],
         now_ns: i64,
-    ) -> Result<Option<Vec<u8>>, ServerError> {
+    ) -> Result<Option<OutboundDatagram>, ServerError> {
         // The parameter decoder already rejects a truncated tag or value, a
         // varint overflow, an out-of-range stats/stamp-at/clock enum, and a
         // server-fill value that is oversized, short-buffered or not UTF-8.
@@ -419,7 +437,9 @@ impl ServerCore {
                 token: 0,
                 params,
             };
-            return self.encode_reply(&reply).map(Some);
+            return self
+                .encode_reply(&reply)
+                .map(|packet| Some(OutboundDatagram::unmarked(packet)));
         }
 
         if self.sessions.len() >= self.config.max_sessions() {
@@ -442,7 +462,7 @@ impl ServerCore {
             token,
             Session::new(peer, reply.params, &self.config, now_ns),
         );
-        Ok(Some(packet))
+        Ok(Some(OutboundDatagram::unmarked(packet)))
     }
 
     /// Releases the session a close request names, if that request owns one.
@@ -491,6 +511,82 @@ impl ServerCore {
             attempts: TOKEN_ATTEMPTS,
         })
     }
+}
+
+/// One reply the core prepared, together with the transport policy it must be
+/// sent under.
+///
+/// The bytes alone are not a complete instruction. A session negotiates a
+/// traffic class, and only the core knows which session a reply belongs to, so
+/// the class travels out with the packet instead of the runtime decoding the
+/// outgoing datagram again or keeping a second copy of session state.
+///
+/// [`traffic_class`](Self::traffic_class) is the **raw 8-bit IPv4 TOS / IPv6
+/// Traffic Class byte**, not a six-bit codepoint: the codepoint is its upper six
+/// bits and the low two are ECN. Zero is a value like any other and means
+/// unmarked — it is deliberately not `Option<u8>`, because a runtime sharing one
+/// socket between sessions has to apply zero as explicitly as it applies
+/// anything else, or an unmarked reply inherits the previous one's marking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutboundDatagram {
+    bytes: Vec<u8>,
+    traffic_class: u8,
+}
+
+impl OutboundDatagram {
+    /// A reply to send with an explicit raw traffic-class byte.
+    fn new(bytes: Vec<u8>, traffic_class: u8) -> Self {
+        Self {
+            bytes,
+            traffic_class,
+        }
+    }
+
+    /// A reply to send unmarked.
+    fn unmarked(bytes: Vec<u8>) -> Self {
+        Self::new(bytes, 0)
+    }
+
+    /// The encoded reply.
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// The raw IPv4 TOS / IPv6 Traffic Class byte this reply is to be sent
+    /// with. Zero means unmarked.
+    #[must_use]
+    pub fn traffic_class(&self) -> u8 {
+        self.traffic_class
+    }
+
+    /// Consumes the datagram, yielding its encoded reply.
+    #[must_use]
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
+    }
+}
+
+impl AsRef<[u8]> for OutboundDatagram {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
+/// The raw traffic-class byte a session's negotiated DSCP parameter asks for.
+///
+/// The wire parameter is an `i64` and this server deliberately accepts values
+/// outside `0..=255` during negotiation, returning and storing them unchanged.
+/// A value that is not a byte cannot be a TOS / Traffic Class byte, so the
+/// transport treats it as unmarked. That is **`irtt-rs` policy, not observed
+/// behavior**: the clean evidence records the reference host's handling of
+/// negative and oversized values as platform-specific and explicitly not a
+/// compatibility requirement, so there is nothing to reproduce. Zero is chosen
+/// over `as`-style truncation or two's-complement wrapping because neither
+/// −1 → 255 nor 256 → 0 is a marking the client asked for, and over refusing the
+/// session because a malformed-but-accepted open should stay usable.
+fn transport_traffic_class(params: &Params) -> u8 {
+    u8::try_from(params.dscp).unwrap_or(0)
 }
 
 /// A structurally decoded request kind, with an echo's arrival instant already

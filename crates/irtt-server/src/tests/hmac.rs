@@ -94,8 +94,12 @@ fn an_authenticating_server_answers_a_valid_open_with_an_authenticated_reply() {
 
     let reply = expect_normal_open_reply(&packet, Some(KEY));
     assert_eq!(reply.token, TOKEN_A);
-    assert_ne!(packet[3] & FLAG_HMAC, 0, "the reply must set FLAG_HMAC");
-    verify_packet_hmac(KEY, &packet).expect("the reply must carry a valid MAC");
+    assert_ne!(
+        packet.bytes()[3] & FLAG_HMAC,
+        0,
+        "the reply must set FLAG_HMAC"
+    );
+    verify_packet_hmac(KEY, packet.bytes()).expect("the reply must carry a valid MAC");
     assert_eq!(core.session_count(), 1);
 }
 
@@ -109,7 +113,7 @@ fn a_non_authenticating_server_answers_an_ordinary_open() {
         .expect("an unauthenticated open must be answered");
 
     expect_normal_open_reply(&packet, None);
-    assert_eq!(packet[3] & FLAG_HMAC, 0);
+    assert_eq!(packet.bytes()[3] & FLAG_HMAC, 0);
     assert_eq!(core.session_count(), 1);
 }
 

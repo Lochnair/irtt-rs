@@ -93,8 +93,15 @@ fn a_valid_echo_is_answered_from_the_negotiated_params() {
         "no timestamps were negotiated, so none are emitted"
     );
     assert!(reply.payload.is_empty());
-    assert_eq!(packet.len(), echo_packet_len(false, &negotiated).unwrap());
-    assert_eq!(packet.len(), 16, "magic, flags, token and sequence only");
+    assert_eq!(
+        packet.bytes().len(),
+        echo_packet_len(false, &negotiated).unwrap()
+    );
+    assert_eq!(
+        packet.bytes().len(),
+        16,
+        "magic, flags, token and sequence only"
+    );
 
     assert_eq!(
         core.session_count(),
@@ -149,7 +156,7 @@ fn a_reply_is_sized_by_the_session_not_by_the_request() {
         let reply = expect_echo_reply(&packet, &negotiated, None);
 
         assert_eq!(
-            packet.len(),
+            packet.bytes().len(),
             64,
             "{name}: the reply is the negotiated length"
         );
@@ -418,7 +425,7 @@ fn an_authenticated_session_answers_only_authenticated_echoes() {
         .unwrap()
         .expect("a correctly authenticated echo must be answered");
     assert!(
-        verify_packet_hmac(KEY, &packet).is_ok(),
+        verify_packet_hmac(KEY, packet.bytes()).is_ok(),
         "the reply must carry a MAC that verifies with the server's key"
     );
     // `expect_echo_reply` pins the HMAC flag and verifies the MAC again while
@@ -596,7 +603,7 @@ fn only_the_negotiated_timestamps_are_emitted() {
         // failure as much as a selected one carrying the wrong instant.
         assert_eq!(reply.timestamps, expected, "{stamp_at:?} on {clock:?}");
         assert_eq!(
-            packet.len(),
+            packet.bytes().len(),
             echo_packet_len(false, &negotiated).unwrap(),
             "{stamp_at:?} on {clock:?} must be the negotiated layout's length"
         );
@@ -704,12 +711,12 @@ fn a_single_clock_midpoint_emits_exactly_one_field() {
         let reply = expect_echo_reply(&packet, &negotiated, None);
 
         assert_eq!(
-            packet.len(),
+            packet.bytes().len(),
             echo_packet_len(false, &negotiated).unwrap(),
             "{clock:?}: the negotiated length, not the compatibility one"
         );
         assert_eq!(
-            packet.len(),
+            packet.bytes().len(),
             24,
             "{clock:?}: one 8-byte midpoint field, not the upstream two"
         );
@@ -734,7 +741,7 @@ fn a_reply_payload_is_zero_filled_and_never_reflects_the_request() {
         .expect("an admissible echo must be answered");
     let reply = expect_echo_reply(&packet, &negotiated, None);
 
-    assert_eq!(packet.len(), 64);
+    assert_eq!(packet.bytes().len(), 64);
     assert_eq!(reply.payload.len(), 48);
     assert!(
         reply.payload.iter().all(|byte| *byte == 0),

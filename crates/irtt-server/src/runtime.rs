@@ -90,7 +90,7 @@ impl Server {
                     }
 
                     if let Some(reply) = self.core.handle_datagram(peer, &self.recv_buffer[..len])? {
-                        let send = self.socket.send_to(&reply, peer);
+                        let send = self.socket.send_to(reply.bytes(), peer);
                         tokio::pin!(send);
                         let sent = loop {
                             tokio::select! {
@@ -99,7 +99,7 @@ impl Server {
                                 sent = &mut send => break sent,
                             }
                         };
-                        if !matches!(sent, Ok(len) if len == reply.len()) {
+                        if !matches!(sent, Ok(len) if len == reply.bytes().len()) {
                             continue;
                         }
                     }

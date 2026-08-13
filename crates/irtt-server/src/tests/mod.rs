@@ -24,3 +24,4 @@ mod rate;
 mod sessions;
 mod support;
 mod tokens;
+mod traffic_class;

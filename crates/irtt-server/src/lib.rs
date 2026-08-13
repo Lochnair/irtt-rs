@@ -10,11 +10,12 @@
 //! receive state, rate and lifetime policy, resource decisions and reply
 //! construction. It performs no I/O; the clock its timestamps and deadlines
 //! come from is a private injected seam, not a runtime abstraction, so the
-//! engine stays testable. [`Server`] owns one Tokio UDP listener and one core,
-//! and provides sequential receive, reply, scheduled expiry maintenance and
-//! caller-controlled shutdown. The crate is intentionally Tokio-native; there
-//! is no blocking or alternate-runtime counterpart and no transport
-//! abstraction.
+//! engine stays testable. Each reply it produces is an [`OutboundDatagram`]:
+//! the packet and the raw traffic class it must be sent with. [`Server`] owns
+//! one Tokio UDP listener and one core, and provides sequential receive, reply,
+//! scheduled expiry maintenance and caller-controlled shutdown. The crate is
+//! intentionally Tokio-native; there is no blocking or alternate-runtime
+//! counterpart and no transport abstraction.
 //!
 //! # Rejection is silence
 //!
@@ -63,6 +64,6 @@ pub use config::{
     ServerConfig, DEFAULT_BURST_ALLOWANCE, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_PACKET_LENGTH,
     DEFAULT_MAX_SESSIONS, DEFAULT_MIN_SEND_INTERVAL,
 };
-pub use core::ServerCore;
+pub use core::{OutboundDatagram, ServerCore};
 pub use error::ServerError;
 pub use runtime::{Server, ServerRuntimeError};
