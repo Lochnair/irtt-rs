@@ -180,11 +180,14 @@ The same applet is reachable through the dispatcher:
 irtt-rs server --bind 192.0.2.10:2112
 ```
 
-An explicit interface address is preferred. A wildcard bind such as
-`--bind 0.0.0.0:2112` is accepted, but reply source-address selection is then
-left to the kernel: per-packet destination-address handling for multi-homed
-hosts is not implemented. One process serves exactly one address, so run a
-second process to serve a second address or family.
+An explicit interface address works on every supported system. A wildcard bind
+such as `--bind 0.0.0.0:2112` reads each request's local destination from packet
+metadata and sends that request's reply from the same address, so a client on a
+multi-homed host is answered from the endpoint it contacted. That is implemented
+on Linux, macOS and FreeBSD; elsewhere a wildcard bind is refused rather than
+served from a routing-table source address a client would discard. One process
+serves exactly one address, so run a second process to serve a second address or
+family.
 
 The bound endpoint is printed on startup, which also resolves a port of `0`.
 `Ctrl-C` stops the server gracefully.
@@ -304,7 +307,7 @@ The client, event stream, machine-readable output, multi-target execution, local
 
 The server library and the server applet are implemented: open negotiation,
 session state, echo processing, per-session rate limiting, idle expiry, the
-maximum-duration close, HMAC authentication, and the negotiated per-session
-reply traffic class, which is applied on sockets that support it. The full
-server fill policy, per-packet source-address selection for wildcard binds on
-multi-homed hosts, and multiple listeners in one process are not implemented.
+maximum-duration close, HMAC authentication, the negotiated per-session reply
+traffic class, which is applied on sockets that support it, and wildcard
+reply-source selection on Linux, macOS and FreeBSD. The full server fill policy
+and multiple listeners in one process are not implemented.

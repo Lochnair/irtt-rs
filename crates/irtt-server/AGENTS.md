@@ -53,13 +53,55 @@ material does not establish a semantic, state the ambiguity instead of guessing.
   the listener. Core state is not rolled back after a transport send failure.
 - Runtime maintenance calls the core's expiry hook. It must not inspect session
   internals or grow a second expiry rule.
-- Explicit-address binds are the source-address-safe supported path. A wildcard
-  bind on a multi-homed host remains subject to kernel source-address selection
-  until packet-info handling is implemented.
 - Do not add a blocking server, an alternate-runtime variant, a transport trait,
   a runtime abstraction layer, or a mirrored client-style API family. There is
   no product requirement for any of them, and `ServerCore` being public is not a
   promise of runtime independence.
+
+## Reply source address
+
+A reply must leave from the address its request was sent to, or a client reading
+from a connected socket discards it. An explicit-address listener satisfies that
+by construction and keeps the plain `recv_from`/`send_to` path — do not route it
+through ancillary machinery merely because the helper exists.
+
+A wildcard listener does not, so it recovers each request's local destination
+and sends that reply from it. The supported targets are Linux, macOS and
+FreeBSD; a wildcard bind anywhere else fails at construction. Correct refusal is
+the point: a listener that starts and then answers from a routing-table source
+address fails invisibly, as loss.
+
+- **Destination metadata is runtime transport state.** It never enters
+  `ServerCore`, `Session` or `OutboundDatagram`. The core knows peers and
+  sessions; which of the host's addresses a request arrived on is not session
+  policy, and adding it there would make the core platform-shaped.
+- **A wildcard listener must never process a datagram whose local destination it
+  could not recover.** Missing destination metadata, `MSG_CTRUNC` and `MSG_TRUNC`
+  all drop the datagram *before* the core, so no receive, rate or lifetime state
+  moves for a request that cannot be answered correctly. There is no fall back
+  to kernel source selection: the listener promised correct sources when it
+  accepted the bind.
+- Wildcard-ness is decided once, from the bound address, and never inferred from
+  a peer.
+- Source selection is **per-packet send metadata**; the traffic class stays the
+  existing socket-wide setting applied before every send. Two transport
+  mechanisms, deliberately: the marking policy is already implemented and tested
+  across a wider target matrix, and sequential send ownership is what keeps it
+  race-free. Do not migrate it into control messages merely because `sendmsg` is
+  now in reach.
+- `recvmsg` and `sendmsg` integrate through Tokio readiness — `readable()` /
+  `writable()` with `try_io` — following the client's ancillary receive path.
+  No blocking call, no `spawn_blocking`, no dedicated receive thread, and still
+  one socket and one task.
+- The crate forbids unsafe code and that is not negotiable for this feature. Use
+  `nix`'s safe `recvmsg`/`sendmsg`, `ControlMessage`, `ControlMessageOwned` and
+  `sockopt` wrappers; no raw syscall, no `CMSG_*` walking, no hand-written ABI
+  layer. A target that cannot be served this way is refused, not excepted.
+- The receive and send structures are not interchangeable, and the BSD IPv4
+  options are not Linux's under other names. Build each direction's control
+  message explicitly rather than echoing a received one back.
+- A send failure is per-packet loss, exactly as an ordinary `send_to` failure
+  is. It never terminates the listener and never rolls back core state.
 
 ## Rejection is silence
 
