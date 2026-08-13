@@ -34,8 +34,8 @@ pub(crate) fn set_reply_traffic_class(
     target_os = "fuchsia",
     target_os = "redox",
     target_os = "solaris",
-    target_os = "illumos",
     target_os = "haiku",
+    target_os = "wasi",
 )))]
 fn set_ipv4_traffic_class(socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
     socket.set_tos_v4(traffic_class)
@@ -45,8 +45,8 @@ fn set_ipv4_traffic_class(socket: SockRef<'_>, traffic_class: u32) -> io::Result
     target_os = "fuchsia",
     target_os = "redox",
     target_os = "solaris",
-    target_os = "illumos",
     target_os = "haiku",
+    target_os = "wasi",
 ))]
 fn set_ipv4_traffic_class(_socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
     unsupported_traffic_class(traffic_class, "IPv4 TOS socket options")
@@ -62,6 +62,7 @@ fn set_ipv4_traffic_class(_socket: SockRef<'_>, traffic_class: u32) -> io::Resul
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "cygwin",
+    target_os = "illumos",
 ))]
 fn set_ipv6_traffic_class(socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
     socket.set_tclass_v6(traffic_class)
@@ -77,6 +78,7 @@ fn set_ipv6_traffic_class(socket: SockRef<'_>, traffic_class: u32) -> io::Result
     target_os = "netbsd",
     target_os = "openbsd",
     target_os = "cygwin",
+    target_os = "illumos",
 )))]
 fn set_ipv6_traffic_class(_socket: SockRef<'_>, traffic_class: u32) -> io::Result<()> {
     unsupported_traffic_class(traffic_class, "IPv6 Traffic Class socket options")
@@ -84,18 +86,20 @@ fn set_ipv6_traffic_class(_socket: SockRef<'_>, traffic_class: u32) -> io::Resul
 
 /// A target where the safe API cannot express this option.
 ///
-/// Requesting *unmarked* still succeeds, because a platform that can never
-/// apply a nonzero class also never left one on the socket for the next reply to
-/// inherit — the invariant the explicit zero exists to protect. Asking for a
-/// real marking reports [`io::ErrorKind::Unsupported`] rather than pretending:
-/// the runtime drops that one reply and stays alive, and no reply ever goes out
-/// carrying a class the server did not intend.
+/// This reports [`io::ErrorKind::Unsupported`] for *every* value, zero
+/// included. Returning success for zero would claim the socket had been cleared
+/// when nothing was written to it, which is not the same statement — a caller
+/// handing [`Server::from_socket`](crate::Server::from_socket) an already
+/// prepared socket may have marked it by some other means. Whether an
+/// unappliable zero is nevertheless safe to send is the runtime's decision, and
+/// it is made from what this server itself has applied; this helper's job is
+/// only to report honestly.
 #[cfg(any(
     target_os = "fuchsia",
     target_os = "redox",
     target_os = "solaris",
-    target_os = "illumos",
     target_os = "haiku",
+    target_os = "wasi",
     not(any(
         target_os = "android",
         target_os = "dragonfly",
@@ -106,15 +110,12 @@ fn set_ipv6_traffic_class(_socket: SockRef<'_>, traffic_class: u32) -> io::Resul
         target_os = "netbsd",
         target_os = "openbsd",
         target_os = "cygwin",
+        target_os = "illumos",
     )),
 ))]
-fn unsupported_traffic_class(traffic_class: u32, option: &'static str) -> io::Result<()> {
-    if traffic_class == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            format!("{option} are unsupported on this target"),
-        ))
-    }
+fn unsupported_traffic_class(_traffic_class: u32, option: &'static str) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!("{option} are unsupported on this target"),
+    ))
 }

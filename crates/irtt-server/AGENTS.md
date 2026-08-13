@@ -194,12 +194,26 @@ session policy lives.
   suspended. Do not introduce concurrent sends without replacing this with
   per-packet control messages.
 - Applying the class and sending are both per-packet transport steps: a failure
-  of either drops that one reply and the listener keeps serving. A class that
+  of either drops that one reply and the listener keeps serving. A marking that
   could not be applied means the reply is not sent at all, because sending it
   would put it on the wire under the previous reply's marking.
+- **One exception, and it is what keeps the server usable on hosts without the
+  option**: an *unmarked* reply may still be sent when this server has never
+  successfully applied a nonzero class to the socket, because then there is no
+  marking of ours for it to inherit. Some Windows builds do not support
+  `IP_TOS`, and a few targets have no safe setter at all; without this, such a
+  host would drop every open reply and no session could ever start. The flag
+  behind it is consulted only on failure — it never elides a call.
+- The platform helper must report failure honestly, including for zero. "The
+  socket was cleared" and "nothing was written" are different statements, and a
+  socket passed to `Server::from_socket` may have been marked by its creator.
+  Whether an unappliable zero is nevertheless safe is the runtime's decision,
+  made from what this server itself applied.
 - The option itself comes from `socket2`'s safe API, chosen by the listener's
   bound address family rather than the peer's. The crate forbids unsafe code;
-  there is no raw `setsockopt` and no `sendmsg`/`cmsg` machinery.
+  there is no raw `setsockopt` and no `sendmsg`/`cmsg` machinery. Keep the
+  target lists identical to the pinned `socket2` version's own gates — check
+  its source rather than copying another crate's older matrix.
 
 ## Rate, lifetime and server-initiated close
 
