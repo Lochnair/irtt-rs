@@ -69,6 +69,46 @@ fn canonical_client_subcommand_reports_unavailable_when_disabled() {
     );
 }
 
+#[cfg(feature = "server")]
+#[test]
+fn canonical_server_subcommand_dispatches_to_server() {
+    let output = irtt_rs().args(["server", "--help"]).output().unwrap();
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Minimal IRTT-compatible UDP server"));
+    assert!(text.contains("--bind <ADDR>"));
+    assert!(text.contains("--max-sessions <COUNT>"));
+    assert!(text.contains("--idle-timeout <DURATION>"));
+}
+
+#[cfg(not(feature = "server"))]
+#[test]
+fn canonical_server_subcommand_reports_unavailable_when_disabled() {
+    let output = irtt_rs().args(["server", "--help"]).output().unwrap();
+    let text = output_text(&output);
+
+    assert!(!output.status.success());
+    assert!(
+        text.contains("server applet is not available; rebuild with the server feature"),
+        "{text}"
+    );
+}
+
+#[cfg(feature = "server")]
+#[test]
+fn standalone_server_binary_exposes_the_same_arguments() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_irtt-server"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Minimal IRTT-compatible UDP server"));
+    assert!(text.contains("--bind <ADDR>"));
+}
+
 #[cfg(unix)]
 #[cfg(feature = "client")]
 #[test]
@@ -128,9 +168,23 @@ fn tui_applet_name_reports_unavailable_when_disabled() {
     assert!(text.contains("TUI applet is not available"), "{text}");
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, feature = "server"))]
 #[test]
-fn server_applet_name_reports_unavailable() {
+fn server_applet_name_dispatches_to_server_when_enabled() {
+    let output = irtt_rs_with_arg0("irtt-server")
+        .arg("--help")
+        .output()
+        .unwrap();
+    let text = output_text(&output);
+
+    assert!(output.status.success(), "{text}");
+    assert!(text.contains("Minimal IRTT-compatible UDP server"));
+    assert!(text.contains("--bind <ADDR>"));
+}
+
+#[cfg(all(unix, not(feature = "server")))]
+#[test]
+fn server_applet_name_reports_unavailable_when_disabled() {
     let output = irtt_rs_with_arg0("irtt-server")
         .arg("--help")
         .output()

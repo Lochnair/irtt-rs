@@ -701,8 +701,10 @@ dependencies = [
  "ctrlc",
  "irtt-client",
  "irtt-proto",
+ "irtt-server",
  "irtt-stats",
  "ratatui",
+ "tokio",
 ]
 
 [[package]]

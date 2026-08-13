@@ -51,7 +51,7 @@ Main boundary:
   - `BlockingManagedClient`: synchronous owner using a dedicated current-thread Tokio runtime.
 - `irtt-server`: exists; see "Server architecture (`irtt-server`)" below.
 - `irtt-stats`: cumulative/rolling/finite statistics over client events. No wire/session state machine logic.
-- `irtt-cli`: argument parsing, managed orchestration, output, summaries, TUI, diagnostics, and exit behavior. Do not duplicate protocol/session state machines here.
+- `irtt-cli`: argument parsing, managed orchestration, output, summaries, TUI, server applet orchestration, diagnostics, and exit behavior. Do not duplicate protocol/session state machines here.
 
 Tokio must remain optional for `irtt-client`; default builds must remain runtime-free and Tokio-free unless an explicit architectural change says otherwise. This rule is specific to `irtt-client` — do not generalize it to `irtt-server`, which has the opposite policy below.
 
@@ -65,7 +65,7 @@ Tokio must remain optional for `irtt-client`; default builds must remain runtime
 - There is currently no requirement for a blocking server API, alternate async runtimes, a runtime abstraction layer, or a runtime-free server feature. Do not build blocking/runtime variants merely for symmetry with the client, and do not invent a mirrored client-style API family (`BlockingServer`, `AsyncServer`, `ManagedServer`, `BlockingManagedServer`, or similar) ahead of agreement.
 - Protocol/session logic should be separated from socket/runtime orchestration where that materially improves deterministic testing, ownership clarity, state-machine reasoning, or maintainability. A `ServerCore`-like internal boundary is therefore desirable, but its exact name/API is not prescribed, it need not be public, it is not a promise of runtime independence, and simple code should not be tortured merely to make the core artificially pure.
 - Runtime/server orchestration belongs around that core and may freely use Tokio for UDP sockets, `recv_from`/`send_to`, IPv4/IPv6 listeners, timers, session expiry, max-duration deadlines, shutdown, bounded control/config channels where useful, and `select!`-style orchestration.
-- The CLI server applet, when added, should remain thin orchestration/configuration over reusable `irtt-server`, not contain a second server state machine.
+- The CLI server applet exists behind the `irtt-cli` `server` feature, which is part of that crate's default build. It is thin orchestration/configuration over reusable `irtt-server` — one current-thread Tokio runtime, one explicitly bound listener, one `Server` — and must not grow a second server state machine. Multi-listener orchestration, hostname resolution, daemonization, and configuration files are deliberately absent.
 - Resource policy: the server should use bounded session/resource policy. Upstream's observed lack of useful default session/per-peer bounds, and its never expiring a session that has not carried an echo request (see `IRTT_SERVER_PROTOCOL_SPEC.md`), are not interoperability requirements and must not be reproduced merely for compatibility.
 - Testing: prefer `irtt-server` for normal compliant fake-peer behavior where practical, as far as its implemented behavior reaches. Keep narrow adversarial/raw peers for intentionally malformed, ambiguous, or non-compliant wire behavior.
 

@@ -37,7 +37,7 @@ fn run_from_env() -> Result<(), Box<dyn std::error::Error>> {
     match requested {
         RequestedApplet::Client => run_client_applet(argv, shutdown_requested.as_ref()),
         RequestedApplet::Tui => run_tui_applet(argv, shutdown_requested.as_ref()),
-        RequestedApplet::Server => Err("server applet is not available in this build".into()),
+        RequestedApplet::Server => run_server_applet(argv, shutdown_requested.as_ref()),
     }
 }
 
@@ -58,6 +58,25 @@ fn run_client_applet(
     _shutdown_requested: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     Err("client applet is not available; rebuild with the client feature".into())
+}
+
+#[cfg(feature = "server")]
+fn run_server_applet(
+    argv: Vec<OsString>,
+    shutdown_requested: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use clap::Parser;
+
+    let args = crate::cmd::server::ServerArgs::parse_from(argv);
+    crate::cmd::server::run_server(args, shutdown_requested)
+}
+
+#[cfg(not(feature = "server"))]
+fn run_server_applet(
+    _argv: Vec<OsString>,
+    _shutdown_requested: &AtomicBool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    Err("server applet is not available; rebuild with the server feature".into())
 }
 
 #[cfg(feature = "tui")]

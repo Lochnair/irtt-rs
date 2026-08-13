@@ -81,7 +81,7 @@ pub fn dispatcher_help() -> String {
         .about("IRTT-compatible multi-applet dispatcher")
         .subcommand(Command::new("client").about(client_applet_about()))
         .subcommand(Command::new("tui").about(tui_applet_about()))
-        .subcommand(Command::new("server").about("Server applet is not available in this build"))
+        .subcommand(Command::new("server").about(server_applet_about()))
         .after_help(dispatcher_after_help());
     command.render_help().to_string()
 }
@@ -102,6 +102,14 @@ fn tui_applet_about() -> &'static str {
     }
 }
 
+fn server_applet_about() -> &'static str {
+    if cfg!(feature = "server") {
+        "Run the UDP server applet"
+    } else {
+        "UDP server applet is not available in this build"
+    }
+}
+
 fn known_applet_binary_names() -> &'static str {
     "irtt-rs, irtt-cli, irtt-tui, irtt-server"
 }
@@ -110,14 +118,26 @@ fn applet_command_names() -> &'static str {
     "client, tui, or server"
 }
 
-fn dispatcher_after_help() -> &'static str {
-    if cfg!(feature = "tui") {
-        "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server"
-    } else if cfg!(feature = "client") {
-        "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server\nOptional applet: irtt-tui requires the tui feature"
-    } else {
-        "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server\nOptional applets: irtt-cli requires the client feature; irtt-tui requires the tui feature"
+fn dispatcher_after_help() -> String {
+    let mut help = "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server".to_owned();
+
+    let mut missing = Vec::new();
+    if !cfg!(feature = "client") {
+        missing.push("irtt-cli requires the client feature");
     }
+    if !cfg!(feature = "server") {
+        missing.push("irtt-server requires the server feature");
+    }
+    if !cfg!(feature = "tui") {
+        missing.push("irtt-tui requires the tui feature");
+    }
+
+    match missing.len() {
+        0 => {}
+        1 => help.push_str(&format!("\nOptional applet: {}", missing[0])),
+        _ => help.push_str(&format!("\nOptional applets: {}", missing.join("; "))),
+    }
+    help
 }
 
 fn applet_basename(argv0: &str) -> &str {
@@ -170,6 +190,11 @@ mod tests {
             assert!(help.contains("Terminal UI applet is not available in this build"));
         }
         assert!(help.contains("server"));
+        if cfg!(feature = "server") {
+            assert!(help.contains("Run the UDP server applet"));
+        } else {
+            assert!(help.contains("UDP server applet is not available in this build"));
+        }
     }
 
     #[test]
