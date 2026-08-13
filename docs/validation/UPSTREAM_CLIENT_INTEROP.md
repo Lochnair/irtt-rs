@@ -64,7 +64,7 @@ loopback addresses and no DNS.
 | Packet-length restriction | `with_max_packet_length(96)` | `-l 128 --loose` | **PASS** | Runs at 96 bytes, 10/10 packets, 0.00% loss, exit 0 |
 | Interval restriction | default (10 ms floor) | `-i 1ms -d 500ms --loose` | **PASS** | `server increased interval from 1ms to 10ms`; 50/50 packets, 0.00% loss — the rate limiter never penalised a client sending at the interval it was given |
 | Maximum-duration Close | `with_max_test_duration(500ms)` | `-d 5s -i 100ms --loose` | **PASS** (restriction) | `server reduced duration from 5s to 500ms`; 5/5 packets, exit 0. Close reply not reached on loopback; see Findings. |
-| Continuous request | `with_max_test_duration(500ms)` | `-d 0` | **SKIPPED** | Upstream rejects it client-side (`[DurationNonPositive] duration (0s) must be > 0`); a continuous request never reaches the wire from this CLI |
+| Continuous request | `with_max_test_duration(500ms)` | `-d 0` | **SKIPPED** | Upstream refuses the argument (`[DurationNonPositive] duration (0s) must be > 0`), exiting non-zero without printing the connection line it prints in every other scenario. No packet capture was taken, so what the client emitted before exiting was not observed; continuous mode was simply not exercisable through this CLI |
 | No-test (optional) | default | `-n -l 128` | **PASS** | `[NoTest] skipping test at user request`, exit 0, no measurement session |
 | Midpoint, single clock (optional) | default | `--tstamp=midpoint --clock=monotonic` | **PASS** | 5/5 packets, exit 0; RTT and IPDV computed from the single midpoint field |
 | Midpoint, wall only (optional) | default | `--tstamp=midpoint --clock=wall` | **PASS** | 3/3 packets, exit 0 |
