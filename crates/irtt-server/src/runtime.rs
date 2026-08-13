@@ -131,8 +131,8 @@ impl Server {
     /// A reply whose marking could not be applied is not sent instead: sending
     /// it would put it on the wire under the previous reply's marking. An
     /// *unmarked* reply on a socket this server has never marked is the one
-    /// exception, so a host that does not support the option at all still runs
-    /// a working server. See [`Server::prepare_reply_traffic_class`].
+    /// exception, so a host that does not support the option at all — some
+    /// Windows builds do not support `IP_TOS` — still runs a working server.
     pub async fn run<F>(&mut self, shutdown: F) -> Result<(), ServerRuntimeError>
     where
         F: Future<Output = ()>,
