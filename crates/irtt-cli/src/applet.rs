@@ -81,7 +81,7 @@ pub fn dispatcher_help() -> String {
         .about("IRTT-compatible multi-applet dispatcher")
         .subcommand(Command::new("client").about(client_applet_about()))
         .subcommand(Command::new("tui").about(tui_applet_about()))
-        .subcommand(Command::new("server").about("Server applet is not available in this build"))
+        .subcommand(Command::new("server").about(server_applet_about()))
         .after_help(dispatcher_after_help());
     command.render_help().to_string()
 }
@@ -102,6 +102,14 @@ fn tui_applet_about() -> &'static str {
     }
 }
 
+fn server_applet_about() -> &'static str {
+    if cfg!(feature = "server") {
+        "Run the UDP server applet"
+    } else {
+        "UDP server applet is not available in this build"
+    }
+}
+
 fn known_applet_binary_names() -> &'static str {
     "irtt-rs, irtt-cli, irtt-tui, irtt-server"
 }
@@ -110,21 +118,60 @@ fn applet_command_names() -> &'static str {
     "client, tui, or server"
 }
 
-fn dispatcher_after_help() -> &'static str {
-    if cfg!(feature = "tui") {
-        "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server"
-    } else if cfg!(feature = "client") {
-        "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server\nOptional applet: irtt-tui requires the tui feature"
-    } else {
-        "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server\nOptional applets: irtt-cli requires the client feature; irtt-tui requires the tui feature"
+fn dispatcher_after_help() -> String {
+    let mut help = "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server".to_owned();
+
+    let mut missing = Vec::new();
+    if !cfg!(feature = "client") {
+        missing.push("irtt-cli requires the client feature");
     }
+    if !cfg!(feature = "server") {
+        missing.push("irtt-server requires the server feature");
+    }
+    if !cfg!(feature = "tui") {
+        missing.push("irtt-tui requires the tui feature");
+    }
+
+    match missing.len() {
+        0 => {}
+        1 => help.push_str(&format!("\nOptional applet: {}", missing[0])),
+        _ => help.push_str(&format!("\nOptional applets: {}", missing.join("; "))),
+    }
+    help
 }
 
 fn applet_basename(argv0: &str) -> &str {
-    Path::new(argv0)
+    let name = Path::new(argv0)
         .file_name()
         .and_then(|name| name.to_str())
-        .unwrap_or(argv0)
+        .unwrap_or(argv0);
+    strip_suffix_ignoring_case(name, std::env::consts::EXE_SUFFIX)
+}
+
+/// Removes the platform executable suffix from a file name.
+///
+/// The suffix is part of the file name on Windows and empty everywhere else, so
+/// this is a no-op on Unix. Without it, every applet name — including the
+/// `irtt-rs` dispatcher itself — reaches argv0 detection as `<name>.exe` and is
+/// rejected as an unknown applet. The applet names themselves are still matched
+/// exactly; only this platform artifact is case-insensitive, because it is not
+/// a name the user chose.
+///
+/// The suffix is a parameter so that Windows behavior is assertable from any
+/// host, not only where `EXE_SUFFIX` happens to be non-empty.
+fn strip_suffix_ignoring_case<'a>(name: &'a str, suffix: &str) -> &'a str {
+    if suffix.is_empty() || name.len() <= suffix.len() {
+        return name;
+    }
+    let split = name.len() - suffix.len();
+    let (Some(stem), Some(tail)) = (name.get(..split), name.get(split..)) else {
+        return name;
+    };
+    if tail.eq_ignore_ascii_case(suffix) {
+        stem
+    } else {
+        name
+    }
 }
 
 fn applet_argv(applet_name: &str, args: &[OsString]) -> Vec<OsString> {
@@ -157,6 +204,52 @@ mod tests {
     }
 
     #[test]
+    fn applet_detection_ignores_the_platform_executable_suffix() {
+        let exe = std::env::consts::EXE_SUFFIX;
+
+        assert_eq!(
+            detect_applet_from_argv0(&format!("/opt/irtt/irtt-server{exe}")),
+            Some(RequestedApplet::Server)
+        );
+        assert_eq!(
+            detect_applet_from_argv0(&format!("irtt-cli{exe}")),
+            Some(RequestedApplet::Client)
+        );
+
+        // The dispatcher's own name must not be taken for an unknown applet.
+        let dispatcher = format!("irtt-rs{exe}");
+        assert_eq!(detect_applet_from_argv0(&dispatcher), None);
+        assert!(dispatch_from_argv(vec![dispatcher.into(), "--help".into()]).is_ok());
+
+        // A name that merely ends in the suffix letters keeps them.
+        assert!(detect_applet_from_argv0("irtt-serverexe").is_none());
+    }
+
+    #[test]
+    fn windows_executable_suffix_handling_is_assertable_from_any_host() {
+        assert_eq!(
+            strip_suffix_ignoring_case("irtt-server.exe", ".exe"),
+            "irtt-server"
+        );
+        assert_eq!(strip_suffix_ignoring_case("IRTT-RS.EXE", ".exe"), "IRTT-RS");
+        assert_eq!(
+            strip_suffix_ignoring_case("irtt-server", ".exe"),
+            "irtt-server"
+        );
+        assert_eq!(
+            strip_suffix_ignoring_case("irtt-serverexe", ".exe"),
+            "irtt-serverexe"
+        );
+        assert_eq!(strip_suffix_ignoring_case(".exe", ".exe"), ".exe");
+        assert_eq!(
+            strip_suffix_ignoring_case("irtt-server.exe", ""),
+            "irtt-server.exe"
+        );
+        // A multi-byte tail must not split mid-character.
+        assert_eq!(strip_suffix_ignoring_case("irtt-så", ".exe"), "irtt-så");
+    }
+
+    #[test]
     fn canonical_help_renders_dispatcher_help() {
         let dispatch = dispatch_from_argv(vec!["irtt-rs".into(), "--help".into()]).unwrap();
         let AppletDispatch::Help(help) = dispatch else {
@@ -170,6 +263,11 @@ mod tests {
             assert!(help.contains("Terminal UI applet is not available in this build"));
         }
         assert!(help.contains("server"));
+        if cfg!(feature = "server") {
+            assert!(help.contains("Run the UDP server applet"));
+        } else {
+            assert!(help.contains("UDP server applet is not available in this build"));
+        }
     }
 
     #[test]

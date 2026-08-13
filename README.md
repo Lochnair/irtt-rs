@@ -1,8 +1,8 @@
 # irtt-rs
 
-`irtt-rs` is a Rust implementation of an IRTT-compatible client.
+`irtt-rs` is a Rust implementation of an IRTT-compatible client and server.
 
-It provides both a command-line client and a reusable Rust library for finite or continuous latency probing. It is intended for interactive diagnostics, scripting, monitoring, and integration into applications such as network autorate controllers.
+It provides command-line applets and reusable Rust libraries for finite or continuous latency probing, plus the server side those probes can run against. It is intended for interactive diagnostics, scripting, monitoring, and integration into applications such as network autorate controllers.
 
 This is not the upstream IRTT project. For the original implementation, protocol background, and broader documentation, see [heistp/irtt](https://github.com/heistp/irtt).
 
@@ -16,9 +16,9 @@ This is not the upstream IRTT project. For the original implementation, protocol
 * Selectable output columns
 * Automatic final summaries for eligible table-output runs
 * Optional terminal UI
+* Reusable Tokio-native server library
+* UDP server applet with explicit bind and session policy options
 * Router-friendly multi-applet binary layout
-
-Server support is not implemented.
 
 The installed dispatcher is named `irtt-rs` rather than `irtt` to avoid conflicting with or being mistaken for upstream IRTT.
 
@@ -38,6 +38,7 @@ This installs:
 
 * `irtt-rs`, the canonical multi-applet dispatcher
 * `irtt-cli`, the stream and text client
+* `irtt-server`, the UDP server
 
 To also install the optional terminal UI:
 
@@ -165,6 +166,51 @@ irtt-tui host-a:2112 host-b:2112 --pacing burst
 
 Quit with `q` or `Ctrl-C`.
 
+## Server
+
+The server applet serves one UDP listener and requires an explicit bind address:
+
+```sh
+irtt-server --bind 127.0.0.1:2112
+```
+
+The same applet is reachable through the dispatcher:
+
+```sh
+irtt-rs server --bind 192.0.2.10:2112
+```
+
+An explicit interface address is preferred. A wildcard bind such as
+`--bind 0.0.0.0:2112` is accepted, but reply source-address selection is then
+left to the kernel: per-packet destination-address handling for multi-homed
+hosts is not implemented. One process serves exactly one address, so run a
+second process to serve a second address or family.
+
+The bound endpoint is printed on startup, which also resolves a port of `0`.
+`Ctrl-C` stops the server gracefully.
+
+Session policy is set with options that map directly onto the server library's
+configuration; anything left unset keeps the library default:
+
+```sh
+irtt-server \
+    --bind 192.0.2.10:2112 \
+    --max-sessions 512 \
+    --idle-timeout 30s
+```
+
+To require authentication, pass the shared key both sides use:
+
+```sh
+irtt-server --bind 192.0.2.10:2112 --hmac secret
+```
+
+For the full option list:
+
+```sh
+irtt-server --help
+```
+
 ## Library usage
 
 `irtt-client` exposes the client session and event layer independently of CLI formatting and statistics.
@@ -221,17 +267,23 @@ synchronous callers. Callers that already own Tokio can drive
 
 ## Binaries and features
 
-| Build                   | Binaries                          |
-| ----------------------- | --------------------------------- |
-| `--no-default-features` | `irtt-rs`                         |
-| Default features        | `irtt-rs`, `irtt-cli`             |
-| `--features tui`        | `irtt-rs`, `irtt-cli`, `irtt-tui` |
-| `--all-features`        | `irtt-rs`, `irtt-cli`, `irtt-tui` |
+| Build                                     | Binaries                                          |
+| ----------------------------------------- | ------------------------------------------------- |
+| `--no-default-features`                   | `irtt-rs`                                         |
+| `--no-default-features --features server` | `irtt-rs`, `irtt-server`                          |
+| Default features                          | `irtt-rs`, `irtt-cli`, `irtt-server`              |
+| `--features tui`                          | `irtt-rs`, `irtt-cli`, `irtt-server`, `irtt-tui`  |
+| `--all-features`                          | `irtt-rs`, `irtt-cli`, `irtt-server`, `irtt-tui`  |
+
+`irtt-cli` requires the `client` feature, `irtt-server` the `server` feature,
+and `irtt-tui` the `tui` feature. The `irtt-rs` dispatcher is always built, and
+reports which applets the build actually contains.
 
 For available command-line options:
 
 ```sh
 irtt-cli --help
+irtt-server --help
 irtt-tui --help
 ```
 
@@ -250,4 +302,8 @@ cargo build -p irtt-cli --all-features --release
 
 The client, event stream, machine-readable output, multi-target execution, local statistics, and optional TUI are implemented.
 
-Server support is not implemented.
+The server library and the server applet are implemented: open negotiation,
+session state, echo processing, per-session rate limiting, idle expiry, the
+maximum-duration close, and HMAC authentication. DSCP application, the full
+server fill policy, per-packet source-address selection for wildcard binds on
+multi-homed hosts, and multiple listeners in one process are not implemented.
