@@ -42,10 +42,12 @@ Flags used were taken from the executable's own `irtt help client` output:
 `--tstamp`, `--clock`.
 
 `--loose` is upstream's documented client-side switch for accepting
-server-restricted test parameters instead of exiting non-zero. Restriction
-scenarios were therefore run **both** ways: without it to confirm the client
-detects and reports the restriction, and with it to confirm the restricted
-session actually runs.
+server-restricted test parameters instead of exiting non-zero. The
+**packet-length** restriction was run both ways: without it, to confirm the
+client detects and reports the restriction, and with it, to confirm the
+restricted session actually runs. The interval and maximum-duration
+restrictions were run with `--loose` only, so strict-mode refusal was observed
+for packet length alone and is not claimed for the other two.
 
 ## Matrix
 
