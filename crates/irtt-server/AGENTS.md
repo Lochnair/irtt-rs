@@ -43,6 +43,19 @@ material does not establish a semantic, state the ambiguity instead of guessing.
   belongs around the core.
 - The server is intentionally **Tokio-native**. Tokio does not need to be
   optional for this crate.
+- `Server` owns exactly one Tokio `UdpSocket` and one `ServerCore`. Run protocol
+  processing sequentially in that one task: do not spawn per datagram, put the
+  core behind a lock, or start an internal detached task.
+- The runtime must remain a thin `recv_from` -> `handle_datagram` -> optional
+  `send_to` loop. Do not duplicate protocol parsing or encoding around the core.
+- A receive failure or core failure may terminate `Server::run`; a per-packet
+  send failure (including a short send) drops only that reply and must not stop
+  the listener. Core state is not rolled back after a transport send failure.
+- Runtime maintenance calls the core's expiry hook. It must not inspect session
+  internals or grow a second expiry rule.
+- Explicit-address binds are the source-address-safe supported path. A wildcard
+  bind on a multi-homed host remains subject to kernel source-address selection
+  until packet-info handling is implemented.
 - Do not add a blocking server, an alternate-runtime variant, a transport trait,
   a runtime abstraction layer, or a mirrored client-style API family. There is
   no product requirement for any of them, and `ServerCore` being public is not a
@@ -189,15 +202,14 @@ Do not rewrite the protocol evidence to match them.
   The only interoperability constraint is negative — expiry must never be
   signalled — and silence satisfies it. A zero idle timeout expires a session at
   the next evaluation; it is not "never expire".
-- **Expiry is packet-driven until the runtime exists.** Logical expiry is
-  timestamp-based, but reclamation happens in a global sweep run after
-  authentication and before dispatch, so an expired session may stay resident
-  until the next authenticated, structurally valid request. Nothing observable
-  turns on it: the table is already bounded, and the sweep runs before capacity
-  is judged, so a stale session cannot deny an open. Because the sweep is global
-  it also runs for a no-test open, where upstream was observed not to reclaim.
-  Do not add a public timer or tick abstraction for this; the Tokio slice may add
-  scheduled sweeps.
+- **Logical expiry is request-exact; physical reclamation also runs on the
+  runtime's fixed maintenance cadence.** Every authenticated, structurally valid
+  request runs the global sweep before dispatch, so a request at the deadline
+  finds the session expired and a stale session cannot deny an open. The Tokio
+  runtime invokes that same core sweep once per second so dead sessions do not
+  remain resident when there is no further traffic. This cadence is internal
+  housekeeping, not protocol policy or public configuration, and the runtime
+  must not inspect session internals or duplicate the expiry rule.
 - **The maximum-duration deadline is `first served echo + maximum + 2 s`.** The
   origin is measured behavior: neither the open, nor a rejected first echo, nor a
   rate-limited one starts it. The two-second grace matches the measured upstream

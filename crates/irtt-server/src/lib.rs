@@ -10,10 +10,11 @@
 //! receive state, rate and lifetime policy, resource decisions and reply
 //! construction. It performs no I/O; the clock its timestamps and deadlines
 //! come from is a private injected seam, not a runtime abstraction, so the
-//! engine stays testable. Socket and runtime orchestration — the UDP listener,
-//! address handling, timers, scheduled sweeps and shutdown — will live around
-//! it and is intentionally Tokio-native. There is no blocking or
-//! alternate-runtime counterpart and no transport abstraction.
+//! engine stays testable. [`Server`] owns one Tokio UDP listener and one core,
+//! and provides sequential receive, reply, scheduled expiry maintenance and
+//! caller-controlled shutdown. The crate is intentionally Tokio-native; there
+//! is no blocking or alternate-runtime counterpart and no transport
+//! abstraction.
 //!
 //! # Rejection is silence
 //!
@@ -40,10 +41,10 @@
 //! # Current scope
 //!
 //! Open handling and negotiation, session creation, normal echo processing,
-//! per-session rate limiting, idle expiry and the maximum-duration
-//! server-initiated close. DSCP application, the full server fill policy and
-//! the Tokio runtime are separate slices: echo payloads are zero-filled, and
-//! expiry is evaluated when a datagram arrives rather than on a timer.
+//! per-session rate limiting, idle expiry, the maximum-duration
+//! server-initiated close and Tokio UDP orchestration. DSCP application, the
+//! full server fill policy, wildcard-bind destination-address metadata and the
+//! CLI server applet remain separate slices. Echo payloads are zero-filled.
 #![forbid(unsafe_code)]
 
 mod clock;
@@ -51,6 +52,7 @@ mod config;
 mod core;
 mod error;
 mod negotiate;
+mod runtime;
 mod session;
 mod token;
 
@@ -63,3 +65,4 @@ pub use config::{
 };
 pub use core::ServerCore;
 pub use error::ServerError;
+pub use runtime::{Server, ServerRuntimeError};

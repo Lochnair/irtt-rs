@@ -111,6 +111,26 @@ fn a_session_that_never_carried_an_echo_still_expires() {
 }
 
 #[test]
+fn maintenance_reclaims_an_idle_session_without_traffic() {
+    let clock = ManualClock::at(0);
+    let mut core = core_with_sources(
+        idle_after(Duration::from_secs(2)),
+        ScriptedTokens::new([TOKEN_A]),
+        clock.clone(),
+    );
+
+    assert!(core
+        .handle_datagram(peer(), &open_request(&params_at(SECOND), None))
+        .unwrap()
+        .is_some());
+    assert_eq!(core.session_count(), 1);
+
+    clock.set(2 * SECOND);
+    core.maintain();
+    assert_eq!(core.session_count(), 0);
+}
+
+#[test]
 fn a_served_echo_moves_the_idle_deadline_along() {
     let (mut core, clock, token, negotiated) = manual_core(
         idle_after(Duration::from_secs(2)),
