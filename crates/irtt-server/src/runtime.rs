@@ -6,7 +6,9 @@ use socket2::SockRef;
 use thiserror::Error;
 use tokio::{net::UdpSocket, time::MissedTickBehavior};
 
-use crate::{socket_options::set_reply_traffic_class, ServerConfig, ServerCore, ServerError};
+use crate::{
+    socket_io, socket_options::set_reply_traffic_class, ServerConfig, ServerCore, ServerError,
+};
 
 /// Fixed transport receive capacity.
 ///
@@ -30,20 +32,34 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 /// marking. Adding a concurrent sender would break that and require per-packet
 /// control messages instead.
 ///
-/// Bind an explicit local address when reply source-address identity matters.
-/// Wildcard binds rely on the kernel's source-address choice; destination
-/// packet metadata and per-packet source selection are not yet implemented for
-/// multi-homed hosts.
+/// # Reply source address
+///
+/// A reply must leave from the exact address the request was sent to. An
+/// explicit-address listener gets that from the bind: it can send from nothing
+/// else. A wildcard listener (`0.0.0.0` or `[::]`) cannot, because the routing
+/// table would choose the source, so it asks the kernel for each request's
+/// local destination and sends that request's reply from it.
+///
+/// That per-packet path exists on Linux, macOS and FreeBSD. Elsewhere a
+/// wildcard bind is **refused** at construction — see
+/// [`ServerRuntimeError::WildcardSourceSelectionUnsupported`] — rather than
+/// served by a listener whose replies a client on a second address would
+/// silently discard. Explicit-address listeners are unaffected everywhere.
 #[derive(Debug)]
 pub struct Server {
     socket: UdpSocket,
     core: ServerCore,
     recv_buffer: Vec<u8>,
     /// The listener's own address family, which selects the IPv4 TOS or IPv6
-    /// Traffic Class option. `None` only if the bound address could not be
-    /// queried at construction, in which case the send path asks again rather
-    /// than guessing a family.
-    listener_is_ipv4: Option<bool>,
+    /// Traffic Class option.
+    listener_is_ipv4: bool,
+    /// Whether this listener is wildcard-bound and must therefore recover each
+    /// request's local destination and reply from it.
+    ///
+    /// Decided once, from the bound address. It is never inferred later from a
+    /// peer: a listener that accepted a wildcard bind owes correct reply
+    /// sources to every request, not to the ones that look multi-homed.
+    select_reply_source: bool,
     /// Whether this server has ever successfully applied a nonzero traffic
     /// class to the socket.
     ///
@@ -57,24 +73,55 @@ pub struct Server {
 impl Server {
     /// Binds one UDP listener at `addr` and creates its independent session
     /// namespace.
+    ///
+    /// A wildcard `addr` additionally configures reply source selection, and
+    /// fails where that is unavailable; see [`Server::from_socket`].
     pub async fn bind(addr: SocketAddr, config: ServerConfig) -> Result<Self, ServerRuntimeError> {
         let socket = UdpSocket::bind(addr)
             .await
             .map_err(|source| ServerRuntimeError::Bind { addr, source })?;
-        Ok(Self::from_socket(socket, config))
+        Self::from_socket(socket, config)
     }
 
     /// Wraps an already prepared Tokio UDP socket in a server.
-    #[must_use]
-    pub fn from_socket(socket: UdpSocket, config: ServerConfig) -> Self {
-        let listener_is_ipv4 = socket.local_addr().ok().map(|addr| addr.is_ipv4());
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// Construction is fallible because a wildcard listener has setup to do
+    /// before it may serve anything. It fails when the socket's bound address
+    /// cannot be queried — which is what says whether this is a wildcard
+    /// listener at all — and, for a wildcard socket, when this target has no
+    /// reply source selection or the kernel refuses to configure it.
+    ///
+    /// Failing here is the point. A wildcard listener that cannot recover a
+    /// request's local destination would start, run, and answer clients on a
+    /// second local address from an endpoint they never contacted, which they
+    /// discard as though the network had dropped it.
+    pub fn from_socket(
+        socket: UdpSocket,
+        config: ServerConfig,
+    ) -> Result<Self, ServerRuntimeError> {
+        let addr = socket
+            .local_addr()
+            .map_err(|source| ServerRuntimeError::LocalAddr { source })?;
+        let select_reply_source = addr.ip().is_unspecified();
+
+        if select_reply_source {
+            if !socket_io::SUPPORTED {
+                return Err(ServerRuntimeError::WildcardSourceSelectionUnsupported { addr });
+            }
+            socket_io::configure_destination_metadata(&socket, addr.is_ipv4())
+                .map_err(|source| ServerRuntimeError::SourceSelectionSetup { addr, source })?;
+        }
+
+        Ok(Self {
             socket,
             core: ServerCore::new(config),
             recv_buffer: vec![0; RECEIVE_BUFFER_LEN],
-            listener_is_ipv4,
+            listener_is_ipv4: addr.is_ipv4(),
+            select_reply_source,
             socket_is_marked: false,
-        }
+        })
     }
 
     /// Applies one reply's raw traffic class to the listener socket, and
@@ -104,11 +151,11 @@ impl Server {
     }
 
     fn apply_reply_traffic_class(&self, traffic_class: u8) -> io::Result<()> {
-        let is_ipv4 = match self.listener_is_ipv4 {
-            Some(is_ipv4) => is_ipv4,
-            None => self.socket.local_addr()?.is_ipv4(),
-        };
-        set_reply_traffic_class(SockRef::from(&self.socket), is_ipv4, traffic_class)
+        set_reply_traffic_class(
+            SockRef::from(&self.socket),
+            self.listener_is_ipv4,
+            traffic_class,
+        )
     }
 
     /// Returns the local endpoint selected for the listener.
@@ -133,6 +180,12 @@ impl Server {
     /// *unmarked* reply on a socket this server has never marked is the one
     /// exception, so a host that does not support the option at all — some
     /// Windows builds do not support `IP_TOS` — still runs a working server.
+    ///
+    /// A wildcard listener drops a request whose local destination did not
+    /// arrive with it, before the core sees it. There is no fall back to a
+    /// routing-table source: the listener promised a correct reply source when
+    /// it accepted the bind, and a request it cannot answer correctly must not
+    /// move a session's receive, rate or lifetime state either.
     pub async fn run<F>(&mut self, shutdown: F) -> Result<(), ServerRuntimeError>
     where
         F: Future<Output = ()>,
@@ -146,12 +199,18 @@ impl Server {
             tokio::select! {
                 _ = &mut shutdown => return Ok(()),
                 _ = maintenance.tick() => self.core.maintain(),
-                received = self.socket.recv_from(&mut self.recv_buffer) => {
-                    let (len, peer) = match received {
-                        Ok(received) => received,
+                received = socket_io::receive(
+                    &self.socket,
+                    &mut self.recv_buffer,
+                    self.select_reply_source,
+                ) => {
+                    let received = match received {
+                        Ok(Some(received)) => received,
+                        Ok(None) => continue,
                         Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
                         Err(source) => return Err(ServerRuntimeError::Receive { source }),
                     };
+                    let (len, peer) = (received.len, received.peer);
                     if len == RECEIVE_BUFFER_LEN {
                         continue;
                     }
@@ -160,7 +219,12 @@ impl Server {
                         if !self.prepare_reply_traffic_class(reply.traffic_class()) {
                             continue;
                         }
-                        let send = self.socket.send_to(reply.bytes(), peer);
+                        let send = socket_io::send(
+                            &self.socket,
+                            reply.bytes(),
+                            peer,
+                            received.reply_source,
+                        );
                         tokio::pin!(send);
                         let sent = loop {
                             tokio::select! {
@@ -210,6 +274,26 @@ pub enum ServerRuntimeError {
         #[source]
         source: io::Error,
     },
+    /// A wildcard listener was requested on a target with no safe per-packet
+    /// reply source selection.
+    ///
+    /// The listener would answer from whichever local address the routing table
+    /// chose, which a client that contacted a different one discards.
+    #[error(
+        "wildcard listener {addr} cannot select its reply source address on this target: \
+         bind an explicit local address instead"
+    )]
+    WildcardSourceSelectionUnsupported { addr: SocketAddr },
+    /// Configuring destination-address metadata for a wildcard listener failed.
+    #[error(
+        "could not configure reply source-address selection for wildcard listener {addr}: \
+         {source}; bind an explicit local address instead"
+    )]
+    SourceSelectionSetup {
+        addr: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
     /// Receiving from the listener failed irrecoverably.
     #[error("UDP receive failed: {source}")]
     Receive {
@@ -251,6 +335,31 @@ mod tests {
             })
             .await
             .unwrap();
+    }
+
+    /// Construction is where a wildcard listener's promise is made or refused.
+    ///
+    /// Both outcomes are asserted from the same code, because which one a target
+    /// gets is exactly the thing under test: a target with a source-selection
+    /// path configures it and serves; one without refuses the bind rather than
+    /// starting a listener whose replies may come from an address no client
+    /// contacted. An explicit bind is unaffected either way.
+    #[tokio::test(flavor = "current_thread")]
+    async fn from_socket_settles_wildcard_source_selection_before_serving_anything() {
+        let explicit = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        assert!(Server::from_socket(explicit, ServerConfig::default()).is_ok());
+
+        let wildcard = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+        let wildcard = Server::from_socket(wildcard, ServerConfig::default());
+        if socket_io::SUPPORTED {
+            let server = wildcard.expect("a supported target configures source selection");
+            assert!(server.select_reply_source);
+        } else {
+            assert!(matches!(
+                wildcard,
+                Err(ServerRuntimeError::WildcardSourceSelectionUnsupported { .. })
+            ));
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]

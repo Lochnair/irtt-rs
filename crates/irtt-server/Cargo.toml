@@ -18,5 +18,11 @@ socket2 = { version = "0.6.5", features = ["all"] }
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }
 
+# Wildcard listeners recover each request's local destination address and send
+# the reply from it. Only these targets have a safe destination-metadata and
+# source-selection path here; elsewhere a wildcard bind is refused.
+[target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
+nix = { version = "0.31.3", default-features = false, features = ["net", "uio"] }
+
 [dev-dependencies]
 irtt-client = { workspace = true, features = ["ancillary", "tokio"] }

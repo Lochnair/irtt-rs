@@ -56,6 +56,7 @@ mod error;
 mod negotiate;
 mod runtime;
 mod session;
+mod socket_io;
 mod socket_options;
 mod token;
 
