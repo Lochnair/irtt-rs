@@ -61,7 +61,7 @@ loopback addresses and no DNS.
 | Packet-length restriction | `with_max_packet_length(96)` | `-l 128` (strict) | **PASS** | `[ServerRestriction] server reduced length from 128 to 96`, exit 1 — upstream's documented strict-mode policy |
 | Packet-length restriction | `with_max_packet_length(96)` | `-l 128 --loose` | **PASS** | Runs at 96 bytes, 10/10 packets, 0.00% loss, exit 0 |
 | Interval restriction | default (10 ms floor) | `-i 1ms -d 500ms --loose` | **PASS** | `server increased interval from 1ms to 10ms`; 50/50 packets, 0.00% loss — the rate limiter never penalised a client sending at the interval it was given |
-| Maximum-duration Close | `with_max_test_duration(500ms)` | `-d 5s -i 100ms --loose` | **PASS** (restriction) | `server reduced duration from 5s to 500ms`; 5/5 packets, exit 0. The Close-flagged reply itself is **not reachable** by a conforming client — see Findings. |
+| Maximum-duration Close | `with_max_test_duration(500ms)` | `-d 5s -i 100ms --loose` | **PASS** (restriction) | `server reduced duration from 5s to 500ms`; 5/5 packets, exit 0. Close reply not reached on loopback; see Findings. |
 | Continuous request | `with_max_test_duration(500ms)` | `-d 0` | **SKIPPED** | Upstream rejects it client-side (`[DurationNonPositive] duration (0s) must be > 0`); a continuous request never reaches the wire from this CLI |
 | No-test (optional) | default | `-n -l 128` | **PASS** | `[NoTest] skipping test at user request`, exit 0, no measurement session |
 | Midpoint, single clock (optional) | default | `--tstamp=midpoint --clock=monotonic` | **PASS** | 5/5 packets, exit 0; RTT and IPDV computed from the single midpoint field |
@@ -86,23 +86,31 @@ and send/receive IPDV from it, in the monotonic-only, wall-only and both-clocks
 cases. This was the tested path most likely to expose a reply-shape
 incompatibility, and it did not.
 
-**The server-initiated maximum-duration Close is not reachable by a conforming
-client.** The deadline is `first served echo + configured maximum + 2 s`, while
-negotiation reduces a session's Duration to at most that same configured maximum.
-A client that honours the Duration it was given therefore always stops sending at
-least two seconds before the deadline, so no echo ever arrives to carry the
-Close flag. That was confirmed empirically: with a 500 ms maximum against a
-requested 5 s test, the upstream client accepted the restriction, sent for
-~400 ms and exited 0 without a Close ever being due.
+**The maximum-duration Close was not reached in the tested loopback run.** The
+deadline is `first served echo + configured maximum + 2 s`, and negotiation
+reduced this session's Duration to the configured 500 ms maximum. On loopback the
+upstream client honoured that restriction, stopped transmitting after ~400 ms and
+exited 0; no echo arrived anywhere near the server's +2 s deadline, so the
+Close-flagged reply was never due and this black-box scenario did not exercise
+it.
+
+That result is scoped to the tested path. Under ordinary low-delay conditions a
+client honouring its negotiated Duration will normally finish sending well before
+the +2 s boundary. It does not follow that the Close is unreachable in general:
+the deadline is evaluated on *arrival*, not on transmission, so an echo sent
+legitimately before the negotiated Duration elapsed could still be queued or
+delayed for more than two seconds on a real network path and arrive after
+`first served echo + configured maximum + 2 s`, carrying Close while the client
+is still draining replies. The loopback run establishes only that this did not
+occur under negligible delay. The Close therefore primarily provides a
+termination path for traffic continuing or arriving beyond the server's
+maximum-duration grace — an overrunning client, or sufficiently delayed in-flight
+echo traffic.
 
 This is not a defect and no fix is authorised for it. The two-second grace is
 recorded in the airlocked evidence as the measured upstream margin and is a fixed
 internal constant; the implementation matches that evidence rather than violating
-it. The consequence is simply that the Close is a defence against a client that
-overruns its negotiated Duration, not part of an ordinary session. Upstream's
-CLI offers no way to build such a client — `--loose` accepts and uses the
-restricted parameters, and a continuous request is rejected before it reaches the
-wire. The Close path itself remains covered deterministically in-repo by
+it. The Close path itself remains covered deterministically in-repo by
 `crates/irtt-server/src/tests/lifecycle.rs`, notably
 `the_first_echo_past_the_maximum_duration_carries_close_and_ends_the_session`.
 
@@ -117,6 +125,11 @@ This validation does **not** establish:
 - behavior on operating systems other than the macOS/arm64 host recorded above;
 - behavior across a real network path, MTU limits or fragmentation.
 
-No claim of universal compatibility is made. No permanent test in this repository
-depends on the upstream executable, the Go toolchain or network access; this
-validation is intentionally manual and reproducible from the commands above.
+No claim of universal compatibility is made.
+
+This document is a record of the manual validation that was performed, not a
+reproduction harness. The server policy and client arguments used in each
+scenario are summarized in the matrix above, but the throwaway harness was
+deliberately discarded afterwards and is not committed, so the run is not
+reproducible from this artifact alone. No permanent test in this repository
+depends on the upstream executable, the Go toolchain or network access.
