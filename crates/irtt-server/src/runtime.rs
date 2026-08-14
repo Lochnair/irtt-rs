@@ -12,7 +12,9 @@ use thiserror::Error;
 use tokio::{net::UdpSocket, time::MissedTickBehavior};
 
 use crate::{
-    socket_io, socket_options::set_reply_traffic_class, ServerConfig, ServerCore, ServerError,
+    socket_io,
+    socket_options::{marks_with_ipv4_option, set_reply_traffic_class},
+    ServerConfig, ServerCore, ServerError,
 };
 
 /// Fixed transport receive capacity.
@@ -123,7 +125,7 @@ impl Server {
             socket,
             core: ServerCore::new(config),
             recv_buffer: vec![0; RECEIVE_BUFFER_LEN],
-            listener_is_ipv4: addr.is_ipv4(),
+            listener_is_ipv4: marks_with_ipv4_option(addr),
             select_reply_source,
             socket_is_marked: false,
         })

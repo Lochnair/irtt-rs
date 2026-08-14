@@ -96,7 +96,19 @@ async fn an_ipv4_mapped_wildcard_listener_replies_from_the_requested_address() {
 
         let mut client = connected_client(target).await;
         assert_started(&mut client, target).await;
-        echo_once(&mut client).await;
+        let meta = echo_once(&mut client).await;
+        // A mapped listener is `AF_INET6` but emits IPv4, and the IPv6 Traffic
+        // Class option does not reach those packets — it leaves their TOS at
+        // zero. Only the IPv4 option marks them, so this asserts the listener
+        // was read as the IPv4 one it is.
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                meta.traffic_class,
+                Some(EF_TRAFFIC_CLASS),
+                "a mapped listener's reply still carries its session's marking"
+            );
+            assert_eq!(meta.dscp, Some(EF_DSCP));
+        }
         assert!(matches!(
             client.close().await.unwrap().as_slice(),
             [ClientEvent::SessionClosed { .. }]

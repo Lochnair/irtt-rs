@@ -258,7 +258,20 @@ session policy lives.
   Whether an unappliable zero is nevertheless safe is the runtime's decision,
   made from what this server itself applied.
 - The option itself comes from `socket2`'s safe API, chosen by the listener's
-  bound address family rather than the peer's. The crate forbids unsafe code;
+  bound address family rather than the peer's. **On Linux an IPv4-mapped bound
+  address is an IPv4 listener**, whatever shape it wears: the socket is
+  `AF_INET6`, but the kernel binds it to the IPv4 side and `IPV6_TCLASS` does not
+  reach the packets it emits — it leaves their TOS at zero and the negotiated
+  marking is lost, while `IP_TOS` on that same socket marks them. macOS rejects
+  `IP_TOS` on an `AF_INET6` socket outright and marks nothing either way, so it
+  keeps the IPv6 option: reading a mapped bind as IPv4 there would turn an
+  unmarked reply into a *dropped* one, because an unappliable marking stops the
+  send. Verify a platform before extending that list.
+- A genuinely dual-stack `[::]` listener still emits **unmarked** IPv4-mapped
+  replies, and this is known. It is not fixed by choosing the option per reply,
+  for the macOS reason above, and it predates wildcard source selection. Leave it
+  until it is worth its own slice, and do not "fix" it by weakening the rule that
+  an unappliable marking stops the send. The crate forbids unsafe code;
   there is no raw `setsockopt` and no `sendmsg`/`cmsg` machinery. Keep the
   target lists identical to the pinned `socket2` version's own gates — check
   its source rather than copying another crate's older matrix.
