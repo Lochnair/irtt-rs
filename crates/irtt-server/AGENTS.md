@@ -58,6 +58,58 @@ material does not establish a semantic, state the ambiguity instead of guessing.
   no product requirement for any of them, and `ServerCore` being public is not a
   promise of runtime independence.
 
+## One listener and several
+
+`Server` is the packet/runtime primitive and stays that: one socket, one core,
+one sequential loop. `ServerSet` is the service around it and owns no protocol
+or session state of its own — it binds listeners, supervises them and shuts them
+down. Nothing it does is visible on the wire.
+
+- **A set of one is an ordinary set.** Singleton sets are normal and supported,
+  and the server CLI runs *every* invocation through one, single bind included.
+  There is no bind-count branch to reintroduce: one orchestration path is what
+  keeps startup, shutdown and failure semantics identical for one listener and
+  for five, and what keeps the singleton case exercised in normal use.
+- **Nothing is shared between listeners but configuration.** Each gets its own
+  socket, `ServerCore`, session table, tokens, receive/rate/lifetime state,
+  clock origin and traffic-class socket state. Do not add an
+  `Arc<Mutex<ServerCore>>`, a process-global token allocator or session
+  registry, or a shared clock: a token from one listener is an unknown token at
+  the others, and that is the point rather than a limitation.
+- **`ServerConfig` is cloned per listener, so every bound in it is per
+  listener.** `max_sessions` of 100 across two listeners admits 100 each. Say so
+  in the rustdoc, the CLI help and the README; do not add a process-wide session
+  cap here.
+- **Construction is all-or-nothing and completes before anything runs.** Bind
+  every listener first, spawn nothing while iterating, and drop what was bound
+  if a later one fails. Startup diagnostics belong after the whole set exists,
+  so a set that never started cannot print that it is listening.
+- **One task per listener, and the listener stays sequential inside it.** Do not
+  spawn per datagram or add a second sender: one sender per socket is what makes
+  the socket-wide traffic class race-free, and that invariant is unchanged by
+  there being several sockets.
+- **One external shutdown, fanned out internally.** The library knows nothing
+  about Ctrl-C, signals or atomics. Every listener task is joined before `run`
+  returns — no detached tasks, no `abort_all()` for ordinary shutdown, and a
+  `JoinError` is never discarded.
+- **A listener failure fails the set.** A listener that errors, or that returns
+  before shutdown was requested, shuts its siblings down; the group drains and
+  returns the first meaningful failure. A service configured for IPv4 and IPv6
+  must not continue silently as IPv4 only. There is no error aggregation.
+- **Same-port coexistence is settled before the bind, and only there.**
+  `IPV6_V6ONLY` can only be set before binding, so a genuine IPv6 listener
+  sharing an explicit port with an IPv4 sibling is created through a small
+  `socket2` helper and handed to `Server::from_socket`. That helper owns nothing
+  else: wildcard destination metadata, the core and traffic-class state stay
+  with `Server`. No `SO_REUSEPORT`, no bind-order dependence, no unsafe code,
+  and standalone `Server::bind` semantics are unchanged.
+- **An IPv4-mapped address is an IPv4 listener here too**, exactly as it is for
+  wildcard handling and the traffic-class option. It is never given
+  `IPV6_V6ONLY` and never counted as the IPv6 half of a same-port pair.
+- Listener sets are fixed at construction. Do not add dynamic add/remove,
+  hostname or interface expansion, or per-listener configuration without
+  agreement.
+
 ## Reply source address
 
 A reply must leave from the address its request was sent to, or a client reading
