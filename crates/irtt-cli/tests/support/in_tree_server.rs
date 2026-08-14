@@ -17,7 +17,7 @@ pub struct InTreeServer {
 }
 
 impl InTreeServer {
-    pub fn start(config: ServerConfig) -> Self {
+    pub fn start() -> Self {
         let (startup_tx, startup_rx) = mpsc::sync_channel(1);
         let (shutdown_tx, shutdown_rx) = oneshot::channel();
         let done = thread::spawn(move || {
@@ -27,7 +27,7 @@ impl InTreeServer {
                 .expect("failed to build in-tree test server runtime");
             runtime.block_on(async move {
                 let bind_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0);
-                let mut server = Server::bind(bind_addr, config).await?;
+                let mut server = Server::bind(bind_addr, ServerConfig::default()).await?;
                 startup_tx
                     .send(server.local_addr()?)
                     .expect("test stopped waiting for in-tree server startup");
@@ -55,7 +55,7 @@ impl InTreeServer {
         }
     }
 
-    fn stop_inner(&mut self) {
+    fn stop(&mut self) {
         if let Some(shutdown) = self.shutdown.take() {
             let _ = shutdown.send(());
         }
@@ -69,6 +69,6 @@ impl InTreeServer {
 
 impl Drop for InTreeServer {
     fn drop(&mut self) {
-        self.stop_inner();
+        self.stop();
     }
 }
