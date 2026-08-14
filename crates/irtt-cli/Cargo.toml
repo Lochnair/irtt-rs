@@ -38,7 +38,7 @@ doc = false
 
 [features]
 default = ["client", "server", "stats"]
-client-runtime = ["dep:irtt-client", "irtt-client/tokio", "dep:irtt-proto"]
+client-runtime = ["dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto"]
 client = ["client-runtime"]
 server = ["dep:irtt-server", "dep:tokio"]
 stats = ["client-runtime", "dep:irtt-stats"]
