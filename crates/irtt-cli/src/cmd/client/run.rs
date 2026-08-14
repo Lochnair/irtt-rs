@@ -9,9 +9,8 @@ use std::{
 
 use irtt_client::{
     managed::{
-        BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy, ManagedEndReason,
-        ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError, ManagedTargetEndReason,
-        ManagedTargetOutcome, TargetInstance,
+        BlockingManagedClient, ManagedEndReason, ManagedEvent, ManagedEventSubscription,
+        ManagedEventTryRecvError, ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
     },
     ClientEvent,
 };
@@ -44,7 +43,6 @@ const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
 
 const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
 const MANAGED_EVENT_WAIT_SLICE: Duration = Duration::from_millis(20);
-const MANAGED_EVENT_CAPACITY: usize = 16_384;
 
 pub fn run_stream(
     args: ClientArgs,
@@ -54,10 +52,10 @@ pub fn run_stream(
         print!("{}", OutputConfig::list_columns());
         return Ok(());
     }
-    let targets = args
-        .managed_targets()
+    let setup = args
+        .prepare()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
-    let multi_target = targets.len() > 1;
+    let multi_target = setup.is_multi_target();
     let output_config = OutputConfig::new(
         args.format,
         args.columns.as_deref(),
@@ -67,7 +65,7 @@ pub fn run_stream(
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let continuous = args.is_continuous();
-    let target_count = targets.len();
+    let target_count = setup.target_count();
 
     if let Some(warning) = finite_stats_memory_warning(&args, target_count) {
         eprintln!("{warning}");
@@ -75,21 +73,9 @@ pub fn run_stream(
     if is_shutdown_requested(shutdown_requested) {
         return Ok(());
     }
-    let config = ManagedClientConfig {
-        client: args.to_client_config(),
-        pacing: args.pacing.into(),
-        completion: ManagedCompletionPolicy::FinishWhenQuiescent,
-        event_capacity: MANAGED_EVENT_CAPACITY,
-        outcome_history_limit: target_count,
-        max_live_target_generations: target_count,
-        ..ManagedClientConfig::default()
-    };
     let (owner, mut events) = BlockingManagedClient::start_with_subscription(
-        config,
-        targets
-            .iter()
-            .map(|target| target.managed.clone())
-            .collect(),
+        setup.managed_config(),
+        setup.managed_targets(),
     )?;
     let handle = owner.handle();
     let mut stdout = io::LineWriter::new(io::stdout().lock());
@@ -101,7 +87,8 @@ pub fn run_stream(
         out: &mut stdout,
     };
 
-    let mut stats = targets
+    let mut stats = setup
+        .targets
         .iter()
         .map(|target| {
             (

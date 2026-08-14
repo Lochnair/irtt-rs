@@ -1,12 +1,10 @@
 use std::time::Duration;
 
-use clap::{Parser, ValueEnum};
-use irtt_client::ClientConfig;
-
 use crate::shared::client::{
-    parse_labelled_target, parse_test_duration, prepare_managed_targets, target_specs,
-    CommonClientArgs, GroupPacingArg, LabelledTargetArg, PreparedTarget, TargetSpec, TimestampArg,
+    parse_labelled_target, parse_test_duration, prepare_managed_run, CommonClientArgs,
+    GroupPacingArg, LabelledTargetArg, ManagedRunSetup, TargetSelection, TimestampArg,
 };
+use clap::{Parser, ValueEnum};
 
 pub const DEFAULT_CLIENT_DURATION: Duration = Duration::from_secs(10);
 
@@ -91,11 +89,19 @@ pub struct ClientArgs {
 }
 
 impl ClientArgs {
-    pub fn to_client_config(&self) -> ClientConfig {
-        self.common.to_client_config(
-            self.primary_target_addr()
-                .expect("target is required unless --list-columns is set"),
+    /// Validate the selected targets and prepare the managed run.
+    ///
+    /// Targets are only required here. `--list-columns` returns before this is
+    /// called, so listing columns still needs no target.
+    pub fn prepare(&self) -> Result<ManagedRunSetup, String> {
+        prepare_managed_run(
+            &self.common,
             self.duration,
+            TargetSelection {
+                positional: &self.targets,
+                labelled: &self.labelled_targets,
+                pacing: self.pacing,
+            },
         )
     }
 
@@ -105,22 +111,6 @@ impl ClientArgs {
 
     pub fn timestamp_mode(&self) -> TimestampArg {
         self.common.tstamp
-    }
-
-    pub fn target_specs(&self) -> Result<Vec<CliTargetSpec>, String> {
-        target_specs(&self.targets, &self.labelled_targets)
-    }
-
-    pub fn managed_targets(&self) -> Result<Vec<CliManagedTarget>, String> {
-        prepare_managed_targets(self.target_specs()?)
-    }
-
-    fn primary_target_addr(&self) -> Option<&str> {
-        self.targets.first().map(String::as_str).or_else(|| {
-            self.labelled_targets
-                .first()
-                .map(|target| target.addr.as_str())
-        })
     }
 }
 
@@ -143,9 +133,6 @@ pub enum OutputFormat {
     /// One JSON object per event row.
     Jsonl,
 }
-
-pub type CliTargetSpec = TargetSpec;
-pub type CliManagedTarget = PreparedTarget;
 
 impl OutputFormat {
     pub fn prints_summary(self) -> bool {
@@ -191,7 +178,7 @@ mod tests {
         assert!(!args.is_continuous());
         assert_eq!(args.timestamp_mode(), TimestampArg::Both);
 
-        let config = args.to_client_config();
+        let config = args.prepare().unwrap().client;
         assert_eq!(config.duration, Some(DEFAULT_CLIENT_DURATION));
         assert_eq!(config.received_stats, ReceivedStats::Both);
         assert_eq!(config.stamp_at, StampAt::Both);
@@ -212,17 +199,22 @@ mod tests {
         let args = parse(&["--list-columns"]).unwrap();
         assert!(args.targets.is_empty());
         assert!(args.list_columns);
+        // The parser accepts no target; preparation is where a target becomes
+        // mandatory, and the stream command returns before preparing when
+        // listing columns.
+        let err = args.prepare().unwrap_err();
+        assert!(err.contains("--list-columns"));
     }
 
     #[test]
     fn multiple_positional_targets_parse_as_targets() {
         let args = parse(&["host-a:2112", "host-b:2112"]).unwrap();
-        let specs = args.target_specs().unwrap();
+        let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "host-a:2112");
-        assert_eq!(specs[0].addr, "host-a:2112");
+        assert_eq!(specs[0].managed.server_addr, "host-a:2112");
         assert_eq!(specs[1].label, "host-b:2112");
-        assert_eq!(specs[1].addr, "host-b:2112");
+        assert_eq!(specs[1].managed.server_addr, "host-b:2112");
     }
 
     #[test]
@@ -234,18 +226,18 @@ mod tests {
             "sg=sg.example.com:2112",
         ])
         .unwrap();
-        let specs = args.target_specs().unwrap();
+        let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "ams");
-        assert_eq!(specs[0].addr, "ams.example.com:2112");
+        assert_eq!(specs[0].managed.server_addr, "ams.example.com:2112");
         assert_eq!(specs[1].label, "sg");
-        assert_eq!(specs[1].addr, "sg.example.com:2112");
+        assert_eq!(specs[1].managed.server_addr, "sg.example.com:2112");
     }
 
     #[test]
     fn duplicate_labels_are_rejected() {
         let args = parse(&["host-a:2112", "--target", "host-a:2112=host-b:2112"]).unwrap();
-        let err = args.target_specs().unwrap_err();
+        let err = args.prepare().unwrap_err();
 
         assert!(err.contains("duplicate target label"));
     }
@@ -253,7 +245,7 @@ mod tests {
     #[test]
     fn duplicate_positional_target_strings_get_stable_suffixes() {
         let args = parse(&["host-a:2112", "host-a:2112"]).unwrap();
-        let specs = args.target_specs().unwrap();
+        let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "host-a:2112");
         assert_eq!(specs[1].label, "host-a:2112#2");
@@ -262,7 +254,7 @@ mod tests {
     #[test]
     fn duplicate_target_endpoints_are_allowed() {
         let args = parse(&["127.0.0.1:2112", "127.0.0.1"]).unwrap();
-        assert_eq!(args.managed_targets().unwrap().len(), 2);
+        assert_eq!(args.prepare().unwrap().target_count(), 2);
     }
 
     #[test]

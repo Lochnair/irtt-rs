@@ -30,7 +30,7 @@ use crate::{
         },
         tui::args::TuiArgs,
     },
-    shared::client::{expected_probe_count, GroupPacingArg},
+    shared::client::{expected_probe_count, GroupPacingArg, ManagedRunSetup},
 };
 
 const HISTORY_LIMIT: usize = 100_000;
@@ -656,11 +656,11 @@ pub(super) struct TuiConfig {
 }
 
 impl TuiConfig {
-    pub(super) fn from_args(args: &TuiArgs) -> Self {
+    pub(super) fn from_args(args: &TuiArgs, setup: &ManagedRunSetup) -> Self {
         Self {
             interval: args.interval,
             duration: (!args.is_continuous()).then_some(args.duration),
-            timeout: args.to_client_config().probe_timeout,
+            timeout: setup.client.probe_timeout,
             target_probes: (!args.is_continuous())
                 .then(|| expected_probe_count(args.duration, args.interval)),
             pacing: args.pacing,
