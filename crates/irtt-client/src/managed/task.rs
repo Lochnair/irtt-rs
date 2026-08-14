@@ -394,13 +394,49 @@ impl TargetState {
     }
 }
 
-#[derive(Default)]
+#[derive(Debug, Default, Eq, PartialEq)]
 struct TargetCounters {
     packets_sent: u64,
+    /// On-time unique echo replies.
+    ///
+    /// A late unique reply is counted by `late` and deliberately not here, so
+    /// `replies_received` stays the count of replies that arrived within their
+    /// probe timeout. These counters are durable, unlike the lossy managed
+    /// presentation events.
     replies_received: u64,
     duplicates: u64,
     late: u64,
     warning_events: u64,
+}
+
+impl TargetCounters {
+    /// Account for one client event.
+    ///
+    /// Events that carry no durable target-local count are ignored. Probe
+    /// sends are not counted here: `packets_sent` is authoritative in the
+    /// underlying client and is synchronized through
+    /// [`TargetRuntime::sync_packets_sent`].
+    fn observe(&mut self, event: &ClientEvent) {
+        match event {
+            ClientEvent::EchoReply { .. } => {
+                self.replies_received = self.replies_received.saturating_add(1);
+            }
+            ClientEvent::DuplicateReply { .. } => {
+                self.duplicates = self.duplicates.saturating_add(1);
+            }
+            ClientEvent::LateReply { .. } => {
+                self.late = self.late.saturating_add(1);
+            }
+            ClientEvent::Warning { .. } => {
+                self.warning_events = self.warning_events.saturating_add(1);
+            }
+            ClientEvent::EchoSent { .. }
+            | ClientEvent::EchoLoss { .. }
+            | ClientEvent::SessionStarted { .. }
+            | ClientEvent::NoTestCompleted { .. }
+            | ClientEvent::SessionClosed { .. } => {}
+        }
+    }
 }
 
 struct TargetRuntime {
@@ -414,6 +450,46 @@ struct TargetRuntime {
     send_waiting: bool,
     active: bool,
     state: TargetState,
+}
+
+impl TargetRuntime {
+    /// Adopt the underlying client's authoritative sent count.
+    ///
+    /// The client owns `packets_sent`; this runtime only mirrors it so a
+    /// terminal outcome can report it after the client is gone.
+    fn sync_packets_sent(&mut self, client: &AsyncClient) {
+        self.record_packets_sent(client.packets_sent());
+    }
+
+    /// Adopt an already-read authoritative sent count.
+    fn record_packets_sent(&mut self, packets_sent: u64) {
+        self.counters.packets_sent = packets_sent;
+    }
+
+    /// Account for one client event against this target's durable counters.
+    fn observe(&mut self, event: &ClientEvent) {
+        self.counters.observe(event);
+    }
+
+    /// Build this target's durable outcome.
+    fn outcome(
+        &self,
+        end_reason: ManagedTargetEndReason,
+        cleanup_failure: Option<ManagedTargetFailure>,
+    ) -> ManagedTargetOutcome {
+        ManagedTargetOutcome {
+            target: self.instance.clone(),
+            server_addr: Arc::clone(&self.server_addr),
+            remote: self.remote,
+            end_reason,
+            packets_sent: self.counters.packets_sent,
+            replies_received: self.counters.replies_received,
+            duplicates: self.counters.duplicates,
+            late: self.counters.late,
+            warning_events: self.counters.warning_events,
+            cleanup_failure,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -451,25 +527,6 @@ fn synchronously_retireable(state: &TargetState) -> bool {
         TargetState::Active { .. } | TargetState::Draining { .. } | TargetState::Closing { .. } => {
             false
         }
-    }
-}
-
-fn target_outcome(
-    target: &TargetRuntime,
-    end_reason: ManagedTargetEndReason,
-    cleanup_failure: Option<ManagedTargetFailure>,
-) -> ManagedTargetOutcome {
-    ManagedTargetOutcome {
-        target: target.instance.clone(),
-        server_addr: Arc::clone(&target.server_addr),
-        remote: target.remote,
-        end_reason,
-        packets_sent: target.counters.packets_sent,
-        replies_received: target.counters.replies_received,
-        duplicates: target.counters.duplicates,
-        late: target.counters.late,
-        warning_events: target.counters.warning_events,
-        cleanup_failure,
     }
 }
 
@@ -709,29 +766,7 @@ impl ManagedClientTask {
 
     fn publish_client_events(&mut self, index: usize, events: Vec<ClientEvent>) {
         for event in events {
-            match event {
-                ClientEvent::EchoReply { .. } => {
-                    self.targets[index].counters.replies_received = self.targets[index]
-                        .counters
-                        .replies_received
-                        .saturating_add(1);
-                }
-                ClientEvent::DuplicateReply { .. } => {
-                    self.targets[index].counters.duplicates =
-                        self.targets[index].counters.duplicates.saturating_add(1);
-                }
-                ClientEvent::LateReply { .. } => {
-                    self.targets[index].counters.late =
-                        self.targets[index].counters.late.saturating_add(1);
-                }
-                ClientEvent::Warning { .. } => {
-                    self.targets[index].counters.warning_events = self.targets[index]
-                        .counters
-                        .warning_events
-                        .saturating_add(1);
-                }
-                _ => {}
-            }
+            self.targets[index].observe(&event);
             self.publish_event(ManagedEvent::Client {
                 target: self.targets[index].instance.clone(),
                 event,
@@ -746,19 +781,7 @@ impl ManagedClientTask {
         cleanup_failure: Option<ManagedTargetFailure>,
     ) {
         self.install_target_state(index, TargetState::Terminal);
-        let target = &self.targets[index];
-        let outcome = ManagedTargetOutcome {
-            target: target.instance.clone(),
-            server_addr: Arc::clone(&target.server_addr),
-            remote: target.remote,
-            end_reason,
-            packets_sent: target.counters.packets_sent,
-            replies_received: target.counters.replies_received,
-            duplicates: target.counters.duplicates,
-            late: target.counters.late,
-            warning_events: target.counters.warning_events,
-            cleanup_failure,
-        };
+        let outcome = self.targets[index].outcome(end_reason, cleanup_failure);
         self.history.record(outcome.clone());
         self.replace_status();
         self.publish_event(ManagedEvent::TargetFinished {
@@ -782,7 +805,7 @@ impl ManagedClientTask {
     ) -> bool {
         let primary_end = ManagedTargetEndReason::Failed(classify_client_error(phase, &error));
         client.discard_prepared_probe();
-        self.targets[index].counters.packets_sent = client.packets_sent();
+        self.targets[index].sync_packets_sent(&client);
         match cleanup {
             OpenSessionFailureCleanup::Drain => self.begin_drain(index, client, primary_end, now),
             OpenSessionFailureCleanup::Close => {
@@ -866,7 +889,7 @@ impl ManagedClientTask {
             if retirement.synchronous {
                 synchronous.insert(retirement.index);
                 if !matches!(target.state, TargetState::Terminal) {
-                    let outcome = target_outcome(target, retirement.reason.clone(), None);
+                    let outcome = target.outcome(retirement.reason.clone(), None);
                     self.history.record(outcome.clone());
                     finished.push(ManagedEvent::TargetFinished {
                         outcome: Arc::new(outcome),
@@ -1137,7 +1160,7 @@ impl ManagedClientTask {
                         .effective_retirement(index)
                         .unwrap_or(ManagedTargetEndReason::Stopped);
                     if !open.has_in_flight_work() {
-                        self.targets[index].counters.packets_sent = client.packets_sent();
+                        self.targets[index].sync_packets_sent(&client);
                         self.finish_target(index, retirement, None);
                         return false;
                     }
@@ -1153,7 +1176,7 @@ impl ManagedClientTask {
                         if self.state == DriverState::Stopping
                             || self.effective_retirement(index).is_some()
                         {
-                            self.targets[index].counters.packets_sent = client.packets_sent();
+                            self.targets[index].sync_packets_sent(&client);
                             self.begin_drain(
                                 index,
                                 client,
@@ -1207,7 +1230,7 @@ impl ManagedClientTask {
                 if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
                 {
                     client.discard_prepared_probe();
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     return self.begin_drain(
                         index,
                         client,
@@ -1241,12 +1264,12 @@ impl ManagedClientTask {
                     }
                 };
                 if client.is_peer_closed() {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, None);
                     return false;
                 }
                 if client.is_run_complete() {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     return self.begin_drain(
                         index,
                         client,
@@ -1309,7 +1332,7 @@ impl ManagedClientTask {
                         true
                     }
                     Poll::Ready(Err(error)) => {
-                        self.targets[index].counters.packets_sent = client.packets_sent();
+                        self.targets[index].sync_packets_sent(&client);
                         cleanup_failure.get_or_insert_with(|| {
                             classify_client_error(ManagedTargetFailurePhase::Receiving, &error)
                         });
@@ -1317,14 +1340,14 @@ impl ManagedClientTask {
                     }
                 };
                 if let Some(error) = injected_receive_failure {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     cleanup_failure.get_or_insert_with(|| {
                         classify_client_error(ManagedTargetFailurePhase::Receiving, &error)
                     });
                     return self.begin_close(index, client, primary_end, cleanup_failure, now);
                 }
                 if client.is_peer_closed() {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, cleanup_failure);
                     return false;
                 }
@@ -1380,7 +1403,7 @@ impl ManagedClientTask {
             } => match client.poll_close(cx) {
                 Poll::Pending => {
                     if now >= deadline {
-                        self.targets[index].counters.packets_sent = client.packets_sent();
+                        self.targets[index].sync_packets_sent(&client);
                         self.finish_target(
                             index,
                             primary_end,
@@ -1398,7 +1421,7 @@ impl ManagedClientTask {
                     }
                 }
                 Poll::Ready(Ok(events)) => {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     self.publish_client_events(index, events);
                     #[cfg(test)]
                     let injected_close_failure = self.take_drain_close_failure().map(|error| {
@@ -1414,7 +1437,7 @@ impl ManagedClientTask {
                     false
                 }
                 Poll::Ready(Err(error)) => {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     let cleanup = classify_client_error(ManagedTargetFailurePhase::Closing, &error);
                     self.finish_target(index, primary_end, cleanup_failure.or(Some(cleanup)));
                     false
@@ -1620,7 +1643,7 @@ impl ManagedClientTask {
             .then(|| client.skip_missed_probe_slots_at(Instant::now()))
             .transpose()
             .err();
-        self.targets[index].counters.packets_sent = after;
+        self.targets[index].record_packets_sent(after);
         match result {
             Poll::Pending => {
                 self.targets[index].send_waiting = true;
@@ -1875,7 +1898,7 @@ impl ManagedClientTask {
                     }
                 }
                 Err(error) => {
-                    self.targets[index].counters.packets_sent = client.packets_sent();
+                    self.targets[index].sync_packets_sent(&client);
                     cleanup_failure.get_or_insert_with(|| {
                         classify_client_error(ManagedTargetFailurePhase::Timing, &error)
                     });

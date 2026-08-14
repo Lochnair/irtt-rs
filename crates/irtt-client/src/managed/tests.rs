@@ -2954,3 +2954,106 @@ fn terminal_subscription_is_closed() {
         Err(ManagedSubscribeError::Closed)
     ));
 }
+
+/// Build the client events target accounting distinguishes.
+fn accounting_events() -> Vec<ClientEvent> {
+    let remote: std::net::SocketAddr = "127.0.0.1:2112".parse().unwrap();
+    let at = ClientTimestamp {
+        mono: Instant::now(),
+        wall: SystemTime::UNIX_EPOCH,
+    };
+    let rtt = crate::RttSample {
+        raw: Duration::from_millis(1),
+        adjusted: None,
+        effective: crate::SignedDuration::from_nanos(1_000_000),
+    };
+    vec![
+        ClientEvent::EchoSent {
+            seq: 0,
+            remote,
+            scheduled_at: at.mono,
+            sent_at: at,
+            bytes: 64,
+            send_call: Duration::ZERO,
+            timer_error: Duration::ZERO,
+        },
+        ClientEvent::EchoReply {
+            seq: 0,
+            remote,
+            sent_at: at,
+            received_at: at,
+            rtt,
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: crate::PacketMeta::default(),
+        },
+        ClientEvent::DuplicateReply {
+            seq: 0,
+            remote,
+            received_at: at,
+            bytes: 64,
+        },
+        ClientEvent::LateReply {
+            seq: 1,
+            highest_seen: 2,
+            remote,
+            sent_at: Some(at),
+            received_at: at,
+            rtt: Some(rtt),
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: crate::PacketMeta::default(),
+        },
+        ClientEvent::EchoLoss {
+            seq: 2,
+            sent_at: at,
+            timeout_at: at.mono,
+        },
+        ClientEvent::Warning {
+            kind: crate::WarningKind::WrongToken,
+            message: "wrong token".to_owned(),
+            at,
+        },
+    ]
+}
+
+#[test]
+fn target_counters_account_for_each_observed_event_once() {
+    let mut counters = TargetCounters::default();
+    for event in accounting_events() {
+        counters.observe(&event);
+    }
+
+    // A late unique reply is counted as late, not as a received reply, and a
+    // probe send is not accounted here because the client owns packets_sent.
+    assert_eq!(counters.packets_sent, 0);
+    assert_eq!(counters.replies_received, 1);
+    assert_eq!(counters.duplicates, 1);
+    assert_eq!(counters.late, 1);
+    assert_eq!(counters.warning_events, 1);
+}
+
+#[test]
+fn target_counters_ignore_events_without_a_durable_count() {
+    let ignored: Vec<ClientEvent> = accounting_events()
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event,
+                ClientEvent::EchoSent { .. } | ClientEvent::EchoLoss { .. }
+            )
+        })
+        .collect();
+    assert_eq!(ignored.len(), 2);
+
+    let mut counters = TargetCounters::default();
+    for event in ignored {
+        counters.observe(&event);
+    }
+
+    assert_eq!(counters, TargetCounters::default());
+}
