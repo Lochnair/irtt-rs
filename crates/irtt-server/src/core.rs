@@ -10,6 +10,7 @@ use crate::{
     clock::{saturating_ns, ClockSample, ClockSource, SystemClock},
     config::ServerConfig,
     error::ServerError,
+    fill::negotiate_server_fill,
     negotiate::negotiate_params,
     session::{RateDecision, Session},
     token::{OsTokenSource, TokenSource, TOKEN_ATTEMPTS},
@@ -421,7 +422,14 @@ impl ServerCore {
         if !open_params_are_admissible(&decoded) {
             return Ok(None);
         }
-        let params = negotiate_params(decoded.params, &self.config);
+        let mut params = negotiate_params(decoded.params, &self.config);
+        // Settled here, once per open, so echo processing never parses a
+        // descriptor. It returns what the session will actually fill with,
+        // which an absent or empty descriptor deliberately does not describe,
+        // and restricts `params` only where an explicit descriptor could not be
+        // honored. A no-test open runs it for the negotiated value alone and
+        // drops the mode, having no session to keep it in.
+        let fill = negotiate_server_fill(&mut params);
         // Deliberately after negotiation, and before either open path: what has
         // to be executable is the effective session, not the request.
         if !negotiated_params_are_admissible(&params, &self.config) {
@@ -460,7 +468,7 @@ impl ServerCore {
         // nothing is cloned to keep both.
         self.sessions.insert(
             token,
-            Session::new(peer, reply.params, &self.config, now_ns),
+            Session::new(peer, reply.params, fill, &self.config, now_ns),
         );
         Ok(Some(OutboundDatagram::unmarked(packet)))
     }

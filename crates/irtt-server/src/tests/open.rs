@@ -191,14 +191,17 @@ fn selecting_timestamps_without_a_clock_is_silently_refused() {
 
 #[test]
 fn current_non_length_parameters_survive_negotiation_unchanged() {
-    // Statistics, timestamps, DSCP and server fill are the values a later
-    // restriction-policy slice will deliberately start changing. Pinning them
-    // now makes that a visible decision rather than an accident. Version, an
-    // oversized packet length, the duration maximum and the interval floor and
-    // cap are already restricted and have their own tests; the length here is
-    // deliberately under the default maximum, and the configuration below
-    // leaves duration and interval unrestricted, so this test says nothing
-    // about either policy.
+    // Statistics, timestamps and DSCP are the values a later restriction-policy
+    // slice will deliberately start changing. Pinning them now makes that a
+    // visible decision rather than an accident. Version, an oversized packet
+    // length, the duration maximum and the interval floor and cap are already
+    // restricted and have their own tests; the length here is deliberately
+    // under the default maximum, and the configuration below leaves duration
+    // and interval unrestricted, so this test says nothing about either policy.
+    //
+    // The server fill below is a *valid* descriptor, which is what survives
+    // unchanged. Fill negotiation has its own restriction rule and its own
+    // tests in `fill`.
     //
     // This is about what *negotiation* rewrites, which is a separate question
     // from whether the core will acknowledge the result: an open whose
@@ -214,7 +217,7 @@ fn current_non_length_parameters_survive_negotiation_unchanged() {
         clock: Clock::Monotonic,
         dscp: 184,
         server_fill: Some(ServerFill {
-            value: "pattern:abc".to_owned(),
+            value: "pattern:abcd".to_owned(),
         }),
     };
 

@@ -2,7 +2,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use irtt_proto::Params;
 
-use crate::{clock::saturating_ns, config::ServerConfig};
+use crate::{clock::saturating_ns, config::ServerConfig, fill::FillMode};
 
 /// How long past its negotiated maximum test duration a session is served
 /// before the next echo it answers carries the Close flag.
@@ -34,6 +34,7 @@ const MAX_DURATION_CLOSE_GRACE: Duration = Duration::from_secs(2);
 pub(crate) struct Session {
     peer: SocketAddr,
     params: Params,
+    fill: FillMode,
     receive: ReceiveState,
     rate: RateState,
     lifetime: LifetimeState,
@@ -48,9 +49,16 @@ impl Session {
     /// [`RateState::new`] for why the two together decide it. The idle deadline
     /// starts running immediately: a session that never carries an echo request
     /// ages out like any other.
+    ///
+    /// `fill` is the *effective* fill negotiation settled on, which the session
+    /// has to be told rather than left to infer from `params` later: an absent
+    /// or empty descriptor keeps its representation on the wire while the
+    /// session uses this server's default fill, and that distinction only
+    /// exists at the moment of negotiation.
     pub(crate) fn new(
         peer: SocketAddr,
         params: Params,
+        fill: FillMode,
         config: &ServerConfig,
         now_ns: i64,
     ) -> Self {
@@ -59,6 +67,7 @@ impl Session {
             lifetime: LifetimeState::opened_at(now_ns),
             peer,
             params,
+            fill,
             receive: ReceiveState::default(),
         }
     }
@@ -87,6 +96,17 @@ impl Session {
     /// that provoked them.
     pub(crate) fn params(&self) -> &Params {
         &self.params
+    }
+
+    /// How this session's echo replies fill their payload region.
+    ///
+    /// This is the *effective* fill, which is not always what
+    /// [`params`](Self::params) reports: a client that expressed no preference
+    /// keeps its absent or empty descriptor in the negotiated parameters and is
+    /// served this server's default fill. Only a descriptor this server could
+    /// not honor is rewritten in `params`.
+    pub(crate) fn fill(&self) -> &FillMode {
+        &self.fill
     }
 
     /// What this session's accepted echo requests have added up to so far.

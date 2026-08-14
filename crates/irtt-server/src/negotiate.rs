@@ -42,8 +42,13 @@ use crate::{clock::saturating_ns, config::ServerConfig};
 /// interval, so this server never enforces a cadence slower than the one it just
 /// handed the client.
 ///
-/// Later policy slices will add the timestamp allowance, DSCP policy and the
-/// server-fill allow-list.
+/// **ServerFill is settled separately**, by
+/// [`negotiate_server_fill`](crate::fill::negotiate_server_fill), because it
+/// produces a second result this function has nowhere to put: the effective
+/// fill the session will use, which is not always what the descriptor in
+/// `Params` says. The two run back to back on the same open.
+///
+/// Later policy slices may add the timestamp allowance and DSCP policy.
 ///
 /// Negotiation is not by itself an acknowledgement: the core validates what this
 /// function returns and silently discards an open whose effective parameters it

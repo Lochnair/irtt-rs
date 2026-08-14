@@ -134,10 +134,14 @@ fn valid_optional_parameter_values_survive_unchanged() {
             },
         ),
         (
+            // Exactly `MAX_SERVER_FILL_BYTES`, and a valid descriptor: the
+            // longest one a client can send is also one this server honors, so
+            // the row stays about the length bound rather than about fill
+            // policy, which `fill` tests on its own.
             "maximum length server fill",
             Params {
                 server_fill: Some(ServerFill {
-                    value: "0123456789abcdef0123456789abcdef".to_owned(),
+                    value: "pattern:0123456789abcdef01234567".to_owned(),
                 }),
                 ..Params::default()
             },
