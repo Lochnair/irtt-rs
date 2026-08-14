@@ -7,12 +7,13 @@
 
 use std::time::Duration;
 
-use irtt_proto::Params;
+use irtt_proto::{Clock, Params, StampAt};
 
 use super::support::{
-    client_params, core_with_tokens, expect_normal_open_reply, open_request, peer, ScriptedTokens,
+    client_params, core_with_tokens, echo_request, expect_echo_reply, expect_normal_open_reply,
+    open_request, peer, unthrottled, ScriptedTokens,
 };
-use crate::ServerConfig;
+use crate::{ServerConfig, TimestampAllowance};
 
 const TOKEN_A: u64 = 0x2f45_9a01_c37d_6e88;
 
@@ -165,4 +166,227 @@ fn a_zero_idle_timeout_caps_nothing() {
         negotiated(config, &requesting(3_000_000_000, 3_600_000_000_000)).interval_ns,
         3_600_000_000_000
     );
+}
+
+#[test]
+fn the_default_configuration_restricts_neither_capability() {
+    // Both controls are opt-in, so an existing configuration negotiates exactly
+    // what it did before they existed.
+    let config = ServerConfig::default();
+
+    assert_eq!(config.timestamp_allowance(), TimestampAllowance::Dual);
+    assert!(config.dscp_allowed());
+    assert_eq!(TimestampAllowance::default(), TimestampAllowance::Dual);
+
+    let restricted = config
+        .clone()
+        .with_timestamp_allowance(TimestampAllowance::Single)
+        .with_dscp_allowed(false);
+    assert_eq!(restricted.timestamp_allowance(), TimestampAllowance::Single);
+    assert!(!restricted.dscp_allowed());
+    assert_ne!(
+        restricted, config,
+        "the policy is part of the configuration"
+    );
+}
+
+#[test]
+fn a_requested_stamp_at_is_reduced_to_the_configured_allowance() {
+    // The whole observed mapping, driven through real opens and read out of the
+    // reply, because the reply is what a client enforces its own restriction
+    // policy against. Only one row substitutes rather than removes: a request
+    // for both instants under a single-timestamp allowance is answered with the
+    // *midpoint*, which still describes both, rather than with whichever of the
+    // two the server preferred.
+    for (requested, allowance, expected) in [
+        (StampAt::None, TimestampAllowance::Dual, StampAt::None),
+        (StampAt::None, TimestampAllowance::Single, StampAt::None),
+        (StampAt::None, TimestampAllowance::None, StampAt::None),
+        (StampAt::Send, TimestampAllowance::Dual, StampAt::Send),
+        (StampAt::Send, TimestampAllowance::Single, StampAt::Send),
+        (StampAt::Send, TimestampAllowance::None, StampAt::None),
+        (StampAt::Receive, TimestampAllowance::Dual, StampAt::Receive),
+        (
+            StampAt::Receive,
+            TimestampAllowance::Single,
+            StampAt::Receive,
+        ),
+        (StampAt::Receive, TimestampAllowance::None, StampAt::None),
+        (StampAt::Both, TimestampAllowance::Dual, StampAt::Both),
+        (StampAt::Both, TimestampAllowance::Single, StampAt::Midpoint),
+        (StampAt::Both, TimestampAllowance::None, StampAt::None),
+        (
+            StampAt::Midpoint,
+            TimestampAllowance::Dual,
+            StampAt::Midpoint,
+        ),
+        (
+            StampAt::Midpoint,
+            TimestampAllowance::Single,
+            StampAt::Midpoint,
+        ),
+        (StampAt::Midpoint, TimestampAllowance::None, StampAt::None),
+    ] {
+        let params = Params {
+            stamp_at: requested,
+            clock: Clock::Both,
+            ..client_params()
+        };
+        let negotiated = negotiated(
+            ServerConfig::default().with_timestamp_allowance(allowance),
+            &params,
+        );
+
+        assert_eq!(
+            negotiated.stamp_at, expected,
+            "{requested:?} under {allowance:?}"
+        );
+        assert_eq!(
+            negotiated.clock,
+            Clock::Both,
+            "{requested:?} under {allowance:?}: the allowance restricts placement, not the clock"
+        );
+    }
+}
+
+#[test]
+fn a_timestamp_restriction_never_rewrites_the_requested_clock() {
+    // The clean evidence describes a timestamp *allowance*, and says nothing
+    // about restricting clock domains. A server that quietly changed the clock
+    // too would report a session the client never asked for — and a client
+    // enforcing strict negotiation would refuse an otherwise serviceable one.
+    let single = negotiated(
+        ServerConfig::default().with_timestamp_allowance(TimestampAllowance::Single),
+        &Params {
+            stamp_at: StampAt::Both,
+            clock: Clock::Wall,
+            ..client_params()
+        },
+    );
+    assert_eq!(single.stamp_at, StampAt::Midpoint);
+    assert_eq!(single.clock, Clock::Wall);
+
+    let none = negotiated(
+        ServerConfig::default().with_timestamp_allowance(TimestampAllowance::None),
+        &Params {
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..client_params()
+        },
+    );
+    assert_eq!(none.stamp_at, StampAt::None);
+    assert_eq!(
+        none.clock,
+        Clock::Both,
+        "the clock tag stays exactly as requested, selecting nothing"
+    );
+}
+
+#[test]
+fn an_allowed_dscp_is_negotiated_stored_and_transported_unchanged() {
+    // The default, and the behavioral compatibility this policy must not
+    // disturb: the raw byte reaches the reply, the session and the transport.
+    let requested = Params {
+        dscp: 0xbb,
+        ..client_params()
+    };
+    let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
+    let open = core
+        .handle_datagram(peer(), &open_request(&requested, None))
+        .unwrap()
+        .expect("the open must be answered");
+
+    let negotiated = expect_normal_open_reply(&open, None).params;
+    assert_eq!(negotiated.dscp, 0xbb);
+    assert_eq!(
+        core.session(TOKEN_A)
+            .expect("the session must be live")
+            .params()
+            .dscp,
+        0xbb
+    );
+
+    let reply = core
+        .handle_datagram(peer(), &echo_request(TOKEN_A, 0, &negotiated, &[], None))
+        .unwrap()
+        .expect("an admissible echo must be answered");
+    expect_echo_reply(&reply, &negotiated, None);
+    assert_eq!(i64::from(reply.traffic_class()), 0xbb);
+}
+
+#[test]
+fn a_disallowed_dscp_is_negotiated_to_zero_and_the_session_runs_unmarked() {
+    // The open is not refused: the server simply will not provide the marking,
+    // and says so in the value it returns. Nothing downstream needs a second
+    // record of the policy — the negotiated zero is what the transport reads.
+    let requested = Params {
+        dscp: 0xb8,
+        ..client_params()
+    };
+    let mut core = core_with_tokens(
+        unthrottled().with_dscp_allowed(false),
+        ScriptedTokens::new([TOKEN_A]),
+    );
+    let open = core
+        .handle_datagram(peer(), &open_request(&requested, None))
+        .unwrap()
+        .expect("a disallowed DSCP must not refuse the open");
+
+    let negotiated = expect_normal_open_reply(&open, None).params;
+    assert_eq!(negotiated.dscp, 0, "restricted to zero");
+    assert_eq!(
+        core.session(TOKEN_A)
+            .expect("the session must be live")
+            .params()
+            .dscp,
+        0,
+        "and stored as the value the session will be run with"
+    );
+
+    let reply = core
+        .handle_datagram(peer(), &echo_request(TOKEN_A, 0, &negotiated, &[], None))
+        .unwrap()
+        .expect("an unmarked session is an ordinary session");
+    expect_echo_reply(&reply, &negotiated, None);
+    assert_eq!(reply.traffic_class(), 0);
+}
+
+#[test]
+fn a_disallowed_dscp_restricts_a_value_no_socket_could_carry_too() {
+    // Restriction runs during negotiation, before the transport's
+    // "out-of-range means unmarked" fallback is relevant at all: these values
+    // never reach the session, so the reply is honest rather than merely
+    // harmless.
+    for dscp in [-1, 256, i64::MAX] {
+        let requested = Params {
+            dscp,
+            ..client_params()
+        };
+        let mut core = core_with_tokens(
+            unthrottled().with_dscp_allowed(false),
+            ScriptedTokens::new([TOKEN_A]),
+        );
+        let open = core
+            .handle_datagram(peer(), &open_request(&requested, None))
+            .unwrap()
+            .unwrap_or_else(|| panic!("an open requesting DSCP {dscp} must still be answered"));
+
+        let negotiated = expect_normal_open_reply(&open, None).params;
+        assert_eq!(negotiated.dscp, 0, "requested {dscp}");
+        assert_eq!(
+            core.session(TOKEN_A)
+                .expect("the session must be live")
+                .params()
+                .dscp,
+            0,
+            "requested {dscp}"
+        );
+
+        let reply = core
+            .handle_datagram(peer(), &echo_request(TOKEN_A, 0, &negotiated, &[], None))
+            .unwrap()
+            .unwrap_or_else(|| panic!("the session must serve echoes after restricting {dscp}"));
+        expect_echo_reply(&reply, &negotiated, None);
+        assert_eq!(reply.traffic_class(), 0, "requested {dscp}");
+    }
 }

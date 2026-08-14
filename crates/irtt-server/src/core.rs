@@ -733,7 +733,9 @@ fn same_endpoint(session: SocketAddr, peer: SocketAddr) -> bool {
 /// during negotiation. Length and DSCP are accepted as decoded, including zero,
 /// negative and out-of-byte-range values; a DSCP the socket could never carry
 /// is negotiated unchanged and transported unmarked instead of being refused
-/// (see [`transport_traffic_class`]). Unknown tags were ignored by the decoder
+/// (see [`transport_traffic_class`]), and a server that disallows DSCP
+/// negotiates zero rather than rejecting the request. Unknown tags were ignored
+/// by the decoder
 /// and are not reflected in the reply.
 fn open_params_are_admissible(decoded: &DecodedParams) -> bool {
     let admissible = |present: bool, value: i64| !present || value > 0;
@@ -783,10 +785,12 @@ fn open_params_are_admissible(decoded: &DecodedParams) -> bool {
 /// default policy makes it unreachable for an acknowledged session anyway, since
 /// negotiation has already reduced the length to a representable maximum.
 ///
-/// The check is deliberately *after* negotiation so that a later policy slice
-/// restricting timestamps can restrict `stamp_at` to [`StampAt::None`], at
-/// which point an absent clock is safe and this predicate holds without
-/// changing.
+/// The check is deliberately *after* negotiation, which is what makes a
+/// configured timestamp allowance of
+/// [`TimestampAllowance::None`](crate::TimestampAllowance::None) accept this
+/// otherwise refused request: its effective `stamp_at` is [`StampAt::None`], so
+/// the absent clock selects nothing that was going to be reported and the
+/// session is executable exactly as negotiated.
 ///
 /// [`ServerError`]: crate::ServerError
 fn negotiated_params_are_admissible(params: &Params, config: &ServerConfig) -> bool {

@@ -1,7 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
-use clap::Parser;
-use irtt_server::ServerConfig;
+use clap::{Parser, ValueEnum};
+use irtt_server::{ServerConfig, TimestampAllowance};
 
 // Every policy option is optional. An omitted option leaves the corresponding
 // `ServerConfig` default in place rather than restating it here, so library and
@@ -79,6 +79,46 @@ pub struct ServerArgs {
         long_help = "Maximum test duration a session may negotiate. A longer request is reduced to it, and a continuous request is answered with it. Omit this flag for no maximum; a maximum of zero cannot be expressed, because a negotiated duration of zero means continuous."
     )]
     pub max_duration: Option<Duration>,
+
+    /// How many timestamps this server will provide.
+    #[arg(
+        long,
+        value_name = "MODE",
+        value_enum,
+        long_help = "How many timestamps this server will provide.\n\ndual: honor a request for send, receive, both or midpoint timestamps.\nsingle: provide at most one timestamp instant; a request for both is negotiated to midpoint.\nnone: provide no timestamps at all.\n\nThe requested clock source is never changed, only which instants are reported, so a single instant is still reported once per requested clock. Omit this flag to honor every requested placement."
+    )]
+    pub timestamp_allowance: Option<TimestampAllowanceArg>,
+
+    /// Refuse to provide requested DSCP marking.
+    #[arg(
+        long,
+        long_help = "Refuse to provide requested traffic-class marking. Any requested DSCP is negotiated to zero, so the client is told its echo replies will be unmarked, and they are sent unmarked. The session is not refused."
+    )]
+    pub no_dscp: bool,
+}
+
+/// The command-line spelling of [`TimestampAllowance`].
+///
+/// A CLI-local enum rather than a `clap` derive on the library type: `irtt-server`
+/// is a reusable crate and has no business depending on an argument parser.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum TimestampAllowanceArg {
+    /// Honor every requested timestamp placement.
+    Dual,
+    /// Provide at most one timestamp instant; both becomes midpoint.
+    Single,
+    /// Provide no timestamps.
+    None,
+}
+
+impl From<TimestampAllowanceArg> for TimestampAllowance {
+    fn from(value: TimestampAllowanceArg) -> Self {
+        match value {
+            TimestampAllowanceArg::Dual => Self::Dual,
+            TimestampAllowanceArg::Single => Self::Single,
+            TimestampAllowanceArg::None => Self::None,
+        }
+    }
 }
 
 impl ServerArgs {
@@ -106,6 +146,14 @@ impl ServerArgs {
         }
         if let Some(value) = self.max_duration {
             config = config.with_max_test_duration(value);
+        }
+        if let Some(value) = self.timestamp_allowance {
+            config = config.with_timestamp_allowance(value.into());
+        }
+        // A negative capability flag, so absence is the ordinary enabled state
+        // and the library default is what an unset flag leaves in place.
+        if self.no_dscp {
+            config = config.with_dscp_allowed(false);
         }
         config
     }
@@ -222,6 +270,55 @@ mod tests {
         assert_eq!(config.burst_allowance(), 3);
         assert_eq!(config.idle_timeout(), Duration::from_secs(30));
         assert_eq!(config.max_test_duration(), Some(Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn the_capability_restrictions_map_onto_the_server_config() {
+        let config = bound(&["--timestamp-allowance", "single", "--no-dscp"]).server_config();
+
+        assert_eq!(
+            config.timestamp_allowance(),
+            TimestampAllowance::Single,
+            "a request for both timestamps is negotiated to midpoint"
+        );
+        assert!(!config.dscp_allowed());
+    }
+
+    #[test]
+    fn every_timestamp_allowance_mode_parses() {
+        for (argument, expected) in [
+            ("dual", TimestampAllowance::Dual),
+            ("single", TimestampAllowance::Single),
+            ("none", TimestampAllowance::None),
+        ] {
+            assert_eq!(
+                bound(&["--timestamp-allowance", argument])
+                    .server_config()
+                    .timestamp_allowance(),
+                expected,
+                "--timestamp-allowance {argument}"
+            );
+        }
+
+        assert!(parse(&[
+            "--bind",
+            "127.0.0.1:2112",
+            "--timestamp-allowance",
+            "midpoint"
+        ])
+        .is_err());
+        assert!(parse(&["--bind", "127.0.0.1:2112", "--timestamp-allowance", "both"]).is_err());
+    }
+
+    #[test]
+    fn the_capability_restrictions_are_off_when_their_flags_are_absent() {
+        // Explicitly, and not only through the whole-config comparison above:
+        // these are the two values that would silently change every existing
+        // deployment's negotiation if the CLI restated them.
+        let config = bound(&["--idle-timeout", "30s"]).server_config();
+
+        assert_eq!(config.timestamp_allowance(), TimestampAllowance::Dual);
+        assert!(config.dscp_allowed());
     }
 
     #[test]

@@ -80,6 +80,8 @@ fn canonical_server_subcommand_dispatches_to_server() {
     assert!(text.contains("--bind <ADDR>"));
     assert!(text.contains("--max-sessions <COUNT>"));
     assert!(text.contains("--idle-timeout <DURATION>"));
+    assert!(text.contains("--timestamp-allowance <MODE>"));
+    assert!(text.contains("--no-dscp"));
 }
 
 #[cfg(not(feature = "server"))]

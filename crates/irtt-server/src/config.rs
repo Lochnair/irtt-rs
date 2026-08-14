@@ -53,12 +53,41 @@ pub const DEFAULT_BURST_ALLOWANCE: u32 = 5;
 /// emits no final reply. See [`ServerConfig::with_idle_timeout`].
 pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// How many timestamps a server is willing to provide.
+///
+/// This is **server policy**, deliberately a separate type from the wire
+/// [`StampAt`](irtt_proto::StampAt) a session requests and negotiates: one
+/// describes what a client asked for, the other what this server will hand out.
+/// Negotiation reduces the requested `StampAt` accordingly, and only it — the
+/// requested [`Clock`](irtt_proto::Clock) is never rewritten, because the clean
+/// evidence records a timestamp allowance restricting timestamp *placement*, not
+/// the clock domains it is read from.
+///
+/// See [`ServerConfig::with_timestamp_allowance`] for the mapping.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampAllowance {
+    /// No timestamps at all: every request is negotiated to
+    /// [`StampAt::None`](irtt_proto::StampAt::None).
+    None,
+    /// At most one timestamp *instant*. A request for both receive and send
+    /// becomes [`StampAt::Midpoint`](irtt_proto::StampAt::Midpoint); every
+    /// placement that already names a single instant is left alone.
+    ///
+    /// This restricts placement, not field count: the reply still carries one
+    /// field per negotiated clock domain, so a session on
+    /// [`Clock::Both`](irtt_proto::Clock::Both) receives both a wall and a
+    /// monotonic midpoint field.
+    Single,
+    /// Every requested placement is honored. This is the default, and the
+    /// behavior of a server that configures nothing.
+    #[default]
+    Dual,
+}
+
 /// Configuration for a [`ServerCore`](crate::ServerCore).
 ///
 /// Fields are private and set through consuming builder methods, so later
-/// slices can add configuration without breaking construction. Optional
-/// timestamp-allowance and DSCP restriction controls would arrive with the
-/// slices that implement them.
+/// slices can add configuration without breaking construction.
 ///
 /// **Server fill is deliberately not configurable.** The policy is fixed and
 /// safe: every valid descriptor is honored, one that cannot be parsed falls back
@@ -78,6 +107,8 @@ pub struct ServerConfig {
     burst_allowance: u32,
     idle_timeout: Duration,
     max_test_duration: Option<Duration>,
+    timestamp_allowance: TimestampAllowance,
+    dscp_allowed: bool,
 }
 
 impl ServerConfig {
@@ -221,6 +252,68 @@ impl ServerConfig {
         self
     }
 
+    /// Sets how many timestamps this server is willing to provide.
+    ///
+    /// A requested placement above the allowance is reduced during negotiation,
+    /// so the open reply is honest about what the session's echo replies will
+    /// carry:
+    ///
+    /// | Requested | [`Dual`] | [`Single`] | [`None`] |
+    /// |-----------|----------|------------|----------|
+    /// | `None` | `None` | `None` | `None` |
+    /// | `Send` | `Send` | `Send` | `None` |
+    /// | `Receive` | `Receive` | `Receive` | `None` |
+    /// | `Both` | `Both` | **`Midpoint`** | `None` |
+    /// | `Midpoint` | `Midpoint` | `Midpoint` | `None` |
+    ///
+    /// The one substitution is the observed one: under a single-timestamp
+    /// allowance a request for both instants is answered with the *midpoint*,
+    /// not with whichever of the two the server felt like keeping.
+    ///
+    /// The requested [`Clock`](irtt_proto::Clock) is left exactly as it was in
+    /// every case. The allowance restricts which *instants* are reported, and
+    /// each reported instant still carries one field per negotiated clock domain
+    /// — [`Single`] on [`Clock::Both`](irtt_proto::Clock::Both) reports a wall
+    /// and a monotonic midpoint. Only [`None`] removes timestamp fields
+    /// outright, and it does so because the echo layout carries none once the
+    /// placement is [`StampAt::None`](irtt_proto::StampAt::None).
+    ///
+    /// Restriction runs *before* the effective-session check, which is what
+    /// makes a [`None`] allowance accept a request that selected timestamps
+    /// without sending a Clock: such a session is refused as requested, because
+    /// timestamps from no clock cannot be produced, but under this policy its
+    /// effective placement is none and the absent clock no longer matters.
+    ///
+    /// [`Dual`]: TimestampAllowance::Dual
+    /// [`Single`]: TimestampAllowance::Single
+    /// [`None`]: TimestampAllowance::None
+    #[must_use]
+    pub fn with_timestamp_allowance(mut self, timestamp_allowance: TimestampAllowance) -> Self {
+        self.timestamp_allowance = timestamp_allowance;
+        self
+    }
+
+    /// Sets whether this server provides the traffic-class marking a session
+    /// requests.
+    ///
+    /// `true`, the default, negotiates the requested DSCP parameter unchanged —
+    /// including a raw value outside `0..=255`, which stays in the negotiated
+    /// parameters and is transported unmarked.
+    ///
+    /// `false` negotiates it to **zero**, whatever was requested, so the reply
+    /// tells the client its replies will be unmarked and the session's stored
+    /// parameters say the same. The open is never refused over DSCP, and nothing
+    /// is clamped or wrapped: this is an operator policy about providing
+    /// traffic-class marking at all, not a judgement about a particular value.
+    ///
+    /// It is also not socket capability detection. What a given host can apply
+    /// to a socket is a transport concern, settled per send by the runtime.
+    #[must_use]
+    pub fn with_dscp_allowed(mut self, dscp_allowed: bool) -> Self {
+        self.dscp_allowed = dscp_allowed;
+        self
+    }
+
     /// The configured HMAC key, if this server authenticates.
     #[must_use]
     pub fn hmac_key(&self) -> Option<&[u8]> {
@@ -267,6 +360,19 @@ impl ServerConfig {
     pub fn max_test_duration(&self) -> Option<Duration> {
         self.max_test_duration
     }
+
+    /// How many timestamps this server is willing to provide.
+    #[must_use]
+    pub fn timestamp_allowance(&self) -> TimestampAllowance {
+        self.timestamp_allowance
+    }
+
+    /// Whether a requested DSCP value is negotiated as asked, rather than to
+    /// zero.
+    #[must_use]
+    pub fn dscp_allowed(&self) -> bool {
+        self.dscp_allowed
+    }
 }
 
 impl Default for ServerConfig {
@@ -279,6 +385,11 @@ impl Default for ServerConfig {
     /// No maximum test duration is configured, matching the reference server's
     /// ordinary policy. A session is still bounded, by the table size and the
     /// idle timeout.
+    ///
+    /// Both capability restrictions are off: every requested timestamp placement
+    /// is honored ([`TimestampAllowance::Dual`]) and a requested DSCP value is
+    /// negotiated as asked. They are opt-in, so an existing configuration
+    /// negotiates exactly what it did before they existed.
     fn default() -> Self {
         Self {
             hmac_key: None,
@@ -288,6 +399,8 @@ impl Default for ServerConfig {
             burst_allowance: DEFAULT_BURST_ALLOWANCE,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             max_test_duration: None,
+            timestamp_allowance: TimestampAllowance::Dual,
+            dscp_allowed: true,
         }
     }
 }
