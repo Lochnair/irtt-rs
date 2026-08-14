@@ -209,15 +209,19 @@ pub struct ManagedTargetOutcome {
     pub end_reason: ManagedTargetEndReason,
     /// Probes the underlying client reported as sent.
     pub packets_sent: u64,
-    /// On-time unique echo replies.
+    /// Unique echo replies that arrived in order and before their probe timed
+    /// out.
     ///
-    /// A unique reply that arrived after its probe timed out is counted by
-    /// `late` instead, so this is the count of replies that arrived in time.
+    /// A unique reply that arrives behind an already-received sequence, or
+    /// after its own probe timed out, is counted by `late` instead.
     pub replies_received: u64,
     /// Replies for a sequence that had already been answered.
     pub duplicates: u64,
-    /// Replies that arrived after their probe timed out, whether or not the
-    /// client could still match them to retained send state.
+    /// Late replies: those arriving behind an already-received sequence
+    /// (reordering) or after their own probe timed out.
+    ///
+    /// This counts every late reply, whether or not the client could still
+    /// match it to retained send state.
     pub late: u64,
     /// Warning events observed for this target.
     pub warning_events: u64,

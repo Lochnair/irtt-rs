@@ -394,15 +394,16 @@ impl TargetState {
     }
 }
 
-#[derive(Debug, Default, Eq, PartialEq)]
+#[derive(Default)]
 struct TargetCounters {
     packets_sent: u64,
-    /// On-time unique echo replies.
+    /// Unique echo replies that arrived in order and before their probe timed
+    /// out.
     ///
-    /// A late unique reply is counted by `late` and deliberately not here, so
-    /// `replies_received` stays the count of replies that arrived within their
-    /// probe timeout. These counters are durable, unlike the lossy managed
-    /// presentation events.
+    /// A reply that arrives behind an already-received sequence, or after its
+    /// own probe timed out, is counted by `late` and deliberately not here.
+    /// These counters are durable, unlike the lossy managed presentation
+    /// events.
     replies_received: u64,
     duplicates: u64,
     late: u64,
