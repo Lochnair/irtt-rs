@@ -17,7 +17,7 @@ pub struct ServerArgs {
     #[arg(
         long,
         value_name = "ADDR",
-        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nAn explicit interface address is preferred. A wildcard bind such as 0.0.0.0:2112 is allowed, but reply source-address selection is then left to the kernel: per-packet destination-address handling for multi-homed hosts is not implemented."
+        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nA wildcard bind such as 0.0.0.0:2112 answers each request from the address it was sent to, using per-packet destination metadata. That is supported on Linux, macOS and FreeBSD; on other systems a wildcard bind is refused and an explicit interface address is required."
     )]
     pub bind: SocketAddr,
 

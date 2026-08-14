@@ -39,14 +39,29 @@
 //! not carried an echo request are explicitly not compatibility targets: an
 //! `irtt-rs` session ages from the moment it is opened.
 //!
+//! # Reply source address
+//!
+//! A reply leaves from the address its request was sent to. An
+//! explicit-address listener gets that from the bind and uses ordinary
+//! receive/send. A wildcard listener (`0.0.0.0` or `[::]`) instead reads each
+//! request's local destination from packet metadata and sends that request's
+//! reply from it, so a client on the host's second address is answered from the
+//! endpoint it contacted rather than from whichever one the routing table would
+//! have chosen.
+//!
+//! That path is implemented for Linux, macOS and FreeBSD. On other targets a
+//! wildcard bind is refused by [`Server::from_socket`] — and so by
+//! [`Server::bind`] — rather than served incorrectly; explicit-address
+//! listeners work everywhere they did before.
+//!
 //! # Current scope
 //!
 //! Open handling and negotiation, session creation, normal echo processing,
 //! per-session rate limiting, idle expiry, the maximum-duration
-//! server-initiated close, the negotiated per-session reply traffic class and
-//! Tokio UDP orchestration. The full server fill policy and wildcard-bind
-//! destination-address metadata remain separate slices. Echo payloads are
-//! zero-filled.
+//! server-initiated close, the negotiated per-session reply traffic class,
+//! wildcard reply-source selection and Tokio UDP orchestration. The full server
+//! fill policy and running several listeners in one process remain separate
+//! slices. Echo payloads are zero-filled.
 #![forbid(unsafe_code)]
 
 mod clock;
@@ -56,6 +71,7 @@ mod error;
 mod negotiate;
 mod runtime;
 mod session;
+mod socket_io;
 mod socket_options;
 mod token;
 
