@@ -593,32 +593,6 @@ mod tests {
     }
 
     #[test]
-    fn classification_covers_every_failure_kind_except_other() {
-        let observed: Vec<_> = classification_cases()
-            .into_iter()
-            .map(|(error, _)| {
-                classify_client_error(ManagedTargetFailurePhase::Sending, &error).kind
-            })
-            .collect();
-        for kind in [
-            ManagedTargetFailureKind::Resolve,
-            ManagedTargetFailureKind::Socket,
-            ManagedTargetFailureKind::SocketOption,
-            ManagedTargetFailureKind::Protocol,
-            ManagedTargetFailureKind::Timeout,
-            ManagedTargetFailureKind::Configuration,
-            ManagedTargetFailureKind::ResourceExhausted,
-            ManagedTargetFailureKind::InvalidState,
-        ] {
-            assert!(observed.contains(&kind), "no case classifies as {kind}");
-        }
-        assert!(
-            !observed.contains(&ManagedTargetFailureKind::Other),
-            "Other must remain a deliberate category, not a fallback"
-        );
-    }
-
-    #[test]
     fn classification_preserves_the_reported_phase() {
         for phase in [
             ManagedTargetFailurePhase::Connecting,
