@@ -712,6 +712,7 @@ name = "irtt-client"
 version = "0.4.0"
 dependencies = [
  "irtt-proto",
+ "irtt-server",
  "nix 0.31.3",
  "socket2",
  "thiserror 2.0.20",

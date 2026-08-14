@@ -83,7 +83,7 @@ fn echo_reply_bytes_consistent_with_echo_packet_len_for_various_lengths() {
 #[test]
 fn backend_large_packet_smoke() {
     let params = params_with_length(1472);
-    let peer = BackendPeer::start_open_echo(params.clone(), None);
+    let peer = BackendPeer::start_open_echo(None);
     let mut client = Client::connect(ClientConfig {
         negotiation_policy: NegotiationPolicy::Loose,
         length: 1472,

@@ -14,11 +14,16 @@ use irtt_proto::{
 };
 use tokio::runtime::{Builder, Runtime};
 
+#[path = "../../tests/support/in_tree_server.rs"]
+mod in_tree_server;
+
 use super::*;
 use crate::{
     probe::PendingProbe, socket_options::tokio_socket_traffic_class, Client, ClientTimestamp,
     RunMode, SocketConfig,
 };
+use in_tree_server::InTreeServer;
+use irtt_server::ServerConfig;
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -245,24 +250,6 @@ fn start_peer_close_server() -> TestServer {
                 peer,
             )
             .unwrap();
-    })
-}
-
-fn start_echo_close_server(key: Option<Vec<u8>>) -> TestServer {
-    start_server(move |socket, tx| {
-        let (params, peer) = open_session(&socket, &tx, key.as_deref());
-
-        let (probe_packet, _) = recv_packet(&socket, &tx);
-        let sequence = echo_request_sequence(&probe_packet, key.as_deref());
-        socket
-            .send_to(
-                &echo_reply(&params, sequence, TOKEN, flags::FLAG_REPLY, key.as_deref()),
-                peer,
-            )
-            .unwrap();
-
-        let (close_packet, _) = recv_packet(&socket, &tx);
-        assert_eq!(close_request_token(&close_packet, key.as_deref()), TOKEN);
     })
 }
 
@@ -1084,16 +1071,16 @@ fn successful_close_uses_post_acceptance_timestamp() {
 #[test]
 fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
     let key = b"async-equivalence-key".to_vec();
-    let blocking_server = start_echo_close_server(Some(key.clone()));
+    let blocking_server = InTreeServer::start(ServerConfig::default().with_hmac_key(key.clone()));
     let mut blocking =
         Client::connect(config(blocking_server.addr, Some(key.clone()), 46)).unwrap();
     let blocking_open = blocking.open().unwrap();
     let blocking_sent = blocking.send_probe().unwrap();
     let blocking_reply = blocking.recv_once().unwrap();
     let blocking_close = blocking.close().unwrap();
-    assert_eq!(blocking_server.finish().len(), 3);
+    drop(blocking_server);
 
-    let async_server = start_echo_close_server(Some(key.clone()));
+    let async_server = InTreeServer::start(ServerConfig::default().with_hmac_key(key.clone()));
     let (async_open, async_sent, async_reply, async_close) = runtime().block_on(async {
         let mut client = AsyncClient::connect(config(async_server.addr, Some(key), 46))
             .await
@@ -1105,7 +1092,7 @@ fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
         let closed = client.close().await.unwrap();
         (opened, sent, reply, closed)
     });
-    assert_eq!(async_server.finish().len(), 3);
+    drop(async_server);
 
     assert_eq!(
         open_negotiated(&blocking_open),
@@ -1118,20 +1105,28 @@ fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
     );
     assert_matching_event_shape(&blocking_sent[0], &async_sent[0]);
     assert_matching_event_shape(&blocking_reply[0], &async_reply[0]);
+    assert!(matches!(
+        blocking_close.as_slice(),
+        [ClientEvent::SessionClosed { token, .. }] if *token == open_token(&blocking_open)
+    ));
+    assert!(matches!(
+        async_close.as_slice(),
+        [ClientEvent::SessionClosed { token, .. }] if *token == open_token(&async_open)
+    ));
     assert_matching_event_shape(&blocking_close[0], &async_close[0]);
 }
 
 #[test]
 fn blocking_and_async_no_test_are_semantically_equivalent() {
-    let blocking_no_test_server = start_no_test_server();
+    let blocking_no_test_server = InTreeServer::start(ServerConfig::default());
     let mut blocking_no_test_config = config(blocking_no_test_server.addr, None, 0);
     blocking_no_test_config.run_mode = RunMode::NoTest;
     let mut blocking_no_test = Client::connect(blocking_no_test_config).unwrap();
     let blocking_no_test_open = blocking_no_test.open().unwrap();
     assert!(blocking_no_test.is_run_complete());
-    assert_eq!(blocking_no_test_server.finish().len(), 1);
+    drop(blocking_no_test_server);
 
-    let async_no_test_server = start_no_test_server();
+    let async_no_test_server = InTreeServer::start(ServerConfig::default());
     let mut async_no_test_config = config(async_no_test_server.addr, None, 0);
     async_no_test_config.run_mode = RunMode::NoTest;
     let async_no_test_open = runtime().block_on(async {
@@ -1140,7 +1135,7 @@ fn blocking_and_async_no_test_are_semantically_equivalent() {
         assert!(client.is_run_complete());
         opened
     });
-    assert_eq!(async_no_test_server.finish().len(), 1);
+    drop(async_no_test_server);
     assert!(matches!(
         blocking_no_test_open,
         OpenOutcome::NoTestCompleted { .. }
@@ -1197,6 +1192,13 @@ fn open_negotiated(outcome: &OpenOutcome) -> &crate::NegotiatedParams {
     }
 }
 
+fn open_token(outcome: &OpenOutcome) -> u64 {
+    match outcome {
+        OpenOutcome::Started { token, .. } => *token,
+        OpenOutcome::NoTestCompleted { .. } => panic!("no-test open has no session token"),
+    }
+}
+
 fn assert_matching_event_shape(blocking: &ClientEvent, asynchronous: &ClientEvent) {
     assert_eq!(event_shape(blocking), event_shape(asynchronous));
 }
@@ -1205,7 +1207,7 @@ fn event_shape(event: &ClientEvent) -> (&'static str, u64, usize) {
     match event {
         ClientEvent::EchoSent { seq, bytes, .. } => ("sent", u64::from(*seq), *bytes),
         ClientEvent::EchoReply { seq, bytes, .. } => ("reply", u64::from(*seq), *bytes),
-        ClientEvent::SessionClosed { token, .. } => ("closed", *token, 0),
+        ClientEvent::SessionClosed { .. } => ("closed", 0, 0),
         other => panic!("unexpected equivalence event: {other:?}"),
     }
 }

@@ -6,7 +6,7 @@ use crate::support::{config_for_params, default_params, params_for_modes, Backen
 #[test]
 fn backend_basic_open_echo_close() {
     let params = default_params();
-    let peer = BackendPeer::start_open_echo(params.clone(), None);
+    let peer = BackendPeer::start_open_echo(None);
     let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
     let outcome = client.open().unwrap();
@@ -31,7 +31,7 @@ fn backend_received_stats_smoke() {
         ReceivedStats::Both,
     ] {
         let params = params_for_modes(mode, StampAt::None, Clock::Both);
-        let peer = BackendPeer::start_open_echo(params.clone(), None);
+        let peer = BackendPeer::start_open_echo(None);
         let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
         client.open().unwrap();
@@ -54,7 +54,7 @@ fn backend_timestamp_smoke() {
         StampAt::Midpoint,
     ] {
         let params = params_for_modes(ReceivedStats::None, mode, Clock::Both);
-        let peer = BackendPeer::start_open_echo(params.clone(), None);
+        let peer = BackendPeer::start_open_echo(None);
         let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
         client.open().unwrap();
@@ -101,7 +101,7 @@ fn backend_timestamp_smoke() {
 fn backend_clock_smoke() {
     for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
         let params = params_for_modes(ReceivedStats::None, StampAt::Both, clock);
-        let peer = BackendPeer::start_open_echo(params.clone(), None);
+        let peer = BackendPeer::start_open_echo(None);
         let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
 
         client.open().unwrap();

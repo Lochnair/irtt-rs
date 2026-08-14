@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+mod in_tree_server;
 mod real_irtt;
 
 use std::{
@@ -17,7 +18,9 @@ use irtt_proto::{
     PacketLayout, Params, ProtoError, ReceivedStats, ServerFill, StampAt, TimestampFields,
     HMAC_SIZE, MAGIC, PROTOCOL_VERSION,
 };
+use irtt_server::ServerConfig;
 
+pub use in_tree_server::InTreeServer;
 pub use real_irtt::RealIrtServer;
 
 const HMAC_OFFSET: usize = 4;
@@ -27,7 +30,7 @@ pub const RECV_WINDOW: u64 = 0x07;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TestBackendKind {
-    Fake,
+    InTree,
     Real,
 }
 
@@ -43,9 +46,9 @@ pub fn selected_backend() -> TestBackendKind {
                 _ => panic!("IRTT_TEST_BACKEND=real but irtt binary not found at '{irtt_bin}'"),
             }
         }
-        Ok("fake") | Err(_) => {
-            debug_backend("[backend] selected backend=fake");
-            TestBackendKind::Fake
+        Ok("in-tree") | Err(_) => {
+            debug_backend("[backend] selected backend=in-tree");
+            TestBackendKind::InTree
         }
         Ok(other) => panic!("unknown IRTT_TEST_BACKEND value: {other}"),
     }
@@ -58,24 +61,25 @@ fn debug_backend(message: &str) {
 }
 
 pub enum BackendPeer {
-    Fake(FakeServer),
+    InTree(InTreeServer),
     Real(RealIrtServer),
 }
 
 impl BackendPeer {
     pub fn addr(&self) -> SocketAddr {
         match self {
-            BackendPeer::Fake(s) => s.addr,
+            BackendPeer::InTree(s) => s.addr,
             BackendPeer::Real(s) => s.addr(),
         }
     }
 
-    pub fn start_open_echo(params: Params, hmac_key: Option<Vec<u8>>) -> Self {
+    pub fn start_open_echo(hmac_key: Option<Vec<u8>>) -> Self {
         match selected_backend() {
-            TestBackendKind::Fake => {
-                let timestamps = standard_timestamps();
-                BackendPeer::Fake(start_one_probe_server(params, timestamps, hmac_key))
-            }
+            TestBackendKind::InTree => BackendPeer::InTree(InTreeServer::start(
+                hmac_key.map_or_else(ServerConfig::default, |key| {
+                    ServerConfig::default().with_hmac_key(key)
+                }),
+            )),
             TestBackendKind::Real => {
                 BackendPeer::Real(RealIrtServer::start(hmac_key.as_deref()).unwrap())
             }
@@ -84,9 +88,8 @@ impl BackendPeer {
 
     pub fn start_hmac_required(key: Vec<u8>) -> Self {
         match selected_backend() {
-            TestBackendKind::Fake => BackendPeer::Fake(start_hmac_required_open_drop_server(
-                key,
-                Duration::from_millis(250),
+            TestBackendKind::InTree => BackendPeer::InTree(InTreeServer::start(
+                ServerConfig::default().with_hmac_key(key),
             )),
             TestBackendKind::Real => BackendPeer::Real(RealIrtServer::start(Some(&key)).unwrap()),
         }

@@ -276,7 +276,7 @@ fn assert_no_duplicate_late_or_warning(events: &[ClientEvent]) {
 fn backend_hmac_correct_key_succeeds() {
     let key = b"compat-secret".to_vec();
     let params = default_params();
-    let peer = BackendPeer::start_open_echo(params.clone(), Some(key.clone()));
+    let peer = BackendPeer::start_open_echo(Some(key.clone()));
     let mut config = config_for_params(peer.addr(), &params);
     config.hmac_key = Some(key);
 
