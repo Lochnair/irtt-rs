@@ -13,9 +13,24 @@
 //! engine stays testable. Each reply it produces is an [`OutboundDatagram`]:
 //! the packet and the raw traffic class it must be sent with. [`Server`] owns
 //! one Tokio UDP listener and one core, and provides sequential receive, reply,
-//! scheduled expiry maintenance and caller-controlled shutdown. The crate is
-//! intentionally Tokio-native; there is no blocking or alternate-runtime
-//! counterpart and no transport abstraction.
+//! scheduled expiry maintenance and caller-controlled shutdown. [`ServerSet`]
+//! owns one or more `Server`s as a single service: it binds them all or none,
+//! runs each in its own task, fans one shutdown out to them and fails the group
+//! if any listener does. The crate is intentionally Tokio-native; there is no
+//! blocking or alternate-runtime counterpart and no transport abstraction.
+//!
+//! # One listener or several
+//!
+//! `Server` is the primitive and stays directly usable. `ServerSet` is the
+//! service around it, and a set of one is an ordinary set rather than a special
+//! case — the server CLI runs every invocation, single-bind included, through
+//! one.
+//!
+//! Listeners in a set share nothing but the configuration they were cloned
+//! from. Each has its own socket, core, session table and tokens, so a token
+//! issued by one is unknown at the others, and every bound in
+//! [`ServerConfig`] — `max_sessions` included — applies **per listener**, not
+//! per process.
 //!
 //! # Rejection is silence
 //!
@@ -60,8 +75,8 @@
 //! per-session rate limiting, idle expiry, the maximum-duration
 //! server-initiated close, the negotiated per-session reply traffic class,
 //! server fill, the optional timestamp-allowance and DSCP capability
-//! restrictions, wildcard reply-source selection and Tokio UDP orchestration.
-//! Running several listeners in one process remains a separate slice.
+//! restrictions, wildcard reply-source selection, Tokio UDP orchestration and
+//! multi-listener supervision through [`ServerSet`].
 //!
 //! # Capability restrictions
 //!
@@ -99,6 +114,7 @@ mod fill;
 mod negotiate;
 mod runtime;
 mod session;
+mod set;
 mod socket_io;
 mod socket_options;
 mod token;
@@ -113,3 +129,4 @@ pub use config::{
 pub use core::{OutboundDatagram, ServerCore};
 pub use error::ServerError;
 pub use runtime::{Server, ServerRuntimeError};
+pub use set::{ServerSet, ServerSetError};
