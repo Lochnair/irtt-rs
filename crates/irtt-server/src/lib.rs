@@ -59,15 +59,29 @@
 //! Open handling and negotiation, session creation, normal echo processing,
 //! per-session rate limiting, idle expiry, the maximum-duration
 //! server-initiated close, the negotiated per-session reply traffic class,
-//! wildcard reply-source selection and Tokio UDP orchestration. The full server
-//! fill policy and running several listeners in one process remain separate
-//! slices. Echo payloads are zero-filled.
+//! server fill, wildcard reply-source selection and Tokio UDP orchestration.
+//! Running several listeners in one process remains a separate slice, as do
+//! optional timestamp and DSCP restriction controls.
+//!
+//! # Server fill
+//!
+//! An echo reply's payload region is filled from the session's negotiated
+//! ServerFill descriptor: `none`, `rand`, or `pattern:` followed by a repeating
+//! hexadecimal pattern. Every valid descriptor is accepted — there is no
+//! allow-list to configure — and one this server cannot parse is answered with
+//! its default, `pattern:69727474`, which is also what a client expressing no
+//! preference is served without any change to the negotiated parameters.
+//!
+//! A `none` payload is zeroes. Payload bytes carry no protocol meaning, and a
+//! server must never emit residue from another request or client. Request
+//! payload bytes never reach a reply under any mode.
 #![forbid(unsafe_code)]
 
 mod clock;
 mod config;
 mod core;
 mod error;
+mod fill;
 mod negotiate;
 mod runtime;
 mod session;

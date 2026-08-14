@@ -308,6 +308,13 @@ The client, event stream, machine-readable output, multi-target execution, local
 The server library and the server applet are implemented: open negotiation,
 session state, echo processing, per-session rate limiting, idle expiry, the
 maximum-duration close, HMAC authentication, the negotiated per-session reply
-traffic class, which is applied on sockets that support it, and wildcard
-reply-source selection on Linux, macOS and FreeBSD. The full server fill policy
-and multiple listeners in one process are not implemented.
+traffic class, which is applied on sockets that support it, server fill, and
+wildcard reply-source selection on Linux, macOS and FreeBSD. Multiple listeners
+in one process are not implemented, and optional timestamp and DSCP restriction
+controls remain separate concerns.
+
+Server replies fill their payload with the negotiated ServerFill mode: `none`,
+which is zero-filled, `rand`, or `pattern:` with a repeating hexadecimal
+pattern. Every valid descriptor is honored; a descriptor the server cannot
+parse, and a client that expresses no fill preference at all, get the default
+`pattern:69727474`.

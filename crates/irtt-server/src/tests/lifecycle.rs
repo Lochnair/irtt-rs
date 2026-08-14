@@ -15,7 +15,7 @@
 
 use std::time::Duration;
 
-use irtt_proto::{Clock, Params, ReceivedStats, StampAt, FLAG_CLOSE};
+use irtt_proto::{echo_header_len, Clock, Params, ReceivedStats, ServerFill, StampAt, FLAG_CLOSE};
 
 use super::support::{
     close_request, core_with_sources, echo_at, echo_params, echo_request,
@@ -416,9 +416,20 @@ fn the_maximum_duration_deadline_starts_at_the_first_served_echo() {
 
 #[test]
 fn the_first_echo_past_the_maximum_duration_carries_close_and_ends_the_session() {
+    // The session negotiates a fill and a payload region, so this covers the
+    // close's payload as well: a server close is an ordinary echo reply with a
+    // flag added, and it fills exactly as the session's other replies do.
+    let requested = Params {
+        server_fill: Some(ServerFill {
+            value: "pattern:aabb".to_owned(),
+        }),
+        length: (echo_header_len(false, &params_at(SECOND)) + 5) as i64,
+        ..params_at(SECOND)
+    };
+    let patterned = vec![0xaa, 0xbb, 0xaa, 0xbb, 0xaa];
     let (mut core, clock, token, negotiated) = manual_core(
         max_duration_of(Duration::from_secs(1)),
-        &params_at(SECOND),
+        &requested,
         ScriptedTokens::new([TOKEN_A]),
         None,
     );
@@ -437,6 +448,7 @@ fn the_first_echo_past_the_maximum_duration_carries_close_and_ends_the_session()
     .expect("short of the deadline must be answered normally");
     let reply = expect_echo_reply(&packet, &negotiated, None);
     assert_eq!(reply.flags & FLAG_CLOSE, 0, "not yet");
+    assert_eq!(reply.payload, patterned, "an ordinary reply's fill");
 
     // At the deadline exactly.
     let packet = echo_at(&mut core, &clock, 13 * SECOND, token, 2, &negotiated, None)
@@ -449,7 +461,10 @@ fn the_first_echo_past_the_maximum_duration_carries_close_and_ends_the_session()
         (Some(3), Some(0x7)),
         "the triggering request is included in the statistics it reports"
     );
-    assert!(reply.payload.is_empty());
+    assert_eq!(
+        reply.payload, patterned,
+        "the close keeps the session's fill; it is not a special packet"
+    );
     assert_eq!(
         packet.bytes().len(),
         irtt_proto::echo_packet_len(false, &negotiated).unwrap(),

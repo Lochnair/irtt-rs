@@ -10,6 +10,7 @@ use crate::{
     clock::{saturating_ns, ClockSample, ClockSource, SystemClock},
     config::ServerConfig,
     error::ServerError,
+    fill::{echo_payload_len, negotiate_server_fill},
     negotiate::negotiate_params,
     session::{RateDecision, Session},
     token::{OsTokenSource, TokenSource, TOKEN_ATTEMPTS},
@@ -48,8 +49,8 @@ use crate::{
 /// normal echo processing, per-session rate limiting, idle expiry,
 /// maximum-duration close and client-initiated close. It decides the traffic
 /// class each reply is to be sent with; actually applying it to a socket is the
-/// runtime's job. The full server fill policy is a separate slice, and echo
-/// payloads are zero-filled. Incoming authenticated requests enforce logical
+/// runtime's job. It also settles each session's server fill and generates the
+/// payload bytes of every echo reply. Incoming authenticated requests enforce logical
 /// expiry exactly; the runtime also calls a private maintenance hook to reclaim
 /// idle sessions when no traffic arrives.
 #[derive(Debug)]
@@ -355,6 +356,10 @@ impl ServerCore {
         // it.
         let sent_at = self.clock.sample();
         let params = session.params();
+        // Fill bytes are prepared before the reply is built, so they go through
+        // the encoder's normal path and the packet's MAC covers them like every
+        // other byte. Nothing mutates a payload after encoding.
+        let payload_len = echo_payload_len(self.config.hmac_key().is_some(), params);
         // Read before the session can be released below: a maximum-duration
         // close is an ordinary echo reply and carries the session's marking like
         // any other.
@@ -373,12 +378,13 @@ impl ServerCore {
             recv_count: params.received_stats.has_count().then_some(next.count),
             recv_window: params.received_stats.has_window().then_some(next.window),
             timestamps: timestamp_fields(params, request.received_at, sent_at),
-            // No payload bytes of our own: the encoder zero-fills the whole
-            // region between the field block and the negotiated length. That is
-            // the initial safe fill policy — payload bytes carry no protocol
-            // meaning, and zeroes cannot disclose residue from another request
-            // or another client. Request payload bytes never reach a reply.
-            payload: Vec::new(),
+            // The session's negotiated fill, generated fresh for this reply and
+            // sized from the layout rather than from `params.length`. A `none`
+            // session contributes no bytes and the encoder's zero-fill stands,
+            // which is what keeps a no-fill reply from disclosing residue.
+            // Nothing from the request reaches here: its payload is opaque, and
+            // ServerFill describes the server's own bytes.
+            payload: session.fill().payload(payload_len),
         };
         let packet = encode_echo_reply(&reply, params, self.config.hmac_key())
             .map_err(|source| ServerError::ReplyEncoding { source })?;
@@ -421,7 +427,14 @@ impl ServerCore {
         if !open_params_are_admissible(&decoded) {
             return Ok(None);
         }
-        let params = negotiate_params(decoded.params, &self.config);
+        let mut params = negotiate_params(decoded.params, &self.config);
+        // Settled here, once per open, so echo processing never parses a
+        // descriptor. It returns what the session will actually fill with,
+        // which an absent or empty descriptor deliberately does not describe,
+        // and restricts `params` only where an explicit descriptor could not be
+        // honored. A no-test open runs it for the negotiated value alone and
+        // drops the mode, having no session to keep it in.
+        let fill = negotiate_server_fill(&mut params);
         // Deliberately after negotiation, and before either open path: what has
         // to be executable is the effective session, not the request.
         if !negotiated_params_are_admissible(&params, &self.config) {
@@ -460,7 +473,7 @@ impl ServerCore {
         // nothing is cloned to keep both.
         self.sessions.insert(
             token,
-            Session::new(peer, reply.params, &self.config, now_ns),
+            Session::new(peer, reply.params, fill, &self.config, now_ns),
         );
         Ok(Some(OutboundDatagram::unmarked(packet)))
     }

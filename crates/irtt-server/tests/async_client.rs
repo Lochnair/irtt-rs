@@ -57,6 +57,11 @@ async fn exercise_client_server() {
             assert_eq!(negotiated.params.received_stats, ReceivedStats::Both);
             assert_eq!(negotiated.params.stamp_at, StampAt::Both);
             assert_eq!(negotiated.params.clock, Clock::Both);
+            // A default client requests no fill, and this open succeeded under
+            // the default strict negotiation policy — which it could not have
+            // if the server had answered an absent request with its own default
+            // descriptor. The server still fills the payload with it.
+            assert_eq!(negotiated.params.server_fill, None);
             assert!(matches!(event, ClientEvent::SessionStarted { .. }));
         }
         OpenOutcome::NoTestCompleted { .. } => panic!("normal client unexpectedly ran no-test"),

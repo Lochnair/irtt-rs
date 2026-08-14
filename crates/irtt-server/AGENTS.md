@@ -202,11 +202,56 @@ effective parameters must be safe for the server to run.
 - For a single-clock midpoint, `irtt-rs` emits the one negotiated field. It does
   not reproduce upstream 0.9.1's dual-field midpoint; `irtt-proto` still decodes
   that form from a peer.
-- Reply payload bytes are zero, which is the initial safe fill policy: payload
-  carries no protocol meaning, and a server must never emit residue from another
-  request or client. Request payload bytes never reach a reply.
-- The full `ServerFill` policy is a later slice. Do not add placeholder session
-  fields for it.
+- Reply payload bytes come from the session's fill; see "Server fill" below.
+  Request payload bytes never reach a reply under any mode.
+
+## Server fill
+
+The ServerFill *string* is wire data `irtt-proto` carries verbatim, and it
+already enforces the 32-byte, UTF-8 and truncation rules. What a descriptor
+*means* is server policy and lives in `fill`. Do not move descriptor parsing
+into `irtt-proto`, and do not duplicate the decoder's checks here.
+
+- **All three valid descriptor families are accepted**: `none`, `rand` and
+  `pattern:HH…`. Mode names are case-sensitive; only a pattern's hexadecimal
+  body is not. This is deliberately more permissive than the reference server's
+  configurable glob allow-list, which is upstream policy rather than an
+  interoperability requirement. Do **not** add glob, regex or allow-list
+  configuration, and do not add server fill CLI knobs.
+- **Absent or empty means no preference.** The negotiated params keep their
+  representation exactly — absent stays absent, empty stays empty — while the
+  session uses the server default internally. Writing the default descriptor
+  into the reply would manufacture a restriction, which a strict client rightly
+  rejects.
+- **The default and fallback descriptor is `pattern:69727474`**, the bytes
+  `irtt`. The descriptor and the bytes are separate constants; neither is
+  derived from the other at run time.
+- **An unknown or malformed explicit descriptor is replaced** in the negotiated
+  params by that default descriptor, because the server really did change what
+  was asked for. The client models it as `ServerFillChanged`; do not weaken
+  client negotiation to hide it.
+- **`none` zero-fills.** The clean evidence records the reference server leaving
+  the region as residual buffer content, returning other clients' bytes. Zero is
+  produced by handing the encoder an empty payload, not by copying zeroes over
+  an already-zeroed packet.
+- **Pattern phase resets for every reply.** Upstream's observed cross-packet and
+  cross-listener continuity is explicitly not required of a conforming server,
+  and per-packet reset keeps the server free of global mutable fill state and
+  makes replies deterministic. There is no shared phase between sessions or
+  listeners, and adding one would be a regression.
+- **`FillMode` belongs to the `Session`**, parsed once at open. Never re-derive
+  it from `params` later: that would lose the absent-descriptor-with-default-
+  behavior distinction. Keep the type crate-private.
+- **Fill is generated before the reply is encoded**, like every other part of an
+  echo, so the packet's HMAC covers the fill bytes through the ordinary encoder
+  path and no session state commits before encoding succeeds. Never mutate a
+  payload after encoding.
+- **A random-source failure zero-fills that one payload and is not fatal.** It
+  must never become a `ServerError`, terminate `Server::run` or drop the
+  session. The bytes exist to vary the payload and are not security state;
+  session tokens keep their own source.
+- Payload length comes from `irtt-proto`'s layout and `echo_packet_len`, never
+  from `params.length`, and needs no second packet-size bound of its own.
 
 ## Reply traffic class
 

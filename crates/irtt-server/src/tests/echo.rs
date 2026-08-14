@@ -725,7 +725,11 @@ fn a_single_clock_midpoint_emits_exactly_one_field() {
 }
 
 #[test]
-fn a_reply_payload_is_zero_filled_and_never_reflects_the_request() {
+fn a_reply_payload_is_server_generated_and_never_reflects_the_request() {
+    // The inbound tail is opaque, and ServerFill describes the *server's* bytes:
+    // a request's payload is neither echoed, mixed in, nor used to seed
+    // anything. This session expressed no fill preference, so the region
+    // carries the server's default fill; `fill` covers the modes themselves.
     let params = echo_params(ReceivedStats::None, StampAt::None, Clock::Unspecified, 64);
     let (mut core, token, negotiated) = session_with(&params);
 
@@ -744,7 +748,14 @@ fn a_reply_payload_is_zero_filled_and_never_reflects_the_request() {
     assert_eq!(packet.bytes().len(), 64);
     assert_eq!(reply.payload.len(), 48);
     assert!(
-        reply.payload.iter().all(|byte| *byte == 0),
-        "the payload region must be zero-filled, never request or buffer residue"
+        !reply.payload.contains(&0xa5),
+        "no request byte may appear in the reply payload"
+    );
+    assert!(
+        reply
+            .payload
+            .chunks(4)
+            .all(|chunk| chunk == &b"irtt"[..chunk.len()]),
+        "the region carries the server's default fill"
     );
 }
