@@ -3078,7 +3078,8 @@ mod tests {
     fn active_sample_data_and_warnings_are_visible_in_the_large_layout() {
         let state = active_dashboard_state();
 
-        let text = render_text(&state, 140, 40);
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
 
         // Session identity from the header.
         assert!(text.contains("0xabcd"));
@@ -3086,10 +3087,20 @@ mod tests {
         // The most recent sample and its effective RTT.
         assert!(text.contains("last seq: 11"));
         assert!(text.contains("2.5ms"));
-        // Warning presentation reaches the recent-events panel and the sample
-        // panel's last-warning row.
-        assert!(text.contains("wrong token"));
-        assert!(text.contains("last warning:"));
+        // The warning reaches the recent-events panel...
+        assert!(rows
+            .iter()
+            .any(|row| row.contains("warning") && row.contains("wrong token")));
+        // ...and the sample panel's last-warning row carries the warning
+        // itself, not the absent-value placeholder.
+        let last_warning = rows
+            .iter()
+            .find(|row| row.contains("last warning:"))
+            .expect("the large layout renders a last-warning row");
+        assert!(
+            last_warning.contains("wrong token"),
+            "last-warning row did not carry the warning: {last_warning}"
+        );
     }
 
     #[test]
