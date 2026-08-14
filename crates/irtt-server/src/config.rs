@@ -56,9 +56,19 @@ pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 /// Configuration for a [`ServerCore`](crate::ServerCore).
 ///
 /// Fields are private and set through consuming builder methods, so later
-/// slices can add configuration without breaking construction. The remaining
-/// parameter restriction knobs — the timestamp allowance, DSCP policy and the
-/// server-fill allow-list — arrive with the slices that implement them.
+/// slices can add configuration without breaking construction. Optional
+/// timestamp-allowance and DSCP restriction controls would arrive with the
+/// slices that implement them.
+///
+/// **Server fill is deliberately not configurable.** The policy is fixed and
+/// safe: every valid descriptor is honored, one that cannot be parsed falls back
+/// to `pattern:69727474`, and a client expressing no preference is served that
+/// same default. There is no allow-list to configure, because refusing a valid
+/// mode would prevent nothing — the payload carries no protocol meaning, a
+/// descriptor is bounded to 32 wire bytes, a random fill is bounded by
+/// [`max_packet_length`](Self::max_packet_length) like every other reply, and
+/// `none` is zero-filled here rather than left as residue. An operator
+/// restriction can be added if a real use case turns up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     hmac_key: Option<Vec<u8>>,

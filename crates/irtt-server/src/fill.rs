@@ -6,7 +6,7 @@
 //! [`FillMode`], which is deliberately crate-private: it is neither wire format
 //! nor public configuration.
 
-use irtt_proto::{Params, ServerFill};
+use irtt_proto::{echo_packet_len, PacketLayout, Params, ServerFill};
 
 /// The bytes of this server's default fill, repeated: `69 72 74 74`, or `irtt`.
 ///
@@ -70,6 +70,34 @@ impl FillMode {
                 .map(Self::Pattern),
         }
     }
+
+    /// The `len` payload bytes an echo reply carries under this mode.
+    ///
+    /// **A pattern always starts at its first byte.** The phase resets for every
+    /// reply, which is `irtt-rs` policy: the clean evidence records the
+    /// reference implementation advancing one phase continuously across replies,
+    /// sessions and listeners, and states equally clearly that payload phase has
+    /// no protocol significance and that a conforming client must not depend on
+    /// it. Resetting is therefore interoperability-equivalent, and it buys
+    /// determinism — no global mutable fill state, no coupling between sessions
+    /// or listeners, and a reply whose bytes a test can state exactly.
+    ///
+    /// Infallible by construction. A pattern and an empty region cannot fail,
+    /// and a random draw that does falls back to zeroes rather than failing the
+    /// reply.
+    pub(crate) fn payload(&self, len: usize) -> Vec<u8> {
+        match self {
+            // No allocation and no copy: the encoder already zero-fills the
+            // whole region between the field block and the negotiated length,
+            // so an empty payload *is* the zero payload. Zero is the policy —
+            // the clean evidence records the reference server leaving this
+            // region as unspecified residual buffer content, which returned
+            // other traffic's bytes, and a compatible server must not.
+            Self::None => Vec::new(),
+            Self::Random => random_payload(len, getrandom::fill),
+            Self::Pattern(pattern) => pattern.iter().copied().cycle().take(len).collect(),
+        }
+    }
 }
 
 /// The pattern a `pattern:` descriptor's body names, or `None` if the body is
@@ -100,6 +128,30 @@ fn hex_digit(digit: u8) -> Option<u8> {
         b'A'..=b'F' => Some(digit - b'A' + 10),
         _ => None,
     }
+}
+
+/// `len` random bytes drawn with `draw`, or `len` zeroes if the draw failed.
+///
+/// `draw` is a parameter rather than a direct call so the failure path is
+/// assertable without a production hook: the caller passes the operating
+/// system's random source and one unit test passes a scripted one. An empty
+/// region asks the source for nothing at all.
+///
+/// **A failed draw zero-fills and is not an error.** Payload bytes carry no
+/// protocol meaning, so a random source having a bad afternoon must not cost a
+/// session its reply, let alone take the server down: the reply is still
+/// structurally valid and interoperable. The buffer is rewritten rather than
+/// trusted, because a failed draw leaves its contents unspecified.
+///
+/// The bytes exist to vary the payload, and nothing here is a security claim.
+/// `getrandom` is used because the crate already depends on it; session tokens,
+/// which *are* security state, keep their own separate source.
+fn random_payload<E>(len: usize, draw: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Vec<u8> {
+    let mut payload = vec![0; len];
+    if len > 0 && draw(&mut payload).is_err() {
+        payload.fill(0);
+    }
+    payload
 }
 
 /// Settles what fill a session will actually use, restricting `params` only
@@ -149,6 +201,25 @@ pub(crate) fn negotiate_server_fill(params: &mut Params) -> FillMode {
             FillMode::default_fill()
         }
     }
+}
+
+/// The payload region of one echo reply under `params`, in bytes.
+///
+/// Derived from `irtt-proto`'s own layout and sizing rather than from
+/// `params.length`, which is neither the packet length nor the payload length:
+/// the mandatory field block, the negotiated statistics and timestamps, and
+/// authentication's 16 bytes all consume packet space, and a length below the
+/// field block asks for no payload at all.
+///
+/// An unrepresentable length yields zero rather than an error. An acknowledged
+/// session cannot reach it — the open path already required [`echo_packet_len`]
+/// to succeed — and if one somehow did, encoding the reply would fail on that
+/// same call, which is where the failure belongs.
+///
+/// [`echo_packet_len`]: irtt_proto::echo_packet_len
+pub(crate) fn echo_payload_len(hmac: bool, params: &Params) -> usize {
+    let header_len = PacketLayout::echo(hmac, params).header_len();
+    echo_packet_len(hmac, params).map_or(0, |len| len.saturating_sub(header_len))
 }
 
 #[cfg(test)]
@@ -204,5 +275,57 @@ mod tests {
             FillMode::parse(DEFAULT_FILL_DESCRIPTOR),
             Some(FillMode::default_fill())
         );
+    }
+
+    #[test]
+    fn a_pattern_repeats_from_its_first_byte_and_stops_at_the_region() {
+        let mode = FillMode::Pattern(vec![0xaa, 0xbb]);
+        assert_eq!(mode.payload(0), Vec::<u8>::new());
+        assert_eq!(mode.payload(1), vec![0xaa]);
+        assert_eq!(
+            mode.payload(7),
+            vec![0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa]
+        );
+    }
+
+    #[test]
+    fn no_fill_leaves_the_region_to_the_encoder() {
+        // Not a length-sized run of zeroes: the encoder has already zeroed the
+        // region, and copying zeroes over zeroes would only cost an allocation.
+        assert!(FillMode::None.payload(16).is_empty());
+    }
+
+    #[test]
+    fn a_failed_random_draw_yields_zeroes() {
+        // The real source cannot be made to fail without a production hook, and
+        // the fallback itself is the policy under test: a failed draw must
+        // produce a full-length payload of zeroes rather than an error or the
+        // buffer's unspecified contents.
+        let scribble = |buffer: &mut [u8]| {
+            buffer.fill(0xab);
+            Err(())
+        };
+        assert_eq!(random_payload(6, scribble), vec![0; 6]);
+    }
+
+    #[test]
+    fn a_successful_random_draw_is_propagated_whole() {
+        // Deterministic on purpose. Nothing here asserts that real random bytes
+        // are nonzero, distinct or well distributed; those are properties of
+        // the operating system's source, and testing them would be a coin flip
+        // dressed up as an assertion.
+        let drawn = [1, 2, 3, 4, 5];
+        let source = |buffer: &mut [u8]| -> Result<(), ()> {
+            assert_eq!(buffer.len(), drawn.len(), "the whole region is offered");
+            buffer.copy_from_slice(&drawn);
+            Ok(())
+        };
+        assert_eq!(random_payload(drawn.len(), source), drawn);
+    }
+
+    #[test]
+    fn an_empty_region_never_reaches_the_random_source() {
+        let source = |_: &mut [u8]| -> Result<(), ()> { panic!("no bytes were needed") };
+        assert!(random_payload(0, source).is_empty());
     }
 }
