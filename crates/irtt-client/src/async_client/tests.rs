@@ -1316,6 +1316,9 @@ fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
     assert_eq!(probe_sequences(&async_sent), [0]);
     assert_eq!(reply_sequences(&blocking_reply), [0]);
     assert_eq!(reply_sequences(&async_reply), [0]);
+    assert_eq!(blocking_sent.len(), async_sent.len());
+    assert_eq!(blocking_reply.len(), async_reply.len());
+    assert_eq!(blocking_close.len(), async_close.len());
     assert_matching_event_shape(&blocking_close[0], &async_close[0]);
 }
 
@@ -1357,6 +1360,10 @@ fn blocking_and_async_complete_every_caller_paced_probe() {
     assert_eq!(probe_sequences(&async_sent), expected);
     assert_eq!(reply_sequences(&blocking_replies), expected);
     assert_eq!(reply_sequences(&async_replies), expected);
+    // Compare the whole emitted streams, not just the probe and reply events
+    // the sequence helpers keep: an extra event on either side is a difference.
+    assert_eq!(blocking_sent.len(), async_sent.len());
+    assert_eq!(blocking_replies.len(), async_replies.len());
     for (blocking, asynchronous) in blocking_sent.iter().zip(&async_sent) {
         assert_matching_event_shape(blocking, asynchronous);
     }
