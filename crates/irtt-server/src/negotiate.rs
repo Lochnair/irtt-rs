@@ -1,6 +1,9 @@
-use irtt_proto::{Params, PROTOCOL_VERSION};
+use irtt_proto::{Params, StampAt, PROTOCOL_VERSION};
 
-use crate::{clock::saturating_ns, config::ServerConfig};
+use crate::{
+    clock::saturating_ns,
+    config::{ServerConfig, TimestampAllowance},
+};
 
 /// Produces the parameters the server returns in an open reply and will enforce
 /// for the session.
@@ -48,7 +51,24 @@ use crate::{clock::saturating_ns, config::ServerConfig};
 /// fill the session will use, which is not always what the descriptor in
 /// `Params` says. The two run back to back on the same open.
 ///
-/// Later policy slices may add the timestamp allowance and DSCP policy.
+/// **StampAt is reduced to the configured timestamp allowance**, by
+/// [`restrict_stamp_at`]. The Clock is deliberately untouched: the allowance is
+/// a policy about which timestamps this server provides, and the echo layout
+/// carries no timestamp field once the placement is [`StampAt::None`], so there
+/// is no clock to restrict as well. Rewriting it would answer with a session the
+/// client did not ask for.
+///
+/// **DSCP is forced to zero when the server disallows it**, and otherwise
+/// returned exactly as requested — including a value outside `0..=255`, which
+/// stays in the negotiated parameters and is transported unmarked. Zero is a
+/// negotiated value like any other and `Params::encode` simply omits it, so a
+/// restricted reply carries no DSCP tag and the session's stored parameters
+/// carry zero. That one value is what the runtime derives an unmarked reply
+/// from; no session or transport state records the policy separately.
+///
+/// Both restrictions run here, before the core validates the effective session,
+/// which is what makes a timestamp-disallowing server accept an open that
+/// selected timestamps without sending a Clock.
 ///
 /// Negotiation is not by itself an acknowledgement: the core validates what this
 /// function returns and silently discards an open whose effective parameters it
@@ -96,5 +116,33 @@ pub(crate) fn negotiate_params(mut requested: Params, config: &ServerConfig) -> 
         requested.interval_ns = idle_cap;
     }
 
+    requested.stamp_at = restrict_stamp_at(requested.stamp_at, config.timestamp_allowance());
+    if !config.dscp_allowed() {
+        requested.dscp = 0;
+    }
+
     requested
+}
+
+/// The timestamp placement a server offering `allowance` provides for a session
+/// that requested `requested`.
+///
+/// The mapping is the observed one, from the clean specification's Section 11.4.
+/// Only one row substitutes rather than removes: under [`Single`], a request for
+/// both instants is answered with [`StampAt::Midpoint`] — one timestamp that
+/// still describes both — and not with whichever of Send or Receive an
+/// implementation happened to prefer. Every already-single placement passes
+/// through, and [`None`] removes all of them.
+///
+/// [`Single`]: TimestampAllowance::Single
+/// [`None`]: TimestampAllowance::None
+fn restrict_stamp_at(requested: StampAt, allowance: TimestampAllowance) -> StampAt {
+    match allowance {
+        TimestampAllowance::Dual => requested,
+        TimestampAllowance::Single => match requested {
+            StampAt::Both => StampAt::Midpoint,
+            other => other,
+        },
+        TimestampAllowance::None => StampAt::None,
+    }
 }

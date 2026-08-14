@@ -138,8 +138,10 @@ effective parameters must be safe for the server to run.
 - `Clock::Unspecified` alone is valid — it is just an absent tag. Only the
   combination is refused, and only an absent tag reaches it, since an explicit
   zero Clock is already out of range for the decoder.
-- Run the check after negotiation, so that a later policy restricting `StampAt`
-  to none makes an omitted clock safe without this rule changing.
+- Run the check after negotiation. That is what makes a configured timestamp
+  allowance of none accept this same request: its effective `StampAt` is none, so
+  the omitted clock selects nothing and the session is executable. See
+  "Capability restrictions" below.
 - Negative `Length` stays an accepted negotiated value, returned unchanged in
   the open reply and stored verbatim in the session. It needs no clamping to be
   executable: `irtt-proto` floors actual echo packet sizing at the required
@@ -252,6 +254,43 @@ into `irtt-proto`, and do not duplicate the decoder's checks here.
   session tokens keep their own source.
 - Payload length comes from `irtt-proto`'s layout and `echo_packet_len`, never
   from `params.length`, and needs no second packet-size bound of its own.
+
+## Capability restrictions
+
+Two optional negotiation policies restrict what a session may ask this server to
+*provide*. Both default to off, so a configuration that sets neither negotiates
+exactly what it did before they existed. Both live in `negotiate`, with the rest
+of open negotiation, and neither reaches the runtime.
+
+- **`TimestampAllowance` is server policy, and deliberately not `StampAt`.** The
+  wire enum describes what a session requests and negotiates; the allowance
+  describes what this server is willing to hand out. Keep the two types apart,
+  and keep the allowance out of `irtt-proto`.
+- The default is `Dual`, which honors every requested placement. `None` maps every
+  non-none placement to none. `Single` maps `Both` to **`Midpoint`** and leaves
+  every already-single placement alone — that one substitution is the only
+  interesting row; the rest is in the clean spec's Section 11.4.
+- **`Clock` is never rewritten.** The evidence describes an allowance on timestamp
+  *placement*, not on clock domains, and the echo layout already carries no
+  timestamp field once the placement is none. Rewriting the clock would answer
+  with a session the client did not ask for.
+- **Restriction runs before the effective-session executability check**, and that
+  ordering is load-bearing: it is what makes a request selecting timestamps with
+  an omitted Clock *safe* under a none allowance, where the same request is
+  refused under the default. Do not move the check onto the requested params.
+- **DSCP permission defaults to allowed.** When disallowed, negotiation sets
+  `Params.dscp` to zero before the reply is encoded and before the `Session`
+  exists, for every requested value including ones outside `0..=255`. The open is
+  never refused over DSCP, and nothing is clamped or wrapped.
+- **No second policy bit anywhere.** The negotiated params are the single source
+  of truth: the session stores zero, `OutboundDatagram`'s traffic class derives
+  from it as for any other zero-DSCP session, and the runtime never learns that
+  `ServerConfig::dscp_allowed` exists. `Params::encode` omits a zero integer, so
+  the reply simply carries no DSCP tag.
+- **This is operator policy, not socket capability detection.** What a given host
+  can apply to a socket is settled per send by the runtime (see "Reply traffic
+  class"). Do not couple `ServerCore` negotiation to `socket2` or to runtime
+  capability state.
 
 ## Reply traffic class
 

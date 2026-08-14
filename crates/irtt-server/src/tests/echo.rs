@@ -23,7 +23,7 @@ use super::support::{
     open_negotiated, other_peer, peer, sample, unthrottled, ScriptedClock, ScriptedTokens, KEY,
     OTHER_KEY,
 };
-use crate::{clock::ClockSample, ServerConfig};
+use crate::{clock::ClockSample, ServerConfig, TimestampAllowance};
 
 const TOKEN_A: u64 = 0x0102_0304_0506_0708;
 const UNKNOWN_TOKEN: u64 = 0x2122_2324_2526_2728;
@@ -758,4 +758,61 @@ fn a_reply_payload_is_server_generated_and_never_reflects_the_request() {
             .all(|chunk| chunk == &b"irtt"[..chunk.len()]),
         "the region carries the server's default fill"
     );
+}
+
+#[test]
+fn a_restricted_session_emits_the_restricted_timestamps_and_not_the_requested_ones() {
+    // Timestamp generation follows the session's *negotiated* placement, which
+    // is the point of restricting it during negotiation: a client asking for
+    // both instants from both clocks gets one midpoint field per clock under a
+    // single-timestamp allowance, and nothing at all under none — with the reply
+    // laid out and sized from the restriction either way, not from the request.
+    for (allowance, expected_stamp_at, expected, expected_len) in [
+        (
+            TimestampAllowance::Single,
+            StampAt::Midpoint,
+            TimestampFields {
+                midpoint_wall: Some(1_100),
+                midpoint_mono: Some(10_150),
+                ..TimestampFields::default()
+            },
+            32,
+        ),
+        (
+            TimestampAllowance::None,
+            StampAt::None,
+            TimestampFields::default(),
+            16,
+        ),
+    ] {
+        let mut core = core_with_sources(
+            unthrottled().with_timestamp_allowance(allowance),
+            ScriptedTokens::new([TOKEN_A]),
+            ScriptedClock::new([open_sample(), sample(1_000, 10_000), sample(1_200, 10_300)]),
+        );
+        let requested = echo_params(ReceivedStats::None, StampAt::Both, Clock::Both, 0);
+        let (token, negotiated) = open_negotiated(&mut core, peer(), &requested, None);
+        assert_eq!(negotiated.stamp_at, expected_stamp_at, "{allowance:?}");
+        assert_eq!(negotiated.clock, Clock::Both, "{allowance:?}");
+
+        let packet = core
+            .handle_datagram(peer(), &echo_request(token, 0, &negotiated, &[], None))
+            .unwrap()
+            .unwrap_or_else(|| panic!("{allowance:?}: an admissible echo must be answered"));
+        let reply = expect_echo_reply(&packet, &negotiated, None);
+
+        // Equality over the whole struct, so a leftover receive or send field is
+        // a failure as much as a missing midpoint one.
+        assert_eq!(reply.timestamps, expected, "{allowance:?}");
+        assert_eq!(
+            packet.bytes().len(),
+            echo_packet_len(false, &negotiated).unwrap(),
+            "{allowance:?}: the restricted layout's length"
+        );
+        assert_eq!(
+            packet.bytes().len(),
+            expected_len,
+            "{allowance:?}: no empty slot is kept for a restricted field"
+        );
+    }
 }

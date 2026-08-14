@@ -4,7 +4,7 @@ use super::support::{
     client_params, core_with_tokens, expect_no_test_reply, no_test_request, open_request,
     open_request_with_raw_params, param_int, peer, unthrottled, ScriptedTokens, KEY,
 };
-use crate::ServerConfig;
+use crate::{ServerConfig, TimestampAllowance};
 
 const TOKEN_A: u64 = 0x0102_0304_0506_0708;
 const TOKEN_B: u64 = 0x1112_1314_1516_1718;
@@ -221,4 +221,38 @@ fn an_empty_no_test_open_is_answered() {
         }
     );
     assert_eq!(core.session_count(), 0);
+}
+
+#[test]
+fn a_no_test_open_reports_the_restricted_capabilities() {
+    // No-test exists to tell a client what the session would be, so it reports
+    // exactly what the same open would have negotiated under this policy —
+    // while still creating nothing and drawing no token. Capability policy is
+    // not skipped merely because no measurement session follows.
+    let tokens = ScriptedTokens::new([TOKEN_A]);
+    let mut core = core_with_tokens(
+        ServerConfig::default()
+            .with_timestamp_allowance(TimestampAllowance::Single)
+            .with_dscp_allowed(false),
+        tokens.clone(),
+    );
+    let requested = Params {
+        stamp_at: StampAt::Both,
+        clock: Clock::Both,
+        dscp: 184,
+        ..client_params()
+    };
+
+    let packet = core
+        .handle_datagram(peer(), &no_test_request(&requested, None))
+        .unwrap()
+        .expect("a no-test open must be answered under a restricting policy");
+
+    let reply = expect_no_test_reply(&packet, None);
+    assert_eq!(reply.params.stamp_at, StampAt::Midpoint);
+    assert_eq!(reply.params.clock, Clock::Both, "the clock is untouched");
+    assert_eq!(reply.params.dscp, 0);
+    assert_eq!(reply.token, 0);
+    assert_eq!(core.session_count(), 0, "no-test creates no session");
+    assert_eq!(tokens.remaining(), 1, "no-test must not draw a token");
 }

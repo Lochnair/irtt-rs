@@ -1,10 +1,10 @@
-use irtt_proto::{Clock, Params, ReceivedStats, ServerFill, StampAt};
+use irtt_proto::{Clock, Params, ReceivedStats, ServerFill, StampAt, TimestampFields};
 
 use super::support::{
-    client_params, core_with_tokens, expect_normal_open_reply, open_request,
-    open_request_with_raw_params, param_int, peer, unthrottled, ScriptedTokens, KEY,
+    client_params, core_with_tokens, echo_request, expect_echo_reply, expect_normal_open_reply,
+    open_request, open_request_with_raw_params, param_int, peer, unthrottled, ScriptedTokens, KEY,
 };
-use crate::{ServerConfig, DEFAULT_MAX_PACKET_LENGTH};
+use crate::{ServerConfig, TimestampAllowance, DEFAULT_MAX_PACKET_LENGTH};
 
 const TOKEN_A: u64 = 0x7896_b6ab_8771_5213;
 
@@ -154,6 +154,10 @@ fn selecting_timestamps_without_a_clock_is_silently_refused() {
     // Only an *absent* Clock tag reaches this: an explicit zero is already out
     // of range for the decoder, and a conforming client always sends a clock
     // when it selects timestamps.
+    //
+    // A server whose timestamp allowance is none accepts the very same request,
+    // because then no timestamp is negotiated to be unproducible; see
+    // `a_timestamp_disallowing_server_accepts_a_request_that_omitted_its_clock`.
     for stamp_at in [
         StampAt::Send,
         StampAt::Receive,
@@ -190,10 +194,58 @@ fn selecting_timestamps_without_a_clock_is_silently_refused() {
 }
 
 #[test]
+fn a_timestamp_disallowing_server_accepts_a_request_that_omitted_its_clock() {
+    // The same request the test above refuses, against a server that provides no
+    // timestamps at all. The restriction runs before the effective-session
+    // check, so `stamp_at` is already none by the time executability is judged:
+    // the absent clock then selects nothing that was going to be reported, and
+    // the session is one the server can run exactly as negotiated.
+    //
+    // This is what the ordering exists for. Validating the *request* instead
+    // would refuse an open that this policy makes perfectly serviceable.
+    let requested = Params {
+        clock: Clock::Unspecified,
+        stamp_at: StampAt::Both,
+        ..client_params()
+    };
+    let mut core = core_with_tokens(
+        unthrottled().with_timestamp_allowance(TimestampAllowance::None),
+        ScriptedTokens::new([TOKEN_A]),
+    );
+
+    let packet = core
+        .handle_datagram(peer(), &open_request(&requested, None))
+        .unwrap()
+        .expect("an omitted clock is safe once no timestamps are negotiated");
+
+    let reply = expect_normal_open_reply(&packet, None);
+    assert_eq!(reply.params.stamp_at, StampAt::None);
+    assert_eq!(
+        reply.params.clock,
+        Clock::Unspecified,
+        "the absent clock tag stays absent"
+    );
+    assert_eq!(core.session_count(), 1);
+
+    let echo = core
+        .handle_datagram(
+            peer(),
+            &echo_request(reply.token, 0, &reply.params, &[], None),
+        )
+        .unwrap()
+        .expect("the session must serve echoes");
+    assert_eq!(
+        expect_echo_reply(&echo, &reply.params, None).timestamps,
+        TimestampFields::default(),
+        "no timestamps were negotiated, so the reply carries none"
+    );
+}
+
+#[test]
 fn current_non_length_parameters_survive_negotiation_unchanged() {
-    // Statistics, timestamps and DSCP are the values a later restriction-policy
-    // slice will deliberately start changing. Pinning them now makes that a
-    // visible decision rather than an accident. Version, an oversized packet
+    // Statistics, timestamps and DSCP are what the capability restrictions
+    // change when they are configured; this is the default configuration, which
+    // restricts none of them. Version, an oversized packet
     // length, the duration maximum and the interval floor and cap are already
     // restricted and have their own tests; the length here is deliberately
     // under the default maximum, and the configuration below leaves duration

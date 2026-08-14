@@ -59,9 +59,22 @@
 //! Open handling and negotiation, session creation, normal echo processing,
 //! per-session rate limiting, idle expiry, the maximum-duration
 //! server-initiated close, the negotiated per-session reply traffic class,
-//! server fill, wildcard reply-source selection and Tokio UDP orchestration.
-//! Running several listeners in one process remains a separate slice, as do
-//! optional timestamp and DSCP restriction controls.
+//! server fill, the optional timestamp-allowance and DSCP capability
+//! restrictions, wildcard reply-source selection and Tokio UDP orchestration.
+//! Running several listeners in one process remains a separate slice.
+//!
+//! # Capability restrictions
+//!
+//! Two optional negotiation policies restrict what a session may ask this server
+//! to provide, and both are off by default, so a configuration that sets neither
+//! negotiates exactly what it always did.
+//!
+//! [`TimestampAllowance`] reduces the requested timestamp placement: `Single`
+//! provides at most one timestamp, answering a request for both instants with
+//! the midpoint, and `None` provides no timestamps at all. The requested clock
+//! is never rewritten. [`ServerConfig::with_dscp_allowed`] refuses to provide
+//! traffic-class marking, negotiating any requested DSCP value to zero, after
+//! which the session's replies leave unmarked like any other zero-DSCP session.
 //!
 //! # Server fill
 //!
@@ -93,8 +106,8 @@ mod token;
 mod tests;
 
 pub use config::{
-    ServerConfig, DEFAULT_BURST_ALLOWANCE, DEFAULT_IDLE_TIMEOUT, DEFAULT_MAX_PACKET_LENGTH,
-    DEFAULT_MAX_SESSIONS, DEFAULT_MIN_SEND_INTERVAL,
+    ServerConfig, TimestampAllowance, DEFAULT_BURST_ALLOWANCE, DEFAULT_IDLE_TIMEOUT,
+    DEFAULT_MAX_PACKET_LENGTH, DEFAULT_MAX_SESSIONS, DEFAULT_MIN_SEND_INTERVAL,
 };
 pub use core::{OutboundDatagram, ServerCore};
 pub use error::ServerError;
