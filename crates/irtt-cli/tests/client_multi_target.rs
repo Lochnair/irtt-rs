@@ -1,5 +1,8 @@
 #![cfg(feature = "client")]
 
+#[path = "support/in_tree_server.rs"]
+mod in_tree_server;
+
 use std::{
     io::Read,
     net::{SocketAddr, UdpSocket},
@@ -10,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use in_tree_server::InTreeServer;
 use irtt_proto::{
     echo_packet_len, encode_echo_reply, encode_open_reply,
     flags::{FLAG_CLOSE, FLAG_OPEN, FLAG_REPLY},
@@ -69,10 +73,7 @@ fn list_columns_succeeds_without_target() {
 
 #[test]
 fn single_target_default_table_omits_target_and_accepts_pacing() {
-    let server = start_echo_server(test_params(
-        Some(Duration::from_millis(30)),
-        Duration::from_millis(10),
-    ));
+    let server = InTreeServer::start();
 
     let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
         .args([
@@ -89,7 +90,7 @@ fn single_target_default_table_omits_target_and_accepts_pacing() {
         .output()
         .unwrap();
 
-    server.join();
+    drop(server);
 
     assert!(
         output.status.success(),
@@ -104,10 +105,7 @@ fn single_target_default_table_omits_target_and_accepts_pacing() {
 
 #[test]
 fn single_target_custom_target_column_renders_positional_label() {
-    let server = start_echo_server(test_params(
-        Some(Duration::from_millis(30)),
-        Duration::from_millis(10),
-    ));
+    let server = InTreeServer::start();
     let target = server.addr.to_string();
 
     let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
@@ -127,7 +125,7 @@ fn single_target_custom_target_column_renders_positional_label() {
         .output()
         .unwrap();
 
-    server.join();
+    drop(server);
 
     assert!(
         output.status.success(),
@@ -238,9 +236,8 @@ fn continuous_single_target_interruption_drains_final_events_and_succeeds() {
 
 #[test]
 fn multi_target_csv_emits_rows_for_both_labels() {
-    let params = test_params(Some(Duration::from_millis(40)), Duration::from_millis(10));
-    let a = start_echo_server(params.clone());
-    let b = start_echo_server(params);
+    let a = InTreeServer::start();
+    let b = InTreeServer::start();
 
     let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
         .args([
@@ -262,8 +259,8 @@ fn multi_target_csv_emits_rows_for_both_labels() {
         .output()
         .unwrap();
 
-    a.join();
-    b.join();
+    drop(a);
+    drop(b);
 
     assert!(
         output.status.success(),
@@ -643,20 +640,9 @@ fn wait_with_timeout(mut child: std::process::Child, timeout: Duration) -> Outpu
     }
 }
 
-fn start_echo_server(params: Params) -> FakeServer {
-    start_echo_server_inner(params, None)
-}
-
 fn start_echo_server_with_first_reply(
     params: Params,
     first_reply_tx: mpsc::Sender<()>,
-) -> FakeServer {
-    start_echo_server_inner(params, Some(first_reply_tx))
-}
-
-fn start_echo_server_inner(
-    params: Params,
-    mut first_reply_tx: Option<mpsc::Sender<()>>,
 ) -> FakeServer {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     socket
@@ -664,6 +650,7 @@ fn start_echo_server_inner(
         .unwrap();
     let addr = socket.local_addr().unwrap();
     let done = thread::spawn(move || {
+        let mut first_reply_tx = Some(first_reply_tx);
         let (_, peer) = recv_request(&socket);
         socket
             .send_to(&open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params), peer)

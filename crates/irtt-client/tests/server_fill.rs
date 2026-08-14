@@ -5,7 +5,7 @@ use irtt_proto::{Params, TimestampFields};
 
 use support::{
     config_for_params, default_params, run_one_probe, run_one_probe_with_config, server_fill,
-    start_open_server, OneProbeRun, ServerObservation,
+    start_open_server, InTreeServer, OneProbeRun, ServerObservation,
 };
 
 use crate::support::test_echo_packet_len;
@@ -68,8 +68,21 @@ fn server_fill_empty_and_oversized_values_are_rejected_at_config_boundary() {
 fn server_fill_negotiated_params_reflect_accepted_value() {
     let mut params = default_params();
     params.server_fill = server_fill("rand");
-    let run = run_one_probe(params.clone(), TimestampFields::default());
-    assert_eq!(run.negotiated.params.server_fill, params.server_fill);
+    let server = InTreeServer::start(irtt_server::ServerConfig::default());
+    let mut client = Client::connect(config_for_params(server.addr, &params)).unwrap();
+    let outcome = client.open().unwrap();
+    let negotiated = match outcome {
+        irtt_client::OpenOutcome::Started { negotiated, .. } => negotiated,
+        other => panic!("expected started outcome, got {other:?}"),
+    };
+    assert_eq!(negotiated.params.server_fill, params.server_fill);
+
+    client.send_probe().unwrap();
+    assert!(matches!(
+        client.recv_once().unwrap().as_slice(),
+        [irtt_client::ClientEvent::EchoReply { .. }]
+    ));
+    client.close().unwrap();
 }
 
 #[test]
