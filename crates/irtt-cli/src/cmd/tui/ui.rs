@@ -2049,6 +2049,7 @@ mod tests {
     use irtt_client::{
         ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming, WarningKind,
     };
+    use ratatui::backend::TestBackend;
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::Arc,
@@ -2934,5 +2935,234 @@ mod tests {
         assert_eq!(graph.client_to_server_ns, Some(-20_000));
         assert_eq!(graph.server_to_client_ns, Some(30_000));
         assert_eq!(graph.server_processing_ns, Some(100_000));
+    }
+
+    // Off-screen render coverage. These exercise draw_dashboard through a real
+    // Ratatui backend, so layout selection, panel presence, and the text a user
+    // actually sees are protected rather than only the pure state and viewport
+    // arithmetic covered above.
+
+    /// Render `state` at the given terminal size and return the visible rows.
+    fn render_rows(state: &TuiState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw_dashboard(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn render_text(state: &TuiState, width: u16, height: u16) -> String {
+        render_rows(state, width, height).join("\n")
+    }
+
+    /// A single-target state carrying a session, one reply, and one warning.
+    ///
+    /// The TUI opens in the graph view, so dashboard tests toggle it.
+    fn active_single_target_state() -> TuiState {
+        let mut state = TuiState::default();
+        let target = target_instance("target");
+        state.process_target_event(
+            &target,
+            &ClientEvent::SessionStarted {
+                remote: remote(),
+                token: 0xabcd,
+                negotiated: NegotiatedParams {
+                    params: irtt_proto::Params::default(),
+                    restrictions: Vec::new(),
+                },
+                at: ts(Duration::ZERO),
+            },
+        );
+        state.process_target_event(&target, &reply(11, 2_500_000));
+        state.process_target_event(
+            &target,
+            &ClientEvent::Warning {
+                kind: WarningKind::WrongToken,
+                message: "wrong token".to_owned(),
+                at: ts(Duration::ZERO),
+            },
+        );
+        state
+    }
+
+    fn active_dashboard_state() -> TuiState {
+        let mut state = active_single_target_state();
+        state.toggle_view();
+        assert_eq!(state.view, TuiView::Dashboard);
+        state
+    }
+
+    #[test]
+    fn a_terminal_below_the_minimum_width_renders_only_the_resize_notice() {
+        let state = active_dashboard_state();
+
+        let text = render_text(&state, MIN_WIDTH - 1, MIN_HEIGHT);
+
+        assert!(text.contains("terminal too small"));
+        assert!(text.contains("press q / Ctrl-C to quit"));
+        assert!(!text.contains("packets"));
+        assert!(!text.contains("q quit"));
+    }
+
+    #[test]
+    fn a_terminal_below_the_minimum_height_renders_only_the_resize_notice() {
+        let state = active_dashboard_state();
+
+        let text = render_text(&state, MIN_WIDTH, MIN_HEIGHT - 1);
+
+        assert!(text.contains("terminal too small"));
+        assert!(!text.contains("q quit"));
+    }
+
+    #[test]
+    fn the_smallest_usable_terminal_renders_the_compact_dashboard() {
+        let state = active_dashboard_state();
+
+        let rows = render_rows(&state, MIN_WIDTH, MIN_HEIGHT);
+        let text = rows.join("\n");
+
+        assert!(!text.contains("terminal too small"));
+        assert!(text.contains("session"));
+        assert!(text.contains("packets"));
+        assert!(rows[usize::from(MIN_HEIGHT) - 2].contains("q quit"));
+    }
+
+    #[test]
+    fn a_compact_terminal_renders_the_header_packet_and_status_rows() {
+        let state = active_dashboard_state();
+
+        let rows = render_rows(&state, 80, 24);
+        let text = rows.join("\n");
+
+        assert!(text.contains("irtt-rs"));
+        assert!(text.contains("session"));
+        assert!(text.contains("packets"));
+        assert!(text.contains("sent"));
+        // The compact layout drops the timing, recent-events, and sample panels
+        // that only fit in the large layout.
+        assert!(!text.contains("recent events"));
+        assert!(!text.contains("last warning:"));
+        assert!(!text.contains("effective RTT          "));
+        // The status line is the bottom bordered row of the layout.
+        assert!(rows[22].contains("q quit"));
+    }
+
+    #[test]
+    fn a_large_terminal_renders_every_dashboard_panel() {
+        let state = active_dashboard_state();
+
+        let rows = render_rows(&state, 180, 44);
+        let text = rows.join("\n");
+
+        for expected in [
+            "session",
+            "packets",
+            "timing",
+            "recent events",
+            "sample",
+            "effective RTT",
+            "send delay",
+            "server process",
+        ] {
+            assert!(text.contains(expected), "missing {expected} in:\n{text}");
+        }
+        assert!(rows[42].contains("q quit"));
+    }
+
+    #[test]
+    fn active_sample_data_and_warnings_are_visible_in_the_large_layout() {
+        let state = active_dashboard_state();
+
+        let text = render_text(&state, 140, 40);
+
+        // Session identity from the header.
+        assert!(text.contains("0xabcd"));
+        assert!(text.contains("127.0.0.1:2112"));
+        // The most recent sample and its effective RTT.
+        assert!(text.contains("last seq: 11"));
+        assert!(text.contains("2.5ms"));
+        // Warning presentation reaches the recent-events panel and the sample
+        // panel's last-warning row.
+        assert!(text.contains("wrong token"));
+        assert!(text.contains("last warning:"));
+    }
+
+    #[test]
+    fn a_failed_run_renders_the_error_status_and_message() {
+        let mut state = active_dashboard_state();
+        state.set_error("open timed out".to_owned());
+
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
+
+        assert!(text.contains("open timed out"));
+        assert!(rows[38].contains(TuiStatus::Error.label()));
+    }
+
+    #[test]
+    fn a_multi_target_state_renders_the_target_table_in_place_of_packet_counters() {
+        let mut state = TuiState::with_target_labels(
+            TuiConfig::default(),
+            ["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+        );
+        state.toggle_view();
+        state.process_target_event(&target_instance("beta"), &reply(4, 3_000_000));
+
+        let text = render_text(&state, 140, 40);
+
+        assert!(text.contains("targets"));
+        for label in ["alpha", "beta", "gamma"] {
+            assert!(text.contains(label), "missing target {label} in:\n{text}");
+        }
+        assert!(text.contains("timing - first target"));
+        assert!(text.contains("sample - first target"));
+    }
+
+    #[test]
+    fn the_graph_view_renders_a_chart_instead_of_the_dashboard_panels() {
+        let state = active_single_target_state();
+        assert_eq!(state.view, TuiView::Graph);
+
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
+
+        assert!(text.contains(state.graph_metric.title()));
+        assert!(text.contains("live"));
+        assert!(rows[38].contains("q quit"));
+        assert!(!text.contains("recent events"));
+        assert!(!text.contains("last warning:"));
+    }
+
+    #[test]
+    fn the_multi_target_graph_view_keeps_the_target_table_header() {
+        let mut state = TuiState::with_target_labels(
+            TuiConfig::default(),
+            ["alpha".to_owned(), "beta".to_owned()],
+        );
+        state.process_target_event(&target_instance("beta"), &reply(4, 3_000_000));
+
+        let text = render_text(&state, 140, 40);
+
+        assert!(text.contains("targets"));
+        assert!(text.contains("alpha"));
+        assert!(text.contains("beta"));
+        assert!(text.contains(state.graph_metric.title()));
+    }
+
+    #[test]
+    fn a_paused_display_with_dropped_events_is_reported_on_the_status_line() {
+        let mut state = active_dashboard_state();
+        state.toggle_pause();
+        state.mark_dropped_managed_events(3);
+
+        let rows = render_rows(&state, 140, 40);
+
+        assert!(rows[38].contains("display paused"));
+        assert!(rows[38].contains("incomplete:dropped=3"));
     }
 }
