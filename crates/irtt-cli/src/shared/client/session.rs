@@ -1,12 +1,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[cfg(feature = "client-runtime")]
+#[cfg(any(feature = "client", feature = "tui"))]
 use irtt_client::managed::{ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError};
 
-#[cfg(feature = "client-runtime")]
+#[cfg(any(feature = "client", feature = "tui"))]
 pub(crate) const MANAGED_EVENT_WORK_BUDGET: usize = 128;
 
-#[cfg(feature = "client-runtime")]
+#[cfg(any(feature = "client", feature = "tui"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ManagedDrainState {
     Empty,
@@ -16,7 +16,7 @@ pub(crate) enum ManagedDrainState {
 
 /// Drain a bounded amount of lossy presentation work before returning to the
 /// frontend control loop.
-#[cfg(feature = "client-runtime")]
+#[cfg(any(feature = "client", feature = "tui"))]
 pub(crate) fn drain_managed_events<E>(
     events: &mut ManagedEventSubscription,
     dropped_events: &mut u64,

@@ -164,7 +164,6 @@ pub struct IpdvPair {
     pub receive_ipdv: Option<Duration>,
 }
 
-#[cfg(feature = "stats")]
 impl From<irtt_stats::EventStatsUpdate> for EventRenderStats {
     fn from(value: irtt_stats::EventStatsUpdate) -> Self {
         Self {
@@ -174,7 +173,6 @@ impl From<irtt_stats::EventStatsUpdate> for EventRenderStats {
     }
 }
 
-#[cfg(feature = "stats")]
 impl From<irtt_stats::IpdvPairUpdate> for IpdvPair {
     fn from(value: irtt_stats::IpdvPairUpdate) -> Self {
         Self {

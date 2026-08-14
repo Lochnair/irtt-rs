@@ -1,2 +1,2 @@
-#[cfg(feature = "client-runtime")]
+#[cfg(any(feature = "client", feature = "tui"))]
 pub mod client;

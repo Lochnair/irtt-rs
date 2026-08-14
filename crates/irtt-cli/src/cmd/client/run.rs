@@ -1,4 +1,3 @@
-#[cfg(feature = "stats")]
 use std::collections::BTreeMap;
 use std::{
     collections::HashSet,
@@ -21,7 +20,7 @@ use super::{
     args::ClientArgs,
     output::{EventRenderStats, OutputConfig},
 };
-#[cfg(feature = "stats")]
+
 use crate::shared::client::expected_probe_count;
 use crate::shared::client::{
     is_shutdown_requested,
@@ -30,20 +29,19 @@ use crate::shared::client::{
         request_managed_stop_once, should_print_final_summary, ManagedDrainState,
     },
 };
-#[cfg(feature = "stats")]
+
 use irtt_stats::{StatsCollector, StatsConfig};
 
-#[cfg(feature = "stats")]
 const FINITE_STATS_BYTES_PER_PROBE: u64 = 500;
-#[cfg(feature = "stats")]
+
 const MIB: u64 = 1024 * 1024;
-#[cfg(feature = "stats")]
+
 const GIB: u64 = 1024 * MIB;
-#[cfg(feature = "stats")]
+
 const FINITE_STATS_MEMORY_WARNING_BYTES: u64 = 128 * MIB;
-#[cfg(feature = "stats")]
+
 const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
-#[cfg(feature = "stats")]
+
 const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
 const MANAGED_EVENT_WAIT_SLICE: Duration = Duration::from_millis(20);
 const MANAGED_EVENT_CAPACITY: usize = 16_384;
@@ -70,7 +68,7 @@ pub fn run_stream(
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let continuous = args.is_continuous();
     let target_count = targets.len();
-    #[cfg(feature = "stats")]
+
     if let Some(warning) = finite_stats_memory_warning(&args, target_count) {
         eprintln!("{warning}");
     }
@@ -102,7 +100,7 @@ pub fn run_stream(
         show_running_only_summary_note: false,
         out: &mut stdout,
     };
-    #[cfg(feature = "stats")]
+
     let mut stats = targets
         .iter()
         .map(|target| {
@@ -135,7 +133,6 @@ pub fn run_stream(
         let drain_state = drain_events(
             &mut events,
             &mut stream_output,
-            #[cfg(feature = "stats")]
             &mut stats,
             &mut terminal_targets,
             &mut dropped_events,
@@ -156,7 +153,6 @@ pub fn run_stream(
     drain_final_events(
         &mut events,
         &mut stream_output,
-        #[cfg(feature = "stats")]
         &mut stats,
         &mut terminal_targets,
         &mut dropped_events,
@@ -196,7 +192,6 @@ pub fn run_stream(
     stream_output.print_final_summary = should_print_final_summary(continuous, interrupted);
     stream_output.show_running_only_summary_note =
         continuous && interrupted && stream_output.print_final_summary;
-    #[cfg(feature = "stats")]
     for (label, stats) in &stats {
         if multi_target
             && stream_output.print_final_summary
@@ -207,8 +202,6 @@ pub fn run_stream(
         }
         stream_output.print_summary(stats)?;
     }
-    #[cfg(not(feature = "stats"))]
-    stream_output.print_summary()?;
     stream_output.out.flush()?;
     if let Some(error) = terminal_error {
         return Err(error.into());
@@ -219,28 +212,19 @@ pub fn run_stream(
 fn process_event<W: Write>(
     event: ManagedEvent,
     stream_output: &mut StreamOutput<'_, W>,
-    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
+    stats: &mut BTreeMap<String, StatsCollector>,
     terminal_targets: &mut HashSet<TargetInstance>,
 ) -> io::Result<()> {
     match event {
         ManagedEvent::Client { target, event } => {
-            #[cfg(feature = "stats")]
-            {
-                let collector = stats
-                    .entry(target.id.as_str().to_owned())
-                    .or_insert_with(|| StatsCollector::new(stats_config(false)));
-                print_events_with_stats(
-                    stream_output,
-                    std::slice::from_ref(&event),
-                    Some(target.id.as_str()),
-                    collector,
-                )?;
-            }
-            #[cfg(not(feature = "stats"))]
+            let collector = stats
+                .entry(target.id.as_str().to_owned())
+                .or_insert_with(|| StatsCollector::new(stats_config(false)));
             print_events_with_stats(
                 stream_output,
                 std::slice::from_ref(&event),
                 Some(target.id.as_str()),
+                collector,
             )?;
         }
         ManagedEvent::TargetFinished { outcome } => {
@@ -255,37 +239,25 @@ fn process_event<W: Write>(
 fn drain_events<W: Write>(
     events: &mut ManagedEventSubscription,
     stream_output: &mut StreamOutput<'_, W>,
-    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
+    stats: &mut BTreeMap<String, StatsCollector>,
     terminal_targets: &mut HashSet<TargetInstance>,
     dropped_events: &mut u64,
 ) -> io::Result<ManagedDrainState> {
     drain_managed_events(events, dropped_events, |event| {
-        process_event(
-            event,
-            stream_output,
-            #[cfg(feature = "stats")]
-            stats,
-            terminal_targets,
-        )
+        process_event(event, stream_output, stats, terminal_targets)
     })
 }
 
 fn drain_final_events<W: Write>(
     events: &mut ManagedEventSubscription,
     stream_output: &mut StreamOutput<'_, W>,
-    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
+    stats: &mut BTreeMap<String, StatsCollector>,
     terminal_targets: &mut HashSet<TargetInstance>,
     dropped_events: &mut u64,
 ) -> io::Result<()> {
     loop {
         match events.try_recv() {
-            Ok(event) => process_event(
-                event,
-                stream_output,
-                #[cfg(feature = "stats")]
-                stats,
-                terminal_targets,
-            )?,
+            Ok(event) => process_event(event, stream_output, stats, terminal_targets)?,
             Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
             Err(ManagedEventTryRecvError::Lagged(count)) => {
                 *dropped_events = dropped_events.saturating_add(count);
@@ -353,7 +325,7 @@ impl<W: Write> StreamOutput<'_, W> {
         }
         Ok(())
     }
-    #[cfg(feature = "stats")]
+
     fn print_summary(&mut self, stats: &StatsCollector) -> io::Result<()> {
         if self.print_final_summary && self.config.prints_summary() {
             write!(
@@ -370,12 +342,8 @@ impl<W: Write> StreamOutput<'_, W> {
         }
         Ok(())
     }
-    #[cfg(not(feature = "stats"))]
-    fn print_summary(&mut self) -> io::Result<()> {
-        Ok(())
-    }
 }
-#[cfg(feature = "stats")]
+
 fn print_events_with_stats<W: Write>(
     stream_output: &mut StreamOutput<'_, W>,
     events: &[ClientEvent],
@@ -388,19 +356,7 @@ fn print_events_with_stats<W: Write>(
         .collect::<Vec<_>>();
     stream_output.print_events(events, target, &updates)
 }
-#[cfg(not(feature = "stats"))]
-fn print_events_with_stats<W: Write>(
-    stream_output: &mut StreamOutput<'_, W>,
-    events: &[ClientEvent],
-    target: Option<&str>,
-) -> io::Result<()> {
-    stream_output.print_events(
-        events,
-        target,
-        &vec![EventRenderStats::default(); events.len()],
-    )
-}
-#[cfg(feature = "stats")]
+
 fn stats_config(continuous: bool) -> StatsConfig {
     if continuous {
         StatsConfig::continuous()
@@ -408,7 +364,6 @@ fn stats_config(continuous: bool) -> StatsConfig {
         StatsConfig::finite()
     }
 }
-#[cfg(feature = "stats")]
 fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option<String> {
     if args.is_continuous() || args.duration.is_zero() {
         return None;
@@ -443,7 +398,6 @@ mod tests {
     };
     use std::sync::Arc;
 
-    #[cfg(feature = "stats")]
     #[test]
     fn finite_stats_memory_warning_accounts_for_target_count() {
         use clap::Parser;
@@ -468,7 +422,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "stats")]
     #[test]
     fn finite_stats_memory_warning_saturates_target_count_multiplication() {
         use clap::Parser;

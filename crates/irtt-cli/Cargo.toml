@@ -37,13 +37,10 @@ required-features = ["server"]
 doc = false
 
 [features]
-default = ["client", "server", "stats"]
-client-runtime = ["dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto"]
-client = ["client-runtime"]
+default = ["client", "server", "tui"]
+client = ["dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats"]
 server = ["dep:irtt-server", "dep:tokio"]
-stats = ["client-runtime", "dep:irtt-stats"]
-tui = ["client-runtime", "stats", "dep:ratatui", "dep:crossterm"]
-full = ["client", "server", "stats", "tui"]
+tui =["dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats", "dep:ratatui", "dep:crossterm"]
 
 [dependencies]
 clap = { version = "4.6.6", features = ["derive"] }
