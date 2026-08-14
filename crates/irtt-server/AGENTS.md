@@ -100,6 +100,12 @@ address fails invisibly, as loss.
 - The receive and send structures are not interchangeable, and the BSD IPv4
   options are not Linux's under other names. Build each direction's control
   message explicitly rather than echoing a received one back.
+- **Pin the source address, not the route.** What the protocol requires is the
+  address a reply leaves from; which interface carries it is the routing table's
+  business. Naming the arrival interface on a send would lose replies on a host
+  whose path back to the peer leaves by another one. The single exception is a
+  link-local source, which is not unique across interfaces and must name its
+  own — every other source, IPv4 included, goes out with no interface set.
 - A send failure is per-packet loss, exactly as an ordinary `send_to` failure
   is. It never terminates the listener and never rolls back core state.
 

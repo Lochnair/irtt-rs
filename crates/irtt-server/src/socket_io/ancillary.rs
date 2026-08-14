@@ -209,14 +209,13 @@ fn send_once(
             address,
             interface_index,
         } => {
-            // For a send, `in6_pktinfo` names the source address and the
-            // interface to leave by — the interface being what makes a scoped
-            // address unambiguous.
+            // For a send, `in6_pktinfo` names the source address and, where it
+            // is needed, the interface to leave by.
             let info = libc::in6_pktinfo {
                 ipi6_addr: libc::in6_addr {
                     s6_addr: address.octets(),
                 },
-                ipi6_ifindex: interface_index,
+                ipi6_ifindex: egress_interface_index(address, interface_index),
             };
             // The destination has to be stated in the same family the control
             // message is: an IPv6 source with an `AF_INET` destination is a
@@ -236,6 +235,28 @@ fn send_once(
     };
 
     Ok(sent)
+}
+
+/// The interface a reply must leave by, which is usually none of our business.
+///
+/// A link-local source address is not unique across a host's interfaces, so a
+/// reply carrying one has to name the interface it belongs to. Every other
+/// source — global, unique-local, loopback, IPv4-mapped — identifies itself
+/// without help.
+///
+/// Pinning the arrival interface for those would only add a way for a reply to
+/// fail: on a host whose route back to the peer leaves by a different interface
+/// than the request arrived on, forcing the ingress interface can make the send
+/// fail outright, losing a reply whose source address was perfectly valid. What
+/// the protocol requires is the source *address*; the route to the peer is the
+/// routing table's business. The IPv4 path makes the same choice for the same
+/// reason.
+fn egress_interface_index(address: Ipv6Addr, interface_index: u32) -> u32 {
+    if address.is_unicast_link_local() {
+        interface_index
+    } else {
+        0
+    }
 }
 
 /// The same endpoint expressed in IPv6, mapping an IPv4 peer.
@@ -314,5 +335,42 @@ impl ControlBuffer {
 
     fn as_mut_slice(&mut self) -> &mut [u8] {
         &mut self.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Which reply sources need their interface named, which no normal
+    /// interface can show: it takes a host whose route back to a peer leaves by
+    /// a different interface than the request arrived on, and a test host has
+    /// one loopback.
+    #[test]
+    fn only_a_link_local_source_pins_the_egress_interface() {
+        const ARRIVED_ON: u32 = 7;
+
+        for (address, expected, why) in [
+            (
+                "fe80::1",
+                ARRIVED_ON,
+                "a link-local source needs its link named",
+            ),
+            (
+                "fe80::7858:baff:fe91:183d",
+                ARRIVED_ON,
+                "and so does any other one",
+            ),
+            ("2001:db8::1", 0, "a global source identifies itself"),
+            ("fd00::1", 0, "so does a unique-local one"),
+            ("::1", 0, "and loopback"),
+            ("::ffff:127.0.0.2", 0, "and an IPv4-mapped destination"),
+        ] {
+            assert_eq!(
+                egress_interface_index(address.parse().unwrap(), ARRIVED_ON),
+                expected,
+                "{address}: {why}"
+            );
+        }
     }
 }

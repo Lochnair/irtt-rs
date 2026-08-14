@@ -48,8 +48,10 @@ pub(crate) enum ReplySource {
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     V4 { address: std::net::Ipv4Addr },
     /// The IPv6 address this request was addressed to, and the interface it
-    /// arrived on. The interface is part of the identity of a scoped address,
-    /// so it is carried rather than rediscovered.
+    /// arrived on. The interface is part of the identity of a *scoped* address,
+    /// so it is carried rather than rediscovered — and it is used on the send
+    /// only where the source address is one, so that a reply is never forced
+    /// out of an interface the route to the peer does not use.
     #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
     V6 {
         address: std::net::Ipv6Addr,
