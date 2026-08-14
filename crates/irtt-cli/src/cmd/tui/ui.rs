@@ -194,7 +194,7 @@ impl TuiState {
                 (TargetStatus::Replaced, "target replaced".to_owned(), None)
             }
             ManagedTargetEndReason::Failed(failure) => {
-                let message = format!("{:?}: {}", failure.kind, failure.message);
+                let message = format!("{}: {}", failure.kind, failure.message);
                 (
                     TargetStatus::Failed,
                     format!("target failed: {message}"),
@@ -205,7 +205,7 @@ impl TuiState {
 
         let cleanup_warning = outcome.cleanup_failure.as_ref().map(|failure| {
             format!(
-                "cleanup failed ({:?} {:?}): {}",
+                "cleanup failed ({} {}): {}",
                 failure.phase, failure.kind, failure.message
             )
         });
@@ -2430,7 +2430,7 @@ mod tests {
         assert!(state.targets[1]
             .last_warning
             .as_deref()
-            .is_some_and(|warning| warning.contains("Timeout")));
+            .is_some_and(|warning| warning.contains("timeout")));
     }
 
     #[test]
@@ -2474,11 +2474,11 @@ mod tests {
         assert!(state.targets[0]
             .last_warning
             .as_deref()
-            .is_some_and(|warning| warning.contains("cleanup failed (Closing Socket)")));
+            .is_some_and(|warning| warning.contains("cleanup failed (closing socket)")));
         assert!(state
             .recent_events
             .iter()
-            .any(|event| event.contains("cleanup failed (Closing Socket)")));
+            .any(|event| event.contains("cleanup failed (closing socket)")));
     }
 
     #[test]
@@ -2509,11 +2509,11 @@ mod tests {
         assert!(state
             .recent_events
             .iter()
-            .any(|event| event.contains("target failed: Protocol: primary failure")));
+            .any(|event| event.contains("target failed: protocol: primary failure")));
         assert!(state
             .recent_events
             .iter()
-            .any(|event| event.contains("cleanup failed (Closing Socket): cleanup failure")));
+            .any(|event| event.contains("cleanup failed (closing socket): cleanup failure")));
     }
 
     #[test]
