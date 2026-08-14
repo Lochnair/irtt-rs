@@ -315,5 +315,6 @@ controls remain separate concerns.
 
 Server replies fill their payload with the negotiated ServerFill mode: `none`,
 which is zero-filled, `rand`, or `pattern:` with a repeating hexadecimal
-pattern. Every valid descriptor is honored; one the server cannot parse, and a
-client that requests none, get the default `pattern:69727474`.
+pattern. Every valid descriptor is honored; a descriptor the server cannot
+parse, and a client that expresses no fill preference at all, get the default
+`pattern:69727474`.
