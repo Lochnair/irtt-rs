@@ -2960,6 +2960,25 @@ mod tests {
         render_rows(state, width, height).join("\n")
     }
 
+    /// The target table's own rows, sliced to that panel's columns.
+    ///
+    /// The table shares its band with the session panel, so a whole-row search
+    /// would happily match a label rendered on the left. Rows are cut at the
+    /// panel separator and stop at the band's bottom border.
+    fn target_table_rows(rows: &[String]) -> Vec<String> {
+        let header = rows
+            .iter()
+            .position(|row| {
+                row.contains("target") && row.contains("status") && row.contains("warn")
+            })
+            .expect("the multi-target layout renders a target table header");
+        rows[header + 1..]
+            .iter()
+            .take_while(|row| row.contains("\u{2502}\u{2502}"))
+            .filter_map(|row| row.rsplit("\u{2502}\u{2502}").next().map(str::to_owned))
+            .collect()
+    }
+
     /// A single-target state carrying a session, one reply, and one warning.
     ///
     /// The TUI opens in the graph view, so dashboard tests toggle it.
@@ -3016,6 +3035,7 @@ mod tests {
         let text = render_text(&state, MIN_WIDTH, MIN_HEIGHT - 1);
 
         assert!(text.contains("terminal too small"));
+        assert!(!text.contains("packets"));
         assert!(!text.contains("q quit"));
     }
 
@@ -3047,7 +3067,7 @@ mod tests {
         // that only fit in the large layout.
         assert!(!text.contains("recent events"));
         assert!(!text.contains("last warning:"));
-        assert!(!text.contains("effective RTT          "));
+        assert!(!text.contains("timing"));
         // The status line is the bottom bordered row of the layout.
         assert!(rows[22].contains("q quit"));
     }
@@ -3084,9 +3104,20 @@ mod tests {
         // Session identity from the header.
         assert!(text.contains("0xabcd"));
         assert!(text.contains("127.0.0.1:2112"));
-        // The most recent sample and its effective RTT.
+        // The most recent sample, with its effective RTT on the sample panel's
+        // own metric row rather than anywhere on the frame.
         assert!(text.contains("last seq: 11"));
-        assert!(text.contains("2.5ms"));
+        let sample_metrics = rows
+            .iter()
+            .find(|row| row.contains("raw / adjusted / effective:"))
+            .expect("the large layout renders a sample metric row");
+        // The whole row, so a regression in any one field is caught: the
+        // fixture's adjusted and effective RTT share a value, and asserting
+        // "2.5ms" alone would still pass with the effective field dropped.
+        assert!(
+            sample_metrics.contains("raw / adjusted / effective: 1.5ms / 2.5ms / 2.5ms"),
+            "unexpected sample metric row: {sample_metrics}"
+        );
         // The warning reaches the recent-events panel...
         assert!(rows
             .iter()
@@ -3124,12 +3155,41 @@ mod tests {
         state.toggle_view();
         state.process_target_event(&target_instance("beta"), &reply(4, 3_000_000));
 
-        let text = render_text(&state, 140, 40);
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
 
         assert!(text.contains("targets"));
+        // Every target gets its own table row. Searching the whole frame would
+        // not prove this: the first target is also named in the session header,
+        // and a target with a reply appears in recent events and the legend.
+        let table = target_table_rows(&rows);
         for label in ["alpha", "beta", "gamma"] {
-            assert!(text.contains(label), "missing target {label} in:\n{text}");
+            let row = table
+                .iter()
+                .find(|row| {
+                    row.trim_start_matches('\u{2502}')
+                        .trim_start()
+                        .starts_with(label)
+                })
+                .unwrap_or_else(|| panic!("no target table row for {label} in:\n{text}"));
+            assert!(
+                row.contains("opening"),
+                "target row for {label} lost its status column: {row}"
+            );
         }
+        // The target that replied shows its last sample; the others do not.
+        let beta = table
+            .iter()
+            .find(|row| {
+                row.trim_start_matches('\u{2502}')
+                    .trim_start()
+                    .starts_with("beta")
+            })
+            .expect("beta has a target table row");
+        assert!(
+            beta.contains("3.0ms"),
+            "beta row lost its last sample: {beta}"
+        );
         assert!(text.contains("timing - first target"));
         assert!(text.contains("sample - first target"));
     }
