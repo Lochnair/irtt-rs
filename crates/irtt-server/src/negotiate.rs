@@ -129,10 +129,13 @@ pub(crate) fn negotiate_params(mut requested: Params, config: &ServerConfig) -> 
 ///
 /// The mapping is the observed one, from the clean specification's Section 11.4.
 /// Only one row substitutes rather than removes: under [`Single`], a request for
-/// both instants is answered with [`StampAt::Midpoint`] — one timestamp that
-/// still describes both — and not with whichever of Send or Receive an
-/// implementation happened to prefer. Every already-single placement passes
-/// through, and [`None`] removes all of them.
+/// both instants is answered with [`StampAt::Midpoint`] — one instant that still
+/// describes both — and not with whichever of Send or Receive an implementation
+/// happened to prefer. Every already-single placement passes through, and
+/// [`None`] removes all of them.
+///
+/// The allowance bounds reported *instants*, not fields: the clock is untouched,
+/// so a negotiated midpoint on `Clock::Both` still reports one field per domain.
 ///
 /// [`Single`]: TimestampAllowance::Single
 /// [`None`]: TimestampAllowance::None

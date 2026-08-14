@@ -69,9 +69,14 @@ pub enum TimestampAllowance {
     /// No timestamps at all: every request is negotiated to
     /// [`StampAt::None`](irtt_proto::StampAt::None).
     None,
-    /// At most one timestamp field. A request for both receive and send becomes
-    /// [`StampAt::Midpoint`](irtt_proto::StampAt::Midpoint); every mode that is
-    /// already single is left alone.
+    /// At most one timestamp *instant*. A request for both receive and send
+    /// becomes [`StampAt::Midpoint`](irtt_proto::StampAt::Midpoint); every
+    /// placement that already names a single instant is left alone.
+    ///
+    /// This restricts placement, not field count: the reply still carries one
+    /// field per negotiated clock domain, so a session on
+    /// [`Clock::Both`](irtt_proto::Clock::Both) receives both a wall and a
+    /// monotonic midpoint field.
     Single,
     /// Every requested placement is honored. This is the default, and the
     /// behavior of a server that configures nothing.
@@ -266,9 +271,12 @@ impl ServerConfig {
     /// not with whichever of the two the server felt like keeping.
     ///
     /// The requested [`Clock`](irtt_proto::Clock) is left exactly as it was in
-    /// every case. The allowance restricts placement, and the echo layout simply
-    /// carries no timestamp field once the placement is
-    /// [`StampAt::None`](irtt_proto::StampAt::None).
+    /// every case. The allowance restricts which *instants* are reported, and
+    /// each reported instant still carries one field per negotiated clock domain
+    /// — [`Single`] on [`Clock::Both`](irtt_proto::Clock::Both) reports a wall
+    /// and a monotonic midpoint. Only [`None`] removes timestamp fields
+    /// outright, and it does so because the echo layout carries none once the
+    /// placement is [`StampAt::None`](irtt_proto::StampAt::None).
     ///
     /// Restriction runs *before* the effective-session check, which is what
     /// makes a [`None`] allowance accept a request that selected timestamps

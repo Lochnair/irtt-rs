@@ -70,9 +70,10 @@
 //! negotiates exactly what it always did.
 //!
 //! [`TimestampAllowance`] reduces the requested timestamp placement: `Single`
-//! provides at most one timestamp, answering a request for both instants with
-//! the midpoint, and `None` provides no timestamps at all. The requested clock
-//! is never rewritten. [`ServerConfig::with_dscp_allowed`] refuses to provide
+//! provides at most one timestamp instant, answering a request for both instants
+//! with the midpoint, and `None` provides no timestamps at all. The requested
+//! clock is never rewritten, so a single placement still reports one field per
+//! negotiated clock domain. [`ServerConfig::with_dscp_allowed`] refuses to provide
 //! traffic-class marking, negotiating any requested DSCP value to zero, after
 //! which the session's replies leave unmarked like any other zero-DSCP session.
 //!

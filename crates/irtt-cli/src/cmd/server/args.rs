@@ -85,7 +85,7 @@ pub struct ServerArgs {
         long,
         value_name = "MODE",
         value_enum,
-        long_help = "How many timestamps this server will provide.\n\ndual: honor a request for send, receive, both or midpoint timestamps.\nsingle: provide at most one timestamp; a request for both is negotiated to midpoint.\nnone: provide no timestamps at all.\n\nThe requested clock source is never changed, only the timestamp placement. Omit this flag to honor every requested placement."
+        long_help = "How many timestamps this server will provide.\n\ndual: honor a request for send, receive, both or midpoint timestamps.\nsingle: provide at most one timestamp instant; a request for both is negotiated to midpoint.\nnone: provide no timestamps at all.\n\nThe requested clock source is never changed, only which instants are reported, so a single instant is still reported once per requested clock. Omit this flag to honor every requested placement."
     )]
     pub timestamp_allowance: Option<TimestampAllowanceArg>,
 
@@ -105,7 +105,7 @@ pub struct ServerArgs {
 pub enum TimestampAllowanceArg {
     /// Honor every requested timestamp placement.
     Dual,
-    /// Provide at most one timestamp; both becomes midpoint.
+    /// Provide at most one timestamp instant; both becomes midpoint.
     Single,
     /// Provide no timestamps.
     None,

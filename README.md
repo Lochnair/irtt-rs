@@ -213,11 +213,12 @@ irtt-server \
 ```
 
 `--timestamp-allowance` takes `dual` (the default, honoring every requested
-placement), `single`, which provides at most one timestamp and answers a request
-for both receive and send timestamps with the midpoint, or `none`, which provides
-no timestamps. The requested clock source is never changed. `--no-dscp`
-negotiates any requested DSCP to zero, so clients are told their echo replies
-will be unmarked, and they are sent unmarked.
+placement), `single`, which provides at most one timestamp instant and answers a
+request for both receive and send timestamps with the midpoint, or `none`, which
+provides no timestamps. The requested clock source is never changed, so a single
+instant is still reported once per requested clock. `--no-dscp` negotiates any
+requested DSCP to zero, so clients are told their echo replies will be unmarked,
+and they are sent unmarked.
 
 To require authentication, pass the shared key both sides use:
 

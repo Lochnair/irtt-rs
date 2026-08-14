@@ -272,7 +272,9 @@ of open negotiation, and neither reaches the runtime.
   interesting row; the rest is in the clean spec's Section 11.4.
 - **`Clock` is never rewritten.** The evidence describes an allowance on timestamp
   *placement*, not on clock domains, and the echo layout already carries no
-  timestamp field once the placement is none. Rewriting the clock would answer
+  timestamp field once the placement is none. So `Single` bounds reported
+  *instants*, not field count: on `Clock::Both` a negotiated midpoint still emits
+  a wall and a monotonic field. Do not document it as one field. Rewriting the clock would answer
   with a session the client did not ask for.
 - **Restriction runs before the effective-session executability check**, and that
   ordering is load-bearing: it is what makes a request selecting timestamps with
