@@ -5,8 +5,8 @@ use crate::loss::loss_stats;
 use crate::normalization::{ReplySample, StatsEvent};
 use crate::time_stats::TimeMetric;
 use crate::{
-    EventCounts, EventStatsUpdate, IpdvPairUpdate, IpdvStats, OneWayDelayStats, PacketCounts,
-    RttStats, SampleMode, ServerProcessingStats, Snapshot,
+    EventCounts, EventStatsUpdate, IpdvPairUpdate, IpdvStats, LateReplyMode, OneWayDelayStats,
+    PacketCounts, RttStats, SampleMode, ServerProcessingStats, Snapshot,
 };
 
 const CONTINUOUS_SEQUENCE_LIMIT: usize = 4096;
@@ -27,10 +27,11 @@ pub(crate) struct CoreStats {
     receive_delay: TimeMetric,
     server_processing: TimeMetric,
     ipdv_tracker: IpdvTracker,
+    late_replies: LateReplyMode,
 }
 
 impl CoreStats {
-    pub(crate) fn new(sample_mode: SampleMode) -> Self {
+    pub(crate) fn new(sample_mode: SampleMode, late_replies: LateReplyMode) -> Self {
         let sequence_limit = if sample_mode == SampleMode::Exact {
             None
         } else {
@@ -52,6 +53,7 @@ impl CoreStats {
             receive_delay: TimeMetric::new(sample_mode == SampleMode::Exact),
             server_processing: TimeMetric::new(false),
             ipdv_tracker: IpdvTracker::new(sequence_limit),
+            late_replies,
         }
     }
 
@@ -97,12 +99,19 @@ impl CoreStats {
     }
 
     fn apply_unique_reply(&mut self, is_late: bool, sample: ReplySample) -> EventStatsUpdate {
+        self.account_unique_reply(is_late, &sample);
+
+        // A matched late reply is always a late unique reply. Whether it is
+        // also allowed to measure is the configured policy, not a property of
+        // the event.
+        if is_late && self.late_replies == LateReplyMode::CountOnly {
+            return EventStatsUpdate::default();
+        }
+
         let mut update = EventStatsUpdate {
             contributed_sample: true,
             ..EventStatsUpdate::default()
         };
-
-        self.account_unique_reply(is_late, &sample);
         self.record_reply_metrics(&sample);
         update.ipdv_pairs = self.apply_ipdv_sample(sample.ipdv);
 

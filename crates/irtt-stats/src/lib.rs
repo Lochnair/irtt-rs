@@ -36,6 +36,8 @@ pub struct StatsConfig {
     pub rolling_count: Option<usize>,
     /// Time span of recent normalized events retained for time-based rolling snapshots.
     pub rolling_time: Option<Duration>,
+    /// Whether matched late replies contribute measurements.
+    pub late_replies: LateReplyMode,
 }
 
 impl StatsConfig {
@@ -49,6 +51,7 @@ impl StatsConfig {
             samples: SampleMode::Exact,
             rolling_count: None,
             rolling_time: None,
+            late_replies: LateReplyMode::Measure,
         }
     }
 
@@ -62,8 +65,32 @@ impl StatsConfig {
             samples: SampleMode::RunningOnly,
             rolling_count: None,
             rolling_time: None,
+            late_replies: LateReplyMode::Measure,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// Whether a matched late reply contributes measurements.
+///
+/// This is a measurement policy, not a classification. A late reply that the
+/// client matched to retained send state is a late unique reply in both modes,
+/// and a late reply that could not be matched remains an untracked late reply
+/// in both modes. Only what a matched late reply is allowed to measure differs,
+/// so a caller that treats late replies as diagnostics does not have to degrade
+/// the event itself to suppress its timing contribution.
+pub enum LateReplyMode {
+    /// Matched late replies contribute timing, one-way, server-processing, and
+    /// IPDV measurements like any other unique reply.
+    #[default]
+    Measure,
+    /// Matched late replies are counted but measure nothing.
+    ///
+    /// Packet, byte, late, and server-reported receive counters still update,
+    /// so the reply stays visible as a late unique reply. Timing metrics,
+    /// one-way and server-processing measurements, and IPDV do not update, and
+    /// [`EventStatsUpdate::contributed_sample`] is `false`.
+    CountOnly,
 }
 
 impl Default for StatsConfig {
@@ -95,7 +122,7 @@ impl StatsCollector {
     /// Creates a collector with the supplied configuration.
     pub fn new(config: StatsConfig) -> Self {
         Self {
-            cumulative: CoreStats::new(config.samples),
+            cumulative: CoreStats::new(config.samples, config.late_replies),
             rolling: RollingEvents::new(config),
         }
     }

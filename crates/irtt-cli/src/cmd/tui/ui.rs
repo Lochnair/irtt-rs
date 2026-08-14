@@ -258,7 +258,7 @@ impl TuiState {
             let Some(target) = self.targets.get_mut(target_idx) else {
                 return;
             };
-            process_tui_stats(event, &mut target.stats);
+            target.stats.process(event);
             match event {
                 ClientEvent::SessionStarted {
                     remote,
@@ -616,43 +616,21 @@ impl GroupPacingArg {
     }
 }
 
+/// Statistics policy for the TUI.
+///
+/// The TUI treats late replies as diagnostics, so it counts a matched late
+/// reply without letting it contribute timing samples. That is an explicit
+/// statistics policy rather than something the TUI expresses by degrading the
+/// event it forwards.
 fn stats_config(continuous: bool) -> irtt_stats::StatsConfig {
-    if continuous {
+    let base = if continuous {
         irtt_stats::StatsConfig::continuous()
     } else {
         irtt_stats::StatsConfig::finite()
-    }
-}
-
-fn process_tui_stats(event: &ClientEvent, stats: &mut StatsCollector) {
-    if let ClientEvent::LateReply {
-        seq,
-        highest_seen,
-        remote,
-        received_at,
-        bytes,
-        packet_meta,
-        ..
-    } = event
-    {
-        // The TUI treats late replies as diagnostics, even when retained send
-        // metadata lets the client attach RTT fields to the event.
-        let late_counter_event = ClientEvent::LateReply {
-            seq: *seq,
-            highest_seen: *highest_seen,
-            remote: *remote,
-            sent_at: None,
-            received_at: *received_at,
-            rtt: None,
-            server_timing: None,
-            one_way: None,
-            received_stats: None,
-            bytes: *bytes,
-            packet_meta: *packet_meta,
-        };
-        stats.process(&late_counter_event);
-    } else {
-        stats.process(event);
+    };
+    irtt_stats::StatsConfig {
+        late_replies: irtt_stats::LateReplyMode::CountOnly,
+        ..base
     }
 }
 
@@ -2267,12 +2245,15 @@ mod tests {
         assert!(target.graph_history.is_empty());
         let snapshot = target.stats.snapshot();
         assert_eq!(snapshot.events.duplicate_replies, 1);
-        assert_eq!(snapshot.events.late_unique_replies, 0);
-        assert_eq!(snapshot.events.untracked_late_replies, 1);
-        assert_eq!(snapshot.packets.unique_replies, 0);
+        // A matched late reply is a late unique reply. The TUI suppresses its
+        // measurements through the late-reply policy, not by reclassifying it.
+        assert_eq!(snapshot.events.late_unique_replies, 1);
+        assert_eq!(snapshot.events.untracked_late_replies, 0);
+        assert_eq!(snapshot.packets.unique_replies, 1);
         assert_eq!(snapshot.packets.duplicates, 1);
         assert_eq!(snapshot.packets.late_packets, 1);
         assert_eq!(snapshot.rtt.primary.count, 0);
+        assert_eq!(snapshot.ipdv.round_trip.count, 0);
         assert!(state
             .recent_events
             .iter()
@@ -2281,6 +2262,32 @@ mod tests {
             .recent_events
             .iter()
             .any(|event| event.contains("late seq=8")));
+    }
+
+    #[test]
+    fn untracked_late_replies_stay_untracked_in_the_tui() {
+        let mut state = TuiState::default();
+        let target = target_instance("target");
+        let late = ClientEvent::LateReply {
+            seq: 8,
+            highest_seen: 9,
+            remote: remote(),
+            sent_at: None,
+            received_at: ts(Duration::from_secs(2)),
+            rtt: None,
+            server_timing: None,
+            one_way: None,
+            received_stats: None,
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
+        };
+        state.process_target_event(&target, &late);
+
+        let snapshot = primary_target(&state).stats.snapshot();
+        assert_eq!(snapshot.events.untracked_late_replies, 1);
+        assert_eq!(snapshot.events.late_unique_replies, 0);
+        assert_eq!(snapshot.packets.unique_replies, 0);
+        assert_eq!(snapshot.packets.late_packets, 1);
     }
 
     #[test]

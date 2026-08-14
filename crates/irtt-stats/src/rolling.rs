@@ -1,6 +1,8 @@
 use std::{collections::VecDeque, time::Duration};
 
-use crate::{core::CoreStats, normalization::StatsEvent, SampleMode, Snapshot, StatsConfig};
+use crate::{
+    core::CoreStats, normalization::StatsEvent, LateReplyMode, SampleMode, Snapshot, StatsConfig,
+};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct RollingEvents {
@@ -8,6 +10,7 @@ pub(crate) struct RollingEvents {
     time_limit: Option<Duration>,
     count_events: Option<VecDeque<StatsEvent>>,
     time_events: Option<VecDeque<StatsEvent>>,
+    late_replies: LateReplyMode,
 }
 
 impl RollingEvents {
@@ -17,6 +20,7 @@ impl RollingEvents {
             time_limit: config.rolling_time,
             count_events: config.rolling_count.map(|_| VecDeque::new()),
             time_events: config.rolling_time.map(|_| VecDeque::new()),
+            late_replies: config.late_replies,
         }
     }
 
@@ -40,16 +44,22 @@ impl RollingEvents {
     }
 
     pub(crate) fn count_snapshot(&self) -> Option<Snapshot> {
-        self.count_events.as_ref().map(snapshot_window)
+        self.count_events
+            .as_ref()
+            .map(|events| snapshot_window(events, self.late_replies))
     }
 
     pub(crate) fn time_snapshot(&self) -> Option<Snapshot> {
-        self.time_events.as_ref().map(snapshot_window)
+        self.time_events
+            .as_ref()
+            .map(|events| snapshot_window(events, self.late_replies))
     }
 }
 
-fn snapshot_window(events: &VecDeque<StatsEvent>) -> Snapshot {
-    let mut core = CoreStats::new(SampleMode::RunningOnly);
+/// Recompute a window snapshot under the same normalized semantics as the
+/// cumulative collector, including its late-reply measurement policy.
+fn snapshot_window(events: &VecDeque<StatsEvent>, late_replies: LateReplyMode) -> Snapshot {
+    let mut core = CoreStats::new(SampleMode::RunningOnly, late_replies);
     for event in events {
         core.apply(event.clone());
     }

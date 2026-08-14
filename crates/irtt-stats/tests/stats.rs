@@ -8,7 +8,9 @@ use common::{
 use irtt_client::{
     ClientEvent, ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, SignedDuration,
 };
-use irtt_stats::{EventStatsUpdate, IpdvPairUpdate, SampleMode, StatsCollector, StatsConfig};
+use irtt_stats::{
+    EventStatsUpdate, IpdvPairUpdate, LateReplyMode, SampleMode, StatsCollector, StatsConfig,
+};
 
 #[test]
 fn running_only_samples_avoid_finite_retention() {
@@ -342,6 +344,7 @@ fn rolling_count_eviction_recomputes_from_bounded_events() {
         samples: SampleMode::RunningOnly,
         rolling_count: Some(2),
         rolling_time: None,
+        late_replies: LateReplyMode::Measure,
     });
     collector.process(&sent(0, ts(0)));
     collector.process(&unadjusted_reply(0, 10));
@@ -359,6 +362,7 @@ fn rolling_time_eviction_uses_event_timestamps() {
         samples: SampleMode::RunningOnly,
         rolling_count: None,
         rolling_time: Some(Duration::from_millis(15)),
+        late_replies: LateReplyMode::Measure,
     });
     collector.process(&sent(0, ts(0)));
     collector.process(&sent(1, ts(10)));
@@ -419,4 +423,121 @@ fn directional_loss_uses_server_received_count_when_available() {
     assert_eq!(loss.downstream_loss_packets, Some(0));
     assert_eq!(loss.packet_loss_percent, 50.0);
     assert_eq!(loss.upstream_loss_percent, 50.0);
+}
+
+fn count_only(base: StatsConfig) -> StatsConfig {
+    StatsConfig {
+        late_replies: LateReplyMode::CountOnly,
+        ..base
+    }
+}
+
+fn untracked_late_reply(seq: u32, received_ms: u64) -> ClientEvent {
+    ClientEvent::LateReply {
+        seq,
+        highest_seen: seq + 1,
+        remote: "127.0.0.1:2112".parse().unwrap(),
+        sent_at: None,
+        received_at: ts(received_ms),
+        rtt: None,
+        server_timing: None,
+        one_way: None,
+        received_stats: None,
+        bytes: 64,
+        packet_meta: PacketMeta::default(),
+    }
+}
+
+#[test]
+fn matched_late_reply_measures_under_the_default_policy() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    collector.process(&sent(0, ts(0)));
+    let update = collector.process(&unadjusted_late_reply(0, 10));
+
+    assert!(update.contributed_sample);
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.events.late_unique_replies, 1);
+    assert_eq!(snapshot.events.untracked_late_replies, 0);
+    assert_eq!(snapshot.packets.unique_replies, 1);
+    assert_eq!(snapshot.packets.late_packets, 1);
+    assert_eq!(snapshot.packets.packets_received, 1);
+    assert_eq!(snapshot.packets.bytes_received, 64);
+    assert_eq!(snapshot.rtt.primary.count, 1);
+    assert_eq!(snapshot.server_processing.processing.count, 1);
+    assert_eq!(snapshot.one_way_delay.send_delay.count, 1);
+}
+
+#[test]
+fn matched_late_reply_counts_without_measuring_under_count_only() {
+    let mut collector = StatsCollector::new(count_only(StatsConfig::finite()));
+    collector.process(&sent(0, ts(0)));
+    let update = collector.process(&unadjusted_late_reply(0, 10));
+
+    assert!(!update.contributed_sample);
+    assert!(update.ipdv_pairs.is_empty());
+
+    let snapshot = collector.snapshot();
+    // Still a matched late unique reply, not a reclassified untracked one.
+    assert_eq!(snapshot.events.late_unique_replies, 1);
+    assert_eq!(snapshot.events.untracked_late_replies, 0);
+    assert_eq!(snapshot.packets.unique_replies, 1);
+    assert_eq!(snapshot.packets.late_packets, 1);
+    assert_eq!(snapshot.packets.packets_received, 1);
+    assert_eq!(snapshot.packets.bytes_received, 64);
+    // ...but it measures nothing.
+    assert_eq!(snapshot.rtt.primary.count, 0);
+    assert_eq!(snapshot.rtt.raw.count, 0);
+    assert_eq!(snapshot.server_processing.processing.count, 0);
+    assert_eq!(snapshot.one_way_delay.send_delay.count, 0);
+    assert_eq!(snapshot.one_way_delay.receive_delay.count, 0);
+    assert_eq!(snapshot.ipdv.round_trip.count, 0);
+}
+
+#[test]
+fn count_only_late_replies_do_not_complete_ipdv_pairs() {
+    let mut collector = StatsCollector::new(count_only(StatsConfig::finite()));
+    collector.process(&unadjusted_reply(0, 10));
+    let update = collector.process(&unadjusted_late_reply(1, 13));
+
+    assert!(update.ipdv_pairs.is_empty());
+    assert_eq!(collector.snapshot().ipdv.round_trip.count, 0);
+}
+
+#[test]
+fn untracked_late_replies_stay_untracked_in_both_policies() {
+    for config in [StatsConfig::finite(), count_only(StatsConfig::finite())] {
+        let mut collector = StatsCollector::new(config);
+        let update = collector.process(&untracked_late_reply(9, 100));
+
+        assert!(!update.contributed_sample);
+
+        let snapshot = collector.snapshot();
+        assert_eq!(snapshot.events.untracked_late_replies, 1);
+        assert_eq!(snapshot.events.late_unique_replies, 0);
+        assert_eq!(snapshot.packets.unique_replies, 0);
+        assert_eq!(snapshot.packets.late_packets, 1);
+        assert_eq!(snapshot.packets.packets_received, 1);
+        assert_eq!(snapshot.rtt.primary.count, 0);
+    }
+}
+
+#[test]
+fn rolling_snapshots_use_the_same_late_reply_policy() {
+    let mut collector = StatsCollector::new(StatsConfig {
+        rolling_count: Some(8),
+        rolling_time: None,
+        ..count_only(StatsConfig::continuous())
+    });
+    collector.process(&sent(0, ts(0)));
+    collector.process(&unadjusted_reply(0, 10));
+    collector.process(&unadjusted_late_reply(1, 10));
+
+    let rolling = collector.rolling_count().unwrap();
+    assert_eq!(rolling.events.late_unique_replies, 1);
+    assert_eq!(rolling.events.untracked_late_replies, 0);
+    assert_eq!(rolling.packets.unique_replies, 2);
+    assert_eq!(rolling.packets.late_packets, 1);
+    assert_eq!(rolling.rtt.primary.count, 1);
+    assert_eq!(rolling.ipdv.round_trip.count, 0);
 }
