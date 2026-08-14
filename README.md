@@ -168,7 +168,7 @@ Quit with `q` or `Ctrl-C`.
 
 ## Server
 
-The server applet serves one UDP listener and requires an explicit bind address:
+The server applet requires at least one explicit bind address:
 
 ```sh
 irtt-server --bind 127.0.0.1:2112
@@ -180,17 +180,34 @@ The same applet is reachable through the dispatcher:
 irtt-rs server --bind 192.0.2.10:2112
 ```
 
+Repeat `--bind` to serve several addresses from one process, in the order given:
+
+```sh
+irtt-server \
+    --bind 0.0.0.0:2112 \
+    --bind [::]:2112
+```
+
+Every invocation runs through the same multi-listener path, so one address is an
+ordinary set of one rather than a separate mode. The policy options below are
+applied to every listener, but the listeners are otherwise independent: each has
+its own sessions and tokens, so a session belongs to the address it was opened
+on and `--max-sessions` bounds each listener rather than the process. Binding is
+all or nothing — if any address cannot be bound, none are served — and a port of
+`0` selects an unused port per listener. If a listener fails while running, the
+others are shut down with it rather than leaving a service configured for two
+families answering on one.
+
 An explicit interface address works on every supported system. A wildcard bind
 such as `--bind 0.0.0.0:2112` reads each request's local destination from packet
 metadata and sends that request's reply from the same address, so a client on a
 multi-homed host is answered from the endpoint it contacted. That is implemented
 on Linux, macOS and FreeBSD; elsewhere a wildcard bind is refused rather than
-served from a routing-table source address a client would discard. One process
-serves exactly one address, so run a second process to serve a second address or
-family.
+served from a routing-table source address a client would discard. Wildcard
+IPv4 and IPv6 listeners may share one port, as above.
 
-The bound endpoint is printed on startup, which also resolves a port of `0`.
-`Ctrl-C` stops the server gracefully.
+Each bound endpoint is printed on startup once every listener is up, which also
+resolves a port of `0`. `Ctrl-C` stops the server gracefully.
 
 Session policy is set with options that map directly onto the server library's
 configuration; anything left unset keeps the library default:
@@ -326,10 +343,10 @@ The client, event stream, machine-readable output, multi-target execution, local
 The server library and the server applet are implemented: open negotiation,
 session state, echo processing, per-session rate limiting, idle expiry, the
 maximum-duration close, HMAC authentication, the negotiated per-session reply
-traffic class, which is applied on sockets that support it, server fill, and
-wildcard reply-source selection on Linux, macOS and FreeBSD. Multiple listeners
-in one process are not implemented, and optional timestamp and DSCP restriction
-controls remain separate concerns.
+traffic class, which is applied on sockets that support it, server fill,
+wildcard reply-source selection on Linux, macOS and FreeBSD, the optional
+timestamp and DSCP restriction controls, and serving several listeners from one
+process with independent sessions per listener.
 
 Server replies fill their payload with the negotiated ServerFill mode: `none`,
 which is zero-filled, `rand`, or `pattern:` with a repeating hexadecimal

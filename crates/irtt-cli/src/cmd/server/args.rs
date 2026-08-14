@@ -10,16 +10,17 @@ use irtt_server::{ServerConfig, TimestampAllowance};
 #[command(
     name = "irtt-server",
     about = "Minimal IRTT-compatible UDP server",
-    after_help = "Policy options left unset keep the irtt-server library defaults.\nOne process serves exactly one listener; run a second process for a second address."
+    after_help = "Policy options left unset keep the irtt-server library defaults.\nRepeat --bind to serve multiple addresses in one process. All listeners use the same policy but keep independent session namespaces."
 )]
 pub struct ServerArgs {
-    /// Local UDP address to bind, as ADDR:PORT.
+    /// Local UDP address to bind, as ADDR:PORT. Repeatable.
     #[arg(
         long,
+        required = true,
         value_name = "ADDR",
-        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nA wildcard bind such as 0.0.0.0:2112 answers each request from the address it was sent to, using per-packet destination metadata. That is supported on Linux, macOS and FreeBSD; on other systems a wildcard bind is refused and an explicit interface address is required."
+        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nRepeat the option to serve several addresses from one process, in the order given. Every listener applies the same policy options, but each keeps its own sessions and tokens, so a session belongs to the address it was opened on. Binding is all or nothing: if any address cannot be bound, none are served.\n\nA wildcard bind such as 0.0.0.0:2112 answers each request from the address it was sent to, using per-packet destination metadata. That is supported on Linux, macOS and FreeBSD; on other systems a wildcard bind is refused and an explicit interface address is required.\n\nA port of 0 selects an unused port per listener, so two such binds get two different ports."
     )]
-    pub bind: SocketAddr,
+    pub bind: Vec<SocketAddr>,
 
     /// HMAC key; every request must then carry a valid MAC.
     #[arg(
@@ -29,11 +30,11 @@ pub struct ServerArgs {
     )]
     pub hmac: Option<String>,
 
-    /// Maximum number of simultaneously live sessions.
+    /// Maximum simultaneously live sessions per listener.
     #[arg(
         long,
         value_name = "COUNT",
-        long_help = "Maximum number of simultaneously live sessions. Once the table is full, a session-creating open is dropped silently; nothing is evicted. Zero refuses every session-creating open."
+        long_help = "Maximum number of simultaneously live sessions per listener. Once a listener's table is full, a session-creating open to it is dropped silently; nothing is evicted. Zero refuses every session-creating open.\n\nThis is a per-listener bound, not a process-wide one: with two --bind options, each listener admits up to this many sessions."
     )]
     pub max_sessions: Option<usize>,
 
@@ -226,16 +227,67 @@ mod tests {
 
     #[test]
     fn bind_is_required_and_parses_both_families() {
-        assert!(parse(&[]).is_err());
+        assert!(
+            parse(&[]).is_err(),
+            "a server with no address serves nothing"
+        );
 
         let ipv4 = parse(&["--bind", "127.0.0.1:2112"]).unwrap();
-        assert_eq!(ipv4.bind, SocketAddr::from((Ipv4Addr::LOCALHOST, 2112)));
+        assert_eq!(ipv4.bind, [SocketAddr::from((Ipv4Addr::LOCALHOST, 2112))]);
 
         let ipv6 = parse(&["--bind", "[::1]:2112"]).unwrap();
-        assert_eq!(ipv6.bind, SocketAddr::from((Ipv6Addr::LOCALHOST, 2112)));
+        assert_eq!(ipv6.bind, [SocketAddr::from((Ipv6Addr::LOCALHOST, 2112))]);
 
         assert!(parse(&["--bind", "127.0.0.1"]).is_err());
         assert!(parse(&["--bind", "localhost:2112"]).is_err());
+        // Still one address per option: comma-separated syntax is not a thing
+        // here, and accepting it silently would be worse than rejecting it.
+        assert!(parse(&["--bind", "127.0.0.1:2112,[::1]:2112"]).is_err());
+    }
+
+    #[test]
+    fn bind_is_repeatable_and_keeps_the_requested_order() {
+        let args = parse(&[
+            "--bind",
+            "[::1]:2112",
+            "--bind",
+            "127.0.0.1:2112",
+            "--bind",
+            "127.0.0.1:2113",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            args.bind,
+            [
+                SocketAddr::from((Ipv6Addr::LOCALHOST, 2112)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 2112)),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 2113)),
+            ],
+            "listeners are served in the order they were requested"
+        );
+    }
+
+    #[test]
+    fn the_configuration_is_one_policy_however_many_listeners_there_are() {
+        // Addresses never enter the server configuration: every listener is
+        // built from a clone of this one value.
+        let one = parse(&["--bind", "127.0.0.1:2112", "--max-sessions", "4"])
+            .unwrap()
+            .server_config();
+        let several = parse(&[
+            "--bind",
+            "127.0.0.1:2112",
+            "--bind",
+            "[::1]:2112",
+            "--max-sessions",
+            "4",
+        ])
+        .unwrap()
+        .server_config();
+
+        assert_eq!(one, several);
+        assert_eq!(several.max_sessions(), 4, "and it is a per-listener bound");
     }
 
     #[test]
