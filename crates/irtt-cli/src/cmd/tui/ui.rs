@@ -2960,23 +2960,91 @@ mod tests {
         render_rows(state, width, height).join("\n")
     }
 
-    /// The target table's own rows, sliced to that panel's columns.
+    /// Whether a bordered panel with this title is on screen.
     ///
-    /// The table shares its band with the session panel, so a whole-row search
-    /// would happily match a label rendered on the left. Rows are cut at the
-    /// panel separator and stop at the band's bottom border.
-    fn target_table_rows(rows: &[String]) -> Vec<String> {
-        let header = rows
+    /// A panel is identified by its title in a top border, so this cannot be
+    /// satisfied by body text that happens to mention the same word.
+    fn has_panel(rows: &[String], title: &str) -> bool {
+        let needle = format!("\u{250c}{title}");
+        rows.iter().any(|row| row.contains(&needle))
+    }
+
+    /// The interior rows of one bordered panel, sliced to that panel's columns.
+    ///
+    /// Panels sit side by side, so a whole-row search matches text belonging to
+    /// a neighbour, and most panel content is echoed somewhere else on the
+    /// frame. Scoping assertions to the owning panel is what makes them
+    /// protect the panel they name.
+    fn panel_rows(rows: &[String], title: &str) -> Vec<String> {
+        let needle: Vec<char> = format!("\u{250c}{title}").chars().collect();
+        let (top, start) = rows
             .iter()
-            .position(|row| {
-                row.contains("target") && row.contains("status") && row.contains("warn")
+            .enumerate()
+            .find_map(|(index, row)| {
+                let chars: Vec<char> = row.chars().collect();
+                chars
+                    .windows(needle.len())
+                    .position(|window| window == needle.as_slice())
+                    .map(|column| (index, column))
             })
-            .expect("the multi-target layout renders a target table header");
-        rows[header + 1..]
+            .unwrap_or_else(|| panic!("no panel titled {title} in:\n{}", rows.join("\n")));
+        let title_row: Vec<char> = rows[top].chars().collect();
+        let end = title_row[start..]
             .iter()
-            .take_while(|row| row.contains("\u{2502}\u{2502}"))
-            .filter_map(|row| row.rsplit("\u{2502}\u{2502}").next().map(str::to_owned))
+            .position(|glyph| *glyph == '\u{2510}')
+            .map(|offset| start + offset)
+            .expect("a panel top border ends with a corner");
+        rows[top + 1..]
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip(start)
+                    .take(end - start + 1)
+                    .collect::<String>()
+            })
+            .take_while(|row| !row.starts_with('\u{2514}'))
             .collect()
+    }
+
+    /// Whether any interior row of `title`'s panel contains `text`.
+    fn panel_contains(rows: &[String], title: &str, text: &str) -> bool {
+        panel_rows(rows, title).iter().any(|row| row.contains(text))
+    }
+
+    /// Assert every target owns a row in the target table, scoped to that
+    /// panel's columns.
+    ///
+    /// A whole-frame search cannot prove this: the first target is also named
+    /// in the session header, and a target that replied appears in recent
+    /// events and as a chart series.
+    fn assert_target_table_rows(rows: &[String], labels: &[&str], replied: &str) {
+        let table = panel_rows(rows, "targets");
+        let row_for = |label: &str| {
+            table
+                .iter()
+                .find(|row| {
+                    row.trim_start_matches('\u{2502}')
+                        .trim_start()
+                        .starts_with(label)
+                })
+                .unwrap_or_else(|| {
+                    panic!("no target table row for {label} in:\n{}", table.join("\n"))
+                })
+                .clone()
+        };
+        for label in labels {
+            let row = row_for(label);
+            assert!(
+                row.contains("opening"),
+                "target row for {label} lost its status column: {row}"
+            );
+        }
+        // The target that replied shows its last sample.
+        let replied_row = row_for(replied);
+        assert!(
+            replied_row.contains("3.0ms"),
+            "{replied} row lost its last sample: {replied_row}"
+        );
     }
 
     /// A single-target state carrying a session, one reply, and one warning.
@@ -3099,18 +3167,18 @@ mod tests {
         let state = active_dashboard_state();
 
         let rows = render_rows(&state, 140, 40);
-        let text = rows.join("\n");
 
-        // Session identity from the header.
-        assert!(text.contains("0xabcd"));
-        assert!(text.contains("127.0.0.1:2112"));
-        // The most recent sample, with its effective RTT on the sample panel's
-        // own metric row rather than anywhere on the frame.
-        assert!(text.contains("last seq: 11"));
-        let sample_metrics = rows
+        // Session identity, on the header panel's own rows: the token is also
+        // echoed by the recent-events panel.
+        assert!(panel_contains(&rows, "session", "session: 0xabcd"));
+        assert!(panel_contains(&rows, "session", "remote: 127.0.0.1:2112"));
+        // The most recent sample, on the sample panel's own rows.
+        assert!(panel_contains(&rows, "sample", "last seq: 11"));
+        let sample = panel_rows(&rows, "sample");
+        let sample_metrics = sample
             .iter()
             .find(|row| row.contains("raw / adjusted / effective:"))
-            .expect("the large layout renders a sample metric row");
+            .expect("the sample panel renders a metric row");
         // The whole row, so a regression in any one field is caught: the
         // fixture's adjusted and effective RTT share a value, and asserting
         // "2.5ms" alone would still pass with the effective field dropped.
@@ -3118,16 +3186,20 @@ mod tests {
             sample_metrics.contains("raw / adjusted / effective: 1.5ms / 2.5ms / 2.5ms"),
             "unexpected sample metric row: {sample_metrics}"
         );
-        // The warning reaches the recent-events panel...
-        assert!(rows
-            .iter()
-            .any(|row| row.contains("warning") && row.contains("wrong token")));
+        // The warning reaches the recent-events panel as an event line: the
+        // sample panel's own last-warning row would otherwise satisfy a loose
+        // "warning" plus "wrong token" search.
+        assert!(panel_contains(
+            &rows,
+            "recent events",
+            "warning WrongToken: wrong token"
+        ));
         // ...and the sample panel's last-warning row carries the warning
         // itself, not the absent-value placeholder.
-        let last_warning = rows
+        let last_warning = sample
             .iter()
             .find(|row| row.contains("last warning:"))
-            .expect("the large layout renders a last-warning row");
+            .expect("the sample panel renders a last-warning row");
         assert!(
             last_warning.contains("wrong token"),
             "last-warning row did not carry the warning: {last_warning}"
@@ -3156,42 +3228,13 @@ mod tests {
         state.process_target_event(&target_instance("beta"), &reply(4, 3_000_000));
 
         let rows = render_rows(&state, 140, 40);
-        let text = rows.join("\n");
 
-        assert!(text.contains("targets"));
-        // Every target gets its own table row. Searching the whole frame would
-        // not prove this: the first target is also named in the session header,
-        // and a target with a reply appears in recent events and the legend.
-        let table = target_table_rows(&rows);
-        for label in ["alpha", "beta", "gamma"] {
-            let row = table
-                .iter()
-                .find(|row| {
-                    row.trim_start_matches('\u{2502}')
-                        .trim_start()
-                        .starts_with(label)
-                })
-                .unwrap_or_else(|| panic!("no target table row for {label} in:\n{text}"));
-            assert!(
-                row.contains("opening"),
-                "target row for {label} lost its status column: {row}"
-            );
-        }
-        // The target that replied shows its last sample; the others do not.
-        let beta = table
-            .iter()
-            .find(|row| {
-                row.trim_start_matches('\u{2502}')
-                    .trim_start()
-                    .starts_with("beta")
-            })
-            .expect("beta has a target table row");
-        assert!(
-            beta.contains("3.0ms"),
-            "beta row lost its last sample: {beta}"
-        );
-        assert!(text.contains("timing - first target"));
-        assert!(text.contains("sample - first target"));
+        assert!(has_panel(&rows, "targets"));
+        assert_target_table_rows(&rows, &["alpha", "beta", "gamma"], "beta");
+        assert!(has_panel(&rows, "timing - first target"));
+        assert!(has_panel(&rows, "sample - first target"));
+        // The table replaces the single-target packet counters.
+        assert!(!has_panel(&rows, "packets"));
     }
 
     #[test]
@@ -3205,8 +3248,13 @@ mod tests {
         assert!(text.contains(state.graph_metric.title()));
         assert!(text.contains("live"));
         assert!(rows[38].contains("q quit"));
-        assert!(!text.contains("recent events"));
-        assert!(!text.contains("last warning:"));
+        // The graph view replaces every dashboard panel, not just some.
+        for panel in ["packets", "timing", "recent events", "sample"] {
+            assert!(
+                !has_panel(&rows, panel),
+                "{panel} panel rendered in the graph view"
+            );
+        }
     }
 
     #[test]
@@ -3217,11 +3265,12 @@ mod tests {
         );
         state.process_target_event(&target_instance("beta"), &reply(4, 3_000_000));
 
-        let text = render_text(&state, 140, 40);
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
 
-        assert!(text.contains("targets"));
-        assert!(text.contains("alpha"));
-        assert!(text.contains("beta"));
+        assert!(has_panel(&rows, "targets"));
+        // Scoped to the table: the replying target also names a chart series.
+        assert_target_table_rows(&rows, &["alpha", "beta"], "beta");
         assert!(text.contains(state.graph_metric.title()));
     }
 
