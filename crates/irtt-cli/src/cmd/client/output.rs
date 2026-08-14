@@ -10,6 +10,7 @@ use irtt_client::{
 };
 
 use super::args::{HeaderMode, OutputFormat};
+use crate::cmd::format::{format_duration, format_signed_duration, ABSENT};
 
 #[derive(Debug, Clone)]
 pub(super) struct OutputConfig {
@@ -817,7 +818,7 @@ fn render_table_row(row: &OutputRow, columns: &[Column], context: RenderContext<
 }
 
 fn format_table_cell(column: &Column, value: Option<String>) -> String {
-    let value = value.unwrap_or_else(|| "-".to_owned());
+    let value = value.unwrap_or_else(|| ABSENT.to_owned());
     let width = column.table_width();
     if column.align_right() {
         format!("{value:>width$}")
@@ -1159,34 +1160,6 @@ fn wall_time_ns(wall: SystemTime) -> Option<u128> {
     wall.duration_since(UNIX_EPOCH)
         .ok()
         .map(|duration| duration.as_nanos())
-}
-
-fn format_duration(duration: Duration) -> String {
-    format_ns(duration.as_nanos() as f64)
-}
-
-fn format_signed_duration(duration: SignedDuration) -> String {
-    format_signed_ns(duration.as_nanos() as f64)
-}
-
-fn format_signed_ns(ns: f64) -> String {
-    if ns < 0.0 {
-        format!("-{}", format_ns(-ns))
-    } else {
-        format_ns(ns)
-    }
-}
-
-fn format_ns(ns: f64) -> String {
-    if ns < 1_000.0 {
-        format!("{ns:.0}ns")
-    } else if ns < 1_000_000.0 {
-        format!("{:.1}µs", ns / 1_000.0)
-    } else if ns < 1_000_000_000.0 {
-        format!("{:.1}ms", ns / 1_000_000.0)
-    } else {
-        format!("{:.3}s", ns / 1_000_000_000.0)
-    }
 }
 
 fn warning_kind(kind: WarningKind) -> &'static str {
