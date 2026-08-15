@@ -528,15 +528,20 @@ impl AsyncClient {
 
             let expected_bytes = prepared.bytes.len();
             let scheduled_at = schedule_commit.scheduled_at;
+            // Private pre-send anchor: finalizes all fallible commit work
+            // (timeout deadline arithmetic, kernel TX lower bound) before
+            // the send attempt. A WouldBlock retry samples a fresh one on
+            // the next loop iteration; only the successful attempt's anchor
+            // is retained (via `machine_commit`/`commit_probe_sent` below).
             #[cfg(not(test))]
-            let sent_at = ClientTimestamp::now();
+            let send_anchor = ClientTimestamp::now();
             #[cfg(test)]
-            let sent_at = test_timestamps
-                .map(|timestamps| timestamps.sent_at)
+            let send_anchor = test_timestamps
+                .map(|timestamps| timestamps.send_anchor)
                 .unwrap_or_else(ClientTimestamp::now);
             let machine_commit = match self
                 .machine
-                .finalize_probe_commit(machine_preflight, sent_at)
+                .finalize_probe_commit(machine_preflight, send_anchor)
             {
                 Ok(commit) => commit,
                 Err(error) => return Poll::Ready(Err(error)),
@@ -553,6 +558,9 @@ impl AsyncClient {
             let send_result = self.socket.try_send(&prepared.bytes);
             let bytes = match send_result {
                 Ok(bytes) => bytes,
+                // No sent_at measurement, no machine commit, no schedule
+                // commit: the transaction is fully discarded and retried
+                // with a fresh send_anchor on the next loop iteration.
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
             };
@@ -563,7 +571,18 @@ impl AsyncClient {
             let send_finished_at = test_timestamps
                 .map(|timestamps| timestamps.send_finished_at)
                 .unwrap_or_else(Instant::now);
-            let sent = self.machine.commit_probe_sent(machine_commit, bytes);
+            // Public post-send measurement, captured only after the
+            // successful send above. The subsequent machine/schedule commit
+            // is infallible.
+            #[cfg(not(test))]
+            let sent_at = ClientTimestamp::now();
+            #[cfg(test)]
+            let sent_at = test_timestamps
+                .map(|timestamps| timestamps.sent_at)
+                .unwrap_or_else(ClientTimestamp::now);
+            let sent = self
+                .machine
+                .commit_probe_sent(machine_commit, sent_at, bytes);
             schedule.commit(schedule_commit);
             self.prepared_probe = None;
 

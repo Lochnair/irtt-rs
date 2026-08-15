@@ -3,6 +3,7 @@ use super::*;
 fn probe_timestamps(permission_at: Instant, sent_at: ClientTimestamp) -> ProbeSendTimestamps {
     ProbeSendTimestamps {
         permission_at,
+        send_anchor: sent_at,
         sent_at,
         send_call_start: sent_at.mono,
         send_finished_at: sent_at.mono,
@@ -176,12 +177,21 @@ fn blocking_probe_separates_permission_committed_send_and_send_call_timing() {
         .unwrap(),
     );
     let permission_at = opened_mono + Duration::from_millis(500);
-    let sent_at = ClientTimestamp {
+    // Distinct pre-send anchor and post-send `sent_at`: the anchor drives
+    // the operational timeout deadline, while `sent_at` (captured after the
+    // send call) is the public measurement/timer_error endpoint. They are
+    // deliberately decoupled by this PR.
+    let send_anchor = ClientTimestamp {
         wall: SystemTime::now(),
         mono: opened_mono + Duration::from_millis(525),
     };
+    let sent_at = ClientTimestamp {
+        wall: SystemTime::now(),
+        mono: opened_mono + Duration::from_millis(534),
+    };
     let timestamps = ProbeSendTimestamps {
         permission_at,
+        send_anchor,
         sent_at,
         send_call_start: opened_mono + Duration::from_millis(526),
         send_finished_at: opened_mono + Duration::from_millis(533),
@@ -200,11 +210,14 @@ fn blocking_probe_separates_permission_committed_send_and_send_call_timing() {
         }] if *scheduled_at == opened_mono
             && *event_sent_at == sent_at
             && *send_call == Duration::from_millis(7)
-            && *timer_error == Duration::from_millis(525)
+            && *timer_error == Duration::from_millis(534)
     ));
     assert_eq!(client.next_send_deadline(), Some(opened_mono + interval));
     assert_eq!(client.runtime.packets_sent(), 1);
-    let timeout_at = sent_at.mono + client.probe_timeout();
+    // The timeout deadline is anchored to the pre-send `send_anchor`, not
+    // to the post-send `sent_at` captured 9ms later.
+    let timeout_at = send_anchor.mono + client.probe_timeout();
+    assert_ne!(timeout_at, sent_at.mono + client.probe_timeout());
     assert!(client
         .poll_timeouts_at(timeout_at - Duration::from_nanos(1))
         .unwrap()
@@ -236,6 +249,7 @@ fn blocking_send_call_excludes_wrapped_history_cleanup() {
     client.runtime.seed_wrapped_probe_history_for_test(sent_at);
     let timestamps = ProbeSendTimestamps {
         permission_at: scheduled_at,
+        send_anchor: sent_at,
         sent_at,
         send_call_start: scheduled_at + Duration::from_millis(6),
         send_finished_at: scheduled_at + Duration::from_millis(13),
@@ -343,6 +357,7 @@ fn managed_probe_skips_missed_schedule_slots() {
     };
     let timestamps = ProbeSendTimestamps {
         permission_at,
+        send_anchor: delayed_send,
         sent_at: delayed_send,
         send_call_start: first_deadline + Duration::from_millis(49),
         send_finished_at: first_deadline + Duration::from_millis(55),

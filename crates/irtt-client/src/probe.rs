@@ -8,15 +8,38 @@ use crate::{error::ClientError, timing::ClientTimestamp};
 #[derive(Debug, Clone)]
 pub(crate) struct PendingProbe {
     pub wire_seq: u32,
+    /// Paired client wall/monotonic timestamp captured immediately after the
+    /// successful UDP send completed. This is the RTT endpoint (via
+    /// `compute_rtt`), the userspace fallback endpoint for upstream one-way
+    /// delay, `timer_error`'s basis, and the value surfaced on the public
+    /// `EchoSent`/`EchoReply`/`EchoLoss`/`LateReply` events. It is *not* the
+    /// input to `timeout_at` below — see that field's doc.
     pub sent_at: ClientTimestamp,
+    /// Operational timeout deadline, computed from the pre-send send
+    /// anchor's monotonic timestamp plus the configured probe timeout
+    /// (`SessionMachine::finalize_probe_commit`), not from `sent_at.mono`
+    /// above. Timeout semantics deliberately stay anchored to before the
+    /// socket send so that fallible deadline arithmetic (and its overflow
+    /// check) still runs, and a `PendingProbe` is only ever created, before
+    /// the datagram is transmitted.
     pub timeout_at: Instant,
+    /// Local wall-clock lower bound for validating an asynchronous Linux
+    /// kernel `TX_SOFTWARE` timestamp, sampled at the same pre-send send
+    /// anchor as `timeout_at` — i.e. before the socket send, not from
+    /// `sent_at.wall` above. A legitimate `TX_SOFTWARE` timestamp can be
+    /// generated during the send path and therefore observed earlier than
+    /// the post-send `sent_at.wall` sample; using this earlier pre-send
+    /// bound instead of `sent_at.wall` avoids rejecting such a timestamp
+    /// merely because userspace samples `sent_at` after `send()` returns.
+    /// See `compute_one_way`'s `preferred_send_wall`.
+    pub tx_not_before_wall: SystemTime,
     /// Observed Linux kernel TX_SOFTWARE wall timestamp for this probe's
     /// send, when the socket has TX timestamping enabled and a matching
     /// `MSG_ERRQUEUE` record has been drained. Optional observed metadata,
     /// eligible only for upstream one-way delay after local plausibility
-    /// validation (see `compute_one_way`'s `preferred_send_wall`). `sent_at`
-    /// remains authoritative for RTT, timeout, pacing/scheduling semantics,
-    /// and the userspace fallback for upstream one-way delay.
+    /// validation against `tx_not_before_wall` (see `compute_one_way`'s
+    /// `preferred_send_wall`). `sent_at` remains the userspace fallback for
+    /// upstream one-way delay when this is absent or implausible.
     pub kernel_tx_timestamp: Option<SystemTime>,
 }
 
@@ -386,10 +409,12 @@ mod tests {
     }
 
     fn pending(seq: u32, timeout_at: Instant) -> PendingProbe {
+        let sent_at = ts(timeout_at - Duration::from_secs(1));
         PendingProbe {
             wire_seq: seq,
-            sent_at: ts(timeout_at - Duration::from_secs(1)),
+            sent_at,
             timeout_at,
+            tx_not_before_wall: sent_at.wall,
             kernel_tx_timestamp: None,
         }
     }

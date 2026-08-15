@@ -152,7 +152,13 @@ pub(crate) struct ProbeCommitPreflight {
 
 #[derive(Debug)]
 pub(crate) struct ProbeCommit {
-    pending: PendingProbe,
+    wire_seq: u32,
+    /// Operational timeout deadline, derived from the pre-send send anchor.
+    /// See [`PendingProbe::timeout_at`].
+    timeout_at: Instant,
+    /// Pre-send wall-clock lower bound for kernel TX plausibility. See
+    /// [`PendingProbe::tx_not_before_wall`].
+    tx_not_before_wall: SystemTime,
     next_wire_seq: u32,
     next_packets_sent: u64,
 }
@@ -351,38 +357,62 @@ impl SessionMachine {
         })
     }
 
+    /// Finalizes all fallible probe-commit preflight work that must happen
+    /// before the socket send: the timeout deadline arithmetic (which can
+    /// overflow) and capturing the pre-send wall-clock lower bound used to
+    /// validate a later asynchronous kernel TX timestamp.
+    ///
+    /// `send_anchor` is a *private* pre-send timestamp, not the public
+    /// measurement `sent_at` — it is sampled immediately before this call,
+    /// before the socket send. Its `mono` field anchors the operational
+    /// timeout deadline and its `wall` field becomes
+    /// [`PendingProbe::tx_not_before_wall`]. See the client crate's
+    /// `AGENTS.md` for why timeout semantics deliberately stay pre-send
+    /// anchored while the public `sent_at` measurement moves after the send.
     pub(crate) fn finalize_probe_commit(
         &self,
         preflight: ProbeCommitPreflight,
-        sent_at: ClientTimestamp,
+        send_anchor: ClientTimestamp,
     ) -> Result<ProbeCommit, ClientError> {
-        let timeout_at = sent_at
+        let timeout_at = send_anchor
             .mono
             .checked_add(self.config.probe_timeout)
             .ok_or(ClientError::DurationOverflow)?;
 
         Ok(ProbeCommit {
-            pending: PendingProbe {
-                wire_seq: preflight.seq,
-                sent_at,
-                timeout_at,
-                kernel_tx_timestamp: None,
-            },
+            wire_seq: preflight.seq,
+            timeout_at,
+            tx_not_before_wall: send_anchor.wall,
             next_wire_seq: preflight.next_wire_seq,
             next_packets_sent: preflight.next_packets_sent,
         })
     }
 
-    pub(crate) fn commit_probe_sent(&mut self, commit: ProbeCommit, bytes: usize) -> ProbeSent {
+    /// Infallibly commits a probe as sent, using the post-send measurement
+    /// `sent_at` captured immediately after the successful socket send
+    /// returned. All fallible work already happened in
+    /// [`Self::finalize_probe_commit`]; nothing here can fail.
+    pub(crate) fn commit_probe_sent(
+        &mut self,
+        commit: ProbeCommit,
+        sent_at: ClientTimestamp,
+        bytes: usize,
+    ) -> ProbeSent {
         let session = match &mut self.state {
             MachineState::Open(session) => session,
             _ => unreachable!("probe commits are only created for an open session"),
         };
-        let seq = commit.pending.wire_seq;
-        let sent_at = commit.pending.sent_at;
+        let seq = commit.wire_seq;
+        let pending = PendingProbe {
+            wire_seq: seq,
+            sent_at,
+            timeout_at: commit.timeout_at,
+            tx_not_before_wall: commit.tx_not_before_wall,
+            kernel_tx_timestamp: None,
+        };
         session.timed_out.remove(seq);
         session.completed.remove(seq);
-        session.pending.commit_insert(commit.pending);
+        session.pending.commit_insert(pending);
         session.next_wire_seq = commit.next_wire_seq;
         session.packets_sent = commit.next_packets_sent;
 
@@ -701,6 +731,7 @@ impl SessionMachine {
                 let server_timing = build_server_timing(&reply.timestamps);
                 let one_way = compute_one_way(
                     &pending.sent_at,
+                    pending.tx_not_before_wall,
                     &now,
                     pending.kernel_tx_timestamp,
                     &meta,
@@ -756,6 +787,7 @@ impl SessionMachine {
                 let server_timing = build_server_timing(&reply.timestamps);
                 let one_way = compute_one_way(
                     &timed_out.sent_at,
+                    timed_out.tx_not_before_wall,
                     &now,
                     timed_out.kernel_tx_timestamp,
                     &meta,
@@ -984,39 +1016,49 @@ fn build_server_timing(ts: &TimestampFields) -> Option<ServerTiming> {
 ///
 /// Prefers the correlated Linux kernel `TX_SOFTWARE` timestamp — a software
 /// timestamp near the driver handoff, not physical NIC departure — when it
-/// is locally plausible: it must not precede `sent_at` and must not follow
-/// `received_at`, both on the client's own wall clock. Comparing only these
-/// two same-client anchors means the check detects local causal-ordering
-/// inconsistency (e.g. a backward wall-clock step), not every possible
-/// wall-clock discontinuity, and it deliberately does not compare against
-/// the remote server's wall clock: cross-host clock offset is a
-/// synchronization property of the resulting delay, not evidence that this
-/// endpoint is invalid. There is no maximum lag bound — unlike scheduler
-/// wakeup delay on the receive side, legitimate send-to-receive time can
-/// exceed a second. Falls back to `sent_at` when the kernel timestamp is
-/// absent or fails this check; the raw observation on `PendingProbe` is
-/// never mutated by a fallback here.
+/// is locally plausible: it must not precede `tx_not_before_wall` and must
+/// not follow `received_at`, both on the client's own wall clock.
+/// `tx_not_before_wall` is the pre-send send-anchor sample, not the
+/// post-send `sent_at_wall` fallback below — a legitimate `TX_SOFTWARE`
+/// timestamp can be generated while the send syscall is still in flight and
+/// therefore legitimately precede the post-send `sent_at` sample, so the
+/// lower bound must stay anchored before the send rather than after it.
+/// Comparing only these two same-client anchors means the check detects
+/// local causal-ordering inconsistency (e.g. a backward wall-clock step),
+/// not every possible wall-clock discontinuity, and it deliberately does
+/// not compare against the remote server's wall clock: cross-host clock
+/// offset is a synchronization property of the resulting delay, not
+/// evidence that this endpoint is invalid. There is no maximum lag bound —
+/// unlike scheduler wakeup delay on the receive side, legitimate
+/// send-to-receive time can exceed a second. Falls back to `sent_at_wall`
+/// (the post-send measurement) when the kernel timestamp is absent or fails
+/// this check; the raw observation on `PendingProbe` is never mutated by a
+/// fallback here.
 fn preferred_send_wall(
-    sent_at: SystemTime,
+    tx_not_before_wall: SystemTime,
+    sent_at_wall: SystemTime,
     kernel_tx_timestamp: Option<SystemTime>,
     received_at: SystemTime,
 ) -> SystemTime {
     match kernel_tx_timestamp {
-        Some(kernel_tx) if sent_at <= kernel_tx && kernel_tx <= received_at => kernel_tx,
-        _ => sent_at,
+        Some(kernel_tx) if tx_not_before_wall <= kernel_tx && kernel_tx <= received_at => kernel_tx,
+        _ => sent_at_wall,
     }
 }
 
 /// Computes both one-way delay directions from wall-clock endpoints.
 ///
 /// The upstream direction prefers a locally plausible correlated kernel
-/// `TX_SOFTWARE` send timestamp over the userspace pre-send sample; see
-/// [`preferred_send_wall`]. The downstream direction uses
+/// `TX_SOFTWARE` send timestamp over the userspace post-send `sent_at`
+/// sample; see [`preferred_send_wall`]. `tx_not_before_wall` is the private
+/// pre-send lower bound used only for that plausibility check — it is never
+/// itself a candidate endpoint. The downstream direction uses
 /// [`ReceiveMeta::preferred_receive_wall`], which prefers a plausible kernel
 /// receive timestamp over the userspace receive wall sample. Neither kernel
 /// timestamp is ever used for RTT.
 pub(crate) fn compute_one_way(
     sent_at: &ClientTimestamp,
+    tx_not_before_wall: SystemTime,
     received_at: &ClientTimestamp,
     kernel_tx_timestamp: Option<SystemTime>,
     meta: &ReceiveMeta,
@@ -1025,7 +1067,12 @@ pub(crate) fn compute_one_way(
     let server_recv_wall = ts.recv_wall.or(ts.midpoint_wall);
     let server_send_wall = ts.send_wall.or(ts.midpoint_wall);
 
-    let client_send_wall = preferred_send_wall(sent_at.wall, kernel_tx_timestamp, received_at.wall);
+    let client_send_wall = preferred_send_wall(
+        tx_not_before_wall,
+        sent_at.wall,
+        kernel_tx_timestamp,
+        received_at.wall,
+    );
     let client_send_ns = unix_epoch_ns_i64(client_send_wall);
     let client_recv_ns = unix_epoch_ns_i64(meta.preferred_receive_wall(received_at.wall));
 
@@ -1125,6 +1172,7 @@ impl SessionMachine {
             wire_seq: 0,
             sent_at: now,
             timeout_at: now.mono,
+            tx_not_before_wall: now.wall,
             kernel_tx_timestamp: None,
         });
         session.completed.insert(0);
@@ -1707,7 +1755,7 @@ mod tests {
         let sent_at = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&accepted).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine.commit_probe_sent(commit, accepted.bytes.len());
+        machine.commit_probe_sent(commit, sent_at, accepted.bytes.len());
 
         let capacity = active(&machine).pending.capacity();
         assert!(matches!(
@@ -1737,7 +1785,7 @@ mod tests {
         }
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        let sent = machine.commit_probe_sent(commit, prepared.bytes.len());
+        let sent = machine.commit_probe_sent(commit, sent_at, prepared.bytes.len());
 
         assert_eq!(sent.seq, 0);
         let session = active(&machine);
@@ -1750,16 +1798,20 @@ mod tests {
     fn probe_commit_does_not_require_presentation_timing() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let prepared = machine.prepare_probe().unwrap().unwrap();
-        let sent_at = timestamp(Instant::now());
+        let send_anchor = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        assert_eq!(commit.pending.sent_at, sent_at);
-        assert_eq!(
-            commit.pending.timeout_at,
-            sent_at.mono + Duration::from_secs(1)
-        );
+        let commit = machine
+            .finalize_probe_commit(preflight, send_anchor)
+            .unwrap();
+        // Fallible work (timeout deadline arithmetic, tx lower bound) is
+        // finalized from the pre-send anchor, not any post-send sample.
+        assert_eq!(commit.timeout_at, send_anchor.mono + Duration::from_secs(1));
+        assert_eq!(commit.tx_not_before_wall, send_anchor.wall);
 
-        let sent = machine.commit_probe_sent(commit, prepared.bytes.len());
+        // The post-send measurement `sent_at` is supplied afterward and can
+        // legitimately differ from the pre-send anchor.
+        let sent_at = timestamp(Instant::now());
+        let sent = machine.commit_probe_sent(commit, sent_at, prepared.bytes.len());
 
         assert_eq!(sent.seq, prepared.seq);
         assert_eq!(sent.sent_at, sent_at);
@@ -1778,7 +1830,7 @@ mod tests {
             .finalize_probe_commit(preflight, timestamp(Instant::now()))
             .unwrap();
 
-        machine.commit_probe_sent(commit, prepared.bytes.len());
+        machine.commit_probe_sent(commit, timestamp(Instant::now()), prepared.bytes.len());
 
         let session = active(&machine);
         assert_eq!(session.pending.capacity(), reserved_capacity);
@@ -1794,7 +1846,7 @@ mod tests {
         let sent_at = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&first).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine.commit_probe_sent(commit, first.bytes.len());
+        machine.commit_probe_sent(commit, sent_at, first.bytes.len());
 
         let second = machine.prepare_probe().unwrap().unwrap();
         assert!(matches!(
@@ -1811,7 +1863,7 @@ mod tests {
         let sent_at = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&first).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine.commit_probe_sent(commit, first.bytes.len());
+        machine.commit_probe_sent(commit, sent_at, first.bytes.len());
         active_mut(&mut machine).next_wire_seq = 0;
 
         let reused = machine.prepare_probe().unwrap().unwrap();
@@ -1862,6 +1914,7 @@ mod tests {
                 wire_seq: seq,
                 sent_at,
                 timeout_at: sent_at.mono + Duration::from_secs(1),
+                tx_not_before_wall: sent_at.wall,
                 kernel_tx_timestamp: None,
             });
         }
@@ -1888,7 +1941,7 @@ mod tests {
         let commit = machine
             .finalize_probe_commit(preflight, timestamp(Instant::now()))
             .unwrap();
-        machine.commit_probe_sent(commit, prepared.bytes.len());
+        machine.commit_probe_sent(commit, timestamp(Instant::now()), prepared.bytes.len());
 
         assert_eq!(active(&machine).next_wire_seq, 0);
         assert_eq!(machine.prepare_probe().unwrap().unwrap().seq, 0);
@@ -1898,10 +1951,12 @@ mod tests {
     fn successful_wrapped_reuse_purges_obsolete_history_only_on_commit() {
         let mut machine = open_machine(3, Duration::from_secs(1));
         let now = Instant::now();
+        let obsolete_sent_at = timestamp(now - Duration::from_secs(1));
         let obsolete = PendingProbe {
             wire_seq: 0,
-            sent_at: timestamp(now - Duration::from_secs(1)),
+            sent_at: obsolete_sent_at,
             timeout_at: now,
+            tx_not_before_wall: obsolete_sent_at.wall,
             kernel_tx_timestamp: None,
         };
         let session = active_mut(&mut machine);
@@ -1917,7 +1972,7 @@ mod tests {
         assert!(active(&machine).timed_out.contains(0));
         assert!(active(&machine).completed.contains(0));
 
-        machine.commit_probe_sent(commit, prepared.bytes.len());
+        machine.commit_probe_sent(commit, timestamp(now), prepared.bytes.len());
         let session = active(&machine);
         assert!(!session.timed_out.contains(0));
         assert!(!session.completed.contains(0));
@@ -1982,8 +2037,21 @@ mod tests {
         }
     }
 
-    /// Machine with one outstanding probe for sequence 0.
+    /// Machine with one outstanding probe for sequence 0. The pre-send
+    /// `tx_not_before_wall` bound defaults to `sent_at.wall`, i.e. this
+    /// helper does not exercise the pre-/post-send distinction; use
+    /// [`machine_with_pending_probe_anchored`] where that distinction
+    /// matters.
     fn machine_with_pending_probe(sent_at: ClientTimestamp) -> SessionMachine {
+        machine_with_pending_probe_anchored(sent_at.wall, sent_at)
+    }
+
+    /// Machine with one outstanding probe for sequence 0, with an explicit
+    /// pre-send `tx_not_before_wall` bound independent of `sent_at.wall`.
+    fn machine_with_pending_probe_anchored(
+        tx_not_before_wall: SystemTime,
+        sent_at: ClientTimestamp,
+    ) -> SessionMachine {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let session = active_mut(&mut machine);
         session.pending.preflight_insert(0).unwrap();
@@ -1991,6 +2059,7 @@ mod tests {
             wire_seq: 0,
             sent_at,
             timeout_at: sent_at.mono + Duration::from_secs(1),
+            tx_not_before_wall,
             kernel_tx_timestamp: None,
         });
         session.next_wire_seq = 1;
@@ -2006,6 +2075,7 @@ mod tests {
             wire_seq: 0,
             sent_at,
             timeout_at: sent_at.mono + Duration::from_secs(1),
+            tx_not_before_wall: sent_at.wall,
             kernel_tx_timestamp: None,
         });
         session.next_wire_seq = 1;
@@ -2310,7 +2380,9 @@ mod tests {
         let prepared = machine.prepare_probe().unwrap().unwrap();
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine.commit_probe_sent(commit, prepared.bytes.len()).seq
+        machine
+            .commit_probe_sent(commit, sent_at, prepared.bytes.len())
+            .seq
     }
 
     #[test]
@@ -2635,82 +2707,129 @@ mod tests {
 
     #[test]
     fn preferred_send_wall_without_kernel_timestamp_uses_sent_at() {
-        let sent_at = send_wall_ms(1_000);
+        let anchor = send_wall_ms(1_000);
         let received_at = send_wall_ms(1_040);
-        assert_eq!(preferred_send_wall(sent_at, None, received_at), sent_at);
+        assert_eq!(
+            preferred_send_wall(anchor, anchor, None, received_at),
+            anchor
+        );
     }
 
     #[test]
     fn preferred_send_wall_uses_kernel_timestamp_strictly_between_bounds() {
-        let sent_at = send_wall_ms(1_000);
+        let anchor = send_wall_ms(1_000);
         let kernel_tx = send_wall_ms(1_005);
         let received_at = send_wall_ms(1_040);
         assert_eq!(
-            preferred_send_wall(sent_at, Some(kernel_tx), received_at),
+            preferred_send_wall(anchor, anchor, Some(kernel_tx), received_at),
             kernel_tx
         );
     }
 
     #[test]
-    fn preferred_send_wall_accepts_kernel_timestamp_equal_to_sent_at() {
-        let sent_at = send_wall_ms(1_000);
+    fn preferred_send_wall_accepts_kernel_timestamp_equal_to_lower_bound() {
+        let anchor = send_wall_ms(1_000);
         let received_at = send_wall_ms(1_040);
         assert_eq!(
-            preferred_send_wall(sent_at, Some(sent_at), received_at),
-            sent_at
+            preferred_send_wall(anchor, anchor, Some(anchor), received_at),
+            anchor
         );
     }
 
     #[test]
     fn preferred_send_wall_accepts_kernel_timestamp_equal_to_received_at() {
-        let sent_at = send_wall_ms(1_000);
+        let anchor = send_wall_ms(1_000);
         let received_at = send_wall_ms(1_040);
         assert_eq!(
-            preferred_send_wall(sent_at, Some(received_at), received_at),
+            preferred_send_wall(anchor, anchor, Some(received_at), received_at),
             received_at
         );
     }
 
     #[test]
-    fn preferred_send_wall_rejects_kernel_timestamp_earlier_than_sent_at() {
-        let sent_at = send_wall_ms(1_000);
-        let kernel_tx = sent_at - Duration::from_nanos(1);
+    fn preferred_send_wall_rejects_kernel_timestamp_earlier_than_lower_bound() {
+        let anchor = send_wall_ms(1_000);
+        let kernel_tx = anchor - Duration::from_nanos(1);
         let received_at = send_wall_ms(1_040);
         assert_eq!(
-            preferred_send_wall(sent_at, Some(kernel_tx), received_at),
-            sent_at
+            preferred_send_wall(anchor, anchor, Some(kernel_tx), received_at),
+            anchor
         );
     }
 
     #[test]
     fn preferred_send_wall_rejects_kernel_timestamp_later_than_received_at() {
-        let sent_at = send_wall_ms(1_000);
+        let anchor = send_wall_ms(1_000);
         let received_at = send_wall_ms(1_040);
         let kernel_tx = received_at + Duration::from_nanos(1);
         assert_eq!(
-            preferred_send_wall(sent_at, Some(kernel_tx), received_at),
-            sent_at
+            preferred_send_wall(anchor, anchor, Some(kernel_tx), received_at),
+            anchor
         );
     }
 
     #[test]
     fn preferred_send_wall_handles_extreme_timestamps_without_panicking() {
-        let sent_at = send_wall_ms(1_000);
+        let anchor = send_wall_ms(1_000);
         let received_at = send_wall_ms(1_040);
         let far_future = UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)) * 4;
         let before_epoch = UNIX_EPOCH - Duration::from_secs(u64::from(u32::MAX));
 
         assert_eq!(
-            preferred_send_wall(sent_at, Some(far_future), received_at),
-            sent_at
+            preferred_send_wall(anchor, anchor, Some(far_future), received_at),
+            anchor
         );
         assert_eq!(
-            preferred_send_wall(sent_at, Some(before_epoch), received_at),
-            sent_at
+            preferred_send_wall(anchor, anchor, Some(before_epoch), received_at),
+            anchor
         );
         assert_eq!(
-            preferred_send_wall(before_epoch, None, received_at),
+            preferred_send_wall(before_epoch, before_epoch, None, received_at),
             before_epoch
+        );
+    }
+
+    // Pre-/post-send decoupling (F-04): the plausibility lower bound is the
+    // pre-send anchor, but the fallback endpoint is the post-send sample,
+    // and the two can legitimately differ.
+
+    #[test]
+    fn preferred_send_wall_accepts_kernel_timestamp_before_post_send_sample() {
+        let tx_not_before_wall = send_wall_ms(1_000);
+        let post_send_sent_at = send_wall_ms(1_008);
+        let kernel_tx = send_wall_ms(1_005);
+        let received_at = send_wall_ms(1_040);
+
+        // The kernel timestamp precedes the post-send sample but follows
+        // the pre-send anchor: it must still be accepted.
+        assert_eq!(
+            preferred_send_wall(
+                tx_not_before_wall,
+                post_send_sent_at,
+                Some(kernel_tx),
+                received_at
+            ),
+            kernel_tx
+        );
+    }
+
+    #[test]
+    fn preferred_send_wall_rejected_kernel_timestamp_falls_back_to_post_send_sample() {
+        let tx_not_before_wall = send_wall_ms(1_000);
+        let post_send_sent_at = send_wall_ms(1_008);
+        let kernel_tx = send_wall_ms(999);
+        let received_at = send_wall_ms(1_040);
+
+        // Below the pre-send lower bound: rejected, and the fallback is the
+        // post-send sample, not the pre-send anchor.
+        assert_eq!(
+            preferred_send_wall(
+                tx_not_before_wall,
+                post_send_sent_at,
+                Some(kernel_tx),
+                received_at
+            ),
+            post_send_sent_at
         );
     }
 
@@ -2876,5 +2995,106 @@ mod tests {
         );
 
         assert_eq!(reply_one_way(&events).unwrap().client_to_server, None);
+    }
+
+    // F-04: post-send `sent_at` measurement timing.
+    //
+    // `sent_at` moved from immediately before timeout finalization/socket
+    // send to immediately after a successful send. These tests pin the
+    // resulting end-to-end behavior: raw RTT and the userspace upstream OWD
+    // fallback both shrink because they no longer include the send-call
+    // interval, while kernel TX plausibility keeps a separate pre-send
+    // lower bound so a legitimate `TX_SOFTWARE` timestamp generated during
+    // the send path is not rejected merely for preceding the post-send
+    // sample.
+
+    #[test]
+    fn raw_rtt_uses_post_send_sent_at_not_pre_send_anchor() {
+        let base = Instant::now();
+        // A pre-send anchor at base+100ms is deliberately not used here:
+        // raw RTT must be measured from the post-send `sent_at` at
+        // base+110ms, giving 50ms, not the 60ms a pre-send anchor would
+        // have produced.
+        let sent_at = ClientTimestamp {
+            mono: base + Duration::from_millis(110),
+            wall: SystemTime::now(),
+        };
+        let received_at = ClientTimestamp {
+            mono: base + Duration::from_millis(160),
+            wall: SystemTime::now(),
+        };
+
+        let rtt = compute_rtt(&sent_at, &received_at, &TimestampFields::default());
+
+        assert_eq!(rtt.raw, Duration::from_millis(50));
+        assert_eq!(rtt.effective, SignedDuration::from_duration(rtt.raw));
+    }
+
+    #[test]
+    fn userspace_upstream_owd_fallback_uses_post_send_sent_at() {
+        let mono = Instant::now();
+        let mut machine = machine_with_pending_probe_anchored(
+            send_wall_ms(1_000), // pre-send anchor
+            ClientTimestamp {
+                mono,
+                wall: send_wall_ms(1_008), // post-send sent_at
+            },
+        );
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        // Old behavior would have used the pre-send 1000ms sample, giving
+        // 20ms. The new fallback uses the post-send 1008ms sample.
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(12_000_000))
+        );
+    }
+
+    #[test]
+    fn kernel_tx_accepted_even_though_earlier_than_post_send_sent_at() {
+        let mono = Instant::now();
+        let mut machine = machine_with_pending_probe_anchored(
+            send_wall_ms(1_000), // pre-send anchor / tx_not_before_wall
+            ClientTimestamp {
+                mono,
+                wall: send_wall_ms(1_008), // post-send sent_at
+            },
+        );
+        // The kernel TX timestamp is after the pre-send anchor and before
+        // the reply, but before the post-send `sent_at` sample. It must
+        // remain accepted: rejecting it here would be the regression this
+        // test guards against.
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(15_000_000))
+        );
+    }
+
+    #[test]
+    fn kernel_tx_below_pre_send_anchor_falls_back_to_post_send_not_pre_send() {
+        let mono = Instant::now();
+        let mut machine = machine_with_pending_probe_anchored(
+            send_wall_ms(1_000), // pre-send anchor / tx_not_before_wall
+            ClientTimestamp {
+                mono,
+                wall: send_wall_ms(1_008), // post-send sent_at
+            },
+        );
+        // Earlier than even the pre-send anchor: implausible, rejected.
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(999));
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        // Fallback is the post-send 1008ms sample (12ms), not the pre-send
+        // 1000ms anchor (which would have given 20ms).
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(12_000_000))
+        );
     }
 }

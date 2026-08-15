@@ -75,9 +75,12 @@ struct ClientTestHooks {
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct ProbeSendTimestamps {
     pub(crate) permission_at: Instant,
-    pub(crate) sent_at: ClientTimestamp,
+    /// Private pre-send anchor: timeout deadline / kernel TX lower bound.
+    pub(crate) send_anchor: ClientTimestamp,
     pub(crate) send_call_start: Instant,
     pub(crate) send_finished_at: Instant,
+    /// Public post-send measurement: RTT / OWD fallback / timer_error.
+    pub(crate) sent_at: ClientTimestamp,
 }
 
 #[cfg(test)]
@@ -410,13 +413,17 @@ impl Client {
         let scheduled_at = schedule_commit.scheduled_at;
         #[cfg(test)]
         let reported_bytes = self.probe_reported_len.take();
+        // All fallible probe-commit preflight (timeout deadline arithmetic,
+        // capacity/collision checks already done above) is finalized from
+        // this PRIVATE pre-send anchor, before the socket send. It is not
+        // the public measurement `sent_at` captured further below.
         #[cfg(not(test))]
-        let sent_at = ClientTimestamp::now();
+        let send_anchor = ClientTimestamp::now();
         #[cfg(test)]
-        let sent_at = test_timestamps
-            .map(|timestamps| timestamps.sent_at)
+        let send_anchor = test_timestamps
+            .map(|timestamps| timestamps.send_anchor)
             .unwrap_or_else(ClientTimestamp::now);
-        let machine_commit = runtime.finalize_probe_commit(machine_preflight, sent_at)?;
+        let machine_commit = runtime.finalize_probe_commit(machine_preflight, send_anchor)?;
         #[cfg(not(test))]
         let send_call_start = Instant::now();
         #[cfg(test)]
@@ -436,7 +443,17 @@ impl Client {
         let send_finished_at = test_timestamps
             .map(|timestamps| timestamps.send_finished_at)
             .unwrap_or_else(Instant::now);
-        let sent = runtime.commit_probe_sent(machine_commit, bytes);
+        // The public measurement timestamp: paired wall/monotonic sample
+        // captured immediately after the successful socket send completed.
+        // This, not `send_anchor` above, is the RTT/OWD-fallback/timer_error
+        // endpoint. The infallible machine/schedule commit below never fails.
+        #[cfg(not(test))]
+        let sent_at = ClientTimestamp::now();
+        #[cfg(test)]
+        let sent_at = test_timestamps
+            .map(|timestamps| timestamps.sent_at)
+            .unwrap_or_else(ClientTimestamp::now);
+        let sent = runtime.commit_probe_sent(machine_commit, sent_at, bytes);
         schedule.commit(schedule_commit);
 
         let send_call = send_finished_at.saturating_duration_since(send_call_start);
