@@ -638,6 +638,7 @@ mod tests {
     /// now is structurally fine, and judging it belongs to whoever measures
     /// with it.
     #[cfg(target_os = "linux")]
+    #[cfg_attr(target_env = "musl", allow(deprecated))]
     #[test]
     fn a_kernel_timestamp_converts_only_where_it_describes_an_instant() {
         assert_eq!(
@@ -660,10 +661,10 @@ mod tests {
             None
         );
         assert_eq!(
-            system_time_from_timespec(TimeSpec::new(i64::MIN, i64::MIN)),
+            system_time_from_timespec(TimeSpec::new(libc::time_t::MIN, libc::c_long::MIN)),
             None,
             "and the extremes convert rather than panic"
         );
-        let _ = system_time_from_timespec(TimeSpec::new(i64::MAX, 999_999_999));
+        let _ = system_time_from_timespec(TimeSpec::new(libc::time_t::MAX, 999_999_999));
     }
 }
