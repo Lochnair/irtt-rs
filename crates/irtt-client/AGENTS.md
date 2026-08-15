@@ -96,33 +96,75 @@ socket.
 ## Retained state
 
 `PendingProbe` carries an optional `kernel_tx_timestamp: Option<SystemTime>`
-alongside the authoritative userspace `sent_at`. It survives pending ->
-timed-out retention (`SessionMachine::record_kernel_tx_timestamp` updates
-whichever of `PendingMap`/`TimedOutMap` still holds the probe) and is
-otherwise bounded by the same limits those maps already enforce — no new
-unbounded state. First valid observation wins on duplicates.
+alongside the userspace `sent_at`. It survives pending -> timed-out retention
+(`SessionMachine::record_kernel_tx_timestamp` updates whichever of
+`PendingMap`/`TimedOutMap` still holds the probe) and is otherwise bounded by
+the same limits those maps already enforce — no new unbounded state. First
+valid observation wins on duplicates.
 
-**It is eligible for exactly one measurement: the upstream (`client_to_server`)
-one-way delay send endpoint.** `compute_one_way`'s private `preferred_send_wall`
-helper prefers it over the userspace `sent_at.wall` sample when
+### Pre-send anchor vs. post-send `sent_at` (F-04)
 
-    sent_at.wall <= kernel_tx_timestamp <= reply_received_at.wall
+The probe send transaction splits into two timestamps around the socket
+send, not one:
+
+- A **private pre-send anchor**, sampled immediately before the fallible
+  commit preflight (`SessionMachine::finalize_probe_commit`) that must
+  happen before the socket send: timeout deadline `checked_add` arithmetic
+  (so `DurationOverflow` still guarantees nothing was transmitted) and the
+  kernel TX lower-plausibility bound. Its monotonic half becomes
+  `PendingProbe::timeout_at`'s basis; its wall half becomes
+  `PendingProbe::tx_not_before_wall`. It is never exposed publicly.
+- The **public `sent_at`**, a paired wall/monotonic `ClientTimestamp`
+  captured immediately after the socket send returns successfully
+  (`SessionMachine::commit_probe_sent`, which is infallible — all fallible
+  work already happened against the pre-send anchor). This is the RTT
+  endpoint, the userspace upstream-OWD fallback endpoint, `timer_error`'s
+  basis, and the value surfaced on `EchoSent`/`EchoReply`/`EchoLoss`/
+  `LateReply`.
+
+So `timeout_at` is deliberately **not** derived from `sent_at.mono` — it
+remains anchored to before the send, on purpose, so the existing pre-send
+timeout/overflow/no-send contract is unchanged. Only the *measurement*
+`sent_at` moved to after the send. A `WouldBlock` `try_send` (Tokio) never
+samples a `sent_at`, never calls `finalize_probe_commit`'s matching
+`commit_probe_sent`, and never advances the machine or schedule; each retry
+gets its own fresh pre-send anchor, and only a successful attempt's anchor
+and `sent_at` are ever retained.
+
+**The kernel TX timestamp is eligible for exactly one measurement: the
+upstream (`client_to_server`) one-way delay send endpoint.**
+`compute_one_way`'s private `preferred_send_wall` helper prefers it over the
+userspace `sent_at.wall` sample when
+
+    tx_not_before_wall <= kernel_tx_timestamp <= reply_received_at.wall
 
 (inclusive, compared only against the client's own wall clock — never
-against the remote server's wall timestamp). Otherwise, including when no
-kernel timestamp was observed, the upstream endpoint falls back to
-`sent_at.wall`; a rejected observation is never erased from `PendingProbe`,
-only skipped for that measurement. There is no maximum-lag bound: unlike the
-kernel receive side, legitimate client send-to-reply time can exceed a
-second.
+against the remote server's wall timestamp). The lower bound is the
+pre-send `tx_not_before_wall`, not the post-send `sent_at.wall`: a
+legitimate `TX_SOFTWARE` timestamp can be generated while the send syscall
+is still in flight, so it can legitimately precede the post-send `sent_at`
+sample without being implausible. Otherwise, including when no kernel
+timestamp was observed, the upstream endpoint falls back to `sent_at.wall`
+(the post-send sample); a rejected observation is never erased from
+`PendingProbe`, only skipped for that measurement. There is no
+maximum-lag bound: unlike the kernel receive side, legitimate client
+send-to-reply time can exceed a second.
 
-`sent_at` remains the sole input to RTT, timeout/scheduling, and the
-downstream (`server_to_client`) one-way delay, exactly as before this
-capability existed; `TX_SOFTWARE` is still a software kernel timestamp near
-the driver handoff, not a NIC hardware transmit time. IPDV is likewise
-unaffected — it is computed from the existing userspace timestamp fields
-only. A normal reply and a measurable late reply (one whose `PendingProbe`
-is still retained in `TimedOutMap`) apply the identical selection policy; an
+`sent_at` remains the RTT endpoint and the userspace fallback for the
+upstream (`client_to_server`) one-way delay, exactly as before this
+capability existed. It is not an input to the downstream
+(`server_to_client`) one-way delay, which is derived solely from
+`ReceiveMeta::preferred_receive_wall` and the negotiated server send
+timestamp — unaffected by this capability or by F-04. `TX_SOFTWARE` is
+still a software kernel timestamp near the driver handoff, not a NIC
+hardware transmit time. `irtt-stats`'s `ReplySample`
+copies public `sent_at` straight into `client_send_mono`/`client_send_wall_ns`,
+which `send_ipdv_ns` compares across probes for the upstream IPDV component —
+so that component shifts endpoint along with `sent_at` itself (pre-send vs.
+post-send) exactly as RTT and the upstream OWD fallback do; it is not a
+separate invariant. A normal
+reply and a measurable late reply (one whose `PendingProbe` is still
+retained in `TimedOutMap`) apply the identical selection policy; an
 untracked late reply has no retained probe and stays unmeasurable, and a
 kernel timestamp that arrives after a reply has already been processed is
 simply never observed by that reply.

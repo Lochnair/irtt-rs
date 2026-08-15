@@ -94,16 +94,19 @@ pub enum ClientEvent {
         remote: SocketAddr,
         /// Monotonic deadline at which the probe was scheduled to be sent.
         scheduled_at: Instant,
-        /// Client wall/monotonic timestamp captured after probe preparation,
-        /// immediately before timeout finalization and the socket send.
+        /// Paired client wall/monotonic timestamp captured immediately after
+        /// the successful UDP send completed. This is the RTT and userspace
+        /// upstream one-way-delay fallback endpoint. The operational probe
+        /// timeout deadline is computed from an earlier, private, pre-send
+        /// timestamp instead — see the client crate's `AGENTS.md`.
         sent_at: ClientTimestamp,
         /// Number of bytes passed to the UDP socket.
         bytes: usize,
         /// Elapsed time spent in the socket send call, excluding protocol and
         /// scheduler commit work.
         send_call: Duration,
-        /// Absolute difference between the scheduled send time and actual send
-        /// timestamp.
+        /// Absolute difference between the scheduled send time and the
+        /// post-send `sent_at` timestamp above.
         timer_error: Duration,
     },
 
@@ -117,7 +120,8 @@ pub enum ClientEvent {
         seq: u32,
         /// Resolved remote socket address.
         remote: SocketAddr,
-        /// Client timestamp recorded when the matching request was sent.
+        /// Client timestamp recorded immediately after the matching request
+        /// finished sending (see `ClientEvent::EchoSent::sent_at`).
         sent_at: ClientTimestamp,
         /// Client timestamp recorded when the reply was received.
         received_at: ClientTimestamp,
@@ -143,7 +147,10 @@ pub enum ClientEvent {
     EchoLoss {
         /// Wire sequence number that timed out.
         seq: u32,
-        /// Client timestamp recorded when the request was sent.
+        /// Client timestamp recorded immediately after the request finished
+        /// sending (see `ClientEvent::EchoSent::sent_at`). The timeout
+        /// deadline below is anchored to an earlier, private, pre-send
+        /// timestamp, not to this one.
         sent_at: ClientTimestamp,
         /// Monotonic deadline at which the probe was declared lost.
         timeout_at: std::time::Instant,
@@ -178,7 +185,8 @@ pub enum ClientEvent {
         highest_seen: u32,
         /// Resolved remote socket address.
         remote: SocketAddr,
-        /// Original client send timestamp, when still retained.
+        /// Original post-send client timestamp, when still retained (see
+        /// `ClientEvent::EchoSent::sent_at`).
         sent_at: Option<ClientTimestamp>,
         /// Client timestamp recorded when the late reply was received.
         received_at: ClientTimestamp,

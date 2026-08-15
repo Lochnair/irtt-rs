@@ -354,6 +354,7 @@ fn timeout_probe(seq: u32, sent_at: Instant, timeout_at: Instant) -> PendingProb
             wall: SystemTime::UNIX_EPOCH,
         },
         timeout_at,
+        tx_not_before_wall: SystemTime::UNIX_EPOCH,
         kernel_tx_timestamp: None,
     }
 }

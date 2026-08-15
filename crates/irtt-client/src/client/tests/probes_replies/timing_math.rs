@@ -72,7 +72,14 @@ fn compute_one_way_omits_samples_when_client_wall_time_overflows_i64() {
     };
 
     assert_eq!(
-        compute_one_way(&sent_at, &received_at, None, &ReceiveMeta::default(), &ts),
+        compute_one_way(
+            &sent_at,
+            sent_at.wall,
+            &received_at,
+            None,
+            &ReceiveMeta::default(),
+            &ts
+        ),
         None
     );
 }
@@ -93,8 +100,15 @@ fn compute_one_way_returns_available_direction_samples() {
         ..Default::default()
     };
 
-    let sample =
-        compute_one_way(&sent_at, &received_at, None, &ReceiveMeta::default(), &ts).unwrap();
+    let sample = compute_one_way(
+        &sent_at,
+        sent_at.wall,
+        &received_at,
+        None,
+        &ReceiveMeta::default(),
+        &ts,
+    )
+    .unwrap();
     assert_eq!(
         sample.client_to_server,
         Some(SignedDuration::from_nanos(15_000_000))
@@ -121,8 +135,15 @@ fn compute_one_way_preserves_negative_client_to_server_delay() {
         ..Default::default()
     };
 
-    let sample =
-        compute_one_way(&sent_at, &received_at, None, &ReceiveMeta::default(), &ts).unwrap();
+    let sample = compute_one_way(
+        &sent_at,
+        sent_at.wall,
+        &received_at,
+        None,
+        &ReceiveMeta::default(),
+        &ts,
+    )
+    .unwrap();
 
     assert_eq!(
         sample.client_to_server,
@@ -150,8 +171,15 @@ fn compute_one_way_preserves_negative_server_to_client_delay() {
         ..Default::default()
     };
 
-    let sample =
-        compute_one_way(&sent_at, &received_at, None, &ReceiveMeta::default(), &ts).unwrap();
+    let sample = compute_one_way(
+        &sent_at,
+        sent_at.wall,
+        &received_at,
+        None,
+        &ReceiveMeta::default(),
+        &ts,
+    )
+    .unwrap();
 
     assert_eq!(
         sample.client_to_server,

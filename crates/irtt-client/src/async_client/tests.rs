@@ -689,12 +689,14 @@ fn probe_false_readiness_resamples_all_timestamps() {
         client.test_hooks.probe_timestamps.borrow_mut().extend([
             ProbeSendTimestamps {
                 permission_at: scheduled_at + Duration::from_millis(1),
+                send_anchor: first_sent,
                 sent_at: first_sent,
                 send_call_start: scheduled_at + Duration::from_millis(4),
                 send_finished_at: scheduled_at + Duration::from_millis(6),
             },
             ProbeSendTimestamps {
                 permission_at: scheduled_at + Duration::from_millis(8),
+                send_anchor: second_sent,
                 sent_at: second_sent,
                 send_call_start: scheduled_at + Duration::from_millis(12),
                 send_finished_at: scheduled_at + Duration::from_millis(17),
@@ -741,6 +743,7 @@ fn public_timeout_polling_remains_exhaustive() {
                     wall: SystemTime::UNIX_EPOCH,
                 },
                 timeout_at: now - Duration::from_secs(1),
+                tx_not_before_wall: SystemTime::UNIX_EPOCH,
                 kernel_tx_timestamp: None,
             });
         }
@@ -803,7 +806,7 @@ fn stale_retained_probe_is_rejected_before_send() {
             .unwrap();
         client
             .machine
-            .commit_probe_sent(commit, advanced.bytes.len());
+            .commit_probe_sent(commit, ClientTimestamp::now(), advanced.bytes.len());
         let attempts = client.test_hooks.send_attempts.get();
 
         assert!(matches!(
@@ -832,6 +835,10 @@ fn finite_duration_boundary_clears_preparation_without_send() {
             .borrow_mut()
             .push_back(ProbeSendTimestamps {
                 permission_at: start + Duration::from_millis(20),
+                send_anchor: ClientTimestamp {
+                    wall: SystemTime::UNIX_EPOCH,
+                    mono: start + Duration::from_millis(21),
+                },
                 sent_at: ClientTimestamp {
                     wall: SystemTime::UNIX_EPOCH,
                     mono: start + Duration::from_millis(21),
