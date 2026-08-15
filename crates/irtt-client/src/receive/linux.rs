@@ -1,25 +1,30 @@
-//! Linux ancillary receive metadata.
+//! Linux ancillary receive and transmit metadata.
 //!
 //! Receive kernel timing uses `SO_TIMESTAMPING` with `RX_SOFTWARE` +
 //! `SOFTWARE` (reported via `SCM_TIMESTAMPING`), not the older
 //! `SO_TIMESTAMPNS`/`SCM_TIMESTAMPNS`. Linux documents fallback quirks when
 //! `SO_TIMESTAMP[NS]` and `SO_TIMESTAMPING` are both enabled on one socket,
-//! so this establishes one unambiguous software-timestamp facility before
-//! TX-side timing is introduced in a follow-up change. `ReceiveMeta`'s
+//! so this establishes one unambiguous software-timestamp facility. `ReceiveMeta`'s
 //! semantics — an optional observed kernel receive wall time, used for
 //! downstream one-way delay only when plausible relative to the userspace
-//! receive sample — are unchanged by this.
+//! receive sample — are unchanged by any of this module's TX-side additions.
 //!
-//! `SOF_TIMESTAMPING_TX_SOFTWARE` is never requested on the production
-//! socket in [`configure_receive_metadata`]. TX flag construction,
-//! `MSG_ERRQUEUE` parsing, and extended-error classification exist as
-//! test-only primitives in [`error_queue`] for a follow-up change to build
-//! on; production does not generate or drain TX timestamp records yet.
+//! After a successful Open, the client adapter best-effort upgrades the
+//! socket from [`RX_TIMESTAMPING_FLAGS`] to [`error_queue::TX_TIMESTAMPING_FLAGS`]
+//! via [`try_enable_tx_timestamping`]. When that succeeds, the automatic
+//! `SOF_TIMESTAMPING_OPT_ID` counter the kernel assigns to each successfully
+//! submitted datagram is used directly as the probe's wire sequence number
+//! (see the client crate's `AGENTS.md` for the correlation invariant this
+//! relies on). [`drain_tx_timestamps`] performs a small bounded, nonblocking
+//! read of `MSG_ERRQUEUE` so the adapter can opportunistically collect those
+//! timestamps without ever waiting for one. The observed kernel TX wall time
+//! is retained as metadata only; it is not consumed by any measurement in
+//! this change.
 
 use std::{
     io::{self, IoSliceMut},
     net::{SocketAddr, UdpSocket},
-    os::fd::{AsRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, RawFd},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
@@ -33,10 +38,74 @@ use nix::sys::{
 
 use crate::{metadata::ReceiveMeta, receive::ReceivedDatagram, timing::ClientTimestamp};
 
-#[cfg(test)]
-mod error_queue;
+pub(crate) mod error_queue;
 
-/// `SO_TIMESTAMPING` flags requested on the production receive socket.
+use error_queue::ErrorQueueRecord;
+
+/// Starvation guard on one opportunistic `MSG_ERRQUEUE` drain.
+///
+/// Each successfully submitted, TX-timestamped datagram generates at most
+/// one record, and drains happen at several natural choke points (after a
+/// probe send, after a normal receive, before timeout expiry), so this is
+/// not a queue-capacity promise: it just bounds the work one drain call can
+/// do. A handful of in-flight probes' worth of backlog is the realistic
+/// case between choke points, so a small constant comfortably covers it
+/// without any unbounded loop.
+pub(crate) const MAX_TX_TIMESTAMP_RECORDS_PER_DRAIN: usize = 32;
+
+/// Best-effort upgrade from RX-only to RX+TX `SO_TIMESTAMPING` flags.
+///
+/// Returns `true` when the upgrade succeeded and the caller may now expect
+/// `MSG_ERRQUEUE` TX timestamp records for subsequent sends. On failure, the
+/// original [`RX_TIMESTAMPING_FLAGS`] are best-effort restored so a failed
+/// upgrade cannot leave the socket without the RX timestamping this client
+/// already depends on; that restore's own failure is not observable here
+/// (both leave the caller without TX capability, which this return value
+/// already reports).
+pub(crate) fn try_enable_tx_timestamping<S: AsFd>(socket: &S) -> bool {
+    if setsockopt(
+        socket,
+        sockopt::Timestamping,
+        &error_queue::TX_TIMESTAMPING_FLAGS,
+    )
+    .is_ok()
+    {
+        return true;
+    }
+    let _ = setsockopt(socket, sockopt::Timestamping, &RX_TIMESTAMPING_FLAGS);
+    false
+}
+
+/// Bounded, nonblocking drain of `fd`'s `MSG_ERRQUEUE`.
+///
+/// Reads and classifies up to [`MAX_TX_TIMESTAMP_RECORDS_PER_DRAIN`] records,
+/// one at a time with no intermediate allocation. Each usable TX timestamp
+/// completion is reported to `on_timestamp` immediately. Malformed or
+/// unsupported timestamp notifications and unrelated records are silently
+/// dropped: timestamp metadata is optional and never fails a probe. A
+/// genuine non-timestamp socket/network error stops the drain and is
+/// returned to the caller, which decides how to surface it.
+pub(crate) fn drain_tx_timestamps<S: AsRawFd>(
+    socket: &S,
+    mut on_timestamp: impl FnMut(u32, SystemTime),
+) -> io::Result<()> {
+    let fd = socket.as_raw_fd();
+    for _ in 0..MAX_TX_TIMESTAMP_RECORDS_PER_DRAIN {
+        match error_queue::try_recv_error_queue_record(fd)? {
+            None => return Ok(()),
+            Some(ErrorQueueRecord::TxTimestamp { id, timestamp }) => on_timestamp(id, timestamp),
+            Some(ErrorQueueRecord::MalformedOrUnsupportedTimestamp | ErrorQueueRecord::Ignored) => {
+            }
+            Some(ErrorQueueRecord::SocketError { errno, .. }) => {
+                return Err(io::Error::from_raw_os_error(errno));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `SO_TIMESTAMPING` flags requested on every production socket at
+/// connect time, before any TX upgrade is attempted.
 ///
 /// `SOF_TIMESTAMPING_RX_SOFTWARE` asks the kernel to generate a software
 /// receive timestamp for each datagram; `SOF_TIMESTAMPING_SOFTWARE` asks it
@@ -44,7 +113,8 @@ mod error_queue;
 /// the older `SO_TIMESTAMP`/`SO_TIMESTAMPNS` on the same socket has
 /// documented fallback quirks, so the client uses `SO_TIMESTAMPING`
 /// exclusively for receive timing. Hardware and TX-side flags are
-/// deliberately excluded: this socket is receive-only.
+/// deliberately excluded here: a fresh socket is receive-only until (and
+/// unless) [`try_enable_tx_timestamping`] later upgrades it.
 const RX_TIMESTAMPING_FLAGS: TimestampingFlag = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
     .union(TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE);
 
@@ -429,5 +499,56 @@ mod tests {
             error.kind(),
             io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
         )
+    }
+
+    #[test]
+    fn try_enable_tx_timestamping_then_drain_reports_ids_through_the_adapter_api() {
+        let (socket, _peer) = connected_ipv4_loopback_pair();
+        // Mirrors production: RX-only first, then a best-effort upgrade.
+        configure_receive_metadata(&socket, socket.peer_addr().unwrap()).unwrap();
+
+        if !super::try_enable_tx_timestamping(&socket) {
+            eprintln!(
+                "skipping adapter-level TX timestamping smoke test: kernel/container denied \
+                 SO_TIMESTAMPING TX flags"
+            );
+            return;
+        }
+
+        if let Err(error) = socket.send(b"one") {
+            eprintln!("skipping adapter-level TX timestamping smoke test: send failed: {error}");
+            return;
+        }
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        let mut observed = None;
+        while observed.is_none() && std::time::Instant::now() < deadline {
+            super::drain_tx_timestamps(&socket, |id, timestamp| {
+                observed = Some((id, timestamp));
+            })
+            .unwrap();
+            std::thread::yield_now();
+        }
+
+        let Some((id, timestamp)) = observed else {
+            eprintln!(
+                "skipping adapter-level TX timestamping smoke test: no TX timestamp record \
+                 arrived within the poll deadline"
+            );
+            return;
+        };
+        assert_eq!(id, 0);
+        assert!(timestamp.duration_since(UNIX_EPOCH).unwrap() > Duration::ZERO);
+    }
+
+    #[test]
+    fn drain_tx_timestamps_is_a_bounded_nonblocking_no_op_on_an_untouched_socket() {
+        let (socket, _peer) = connected_ipv4_loopback_pair();
+        configure_receive_metadata(&socket, socket.peer_addr().unwrap()).unwrap();
+
+        let mut calls = 0_usize;
+        super::drain_tx_timestamps(&socket, |_, _| calls += 1).unwrap();
+
+        assert_eq!(calls, 0);
     }
 }
