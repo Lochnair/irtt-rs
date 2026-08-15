@@ -59,7 +59,6 @@ pub fn run_stream(
         args.columns.as_deref(),
         args.header,
         args.verbose,
-        multi_target,
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let continuous = args.is_continuous();

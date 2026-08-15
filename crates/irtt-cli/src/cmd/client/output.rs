@@ -27,15 +27,14 @@ impl OutputConfig {
         columns: Option<&str>,
         header: HeaderMode,
         verbose: bool,
-        multi_target: bool,
     ) -> Result<Self, String> {
         let uses_default_columns = columns
             .map(|columns| columns.trim() == "default")
             .unwrap_or(true);
         let default_table_rows = format == OutputFormat::Table && uses_default_columns;
         let columns = match columns {
-            Some(columns) => parse_columns(columns, format, verbose, multi_target)?,
-            None => default_columns(format, verbose, multi_target),
+            Some(columns) => parse_columns(columns, format, verbose)?,
+            None => default_columns(format, verbose),
         };
 
         Ok(Self {
@@ -723,12 +722,7 @@ impl CellValue {
     }
 }
 
-fn parse_columns(
-    input: &str,
-    format: OutputFormat,
-    verbose: bool,
-    multi_target: bool,
-) -> Result<Vec<Column>, String> {
+fn parse_columns(input: &str, format: OutputFormat, verbose: bool) -> Result<Vec<Column>, String> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err("--columns requires at least one column".to_owned());
@@ -737,7 +731,7 @@ fn parse_columns(
         return Ok(ALL_COLUMNS.to_vec());
     }
     if trimmed == "default" {
-        return Ok(default_columns(format, verbose, multi_target));
+        return Ok(default_columns(format, verbose));
     }
 
     let mut columns = Vec::new();
@@ -754,10 +748,11 @@ fn parse_columns(
     Ok(columns)
 }
 
-fn default_columns(format: OutputFormat, verbose: bool, multi_target: bool) -> Vec<Column> {
+fn default_columns(format: OutputFormat, verbose: bool) -> Vec<Column> {
     match format {
         OutputFormat::Table => {
             let mut columns = vec![
+                Column::Target,
                 Column::Event,
                 Column::Seq,
                 Column::Rtt,
@@ -767,9 +762,6 @@ fn default_columns(format: OutputFormat, verbose: bool, multi_target: bool) -> V
                 Column::ServerProcessing,
                 Column::Message,
             ];
-            if multi_target {
-                columns.insert(0, Column::Target);
-            }
             if verbose {
                 columns.extend([
                     Column::Remote,
@@ -784,17 +776,7 @@ fn default_columns(format: OutputFormat, verbose: bool, multi_target: bool) -> V
             }
             columns
         }
-        OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Jsonl => {
-            if multi_target {
-                ALL_COLUMNS.to_vec()
-            } else {
-                ALL_COLUMNS
-                    .iter()
-                    .copied()
-                    .filter(|column| *column != Column::Target)
-                    .collect()
-            }
-        }
+        OutputFormat::Csv | OutputFormat::Tsv | OutputFormat::Jsonl => ALL_COLUMNS.to_vec(),
     }
 }
 
@@ -1209,12 +1191,8 @@ mod tests {
         time::Instant,
     };
 
-    fn output_config(
-        format: OutputFormat,
-        columns: Option<&str>,
-        multi_target: bool,
-    ) -> OutputConfig {
-        OutputConfig::new(format, columns, HeaderMode::Auto, false, multi_target).unwrap()
+    fn output_config(format: OutputFormat, columns: Option<&str>) -> OutputConfig {
+        OutputConfig::new(format, columns, HeaderMode::Auto, false).unwrap()
     }
 
     fn remote() -> SocketAddr {
@@ -1254,38 +1232,48 @@ mod tests {
     }
 
     #[test]
-    fn default_table_columns_include_target_only_for_multi_target() {
-        let single = output_config(OutputFormat::Table, None, false)
-            .render_header()
-            .unwrap();
-        let multi = output_config(OutputFormat::Table, None, true)
+    fn default_table_columns_always_include_target_first() {
+        let header = output_config(OutputFormat::Table, None)
             .render_header()
             .unwrap();
 
-        assert!(!single.split_whitespace().any(|column| column == "target"));
-        assert_eq!(multi.split_whitespace().next(), Some("target"));
+        assert_eq!(header.split_whitespace().next(), Some("target"));
     }
 
     #[test]
-    fn default_structured_columns_include_target_for_multi_target() {
-        let single = output_config(OutputFormat::Csv, None, false)
-            .render_header()
-            .unwrap();
-        let multi = output_config(OutputFormat::Csv, None, true)
-            .render_header()
-            .unwrap();
+    fn default_structured_columns_always_include_target_first() {
+        for format in [OutputFormat::Csv, OutputFormat::Tsv, OutputFormat::Jsonl] {
+            let columns = default_columns(format, false);
+            assert_eq!(columns.first(), Some(&Column::Target));
+            assert_eq!(columns, ALL_COLUMNS);
+        }
+    }
 
-        assert!(!single.split(',').any(|column| column == "target"));
-        assert_eq!(multi.split(',').next(), Some("target"));
+    #[test]
+    fn columns_default_keyword_matches_omitted_columns() {
+        for format in [
+            OutputFormat::Table,
+            OutputFormat::Csv,
+            OutputFormat::Tsv,
+            OutputFormat::Jsonl,
+        ] {
+            let omitted = output_config(format, None).render_header();
+            let explicit = output_config(format, Some("default")).render_header();
+            assert_eq!(omitted, explicit);
+        }
+    }
+
+    #[test]
+    fn custom_columns_do_not_insert_target() {
+        let config = output_config(OutputFormat::Csv, Some("seq,effective_rtt_us"));
+        let header = config.render_header().unwrap();
+
+        assert!(!header.split(',').any(|column| column == "target"));
     }
 
     #[test]
     fn custom_target_column_renders_label() {
-        let config = output_config(
-            OutputFormat::Csv,
-            Some("target,seq,effective_rtt_us"),
-            false,
-        );
+        let config = output_config(OutputFormat::Csv, Some("target,seq,effective_rtt_us"));
         let line = config
             .render_event(&reply(), Some("ams"), Some(&EventRenderStats::default()))
             .unwrap();
@@ -1295,5 +1283,25 @@ mod tests {
             Some("target,seq,effective_rtt_us")
         );
         assert_eq!(line, "ams,7,1200");
+    }
+
+    #[test]
+    fn default_csv_renders_target_label_in_row() {
+        let config = output_config(OutputFormat::Csv, None);
+        let line = config
+            .render_event(&reply(), Some("ams"), Some(&EventRenderStats::default()))
+            .unwrap();
+
+        assert_eq!(line.split(',').next(), Some("ams"));
+    }
+
+    #[test]
+    fn default_jsonl_renders_target_key_first() {
+        let config = output_config(OutputFormat::Jsonl, None);
+        let line = config
+            .render_event(&reply(), Some("ams"), Some(&EventRenderStats::default()))
+            .unwrap();
+
+        assert!(line.starts_with("{\"target\":\"ams\""));
     }
 }
