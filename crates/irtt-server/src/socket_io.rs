@@ -90,10 +90,23 @@ pub(crate) fn configure_destination_metadata(
 /// `select_reply_source` is the listener's own wildcard-ness, decided once at
 /// construction. It is never inferred from a peer address.
 ///
-/// `Ok(None)` is a datagram the runtime must drop without letting it reach the
-/// core: it was truncated, its ancillary metadata was truncated, or a wildcard
-/// listener could not recover its local destination. Answering it correctly is
-/// impossible, so it must not advance any session's state either.
+/// This is the one place deciding whether a datagram may reach
+/// [`ServerCore`](crate::ServerCore). `Ok(Some(..))` is a datagram the transport
+/// layer accepts; `Ok(None)` is one the caller must consume and drop without
+/// advancing any protocol or session state, because answering it correctly is
+/// impossible. `Ok(None)` covers:
+///
+/// - payload truncation reported by an ancillary receive (`MSG_TRUNC`);
+/// - ancillary metadata truncation (`MSG_CTRUNC`);
+/// - a wildcard listener's missing or unusable local destination;
+/// - a datagram filling `buffer` exactly, which is conservatively treated as
+///   potentially truncated.
+///
+/// That last rule exists because `recv_from` reports no truncation flag, so an
+/// exactly-full result cannot be told apart from a larger datagram cut down to
+/// the supplied capacity. It is expressed against `buffer.len()`, so the policy
+/// follows whatever receive capacity the caller supplies, and it applies to both
+/// receive paths alike.
 ///
 /// Cancel-safe: nothing is consumed until a datagram is fully received.
 pub(crate) async fn receive(
@@ -101,16 +114,19 @@ pub(crate) async fn receive(
     buffer: &mut [u8],
     select_reply_source: bool,
 ) -> io::Result<Option<ReceivedDatagram>> {
-    if select_reply_source {
-        return receive_with_destination(socket, buffer).await;
-    }
+    let capacity = buffer.len();
+    let received = if select_reply_source {
+        receive_with_destination(socket, buffer).await?
+    } else {
+        let (len, peer) = socket.recv_from(buffer).await?;
+        Some(ReceivedDatagram {
+            len,
+            peer,
+            reply_source: ReplySource::Bound,
+        })
+    };
 
-    let (len, peer) = socket.recv_from(buffer).await?;
-    Ok(Some(ReceivedDatagram {
-        len,
-        peer,
-        reply_source: ReplySource::Bound,
-    }))
+    Ok(received.filter(|datagram| datagram.len < capacity))
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))]
@@ -154,4 +170,66 @@ fn unsupported() -> io::Error {
         io::ErrorKind::Unsupported,
         "reply source-address selection is unsupported on this target",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use std::net::Ipv4Addr;
+
+    use super::*;
+
+    /// Sends `payload` to a fresh explicit-address listener and returns what the
+    /// transport layer decided about it, received into a `capacity`-byte buffer.
+    ///
+    /// The buffer is deliberately tiny: the full-buffer rule is written against
+    /// the caller's capacity, so it is provable without a 65,536-byte datagram.
+    async fn receive_one(
+        capacity: usize,
+        payload: &[u8],
+    ) -> (io::Result<Option<ReceivedDatagram>>, Vec<u8>) {
+        let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        sender
+            .send_to(payload, listener.local_addr().unwrap())
+            .await
+            .unwrap();
+
+        let mut buffer = vec![0; capacity];
+        let received = receive(&listener, &mut buffer, false).await;
+        (received, buffer)
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_datagram_shorter_than_the_buffer_reaches_the_core_intact() {
+        let payload = b"irtt";
+        let (received, buffer) = receive_one(16, payload).await;
+
+        let received = received
+            .unwrap()
+            .expect("a datagram that cannot have been truncated is accepted");
+        assert_eq!(received.len, payload.len());
+        assert_eq!(received.peer.ip(), Ipv4Addr::LOCALHOST);
+        assert_eq!(received.reply_source, ReplySource::Bound);
+        assert_eq!(&buffer[..received.len], payload);
+    }
+
+    /// An exactly-full receive is ambiguous, not obviously fine: `recv_from`
+    /// reports no truncation flag, so this datagram is indistinguishable from a
+    /// larger one cut down to the same capacity. Both are dropped.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_datagram_filling_the_buffer_is_dropped_as_possibly_truncated() {
+        let (received, _) = receive_one(4, b"irtt").await;
+        assert!(received.unwrap().is_none());
+    }
+
+    /// What matters is that an oversized datagram never reaches the core, not
+    /// how the platform says so: Unix truncates it to the buffer, which the
+    /// full-buffer rule then drops, while Windows fails the receive outright
+    /// with `WSAEMSGSIZE`. Asserting the shared guarantee keeps this test true
+    /// on both.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_datagram_larger_than_the_buffer_never_reaches_the_core() {
+        let (received, _) = receive_one(4, b"irtt-rs").await;
+        assert!(!matches!(received, Ok(Some(_))));
+    }
 }

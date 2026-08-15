@@ -19,9 +19,10 @@ use crate::{
 
 /// Fixed transport receive capacity.
 ///
-/// Standard UDP payloads fit in this buffer. A datagram reported as filling it
-/// exactly is dropped conservatively instead of passing potentially truncated
-/// bytes to the protocol core. IPv6 jumbograms are not supported.
+/// Standard UDP payloads fit in this buffer; IPv6 jumbograms are not supported.
+/// This is allocation policy only: whether a received datagram may reach the
+/// protocol core — the conservative rejection of one filling the buffer
+/// included — belongs to [`socket_io::receive`].
 const RECEIVE_BUFFER_LEN: usize = 65_536;
 const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -218,10 +219,6 @@ impl Server {
                         Err(source) => return Err(ServerRuntimeError::Receive { source }),
                     };
                     let (len, peer) = (received.len, received.peer);
-                    if len == RECEIVE_BUFFER_LEN {
-                        continue;
-                    }
-
                     if let Some(reply) = self.core.handle_datagram(peer, &self.recv_buffer[..len])? {
                         if !self.prepare_reply_traffic_class(reply.traffic_class()) {
                             continue;
