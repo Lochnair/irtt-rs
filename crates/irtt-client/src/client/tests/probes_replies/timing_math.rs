@@ -1,4 +1,5 @@
 use super::*;
+use crate::metadata::ReceiveMeta;
 
 #[test]
 fn server_processing_greater_than_raw_does_not_underflow() {
@@ -70,7 +71,10 @@ fn compute_one_way_omits_samples_when_client_wall_time_overflows_i64() {
         ..Default::default()
     };
 
-    assert_eq!(compute_one_way(&sent_at, &received_at, &ts), None);
+    assert_eq!(
+        compute_one_way(&sent_at, &received_at, &ReceiveMeta::default(), &ts),
+        None
+    );
 }
 
 #[test]
@@ -89,7 +93,7 @@ fn compute_one_way_returns_available_direction_samples() {
         ..Default::default()
     };
 
-    let sample = compute_one_way(&sent_at, &received_at, &ts).unwrap();
+    let sample = compute_one_way(&sent_at, &received_at, &ReceiveMeta::default(), &ts).unwrap();
     assert_eq!(
         sample.client_to_server,
         Some(SignedDuration::from_nanos(15_000_000))
@@ -116,7 +120,7 @@ fn compute_one_way_preserves_negative_client_to_server_delay() {
         ..Default::default()
     };
 
-    let sample = compute_one_way(&sent_at, &received_at, &ts).unwrap();
+    let sample = compute_one_way(&sent_at, &received_at, &ReceiveMeta::default(), &ts).unwrap();
 
     assert_eq!(
         sample.client_to_server,
@@ -144,7 +148,7 @@ fn compute_one_way_preserves_negative_server_to_client_delay() {
         ..Default::default()
     };
 
-    let sample = compute_one_way(&sent_at, &received_at, &ts).unwrap();
+    let sample = compute_one_way(&sent_at, &received_at, &ReceiveMeta::default(), &ts).unwrap();
 
     assert_eq!(
         sample.client_to_server,
