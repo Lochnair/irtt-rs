@@ -1211,3 +1211,207 @@ fn event_shape(event: &ClientEvent) -> (&'static str, u64, usize) {
         other => panic!("unexpected equivalence event: {other:?}"),
     }
 }
+
+/// A peer that ignores the first `ignored_requests` datagrams before serving a
+/// compliant open, one echo, and one close.
+///
+/// Silence is the point here, so this stays a narrow fake peer rather than a
+/// real `irtt-server`: a compliant server has no way to be deliberately mute
+/// for exactly one open attempt.
+fn start_silent_then_open_server(ignored_requests: usize) -> TestServer {
+    start_server(move |socket, tx| {
+        for _ in 0..ignored_requests {
+            let _ = recv_packet(&socket, &tx);
+        }
+        let (params, peer) = open_session(&socket, &tx, None);
+        let (probe_packet, _) = recv_packet(&socket, &tx);
+        let sequence = echo_request_sequence(&probe_packet, None);
+        socket
+            .send_to(
+                &echo_reply(&params, sequence, TOKEN, flags::FLAG_REPLY, None),
+                peer,
+            )
+            .unwrap();
+        let (close_packet, _) = recv_packet(&socket, &tx);
+        assert_eq!(close_request_token(&close_packet, None), TOKEN);
+    })
+}
+
+/// Stable name for a `ClientError` variant, for comparing what each driver
+/// promises rather than how it produced it.
+fn error_name(error: &ClientError) -> &'static str {
+    match error {
+        ClientError::OpenTimeout => "open timeout",
+        ClientError::NotOpen => "not open",
+        ClientError::AlreadyOpen => "already open",
+        ClientError::AlreadyClosed => "already closed",
+        ClientError::AlreadyCompleted => "already completed",
+        ClientError::ServerRejected => "server rejected",
+        other => panic!("unexpected conformance error: {other:?}"),
+    }
+}
+
+fn probe_sequences(events: &[ClientEvent]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::EchoSent { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect()
+}
+
+fn reply_sequences(events: &[ClientEvent]) -> Vec<u32> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ClientEvent::EchoReply { seq, .. } => Some(*seq),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
+    // One open attempt is ignored, so the first open times out and the second
+    // must be able to open the same connected client.
+    let blocking_server = start_silent_then_open_server(1);
+    let mut blocking = Client::connect(config(blocking_server.addr, None, 0)).unwrap();
+    let blocking_first = blocking.open().unwrap_err();
+    let blocking_second = blocking.open().unwrap();
+    let blocking_sent = blocking.send_probe().unwrap();
+    let blocking_reply = blocking.recv_once().unwrap();
+    let blocking_close = blocking.close().unwrap();
+    assert_eq!(blocking_server.finish().len(), 4);
+
+    let async_server = start_silent_then_open_server(1);
+    let (async_first, async_second, async_sent, async_reply, async_close) =
+        runtime().block_on(async {
+            let mut client = AsyncClient::connect(config(async_server.addr, None, 0))
+                .await
+                .unwrap();
+            let first = client.open().await.unwrap_err();
+            let second = client.open().await.unwrap();
+            let sent = client.send_probe().await.unwrap();
+            let reply = client.recv().await.unwrap();
+            let closed = client.close().await.unwrap();
+            (first, second, sent, reply, closed)
+        });
+    assert_eq!(async_server.finish().len(), 4);
+
+    // Both drivers promise the same failure, and neither leaves the client in a
+    // state that refuses the retry.
+    assert_eq!(error_name(&blocking_first), "open timeout");
+    assert_eq!(error_name(&blocking_first), error_name(&async_first));
+    assert!(matches!(blocking_second, OpenOutcome::Started { .. }));
+    assert!(matches!(async_second, OpenOutcome::Started { .. }));
+    assert_eq!(
+        open_negotiated(&blocking_second),
+        open_negotiated(&async_second)
+    );
+    assert_eq!(open_token(&blocking_second), open_token(&async_second));
+
+    // The retried session starts a fresh probe sequence in both drivers.
+    assert_eq!(probe_sequences(&blocking_sent), [0]);
+    assert_eq!(probe_sequences(&async_sent), [0]);
+    assert_eq!(reply_sequences(&blocking_reply), [0]);
+    assert_eq!(reply_sequences(&async_reply), [0]);
+    assert_eq!(blocking_sent.len(), async_sent.len());
+    assert_eq!(blocking_reply.len(), async_reply.len());
+    assert_eq!(blocking_close.len(), async_close.len());
+    assert_matching_event_shape(&blocking_close[0], &async_close[0]);
+}
+
+#[test]
+fn blocking_and_async_complete_every_caller_paced_probe() {
+    const PROBES: u32 = 3;
+
+    let blocking_server = InTreeServer::start(ServerConfig::default());
+    let mut blocking = Client::connect(config(blocking_server.addr, None, 0)).unwrap();
+    blocking.open().unwrap();
+    let mut blocking_sent = Vec::new();
+    let mut blocking_replies = Vec::new();
+    for _ in 0..PROBES {
+        blocking_sent.extend(blocking.send_probe().unwrap());
+        blocking_replies.extend(blocking.recv_once().unwrap());
+    }
+    blocking.close().unwrap();
+    drop(blocking_server);
+
+    let async_server = InTreeServer::start(ServerConfig::default());
+    let (async_sent, async_replies) = runtime().block_on(async {
+        let mut client = AsyncClient::connect(config(async_server.addr, None, 0))
+            .await
+            .unwrap();
+        client.open().await.unwrap();
+        let mut sent = Vec::new();
+        let mut replies = Vec::new();
+        for _ in 0..PROBES {
+            sent.extend(client.send_probe().await.unwrap());
+            replies.extend(client.recv().await.unwrap());
+        }
+        client.close().await.unwrap();
+        (sent, replies)
+    });
+    drop(async_server);
+
+    let expected: Vec<u32> = (0..PROBES).collect();
+    assert_eq!(probe_sequences(&blocking_sent), expected);
+    assert_eq!(probe_sequences(&async_sent), expected);
+    assert_eq!(reply_sequences(&blocking_replies), expected);
+    assert_eq!(reply_sequences(&async_replies), expected);
+    // Compare the whole emitted streams, not just the probe and reply events
+    // the sequence helpers keep: an extra event on either side is a difference.
+    assert_eq!(blocking_sent.len(), async_sent.len());
+    assert_eq!(blocking_replies.len(), async_replies.len());
+    for (blocking, asynchronous) in blocking_sent.iter().zip(&async_sent) {
+        assert_matching_event_shape(blocking, asynchronous);
+    }
+    for (blocking, asynchronous) in blocking_replies.iter().zip(&async_replies) {
+        assert_matching_event_shape(blocking, asynchronous);
+    }
+}
+
+#[test]
+fn blocking_and_async_reject_probes_before_open_and_after_close() {
+    let blocking_server = InTreeServer::start(ServerConfig::default());
+    let mut blocking = Client::connect(config(blocking_server.addr, None, 0)).unwrap();
+    let blocking_before = blocking.send_probe().unwrap_err();
+    blocking.open().unwrap();
+    let blocking_reopen = blocking.open().unwrap_err();
+    blocking.close().unwrap();
+    let blocking_after_send = blocking.send_probe().unwrap_err();
+    let blocking_after_close = blocking.close().unwrap_err();
+    drop(blocking_server);
+
+    let async_server = InTreeServer::start(ServerConfig::default());
+    let (async_before, async_reopen, async_after_send, async_after_close) =
+        runtime().block_on(async {
+            let mut client = AsyncClient::connect(config(async_server.addr, None, 0))
+                .await
+                .unwrap();
+            let before = client.send_probe().await.unwrap_err();
+            client.open().await.unwrap();
+            let reopen = client.open().await.unwrap_err();
+            client.close().await.unwrap();
+            let after_send = client.send_probe().await.unwrap_err();
+            let after_close = client.close().await.unwrap_err();
+            (before, reopen, after_send, after_close)
+        });
+    drop(async_server);
+
+    assert_eq!(error_name(&blocking_before), "not open");
+    assert_eq!(error_name(&blocking_reopen), "already open");
+    assert_eq!(error_name(&blocking_after_send), "already closed");
+    assert_eq!(error_name(&blocking_after_close), "already closed");
+    assert_eq!(error_name(&blocking_before), error_name(&async_before));
+    assert_eq!(error_name(&blocking_reopen), error_name(&async_reopen));
+    assert_eq!(
+        error_name(&blocking_after_send),
+        error_name(&async_after_send)
+    );
+    assert_eq!(
+        error_name(&blocking_after_close),
+        error_name(&async_after_close)
+    );
+}
