@@ -1,8 +1,8 @@
 use std::time::Duration;
 
 use crate::shared::client::{
-    parse_labelled_target, parse_test_duration, prepare_managed_run, CommonClientArgs,
-    GroupPacingArg, LabelledTargetArg, ManagedRunSetup, TargetSelection, TimestampArg,
+    parse_target, parse_test_duration, prepare_managed_run, CommonClientArgs, GroupPacingArg,
+    ManagedRunSetup, TargetArg, TargetSelection, TimestampArg,
 };
 use clap::{Parser, ValueEnum};
 
@@ -11,22 +11,14 @@ pub const DEFAULT_CLIENT_DURATION: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Parser)]
 #[command(name = "irtt-cli", about = "Minimal IRTT-compatible stream client")]
 pub struct ClientArgs {
-    /// Server address or host, with optional port. Repeat for multi-target mode.
+    /// Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.
     #[arg(
         value_name = "TARGET",
         num_args = 0..,
-        long_help = "Server address or host, with optional port. Repeat the positional target for multi-target mode, for example: irtt-cli host-a:2112 host-b:2112."
+        value_parser = parse_target,
+        long_help = "Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.\n\nExamples:\n  irtt-cli host-a:2112 host-b:2112\n  irtt-cli eu=host-a:2112 us=host-b:2112\n  irtt-cli host-a:2112 eu=host-b:2112"
     )]
-    pub targets: Vec<String>,
-
-    /// Explicit labelled target, as label=host:port. Repeat for multi-target mode.
-    #[arg(
-        long = "target",
-        value_name = "LABEL=TARGET",
-        value_parser = parse_labelled_target,
-        long_help = "Explicit labelled target, as label=host:port. Repeat for multi-target mode. The label is used as the target column and must be unique."
-    )]
-    pub labelled_targets: Vec<LabelledTargetArg>,
+    pub targets: Vec<TargetArg>,
 
     /// Managed group pacing for multi-target mode.
     #[arg(
@@ -98,8 +90,7 @@ impl ClientArgs {
             &self.common,
             self.duration,
             TargetSelection {
-                positional: &self.targets,
-                labelled: &self.labelled_targets,
+                targets: &self.targets,
                 pacing: self.pacing,
             },
         )
@@ -167,8 +158,9 @@ mod tests {
     fn client_parser_keeps_finite_default_duration() {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
 
-        assert_eq!(args.targets, ["127.0.0.1:2112"]);
-        assert!(args.labelled_targets.is_empty());
+        assert_eq!(args.targets.len(), 1);
+        assert_eq!(args.targets[0].label, None);
+        assert_eq!(args.targets[0].addr, "127.0.0.1:2112");
         assert_eq!(args.pacing, GroupPacingArg::Staggered);
         assert_eq!(args.duration, DEFAULT_CLIENT_DURATION);
         assert_eq!(args.interval, Duration::from_secs(1));
@@ -218,14 +210,8 @@ mod tests {
     }
 
     #[test]
-    fn repeated_labelled_targets_parse() {
-        let args = parse(&[
-            "--target",
-            "ams=ams.example.com:2112",
-            "--target",
-            "sg=sg.example.com:2112",
-        ])
-        .unwrap();
+    fn repeated_labeled_targets_parse() {
+        let args = parse(&["ams=ams.example.com:2112", "sg=sg.example.com:2112"]).unwrap();
         let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "ams");
@@ -235,8 +221,17 @@ mod tests {
     }
 
     #[test]
+    fn mixed_labeled_and_unlabeled_targets_preserve_argument_order() {
+        let args = parse(&["local.example", "eu=a.example", "backup.example"]).unwrap();
+        let specs = args.prepare().unwrap().targets;
+
+        let labels: Vec<_> = specs.iter().map(|target| target.label.as_str()).collect();
+        assert_eq!(labels, ["local.example", "eu", "backup.example"]);
+    }
+
+    #[test]
     fn duplicate_labels_are_rejected() {
-        let args = parse(&["host-a:2112", "--target", "host-a:2112=host-b:2112"]).unwrap();
+        let args = parse(&["host-a:2112", "host-a:2112=host-b:2112"]).unwrap();
         let err = args.prepare().unwrap_err();
 
         assert!(err.contains("duplicate target label"));
@@ -259,9 +254,13 @@ mod tests {
 
     #[test]
     fn invalid_labelled_target_syntax_is_rejected() {
-        assert!(parse(&["--target", "missing-equals"]).is_err());
-        assert!(parse(&["--target", "=127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--target", "label="]).is_err());
+        assert!(parse(&["=127.0.0.1:2112"]).is_err());
+        assert!(parse(&["label="]).is_err());
+    }
+
+    #[test]
+    fn old_target_option_is_rejected() {
+        assert!(parse(&["--target", "eu=host.example"]).is_err());
     }
 
     #[test]
@@ -284,7 +283,7 @@ mod tests {
     fn client_help_lists_shared_protocol_options() {
         let help = ClientArgs::command().render_help().to_string();
         assert!(help.contains("--format <FORMAT>"));
-        assert!(help.contains("--target <LABEL=TARGET>"));
+        assert!(!help.contains("--target "));
         assert!(help.contains("--pacing <PACING>"));
         assert!(help.contains("--columns <COLUMNS>"));
         assert!(help.contains("--list-columns"));

@@ -54,6 +54,18 @@ impl InterruptibleFakeServer {
 }
 
 #[test]
+fn old_target_option_is_rejected_as_an_unknown_argument() {
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args(["--target", "eu=127.0.0.1:2112"])
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unexpected argument"), "{stderr}");
+}
+
+#[test]
 fn list_columns_succeeds_without_target() {
     let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
         .arg("--list-columns")
@@ -121,7 +133,6 @@ fn single_labeled_target_default_table_includes_target() {
             "10ms",
             "--header",
             "always",
-            "--target",
             &format!("eu={}", server.addr),
         ])
         .output()
@@ -159,7 +170,6 @@ fn single_labeled_target_default_csv_includes_target_and_event_wall_ns() {
             "csv",
             "--header",
             "always",
-            "--target",
             &format!("eu={}", server.addr),
         ])
         .output()
@@ -235,9 +245,7 @@ fn multi_target_default_table_includes_both_labels() {
             "10ms",
             "--header",
             "always",
-            "--target",
             &format!("a={}", a.addr),
-            "--target",
             &format!("b={}", b.addr),
         ])
         .output()
@@ -265,6 +273,52 @@ fn multi_target_default_table_includes_both_labels() {
     assert!(
         rows.iter()
             .any(|line| line.split_whitespace().next() == Some("b")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn mixed_labeled_and_unlabeled_positional_targets_both_appear_in_output() {
+    let a = InTreeServer::start();
+    let b = InTreeServer::start();
+    let unlabeled_addr = a.addr.to_string();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "40ms",
+            "--interval",
+            "10ms",
+            "--header",
+            "always",
+            &unlabeled_addr,
+            &format!("eu={}", b.addr),
+        ])
+        .output()
+        .unwrap();
+
+    drop(a);
+    drop(b);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    assert_eq!(header.split_whitespace().next(), Some("target"));
+    let rows: Vec<&str> = lines.collect();
+    assert!(
+        rows.iter()
+            .any(|line| line.split_whitespace().next() == Some(unlabeled_addr.as_str())),
+        "{stdout}"
+    );
+    assert!(
+        rows.iter()
+            .any(|line| line.split_whitespace().next() == Some("eu")),
         "{stdout}"
     );
 }
@@ -358,7 +412,6 @@ fn columns_default_keyword_includes_target_for_single_target() {
             "default",
             "--header",
             "always",
-            "--target",
             &format!("eu={}", server.addr),
         ])
         .output()
@@ -391,7 +444,6 @@ fn single_labeled_target_default_jsonl_includes_target() {
             "10ms",
             "--format",
             "jsonl",
-            "--target",
             &format!("eu={}", server.addr),
         ])
         .output()
@@ -523,9 +575,7 @@ fn multi_target_csv_emits_rows_for_both_labels() {
             "target,seq,effective_rtt_us",
             "--header",
             "never",
-            "--target",
             &format!("a={}", a.addr),
-            "--target",
             &format!("b={}", b.addr),
         ])
         .output()
@@ -568,9 +618,7 @@ fn finite_multi_target_peer_close_is_accepted_as_completion() {
         "target,seq",
         "--header",
         "never",
-        "--target",
         &format!("a={}", a.addr),
-        "--target",
         &format!("b={}", b.addr),
     ]);
 
@@ -632,9 +680,7 @@ fn continuous_all_peer_closed_targets_exit_nonzero() {
         "target,seq",
         "--header",
         "never",
-        "--target",
         &format!("a={}", a.addr),
-        "--target",
         &format!("b={}", b.addr),
     ]);
 
@@ -684,9 +730,7 @@ fn continuous_partial_peer_close_preserves_queued_rows_and_reports_peer_close() 
         "target,seq",
         "--header",
         "never",
-        "--target",
         &format!("healthy={}", healthy.addr),
-        "--target",
         &format!("peer={}", peer_closed.addr),
     ]);
 
@@ -740,11 +784,8 @@ fn continuous_mixed_peer_close_and_open_failure_exits_nonzero() {
         "target,seq",
         "--header",
         "never",
-        "--target",
         &format!("failure={}", failure.addr),
-        "--target",
         &format!("healthy={}", healthy.addr),
-        "--target",
         &format!("peer={}", peer_closed.addr),
     ]);
 
@@ -795,9 +836,7 @@ fn explicit_group_interruption_succeeds_without_peer_close_error() {
         "target,seq",
         "--header",
         "never",
-        "--target",
         &format!("a={}", a.addr),
-        "--target",
         &format!("b={}", b.addr),
     ]);
 
@@ -851,9 +890,7 @@ fn all_open_failures_exit_nonzero_with_diagnostics() {
         "0s",
         "--interval",
         "10ms",
-        "--target",
         &format!("a={}", a.addr),
-        "--target",
         &format!("b={}", b.addr),
     ]);
 

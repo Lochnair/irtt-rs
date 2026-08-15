@@ -4,8 +4,8 @@ use clap::ValueEnum;
 use irtt_client::managed::{ManagedPacing, ManagedTargetConfig, TargetId};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct LabelledTargetArg {
-    pub label: String,
+pub struct TargetArg {
+    pub label: Option<String>,
     pub addr: String,
 }
 
@@ -36,45 +36,46 @@ impl From<GroupPacingArg> for ManagedPacing {
     }
 }
 
-pub fn parse_labelled_target(input: &str) -> Result<LabelledTargetArg, String> {
-    let (label, addr) = input
-        .split_once('=')
-        .ok_or_else(|| "target must use LABEL=TARGET syntax".to_owned())?;
-    if label.is_empty() {
-        return Err("target label must not be empty".to_owned());
+/// Parse one positional target argument, as `TARGET` or `LABEL=TARGET`.
+pub fn parse_target(input: &str) -> Result<TargetArg, String> {
+    match input.split_once('=') {
+        None => Ok(TargetArg {
+            label: None,
+            addr: input.to_owned(),
+        }),
+        Some((label, addr)) => {
+            if label.is_empty() {
+                return Err("target label must not be empty".to_owned());
+            }
+            if addr.is_empty() {
+                return Err("target address must not be empty".to_owned());
+            }
+            Ok(TargetArg {
+                label: Some(label.to_owned()),
+                addr: addr.to_owned(),
+            })
+        }
     }
-    if addr.is_empty() {
-        return Err("target address must not be empty".to_owned());
-    }
-    Ok(LabelledTargetArg {
-        label: label.to_owned(),
-        addr: addr.to_owned(),
-    })
 }
 
-pub fn target_specs(
-    positional_targets: &[String],
-    labelled_targets: &[LabelledTargetArg],
-) -> Result<Vec<TargetSpec>, String> {
-    let mut specs = Vec::new();
-    let mut positional_counts = std::collections::HashMap::<&str, usize>::new();
-    for target in positional_targets {
-        let count = positional_counts.entry(target.as_str()).or_default();
-        *count += 1;
-        let label = if *count == 1 {
-            target.clone()
-        } else {
-            format!("{target}#{}", *count)
+pub fn target_specs(targets: &[TargetArg]) -> Result<Vec<TargetSpec>, String> {
+    let mut specs = Vec::with_capacity(targets.len());
+    let mut unlabeled_counts = std::collections::HashMap::<&str, usize>::new();
+    for target in targets {
+        let label = match &target.label {
+            Some(label) => label.clone(),
+            None => {
+                let count = unlabeled_counts.entry(target.addr.as_str()).or_default();
+                *count += 1;
+                if *count == 1 {
+                    target.addr.clone()
+                } else {
+                    format!("{}#{}", target.addr, *count)
+                }
+            }
         };
         specs.push(TargetSpec {
             label,
-            addr: target.clone(),
-        });
-    }
-
-    for target in labelled_targets {
-        specs.push(TargetSpec {
-            label: target.label.clone(),
             addr: target.addr.clone(),
         });
     }
@@ -108,19 +109,101 @@ pub fn prepare_managed_targets(specs: Vec<TargetSpec>) -> Result<Vec<PreparedTar
 mod tests {
     use super::*;
 
+    fn unlabeled(addr: &str) -> TargetArg {
+        TargetArg {
+            label: None,
+            addr: addr.to_owned(),
+        }
+    }
+
+    fn labeled(label: &str, addr: &str) -> TargetArg {
+        TargetArg {
+            label: Some(label.to_owned()),
+            addr: addr.to_owned(),
+        }
+    }
+
     #[test]
-    fn target_specs_suffix_repeated_positionals_and_reject_duplicate_labels() {
-        let positionals = vec!["host-a:2112".to_owned(), "host-a:2112".to_owned()];
-        let specs = target_specs(&positionals, &[]).unwrap();
+    fn parse_target_without_equals_is_unlabeled() {
+        let target = parse_target("host.example").unwrap();
+        assert_eq!(target.label, None);
+        assert_eq!(target.addr, "host.example");
+
+        let target = parse_target("host.example:2112").unwrap();
+        assert_eq!(target.label, None);
+        assert_eq!(target.addr, "host.example:2112");
+
+        let target = parse_target("[::1]:2112").unwrap();
+        assert_eq!(target.label, None);
+        assert_eq!(target.addr, "[::1]:2112");
+    }
+
+    #[test]
+    fn parse_target_with_equals_splits_on_first() {
+        let target = parse_target("eu=host.example").unwrap();
+        assert_eq!(target.label, Some("eu".to_owned()));
+        assert_eq!(target.addr, "host.example");
+
+        let target = parse_target("eu=host.example:2112").unwrap();
+        assert_eq!(target.label, Some("eu".to_owned()));
+        assert_eq!(target.addr, "host.example:2112");
+    }
+
+    #[test]
+    fn parse_target_rejects_empty_label_or_address() {
+        assert!(parse_target("=host.example").is_err());
+        assert!(parse_target("eu=").is_err());
+    }
+
+    #[test]
+    fn target_specs_suffix_repeated_unlabeled_and_reject_duplicate_labels() {
+        let targets = vec![unlabeled("host-a:2112"), unlabeled("host-a:2112")];
+        let specs = target_specs(&targets).unwrap();
 
         assert_eq!(specs[0].label, "host-a:2112");
         assert_eq!(specs[1].label, "host-a:2112#2");
 
-        let labels = vec![LabelledTargetArg {
-            label: "host-a:2112".to_owned(),
-            addr: "host-b:2112".to_owned(),
-        }];
-        let err = target_specs(&positionals[..1], &labels).unwrap_err();
+        let targets = vec![
+            unlabeled("host-a:2112"),
+            labeled("host-a:2112", "host-b:2112"),
+        ];
+        let err = target_specs(&targets).unwrap_err();
+        assert!(err.contains("duplicate target label"));
+    }
+
+    #[test]
+    fn target_specs_preserve_argument_order_with_mixed_labels() {
+        let targets = vec![
+            unlabeled("local"),
+            labeled("eu", "eu.example"),
+            unlabeled("backup"),
+            labeled("us", "us.example"),
+        ];
+        let specs = target_specs(&targets).unwrap();
+
+        let labels: Vec<_> = specs.iter().map(|spec| spec.label.as_str()).collect();
+        assert_eq!(labels, ["local", "eu", "backup", "us"]);
+        let addrs: Vec<_> = specs.iter().map(|spec| spec.addr.as_str()).collect();
+        assert_eq!(addrs, ["local", "eu.example", "backup", "us.example"]);
+    }
+
+    #[test]
+    fn target_specs_count_unlabeled_occurrences_independently_of_explicit_labels() {
+        let targets = vec![unlabeled("foo"), labeled("eu", "foo"), unlabeled("foo")];
+        let specs = target_specs(&targets).unwrap();
+
+        let labels: Vec<_> = specs.iter().map(|spec| spec.label.as_str()).collect();
+        assert_eq!(labels, ["foo", "eu", "foo#2"]);
+    }
+
+    #[test]
+    fn target_specs_reject_generated_suffix_collisions() {
+        let targets = vec![
+            unlabeled("host.example"),
+            unlabeled("host.example"),
+            labeled("host.example#2", "other.example"),
+        ];
+        let err = target_specs(&targets).unwrap_err();
         assert!(err.contains("duplicate target label"));
     }
 

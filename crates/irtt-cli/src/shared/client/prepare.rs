@@ -16,7 +16,7 @@ use irtt_client::{
 
 use super::{
     args::CommonClientArgs,
-    targets::{prepare_managed_targets, target_specs, GroupPacingArg, LabelledTargetArg},
+    targets::{prepare_managed_targets, target_specs, GroupPacingArg, TargetArg},
     PreparedTarget,
 };
 
@@ -29,8 +29,7 @@ pub const MANAGED_EVENT_CAPACITY: usize = 16_384;
 /// means and what its default is, so each keeps its own.
 #[derive(Debug, Clone, Copy)]
 pub struct TargetSelection<'a> {
-    pub positional: &'a [String],
-    pub labelled: &'a [LabelledTargetArg],
+    pub targets: &'a [TargetArg],
     pub pacing: GroupPacingArg,
 }
 
@@ -92,7 +91,7 @@ pub fn prepare_managed_run(
     duration: Duration,
     selection: TargetSelection<'_>,
 ) -> Result<ManagedRunSetup, String> {
-    let specs = target_specs(selection.positional, selection.labelled)?;
+    let specs = target_specs(selection.targets)?;
     let targets = prepare_managed_targets(specs)?;
     Ok(ManagedRunSetup {
         targets,
@@ -119,29 +118,32 @@ mod tests {
         CommonOnlyArgs::try_parse_from(argv).unwrap().common
     }
 
+    fn unlabeled(addr: &str) -> TargetArg {
+        TargetArg {
+            label: None,
+            addr: addr.to_owned(),
+        }
+    }
+
+    fn labeled(label: &str, addr: &str) -> TargetArg {
+        TargetArg {
+            label: Some(label.to_owned()),
+            addr: addr.to_owned(),
+        }
+    }
+
     fn prepare(
-        positional: &[&str],
-        labelled: &[LabelledTargetArg],
+        targets: &[TargetArg],
         pacing: GroupPacingArg,
         duration: Duration,
     ) -> Result<ManagedRunSetup, String> {
-        let positional: Vec<String> = positional.iter().map(|value| (*value).to_owned()).collect();
-        prepare_managed_run(
-            &common(&[]),
-            duration,
-            TargetSelection {
-                positional: &positional,
-                labelled,
-                pacing,
-            },
-        )
+        prepare_managed_run(&common(&[]), duration, TargetSelection { targets, pacing })
     }
 
     #[test]
     fn a_single_target_prepares_one_managed_target_and_a_finite_duration() {
         let setup = prepare(
-            &["127.0.0.1:2112"],
-            &[],
+            &[unlabeled("127.0.0.1:2112")],
             GroupPacingArg::Staggered,
             Duration::from_secs(30),
         )
@@ -158,8 +160,7 @@ mod tests {
     #[test]
     fn a_zero_duration_prepares_a_continuous_client_config() {
         let setup = prepare(
-            &["127.0.0.1:2112"],
-            &[],
+            &[unlabeled("127.0.0.1:2112")],
             GroupPacingArg::Staggered,
             Duration::ZERO,
         )
@@ -170,13 +171,12 @@ mod tests {
 
     #[test]
     fn multiple_targets_keep_argument_order_and_share_one_client_config() {
-        let labelled = vec![LabelledTargetArg {
-            label: "sg".to_owned(),
-            addr: "sg.example.test:2112".to_owned(),
-        }];
         let setup = prepare(
-            &["host-a:2112", "host-b:2112"],
-            &labelled,
+            &[
+                unlabeled("host-a:2112"),
+                unlabeled("host-b:2112"),
+                labeled("sg", "sg.example.test:2112"),
+            ],
             GroupPacingArg::Burst,
             Duration::from_secs(10),
         )
@@ -205,13 +205,12 @@ mod tests {
     fn the_shared_client_config_carries_no_target_of_its_own() {
         // The managed driver replaces the address, and the CLI's key, per
         // target, so the template must not pin either to one target.
-        let positional = vec!["host-a:2112".to_owned(), "host-b:2112".to_owned()];
+        let targets = vec![unlabeled("host-a:2112"), unlabeled("host-b:2112")];
         let setup = prepare_managed_run(
             &common(&["--hmac", "secret"]),
             Duration::from_secs(10),
             TargetSelection {
-                positional: &positional,
-                labelled: &[],
+                targets: &targets,
                 pacing: GroupPacingArg::Staggered,
             },
         )
@@ -232,8 +231,7 @@ mod tests {
 
     #[test]
     fn an_empty_target_set_is_rejected_with_the_list_columns_hint() {
-        let err =
-            prepare(&[], &[], GroupPacingArg::Staggered, Duration::from_secs(10)).unwrap_err();
+        let err = prepare(&[], GroupPacingArg::Staggered, Duration::from_secs(10)).unwrap_err();
 
         assert!(err.contains("at least one target is required"));
         assert!(err.contains("--list-columns"));
@@ -241,17 +239,12 @@ mod tests {
 
     #[test]
     fn a_duplicate_label_is_rejected_before_any_configuration_is_built() {
-        let labelled = vec![LabelledTargetArg {
-            label: "host-a:2112".to_owned(),
-            addr: "host-b:2112".to_owned(),
-        }];
-        let err = prepare(
-            &["host-a:2112"],
-            &labelled,
-            GroupPacingArg::Staggered,
-            Duration::from_secs(10),
-        )
-        .unwrap_err();
+        let targets = vec![
+            unlabeled("host-a:2112"),
+            labeled("host-a:2112", "host-b:2112"),
+        ];
+        let err =
+            prepare(&targets, GroupPacingArg::Staggered, Duration::from_secs(10)).unwrap_err();
 
         assert!(err.contains("duplicate target label"));
     }
