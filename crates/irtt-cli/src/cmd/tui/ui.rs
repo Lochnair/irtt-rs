@@ -1992,6 +1992,7 @@ mod tests {
     use irtt_client::{
         ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming, WarningKind,
     };
+    use ratatui::backend::TestBackend;
     use std::{
         net::{IpAddr, Ipv4Addr, SocketAddr},
         sync::Arc,
@@ -2917,5 +2918,354 @@ mod tests {
         assert_eq!(graph.client_to_server_ns, Some(-20_000));
         assert_eq!(graph.server_to_client_ns, Some(30_000));
         assert_eq!(graph.server_processing_ns, Some(100_000));
+    }
+
+    // Off-screen render coverage. These exercise draw_dashboard through a real
+    // Ratatui backend, so layout selection, panel presence, and the text a user
+    // actually sees are protected rather than only the pure state and viewport
+    // arithmetic covered above.
+
+    /// Render `state` at the given terminal size and return the visible rows.
+    fn render_rows(state: &TuiState, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw_dashboard(frame, state)).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer.cell((x, y)).map(|cell| cell.symbol()).unwrap_or(" "))
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    fn render_text(state: &TuiState, width: u16, height: u16) -> String {
+        render_rows(state, width, height).join("\n")
+    }
+
+    /// Whether a bordered panel with this title is on screen.
+    ///
+    /// A panel is identified by its title in a top border, so this cannot be
+    /// satisfied by body text that happens to mention the same word.
+    fn has_panel(rows: &[String], title: &str) -> bool {
+        let needle = format!("\u{250c}{title}");
+        rows.iter().any(|row| row.contains(&needle))
+    }
+
+    /// The interior rows of one bordered panel, sliced to that panel's columns.
+    ///
+    /// Panels sit side by side, so a whole-row search matches text belonging to
+    /// a neighbour, and most panel content is echoed somewhere else on the
+    /// frame. Scoping assertions to the owning panel is what makes them
+    /// protect the panel they name.
+    fn panel_rows(rows: &[String], title: &str) -> Vec<String> {
+        let needle: Vec<char> = format!("\u{250c}{title}").chars().collect();
+        let (top, start) = rows
+            .iter()
+            .enumerate()
+            .find_map(|(index, row)| {
+                let chars: Vec<char> = row.chars().collect();
+                chars
+                    .windows(needle.len())
+                    .position(|window| window == needle.as_slice())
+                    .map(|column| (index, column))
+            })
+            .unwrap_or_else(|| panic!("no panel titled {title} in:\n{}", rows.join("\n")));
+        let title_row: Vec<char> = rows[top].chars().collect();
+        let end = title_row[start..]
+            .iter()
+            .position(|glyph| *glyph == '\u{2510}')
+            .map(|offset| start + offset)
+            .expect("a panel top border ends with a corner");
+        rows[top + 1..]
+            .iter()
+            .map(|row| {
+                row.chars()
+                    .skip(start)
+                    .take(end - start + 1)
+                    .collect::<String>()
+            })
+            .take_while(|row| !row.starts_with('\u{2514}'))
+            .collect()
+    }
+
+    /// Whether any interior row of `title`'s panel contains `text`.
+    fn panel_contains(rows: &[String], title: &str, text: &str) -> bool {
+        panel_rows(rows, title).iter().any(|row| row.contains(text))
+    }
+
+    /// Assert every target owns a row in the target table, scoped to that
+    /// panel's columns.
+    ///
+    /// A whole-frame search cannot prove this: the first target is also named
+    /// in the session header, and a target that replied appears in recent
+    /// events and as a chart series.
+    fn assert_target_table_rows(rows: &[String], labels: &[&str], replied: &str) {
+        let table = panel_rows(rows, "targets");
+        let row_for = |label: &str| {
+            table
+                .iter()
+                .find(|row| {
+                    row.trim_start_matches('\u{2502}')
+                        .trim_start()
+                        .starts_with(label)
+                })
+                .unwrap_or_else(|| {
+                    panic!("no target table row for {label} in:\n{}", table.join("\n"))
+                })
+                .clone()
+        };
+        for label in labels {
+            let row = row_for(label);
+            assert!(
+                row.contains("opening"),
+                "target row for {label} lost its status column: {row}"
+            );
+        }
+        // The target that replied shows its last sample.
+        let replied_row = row_for(replied);
+        assert!(
+            replied_row.contains("3.0ms"),
+            "{replied} row lost its last sample: {replied_row}"
+        );
+    }
+
+    /// A single-target state carrying a session, one reply, and one warning.
+    ///
+    /// The TUI opens in the graph view, so dashboard tests toggle it.
+    fn active_single_target_state() -> TuiState {
+        let mut state = TuiState::default();
+        let target = target_instance("target");
+        state.process_target_event(
+            &target,
+            &ClientEvent::SessionStarted {
+                remote: remote(),
+                token: 0xabcd,
+                negotiated: NegotiatedParams {
+                    params: irtt_proto::Params::default(),
+                    restrictions: Vec::new(),
+                },
+                at: ts(Duration::ZERO),
+            },
+        );
+        state.process_target_event(&target, &reply(11, 2_500_000));
+        state.process_target_event(
+            &target,
+            &ClientEvent::Warning {
+                kind: WarningKind::WrongToken,
+                message: "wrong token".to_owned(),
+                at: ts(Duration::ZERO),
+            },
+        );
+        state
+    }
+
+    fn active_dashboard_state() -> TuiState {
+        let mut state = active_single_target_state();
+        state.toggle_view();
+        assert_eq!(state.view, TuiView::Dashboard);
+        state
+    }
+
+    #[test]
+    fn a_terminal_below_the_minimum_width_renders_only_the_resize_notice() {
+        let state = active_dashboard_state();
+
+        let text = render_text(&state, MIN_WIDTH - 1, MIN_HEIGHT);
+
+        assert!(text.contains("terminal too small"));
+        assert!(text.contains("press q / Ctrl-C to quit"));
+        assert!(!text.contains("packets"));
+        assert!(!text.contains("q quit"));
+    }
+
+    #[test]
+    fn a_terminal_below_the_minimum_height_renders_only_the_resize_notice() {
+        let state = active_dashboard_state();
+
+        let text = render_text(&state, MIN_WIDTH, MIN_HEIGHT - 1);
+
+        assert!(text.contains("terminal too small"));
+        assert!(!text.contains("packets"));
+        assert!(!text.contains("q quit"));
+    }
+
+    #[test]
+    fn the_smallest_usable_terminal_renders_the_compact_dashboard() {
+        let state = active_dashboard_state();
+
+        let rows = render_rows(&state, MIN_WIDTH, MIN_HEIGHT);
+        let text = rows.join("\n");
+
+        assert!(!text.contains("terminal too small"));
+        assert!(text.contains("session"));
+        assert!(text.contains("packets"));
+        assert!(rows[usize::from(MIN_HEIGHT) - 2].contains("q quit"));
+    }
+
+    #[test]
+    fn a_compact_terminal_renders_the_header_packet_and_status_rows() {
+        let state = active_dashboard_state();
+
+        let rows = render_rows(&state, 80, 24);
+        let text = rows.join("\n");
+
+        assert!(text.contains("irtt-rs"));
+        assert!(text.contains("session"));
+        assert!(text.contains("packets"));
+        assert!(text.contains("sent"));
+        // The compact layout drops the timing, recent-events, and sample panels
+        // that only fit in the large layout.
+        assert!(!text.contains("recent events"));
+        assert!(!text.contains("last warning:"));
+        assert!(!text.contains("timing"));
+        // The status line is the bottom bordered row of the layout.
+        assert!(rows[22].contains("q quit"));
+    }
+
+    #[test]
+    fn a_large_terminal_renders_every_dashboard_panel() {
+        let state = active_dashboard_state();
+
+        let rows = render_rows(&state, 180, 44);
+        let text = rows.join("\n");
+
+        for expected in [
+            "session",
+            "packets",
+            "timing",
+            "recent events",
+            "sample",
+            "effective RTT",
+            "send delay",
+            "server process",
+        ] {
+            assert!(text.contains(expected), "missing {expected} in:\n{text}");
+        }
+        assert!(rows[42].contains("q quit"));
+    }
+
+    #[test]
+    fn active_sample_data_and_warnings_are_visible_in_the_large_layout() {
+        let state = active_dashboard_state();
+
+        let rows = render_rows(&state, 140, 40);
+
+        // Session identity, on the header panel's own rows: the token is also
+        // echoed by the recent-events panel.
+        assert!(panel_contains(&rows, "session", "session: 0xabcd"));
+        assert!(panel_contains(&rows, "session", "remote: 127.0.0.1:2112"));
+        // The most recent sample, on the sample panel's own rows.
+        assert!(panel_contains(&rows, "sample", "last seq: 11"));
+        let sample = panel_rows(&rows, "sample");
+        let sample_metrics = sample
+            .iter()
+            .find(|row| row.contains("raw / adjusted / effective:"))
+            .expect("the sample panel renders a metric row");
+        // The whole row, so a regression in any one field is caught: the
+        // fixture's adjusted and effective RTT share a value, and asserting
+        // "2.5ms" alone would still pass with the effective field dropped.
+        assert!(
+            sample_metrics.contains("raw / adjusted / effective: 1.5ms / 2.5ms / 2.5ms"),
+            "unexpected sample metric row: {sample_metrics}"
+        );
+        // The warning reaches the recent-events panel as an event line: the
+        // sample panel's own last-warning row would otherwise satisfy a loose
+        // "warning" plus "wrong token" search.
+        assert!(panel_contains(
+            &rows,
+            "recent events",
+            "warning WrongToken: wrong token"
+        ));
+        // ...and the sample panel's last-warning row carries the warning
+        // itself, not the absent-value placeholder.
+        let last_warning = sample
+            .iter()
+            .find(|row| row.contains("last warning:"))
+            .expect("the sample panel renders a last-warning row");
+        assert!(
+            last_warning.contains("wrong token"),
+            "last-warning row did not carry the warning: {last_warning}"
+        );
+    }
+
+    #[test]
+    fn a_failed_run_renders_the_error_status_and_message() {
+        let mut state = active_dashboard_state();
+        state.set_error("open timed out".to_owned());
+
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
+
+        assert!(text.contains("open timed out"));
+        assert!(rows[38].contains(TuiStatus::Error.label()));
+    }
+
+    #[test]
+    fn a_multi_target_state_renders_the_target_table_in_place_of_packet_counters() {
+        let mut state = TuiState::with_target_labels(
+            TuiConfig::default(),
+            ["alpha".to_owned(), "beta".to_owned(), "gamma".to_owned()],
+        );
+        state.toggle_view();
+        state.process_target_event(&target_instance("beta"), &reply(4, 3_000_000));
+
+        let rows = render_rows(&state, 140, 40);
+
+        assert!(has_panel(&rows, "targets"));
+        assert_target_table_rows(&rows, &["alpha", "beta", "gamma"], "beta");
+        assert!(has_panel(&rows, "timing - first target"));
+        assert!(has_panel(&rows, "sample - first target"));
+        // The table replaces the single-target packet counters.
+        assert!(!has_panel(&rows, "packets"));
+    }
+
+    #[test]
+    fn the_graph_view_renders_a_chart_instead_of_the_dashboard_panels() {
+        let state = active_single_target_state();
+        assert_eq!(state.view, TuiView::Graph);
+
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
+
+        assert!(text.contains(state.graph_metric.title()));
+        assert!(text.contains("live"));
+        assert!(rows[38].contains("q quit"));
+        // The graph view replaces every dashboard panel, not just some.
+        for panel in ["packets", "timing", "recent events", "sample"] {
+            assert!(
+                !has_panel(&rows, panel),
+                "{panel} panel rendered in the graph view"
+            );
+        }
+    }
+
+    #[test]
+    fn the_multi_target_graph_view_keeps_the_target_table_header() {
+        let mut state = TuiState::with_target_labels(
+            TuiConfig::default(),
+            ["alpha".to_owned(), "beta".to_owned()],
+        );
+        state.process_target_event(&target_instance("beta"), &reply(4, 3_000_000));
+
+        let rows = render_rows(&state, 140, 40);
+        let text = rows.join("\n");
+
+        assert!(has_panel(&rows, "targets"));
+        // Scoped to the table: the replying target also names a chart series.
+        assert_target_table_rows(&rows, &["alpha", "beta"], "beta");
+        assert!(text.contains(state.graph_metric.title()));
+    }
+
+    #[test]
+    fn a_paused_display_with_dropped_events_is_reported_on_the_status_line() {
+        let mut state = active_dashboard_state();
+        state.toggle_pause();
+        state.mark_dropped_managed_events(3);
+
+        let rows = render_rows(&state, 140, 40);
+
+        assert!(rows[38].contains("display paused"));
+        assert!(rows[38].contains("incomplete:dropped=3"));
     }
 }
