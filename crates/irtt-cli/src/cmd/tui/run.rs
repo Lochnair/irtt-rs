@@ -19,27 +19,26 @@ use crate::{
 };
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use irtt_client::managed::{
-    BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy, ManagedEndReason,
-    ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError, TargetInstance,
+    BlockingManagedClient, ManagedEndReason, ManagedEvent, ManagedEventSubscription,
+    ManagedEventTryRecvError, TargetInstance,
 };
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_WAIT_SLICE: Duration = Duration::from_millis(20);
-const MANAGED_EVENT_CAPACITY: usize = 16_384;
 const INPUT_EVENT_WORK_BUDGET: usize = 128;
 
 pub fn run_tui(
     args: TuiArgs,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let targets = args
-        .managed_targets()
+    let setup = args
+        .prepare()
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let continuous = args.is_continuous();
     let mut terminal = TuiTerminal::enter()?;
     let mut state = TuiState::with_target_labels(
-        TuiConfig::from_args(&args),
-        targets.iter().map(|target| target.label.clone()),
+        TuiConfig::from_args(&args, &setup),
+        setup.targets.iter().map(|target| target.label.clone()),
     );
     let mut next_render = Instant::now();
     if is_shutdown_requested(shutdown_requested) {
@@ -47,22 +46,9 @@ pub fn run_tui(
     }
     state.set_status(TuiStatus::Opening);
     render_if_due(&mut terminal, &state, &mut next_render, true)?;
-    let target_count = targets.len();
-    let config = ManagedClientConfig {
-        client: args.to_client_config(),
-        pacing: args.pacing.into(),
-        completion: ManagedCompletionPolicy::FinishWhenQuiescent,
-        event_capacity: MANAGED_EVENT_CAPACITY,
-        outcome_history_limit: target_count,
-        max_live_target_generations: target_count,
-        ..ManagedClientConfig::default()
-    };
     let (owner, mut events) = match BlockingManagedClient::start_with_subscription(
-        config,
-        targets
-            .iter()
-            .map(|target| target.managed.clone())
-            .collect(),
+        setup.managed_config(),
+        setup.managed_targets(),
     ) {
         Ok(value) => value,
         Err(error) => {

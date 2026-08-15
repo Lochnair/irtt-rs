@@ -1,13 +1,12 @@
 use std::time::Duration;
 
 use clap::Parser;
-use irtt_client::ClientConfig;
 
 #[cfg(test)]
 use crate::shared::client::TimestampArg;
 use crate::shared::client::{
-    parse_labelled_target, parse_test_duration, prepare_managed_targets, target_specs,
-    CommonClientArgs, GroupPacingArg, LabelledTargetArg, PreparedTarget, TargetSpec,
+    parse_labelled_target, parse_test_duration, prepare_managed_run, CommonClientArgs,
+    GroupPacingArg, LabelledTargetArg, ManagedRunSetup, TargetSelection,
 };
 
 pub const DEFAULT_TUI_DURATION: Duration = Duration::ZERO;
@@ -56,11 +55,19 @@ pub struct TuiArgs {
 }
 
 impl TuiArgs {
-    pub fn to_client_config(&self) -> ClientConfig {
-        self.common.to_client_config(
-            self.primary_target_addr()
-                .expect("at least one target is required"),
+    /// Validate the selected targets and prepare the managed run.
+    ///
+    /// The TUI always requires a target: the parser rejects an empty target
+    /// list, and this rejects a target set that cannot be labelled uniquely.
+    pub fn prepare(&self) -> Result<ManagedRunSetup, String> {
+        prepare_managed_run(
+            &self.common,
             self.duration,
+            TargetSelection {
+                positional: &self.targets,
+                labelled: &self.labelled_targets,
+                pacing: self.pacing,
+            },
         )
     }
 
@@ -68,30 +75,11 @@ impl TuiArgs {
         self.duration == Duration::ZERO
     }
 
-    pub fn target_specs(&self) -> Result<Vec<TuiTargetSpec>, String> {
-        target_specs(&self.targets, &self.labelled_targets)
-    }
-
-    pub fn managed_targets(&self) -> Result<Vec<TuiManagedTarget>, String> {
-        prepare_managed_targets(self.target_specs()?)
-    }
-
     #[cfg(test)]
     pub fn timestamp_mode(&self) -> TimestampArg {
         self.common.tstamp
     }
-
-    fn primary_target_addr(&self) -> Option<&str> {
-        self.targets.first().map(String::as_str).or_else(|| {
-            self.labelled_targets
-                .first()
-                .map(|target| target.addr.as_str())
-        })
-    }
 }
-
-pub type TuiTargetSpec = TargetSpec;
-pub type TuiManagedTarget = PreparedTarget;
 
 impl std::ops::Deref for TuiArgs {
     type Target = CommonClientArgs;
@@ -132,12 +120,12 @@ mod tests {
         assert_eq!(args.pacing, GroupPacingArg::Staggered);
         assert_eq!(args.duration, DEFAULT_TUI_DURATION);
         assert!(args.is_continuous());
-        assert_eq!(args.to_client_config().duration, None);
+        assert_eq!(args.prepare().unwrap().client.duration, None);
 
         let finite = parse(&["--duration", "30s", "127.0.0.1:2112"]).unwrap();
         assert_eq!(finite.duration, Duration::from_secs(30));
         assert_eq!(
-            finite.to_client_config().duration,
+            finite.prepare().unwrap().client.duration,
             Some(Duration::from_secs(30))
         );
 
@@ -149,12 +137,12 @@ mod tests {
     #[test]
     fn multiple_positional_targets_parse() {
         let args = parse(&["host-a:2112", "host-b:2112"]).unwrap();
-        let specs = args.target_specs().unwrap();
+        let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "host-a:2112");
-        assert_eq!(specs[0].addr, "host-a:2112");
+        assert_eq!(specs[0].managed.server_addr, "host-a:2112");
         assert_eq!(specs[1].label, "host-b:2112");
-        assert_eq!(specs[1].addr, "host-b:2112");
+        assert_eq!(specs[1].managed.server_addr, "host-b:2112");
     }
 
     #[test]
@@ -166,23 +154,26 @@ mod tests {
             "sg=sg.example.com:2112",
         ])
         .unwrap();
-        let specs = args.target_specs().unwrap();
+        let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "ams");
-        assert_eq!(specs[0].addr, "ams.example.com:2112");
+        assert_eq!(specs[0].managed.server_addr, "ams.example.com:2112");
         assert_eq!(specs[1].label, "sg");
-        assert_eq!(specs[1].addr, "sg.example.com:2112");
+        assert_eq!(specs[1].managed.server_addr, "sg.example.com:2112");
     }
 
     #[test]
     fn at_least_one_target_is_required() {
+        // The TUI has no target-free mode, so this is rejected at parse time
+        // rather than during preparation.
         assert!(parse(&[]).is_err());
+        assert!(parse(&["--target", "ams=ams.example.com:2112"]).is_ok());
     }
 
     #[test]
     fn duplicate_labels_are_rejected() {
         let args = parse(&["host-a:2112", "--target", "host-a:2112=host-b:2112"]).unwrap();
-        let err = args.target_specs().unwrap_err();
+        let err = args.prepare().unwrap_err();
 
         assert!(err.contains("duplicate target label"));
     }
@@ -190,7 +181,7 @@ mod tests {
     #[test]
     fn duplicate_positional_target_strings_get_stable_suffixes() {
         let args = parse(&["host-a:2112", "host-a:2112"]).unwrap();
-        let specs = args.target_specs().unwrap();
+        let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "host-a:2112");
         assert_eq!(specs[1].label, "host-a:2112#2");
@@ -199,7 +190,7 @@ mod tests {
     #[test]
     fn duplicate_target_endpoints_are_allowed() {
         let args = parse(&["127.0.0.1:2112", "127.0.0.1"]).unwrap();
-        assert_eq!(args.managed_targets().unwrap().len(), 2);
+        assert_eq!(args.prepare().unwrap().target_count(), 2);
     }
 
     #[test]
@@ -272,11 +263,10 @@ mod tests {
             "--loose",
             "127.0.0.1:2112",
         ];
-        let tui = parse(&tui_args).unwrap().to_client_config();
+        let tui = parse(&tui_args).unwrap().prepare().unwrap().client;
         let common = parse_shared(&shared).unwrap().common;
-        let shared = common.to_client_config("127.0.0.1:2112", Duration::from_secs(30));
+        let shared = common.to_client_config(Duration::from_secs(30));
 
-        assert_eq!(shared.server_addr, tui.server_addr);
         assert_eq!(shared.duration, tui.duration);
         assert_eq!(shared.interval, tui.interval);
         assert_eq!(shared.length, tui.length);

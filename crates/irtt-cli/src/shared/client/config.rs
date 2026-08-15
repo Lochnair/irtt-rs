@@ -7,9 +7,13 @@ use super::args::CommonClientArgs;
 pub const DEFAULT_RECV_TIMEOUT: Duration = Duration::from_millis(20);
 
 impl CommonClientArgs {
-    pub fn to_client_config(&self, server: &str, duration: Duration) -> ClientConfig {
+    /// Build the shared client configuration template for a managed run.
+    ///
+    /// The template carries no server address: the managed driver replaces it
+    /// per target from that target's configuration, so deriving one here from
+    /// an arbitrary target would be dead data.
+    pub fn to_client_config(&self, duration: Duration) -> ClientConfig {
         ClientConfig {
-            server_addr: server.to_owned(),
             duration: (!duration.is_zero()).then_some(duration),
             interval: self.interval,
             length: self.length,
