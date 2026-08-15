@@ -100,9 +100,29 @@ alongside the authoritative userspace `sent_at`. It survives pending ->
 timed-out retention (`SessionMachine::record_kernel_tx_timestamp` updates
 whichever of `PendingMap`/`TimedOutMap` still holds the probe) and is
 otherwise bounded by the same limits those maps already enforce — no new
-unbounded state. First valid observation wins on duplicates. **It is
-currently dormant metadata only**: no RTT, OWD, or IPDV computation reads
-it. `sent_at` remains the sole input to all of those, exactly as before this
-capability existed. A later change may select it as a preferred send
-timestamp; until then, treat any code path that reads
-`kernel_tx_timestamp` for a measurement as a bug.
+unbounded state. First valid observation wins on duplicates.
+
+**It is eligible for exactly one measurement: the upstream (`client_to_server`)
+one-way delay send endpoint.** `compute_one_way`'s private `preferred_send_wall`
+helper prefers it over the userspace `sent_at.wall` sample when
+
+    sent_at.wall <= kernel_tx_timestamp <= reply_received_at.wall
+
+(inclusive, compared only against the client's own wall clock — never
+against the remote server's wall timestamp). Otherwise, including when no
+kernel timestamp was observed, the upstream endpoint falls back to
+`sent_at.wall`; a rejected observation is never erased from `PendingProbe`,
+only skipped for that measurement. There is no maximum-lag bound: unlike the
+kernel receive side, legitimate client send-to-reply time can exceed a
+second.
+
+`sent_at` remains the sole input to RTT, timeout/scheduling, and the
+downstream (`server_to_client`) one-way delay, exactly as before this
+capability existed; `TX_SOFTWARE` is still a software kernel timestamp near
+the driver handoff, not a NIC hardware transmit time. IPDV is likewise
+unaffected — it is computed from the existing userspace timestamp fields
+only. A normal reply and a measurable late reply (one whose `PendingProbe`
+is still retained in `TimedOutMap`) apply the identical selection policy; an
+untracked late reply has no retained probe and stays unmeasurable, and a
+kernel timestamp that arrives after a reply has already been processed is
+simply never observed by that reply.

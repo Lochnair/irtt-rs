@@ -12,9 +12,11 @@ pub(crate) struct PendingProbe {
     pub timeout_at: Instant,
     /// Observed Linux kernel TX_SOFTWARE wall timestamp for this probe's
     /// send, when the socket has TX timestamping enabled and a matching
-    /// `MSG_ERRQUEUE` record has been drained. Dormant metadata only: no
-    /// measurement in this change reads it. `sent_at` remains authoritative
-    /// for RTT, timeout, and current one-way delay.
+    /// `MSG_ERRQUEUE` record has been drained. Optional observed metadata,
+    /// eligible only for upstream one-way delay after local plausibility
+    /// validation (see `compute_one_way`'s `preferred_send_wall`). `sent_at`
+    /// remains authoritative for RTT, timeout, pacing/scheduling semantics,
+    /// and the userspace fallback for upstream one-way delay.
     pub kernel_tx_timestamp: Option<SystemTime>,
 }
 
