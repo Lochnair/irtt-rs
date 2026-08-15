@@ -183,7 +183,10 @@ mod tests {
     ///
     /// The buffer is deliberately tiny: the full-buffer rule is written against
     /// the caller's capacity, so it is provable without a 65,536-byte datagram.
-    async fn receive_one(capacity: usize, payload: &[u8]) -> (Option<ReceivedDatagram>, Vec<u8>) {
+    async fn receive_one(
+        capacity: usize,
+        payload: &[u8],
+    ) -> (io::Result<Option<ReceivedDatagram>>, Vec<u8>) {
         let listener = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         sender
@@ -192,7 +195,7 @@ mod tests {
             .unwrap();
 
         let mut buffer = vec![0; capacity];
-        let received = receive(&listener, &mut buffer, false).await.unwrap();
+        let received = receive(&listener, &mut buffer, false).await;
         (received, buffer)
     }
 
@@ -201,7 +204,9 @@ mod tests {
         let payload = b"irtt";
         let (received, buffer) = receive_one(16, payload).await;
 
-        let received = received.expect("a datagram that cannot have been truncated is accepted");
+        let received = received
+            .unwrap()
+            .expect("a datagram that cannot have been truncated is accepted");
         assert_eq!(received.len, payload.len());
         assert_eq!(received.peer.ip(), Ipv4Addr::LOCALHOST);
         assert_eq!(received.reply_source, ReplySource::Bound);
@@ -214,12 +219,17 @@ mod tests {
     #[tokio::test(flavor = "current_thread")]
     async fn a_datagram_filling_the_buffer_is_dropped_as_possibly_truncated() {
         let (received, _) = receive_one(4, b"irtt").await;
-        assert!(received.is_none());
+        assert!(received.unwrap().is_none());
     }
 
+    /// What matters is that an oversized datagram never reaches the core, not
+    /// how the platform says so: Unix truncates it to the buffer, which the
+    /// full-buffer rule then drops, while Windows fails the receive outright
+    /// with `WSAEMSGSIZE`. Asserting the shared guarantee keeps this test true
+    /// on both.
     #[tokio::test(flavor = "current_thread")]
-    async fn a_datagram_larger_than_the_buffer_is_dropped() {
+    async fn a_datagram_larger_than_the_buffer_never_reaches_the_core() {
         let (received, _) = receive_one(4, b"irtt-rs").await;
-        assert!(received.is_none());
+        assert!(!matches!(received, Ok(Some(_))));
     }
 }
