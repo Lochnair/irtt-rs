@@ -665,6 +665,45 @@ fn untracked_late_replies_stay_untracked_in_both_policies() {
 }
 
 #[test]
+fn rolling_snapshots_report_no_medians_even_in_exact_mode() {
+    let mut collector = StatsCollector::new(StatsConfig {
+        rolling_count: Some(8),
+        rolling_time: Some(Duration::from_secs(60)),
+        ..StatsConfig::finite()
+    });
+    for seq in 0..3 {
+        collector.process(&sent(seq, ts(u64::from(seq) * 10)));
+        collector.process(&adjusted_reply(
+            seq,
+            10 + u64::from(seq),
+            9 + i128::from(seq),
+        ));
+    }
+
+    // The cumulative snapshot keeps the exact-mode contract...
+    let cumulative = collector.snapshot();
+    assert!(cumulative.rtt.primary.median_ns.is_some());
+    assert!(cumulative.send_call.median_ns.is_some());
+    assert!(cumulative.server_processing.processing.median_ns.is_some());
+
+    // ...while a rolling window is a bounded recent view recomputed from
+    // running statistics, so it reports no median whatever the sample mode.
+    for rolling in [
+        collector.rolling_count().unwrap(),
+        collector.rolling_time().unwrap(),
+    ] {
+        assert!(
+            rolling.rtt.primary.count > 0,
+            "the window should have samples"
+        );
+        assert_eq!(rolling.rtt.primary.median_ns, None);
+        assert_eq!(rolling.send_call.median_ns, None);
+        assert_eq!(rolling.timer_error.median_ns, None);
+        assert_eq!(rolling.server_processing.processing.median_ns, None);
+    }
+}
+
+#[test]
 fn rolling_snapshots_use_the_same_late_reply_policy() {
     let mut collector = StatsCollector::new(StatsConfig {
         rolling_count: Some(8),
