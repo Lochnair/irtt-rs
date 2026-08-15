@@ -177,17 +177,74 @@ the mirror image of destination metadata, and the contrast is the point.
   on an explicit listener, or one that describes no representable instant, all
   mean the datagram is served with `kernel_rx_timestamp: None`. Only the
   destination rules a datagram out, and only for the listener that needs one.
-- **Nothing consumes it yet.** It stops at the runtime boundary. Do not thread it
-  into `ServerCore`, add a timestamp argument or variant to `handle_datagram`,
-  stash it in a "next receive" side channel, or wrap the core's clock. How a
-  kernel-observed arrival time should enter the core is an open design question,
-  to be settled deliberately and not as a side effect of some other change.
 - **Do not map wall to monotonic.** It is a realtime reading with no monotonic
   counterpart, and `ClockSample` is a paired userspace instant. Synthesizing the
   missing half would invent precision the kernel never reported.
-- **Do not judge plausibility here.** Conversion is structural only. Whether a
-  representable reading is close enough to the server's own sample to measure
-  against belongs with whoever measures.
+- **Do not judge plausibility in the socket layer.** Conversion there is
+  structural only. Whether a representable reading is close enough to the
+  server's own sample to measure against belongs with whoever measures, which is
+  the core.
+
+### How it reaches the core, and what it may change
+
+There are two receive entry points and one implementation behind them.
+
+- **`ServerCore::handle_datagram(peer, packet)` is the public one and takes no
+  timing.** A caller hands over bytes and an endpoint; every instant the reply
+  reports is one the core sampled itself. This is exactly the behavior it had
+  before the kernel timestamp was consumed, and it is what a direct or manual
+  `ServerCore` user gets.
+- **The Tokio runtime uses a crate-private entry point** that additionally takes
+  the optional kernel-observed wall receive time, passed with the datagram it
+  describes. That is the whole mechanism: an explicit per-datagram argument. Do
+  **not** replace it with a "next receive timestamp" setter, a pending-metadata
+  field, thread-local or global state, or a `ClockSource` wrapper that returns
+  transport metadata on the next sample — those hide a per-datagram input behind
+  ambient mutable state. Do not make the runtime path a second public API, and
+  do not pass `ReplySource` or the whole `ReceivedDatagram` into the core: it
+  needs a peer, bytes and an arrival observation, not socket addressing.
+- **`ClockSample` is unchanged and still one paired userspace instant.** The
+  preferred receive wall value is carried beside it on the classified echo, never
+  inside it. A `ClockSample` whose `wall_ns` came from the kernel and whose
+  `mono_ns` came from userspace would claim two physical instants were one
+  sample.
+
+The acceptance rule is the client's, in principle and in its bound, and lives in
+the core as `preferred_receive_wall_ns`. A reading is used only when it converts
+into the wire's signed-nanosecond vocabulary, is not later than the core's own
+paired receive sample, and lags it by no more than `MAX_KERNEL_RX_LAG` — one
+second, inclusive, and a sanity guard rather than an expected wakeup latency.
+Anything else falls back to the userspace wall reading. **A rejected reading is
+never a rejected datagram**: no error reply, no dropped packet, no session state
+moved. Keep the two implementations separate from the client's; a shared helper
+is not worth a crate dependency for a dozen lines of timing policy.
+
+What the observation may change is one field:
+
+- **Measurement policy**: `recv_wall` under `StampAt::Receive` and `StampAt::Both`
+  on a clock that reports wall time. Nothing else.
+- **Lifecycle policy**: always `received_at.mono_ns`, the core's own userspace
+  monotonic reading. Idle expiry, rate allowance and the maximum-duration
+  deadline never see a kernel value, including for the rate-limited echo that
+  produces no reply and for the final echo that carries the close.
+- **Midpoint**: always the paired userspace receive and send samples. Moving only
+  the wall receive endpoint would improve apparent upstream delay by exactly what
+  it cost apparent downstream delay, and leave `midpoint_wall` and
+  `midpoint_mono` describing different midpoints — with no residency interval
+  recoverable from a midpoint to show for it.
+- **`StampAt::Send`, `StampAt::None` and `Clock::Monotonic`** emit no arrival wall
+  field, so an observation cannot reach them. An open or a close ignores it too.
+- **Ordering still holds.** The reported arrival wall value is held back to the
+  send reading in its own right, because it may not have come from the receive
+  sample `ClockSample::not_after` orders.
+
+One consequence is intended: under `Clock::Wall` with `StampAt::Both`, the
+server-processing interval a client computes now runs from the kernel's arrival
+reading rather than the server's wakeup, so it includes the kernel-to-userspace
+portion of the server's residency and the adjusted round-trip shrinks to match.
+Under `Clock::Both` the monotonic pair still yields the unchanged userspace
+interval. Do not force the two to agree, and in particular do not estimate a
+kernel monotonic instant to do it.
 - Linux only, and receive only. No macOS, FreeBSD or Windows implementation, and
   no transmit timestamping, without a reason and agreement.
 - Control-buffer capacity is derived from the cmsg payload types and asserted at
@@ -283,7 +340,9 @@ effective parameters must be safe for the server to run.
   clock source and is stable for its life.
 - A reply's receive instant is held back to its send instant where the wall
   clock stepped backwards between the two readings, so the required ordering
-  holds. That correction is per reply and stateless on purpose: latching a
+  holds — and so is a reported arrival wall value that came from the kernel
+  instead, which needs the rule applied in its own right because it was not part
+  of the pair. That correction is per reply and stateless on purpose: latching a
   pre-step wall value across packets would keep reporting a time the host has
   corrected away, which is the smoothing the specification forbids, and
   anchoring the wall clock to the monotonic origin would drift and never pick up
