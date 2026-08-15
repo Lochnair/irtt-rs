@@ -23,7 +23,13 @@ use ratatui::{
 };
 
 use crate::{
-    cmd::tui::args::TuiArgs,
+    cmd::{
+        format::{
+            format_count, format_duration, format_ns_f64, format_optional_count,
+            format_optional_ns_i128, format_percent, format_percent_ratio, ABSENT,
+        },
+        tui::args::TuiArgs,
+    },
     shared::client::{expected_probe_count, GroupPacingArg},
 };
 
@@ -330,7 +336,7 @@ impl TuiState {
                     recent = Some(format!(
                         "reply seq={} effective={}",
                         format_seq(*seq),
-                        format_ns_i128(Some(rtt.effective.as_nanos()))
+                        format_optional_ns_i128(Some(rtt.effective.as_nanos()))
                     ));
                 }
                 ClientEvent::EchoLoss { seq, .. } => {
@@ -349,7 +355,7 @@ impl TuiState {
                         .map(|sample| {
                             format!(
                                 " effective={}",
-                                format_ns_i128(Some(sample.effective.as_nanos()))
+                                format_optional_ns_i128(Some(sample.effective.as_nanos()))
                             )
                         })
                         .unwrap_or_default();
@@ -1149,8 +1155,8 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
     let session = selected
         .and_then(|target| target.session.as_deref())
         .unwrap_or("-");
-    let elapsed = format_duration(state.started_at.elapsed());
-    let duration = format_optional_duration(state.config.duration);
+    let elapsed = format_span(state.started_at.elapsed());
+    let duration = format_optional_span(state.config.duration);
     let mode = if state.config.duration.is_some() {
         "finite"
     } else {
@@ -1186,8 +1192,8 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
                 )),
                 Line::from(format!(
                     "interval: {}  timeout: {}",
-                    format_duration(state.config.interval),
-                    format_duration(state.config.timeout)
+                    format_span(state.config.interval),
+                    format_span(state.config.timeout)
                 )),
                 Line::from(negotiated),
             ]);
@@ -1197,7 +1203,7 @@ fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
                 Line::from(format!("session: {session}")),
                 Line::from(format!(
                     "{mode}  elapsed: {elapsed}  interval: {}",
-                    format_duration(state.config.interval)
+                    format_span(state.config.interval)
                 )),
             ]);
         }
@@ -1216,12 +1222,12 @@ fn graph_summary_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'stat
     let remote = selected
         .and_then(|target| target.remote.as_deref())
         .unwrap_or("-");
-    let elapsed = format_duration(state.started_at.elapsed());
+    let elapsed = format_span(state.started_at.elapsed());
     let packets = snapshot.packets;
     let last = state
         .selected_target()
         .and_then(|target| target.last_sample)
-        .map(|sample| format_ns_i128(Some(sample.effective_ns)))
+        .map(|sample| format_optional_ns_i128(Some(sample.effective_ns)))
         .unwrap_or_else(|| "-".to_owned());
 
     let target_context = if state.is_multi_target() {
@@ -1295,7 +1301,7 @@ fn packet_panel(state: &TuiState, snapshot: &Snapshot, panel_height: u16) -> Par
         )),
         Line::from(format!(
             "server received {}   window {}",
-            format_optional_u64(packets.server_packets_received),
+            format_optional_count(packets.server_packets_received),
             format_optional_hex(packets.server_received_window)
         )),
     ])
@@ -1314,7 +1320,7 @@ fn target_table_panel(state: &TuiState, panel_height: u16) -> Paragraph<'static>
         let snapshot = target.stats.snapshot();
         let last = target
             .last_sample
-            .map(|sample| format_ns_i128(Some(sample.effective_ns)))
+            .map(|sample| format_optional_ns_i128(Some(sample.effective_ns)))
             .unwrap_or_else(|| "-".to_owned());
         lines.push(Line::from(vec![
             target_label_span(&target.label, idx, 16),
@@ -1695,7 +1701,7 @@ fn viewport_x_bounds(viewport: GraphViewportRange) -> [f64; 2] {
 
 fn viewport_x_axis_labels(viewport: GraphViewportRange) -> Vec<Span<'static>> {
     vec![
-        Span::raw(format!("-{}", format_duration(viewport.window))),
+        Span::raw(format!("-{}", format_span(viewport.window))),
         Span::raw(if viewport.is_live { "live" } else { "end" }),
     ]
 }
@@ -1704,7 +1710,7 @@ fn graph_context(state: &TuiState, viewport: GraphViewportRange) -> String {
     format!(
         "{} | window {}",
         graph_viewport_status(state),
-        format_duration(viewport.window)
+        format_span(viewport.window)
     )
 }
 
@@ -1744,9 +1750,9 @@ fn format_axis_time_ms(value_ms: f64) -> String {
     if abs_ms < 1.0 {
         let us = abs_ms * 1_000.0;
         if us < 10.0 {
-            format!("{sign}{us:.1}us")
+            format!("{sign}{us:.1}µs")
         } else {
-            format!("{sign}{us:.0}us")
+            format!("{sign}{us:.0}µs")
         }
     } else if abs_ms < 1_000.0 {
         if abs_ms < 10.0 {
@@ -1804,23 +1810,23 @@ fn sample_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
         )),
         Line::from(format!(
             "raw / adjusted / effective: {} / {} / {}",
-            last.map(|sample| format_ns_i128(Some(sample.raw_ns)))
+            last.map(|sample| format_optional_ns_i128(Some(sample.raw_ns)))
                 .unwrap_or_else(|| "-".to_owned()),
-            last.map(|sample| format_ns_i128(sample.adjusted_ns))
+            last.map(|sample| format_optional_ns_i128(sample.adjusted_ns))
                 .unwrap_or_else(|| "-".to_owned()),
-            last.map(|sample| format_ns_i128(Some(sample.effective_ns)))
+            last.map(|sample| format_optional_ns_i128(Some(sample.effective_ns)))
                 .unwrap_or_else(|| "-".to_owned())
         )),
         Line::from(format!(
             "one-way c2s / s2c: {} / {}",
-            last.map(|sample| format_ns_i128(sample.client_to_server_ns))
+            last.map(|sample| format_optional_ns_i128(sample.client_to_server_ns))
                 .unwrap_or_else(|| "-".to_owned()),
-            last.map(|sample| format_ns_i128(sample.server_to_client_ns))
+            last.map(|sample| format_optional_ns_i128(sample.server_to_client_ns))
                 .unwrap_or_else(|| "-".to_owned())
         )),
         Line::from(format!(
             "server processing: {}",
-            last.map(|sample| format_ns_i128(sample.server_processing_ns))
+            last.map(|sample| format_optional_ns_i128(sample.server_processing_ns))
                 .unwrap_or_else(|| "-".to_owned())
         )),
         Line::from(format!(
@@ -1888,7 +1894,7 @@ fn graph_viewport_status(state: &TuiState) -> String {
             let live_end = state.newest_graph_sample_time().unwrap_or(now).max(now);
             format!(
                 "history -{}",
-                format_duration(live_end.saturating_duration_since(end))
+                format_span(live_end.saturating_duration_since(end))
             )
         }
     }
@@ -1906,9 +1912,9 @@ fn push_time_line(lines: &mut Vec<Line<'_>>, label: &str, stats: &TimeStats) {
     lines.push(Line::from(format!(
         "{label:<18} {:>5} {:>9} {:>9} {:>9} {:>9}",
         format_count(stats.count),
-        format_ns_i128(stats.min_ns),
+        format_optional_ns_i128(stats.min_ns),
         format_ns_f64(stats.mean_ns),
-        format_ns_i128(stats.max_ns),
+        format_optional_ns_i128(stats.max_ns),
         format_ns_f64(stats.stddev_ns())
     )));
 }
@@ -1918,7 +1924,7 @@ fn format_negotiated(negotiated: &NegotiatedParams) -> String {
     let duration = if params.duration_ns == 0 {
         "-".to_owned()
     } else {
-        format_ns_i128(Some(i128::from(params.duration_ns)))
+        format_optional_ns_i128(Some(i128::from(params.duration_ns)))
     };
     let restrictions = if negotiated.restrictions.is_empty() {
         "none".to_owned()
@@ -1928,7 +1934,7 @@ fn format_negotiated(negotiated: &NegotiatedParams) -> String {
     format!(
         "duration={} interval={} length={} clock={:?} timestamps={:?} stats={:?} restrictions={}",
         duration,
-        format_ns_i128(Some(i128::from(params.interval_ns))),
+        format_optional_ns_i128(Some(i128::from(params.interval_ns))),
         params.length,
         params.clock,
         params.stamp_at,
@@ -1937,78 +1943,41 @@ fn format_negotiated(negotiated: &NegotiatedParams) -> String {
     )
 }
 
-fn format_optional_duration(value: Option<Duration>) -> String {
-    value.map(format_duration).unwrap_or_else(|| "-".to_owned())
+fn format_optional_span(value: Option<Duration>) -> String {
+    value.map(format_span).unwrap_or_else(|| ABSENT.to_owned())
 }
 
-fn format_duration(value: Duration) -> String {
+/// Format a wall-clock span shown in the TUI's headers, config lines, and
+/// graph window labels.
+///
+/// Spans are read at a glance rather than compared numerically, so they are
+/// deliberately coarser than the shared scalar policy: a zero span is `0s`,
+/// whole seconds carry one decimal, and a span of a minute or more is written
+/// as minutes and seconds. Below one second there is nothing to gain from a
+/// second spelling, so the shared scalar vocabulary is used directly.
+fn format_span(value: Duration) -> String {
     if value.is_zero() {
         return "0s".to_owned();
     }
     let nanos = value.as_nanos();
-    if nanos < 1_000 {
-        format!("{nanos}ns")
-    } else if nanos < 1_000_000 {
-        format!("{:.1}us", nanos as f64 / 1_000.0)
-    } else if nanos < 1_000_000_000 {
-        format!("{:.1}ms", nanos as f64 / 1_000_000.0)
-    } else if nanos < 60_000_000_000 {
+    if nanos < 1_000_000_000 {
+        return format_duration(value);
+    }
+    let secs = value.as_secs();
+    if nanos < 60_000_000_000 {
         format!("{:.1}s", nanos as f64 / 1_000_000_000.0)
     } else {
-        let secs = value.as_secs();
         format!("{}m{:02}s", secs / 60, secs % 60)
-    }
-}
-
-fn format_ns_i128(value: Option<i128>) -> String {
-    value.map(format_ns_value).unwrap_or_else(|| "-".to_owned())
-}
-
-fn format_ns_f64(value: f64) -> String {
-    format_ns_value(value.round() as i128)
-}
-
-fn format_ns_value(value: i128) -> String {
-    let sign = if value < 0 { "-" } else { "" };
-    let value = value.saturating_abs() as f64;
-    if value < 1_000.0 {
-        format!("{sign}{value:.0}ns")
-    } else if value < 1_000_000.0 {
-        format!("{sign}{:.1}us", value / 1_000.0)
-    } else if value < 1_000_000_000.0 {
-        format!("{sign}{:.1}ms", value / 1_000_000.0)
-    } else {
-        format!("{sign}{:.3}s", value / 1_000_000_000.0)
-    }
-}
-
-fn format_percent(value: f64) -> String {
-    if value.is_finite() {
-        format!("{value:.2}%")
-    } else {
-        "-".to_owned()
-    }
-}
-
-fn format_percent_ratio(value: u64, total: u64) -> String {
-    if total == 0 {
-        "-".to_owned()
-    } else {
-        format_percent((value as f64 / total as f64 * 100.0).min(100.0))
     }
 }
 
 fn format_rate(count: u64, elapsed: Duration) -> String {
     let secs = elapsed.as_secs_f64();
     if secs <= f64::EPSILON {
-        "-".to_owned()
+        ABSENT.to_owned()
     } else {
         format!("{:.2}/s", count as f64 / secs)
     }
-}
-
-fn format_count(value: u64) -> String {
-    value.to_string()
 }
 
 fn truncate(value: &str, max_chars: usize) -> String {
@@ -2026,14 +1995,10 @@ fn format_seq(value: u32) -> String {
     value.to_string()
 }
 
-fn format_optional_u64(value: Option<u64>) -> String {
-    value.map(format_count).unwrap_or_else(|| "-".to_owned())
-}
-
 fn format_optional_hex(value: Option<u64>) -> String {
     value
         .map(|value| format!("0x{value:x}"))
-        .unwrap_or_else(|| "-".to_owned())
+        .unwrap_or_else(|| ABSENT.to_owned())
 }
 
 fn duration_ns(value: Duration) -> i128 {
@@ -2178,11 +2143,22 @@ mod tests {
     }
 
     #[test]
+    fn spans_stay_coarse_above_a_second_and_share_scalar_units_below_it() {
+        assert_eq!(format_span(Duration::ZERO), "0s");
+        assert_eq!(format_span(Duration::from_nanos(750)), "750ns");
+        assert_eq!(format_span(Duration::from_micros(500)), "500.0µs");
+        assert_eq!(format_span(Duration::from_millis(25)), "25.0ms");
+        assert_eq!(format_span(Duration::from_millis(1_500)), "1.5s");
+        assert_eq!(format_span(Duration::from_secs(90)), "1m30s");
+    }
+
+    #[test]
     fn formats_signed_durations_and_missing_values() {
-        assert_eq!(format_ns_i128(Some(-1_500_000)), "-1.5ms");
-        assert_eq!(format_ns_i128(Some(750)), "750ns");
-        assert_eq!(format_ns_i128(None), "-");
-        assert_eq!(format_optional_duration(None), "-");
+        assert_eq!(format_optional_ns_i128(Some(-1_500_000)), "-1.5ms");
+        assert_eq!(format_optional_ns_i128(Some(750)), "750ns");
+        assert_eq!(format_optional_ns_i128(None), "-");
+        assert_eq!(format_optional_ns_i128(Some(1_500)), "1.5µs");
+        assert_eq!(format_optional_span(None), "-");
         assert_eq!(format_duration(Duration::from_millis(25)), "25.0ms");
         assert_eq!(format_percent_ratio(1, 4), "25.00%");
         assert_eq!(format_optional_hex(Some(0x1f)), "0x1f");
@@ -2748,7 +2724,7 @@ mod tests {
 
         assert_eq!(
             rendered,
-            vec!["-1.00ms", "-500us", "0.0us", "500us", "1.00ms"]
+            vec!["-1.00ms", "-500µs", "0.0µs", "500µs", "1.00ms"]
         );
     }
 

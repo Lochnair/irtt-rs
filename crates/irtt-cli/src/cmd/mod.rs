@@ -1,5 +1,7 @@
 #[cfg(feature = "client")]
 pub mod client;
+#[cfg(any(feature = "client", feature = "tui"))]
+mod format;
 #[cfg(feature = "server")]
 pub mod server;
 #[cfg(feature = "tui")]

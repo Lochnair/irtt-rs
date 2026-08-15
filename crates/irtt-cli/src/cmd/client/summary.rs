@@ -2,6 +2,11 @@ use std::fmt::Write as _;
 
 use irtt_stats::{Snapshot, TimeStats};
 
+use crate::cmd::format::{
+    format_ns_f64, format_optional_ns_f64 as format_ns_f64_opt,
+    format_optional_ns_i128 as format_ns_i128, format_percent,
+};
+
 pub fn format_summary(summary: &Snapshot) -> String {
     format_summary_with_options(summary, SummaryFormatOptions::default())
 }
@@ -115,34 +120,6 @@ fn write_time_row(out: &mut String, label: &str, value: &TimeStats) {
         format_ns_f64(value.stddev_ns())
     )
     .unwrap();
-}
-
-fn format_percent(value: f64) -> String {
-    format!("{value:.2}%")
-}
-
-fn format_ns_i128(value: Option<i128>) -> String {
-    value
-        .map(|value| format_ns_f64(value as f64))
-        .unwrap_or_else(|| "-".to_owned())
-}
-
-fn format_ns_f64_opt(value: Option<f64>) -> String {
-    value.map(format_ns_f64).unwrap_or_else(|| "-".to_owned())
-}
-
-fn format_ns_f64(value: f64) -> String {
-    let sign = if value.is_sign_negative() { "-" } else { "" };
-    let value = value.abs();
-    if value < 1_000.0 {
-        format!("{sign}{value:.0}ns")
-    } else if value < 1_000_000.0 {
-        format!("{sign}{:.1}µs", value / 1_000.0)
-    } else if value < 1_000_000_000.0 {
-        format!("{sign}{:.1}ms", value / 1_000_000.0)
-    } else {
-        format!("{sign}{:.3}s", value / 1_000_000_000.0)
-    }
 }
 
 #[cfg(test)]
