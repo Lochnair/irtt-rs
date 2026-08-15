@@ -153,8 +153,12 @@ send-to-reply time can exceed a second.
 `sent_at` remains the sole input to RTT and the downstream
 (`server_to_client`) one-way delay, exactly as before this capability
 existed; `TX_SOFTWARE` is still a software kernel timestamp near the driver
-handoff, not a NIC hardware transmit time. IPDV is likewise unaffected — it
-is computed from the existing userspace timestamp fields only. A normal
+handoff, not a NIC hardware transmit time. `irtt-stats`'s `ReplySample`
+copies public `sent_at` straight into `client_send_mono`/`client_send_wall_ns`,
+which `send_ipdv_ns` compares across probes for the upstream IPDV component —
+so that component shifts endpoint along with `sent_at` itself (pre-send vs.
+post-send) exactly as RTT and the upstream OWD fallback do; it is not a
+separate invariant. A normal
 reply and a measurable late reply (one whose `PendingProbe` is still
 retained in `TimedOutMap`) apply the identical selection policy; an
 untracked late reply has no retained probe and stays unmeasurable, and a
