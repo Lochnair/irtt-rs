@@ -1,4 +1,8 @@
-use std::{collections::HashMap, net::SocketAddr};
+use std::{
+    collections::HashMap,
+    net::SocketAddr,
+    time::{Duration, SystemTime},
+};
 
 use irtt_proto::{
     decode_request, echo_packet_len, encode_echo_reply, encode_open_reply, verify_packet_hmac,
@@ -7,7 +11,7 @@ use irtt_proto::{
 };
 
 use crate::{
-    clock::{saturating_ns, ClockSample, ClockSource, SystemClock},
+    clock::{saturating_ns, wall_ns_of, ClockSample, ClockSource, SystemClock},
     config::ServerConfig,
     error::ServerError,
     fill::{echo_payload_len, negotiate_server_fill},
@@ -154,6 +158,12 @@ impl ServerCore {
     /// data or consulting the session table, and no reply behavior may reveal
     /// which stage rejected it.
     ///
+    /// Every instant this reports is one the core sampled itself: a caller hands
+    /// over bytes and an endpoint, not timings. The Tokio runtime, which does
+    /// have transport metadata, reaches the same implementation through a
+    /// crate-private entry point that may add a kernel-observed arrival time;
+    /// this path behaves exactly as it does with none.
+    ///
     /// # Errors
     ///
     /// Returns [`ServerError`] only for an internal failure — the random source
@@ -164,6 +174,49 @@ impl ServerCore {
         &mut self,
         peer: SocketAddr,
         packet: &[u8],
+    ) -> Result<Option<OutboundDatagram>, ServerError> {
+        self.process(peer, packet, None)
+    }
+
+    /// Handles one received datagram together with what the transport observed
+    /// about its arrival.
+    ///
+    /// This is the entry point the Tokio runtime uses, and the only difference
+    /// from [`handle_datagram`](Self::handle_datagram) is `kernel_rx_timestamp`:
+    /// a wall-clock arrival instant the kernel recorded for this datagram, where
+    /// the listener could obtain one. Both paths run the same implementation,
+    /// and `None` reproduces the public path exactly.
+    ///
+    /// The observation is measurement input and nothing else. It may become the
+    /// receive wall value of an echo reply that negotiated one, and it can never
+    /// reach lifecycle, rate or deadline policy, the monotonic domain, or a
+    /// midpoint — those stay on the core's own paired userspace sample. An
+    /// implausible or unrepresentable value is not a reason to reject the
+    /// datagram; it simply is not used. See
+    /// [`preferred_receive_wall_ns`].
+    ///
+    /// It is crate-private on purpose: transport metadata reaches the core by
+    /// being passed with the datagram it describes, and there is no second
+    /// public API for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`handle_datagram`](Self::handle_datagram).
+    pub(crate) fn handle_received_datagram(
+        &mut self,
+        peer: SocketAddr,
+        packet: &[u8],
+        kernel_rx_timestamp: Option<SystemTime>,
+    ) -> Result<Option<OutboundDatagram>, ServerError> {
+        self.process(peer, packet, kernel_rx_timestamp)
+    }
+
+    /// The one implementation behind both receive entry points.
+    fn process(
+        &mut self,
+        peer: SocketAddr,
+        packet: &[u8],
+        kernel_rx_timestamp: Option<SystemTime>,
     ) -> Result<Option<OutboundDatagram>, ServerError> {
         let Ok(request) = decode_request(packet) else {
             return Ok(None);
@@ -176,7 +229,7 @@ impl ServerCore {
         // protocol state, and it is a strictly better trade than looking a
         // session up before authentication to discover whether it even wanted
         // timestamps.
-        let kind = self.classify(&request.kind, packet.len());
+        let kind = self.classify(&request.kind, packet.len(), kernel_rx_timestamp);
 
         // The HMAC flag must agree with this server's configuration in both
         // directions of mismatch, and the MAC itself is verified separately.
@@ -248,10 +301,17 @@ impl ServerCore {
 
     /// Pairs a structurally decoded request with the clock sample an echo
     /// needs, leaving every other kind untouched.
+    ///
+    /// An echo also settles here which wall instant its reply may report as the
+    /// arrival time, because that is the moment both candidates are in hand.
+    /// `kernel_rx_timestamp` is ignored for every other kind: an open or a close
+    /// emits no receive timestamp, so having observed one changes nothing about
+    /// it.
     fn classify<'a>(
         &mut self,
         kind: &DecodedRequestKind<'a>,
         datagram_len: usize,
+        kernel_rx_timestamp: Option<SystemTime>,
     ) -> ClassifiedKind<'a> {
         match *kind {
             DecodedRequestKind::Open { no_test, params } => {
@@ -262,12 +322,16 @@ impl ServerCore {
             // read no further than its length.
             DecodedRequestKind::Echo {
                 token, sequence, ..
-            } => ClassifiedKind::Echo(EchoRequest {
-                token,
-                sequence,
-                datagram_len,
-                received_at: self.clock.sample(),
-            }),
+            } => {
+                let received_at = self.clock.sample();
+                ClassifiedKind::Echo(EchoRequest {
+                    token,
+                    sequence,
+                    datagram_len,
+                    received_at,
+                    receive_wall_ns: preferred_receive_wall_ns(kernel_rx_timestamp, received_at),
+                })
+            }
         }
     }
 
@@ -377,7 +441,12 @@ impl ServerCore {
             sequence: request.sequence,
             recv_count: params.received_stats.has_count().then_some(next.count),
             recv_window: params.received_stats.has_window().then_some(next.window),
-            timestamps: timestamp_fields(params, request.received_at, sent_at),
+            timestamps: timestamp_fields(
+                params,
+                request.received_at,
+                sent_at,
+                request.receive_wall_ns,
+            ),
             // The session's negotiated fill, generated fresh for this reply and
             // sized from the layout rather than from `params.length`. A `none`
             // session contributes no bytes and the encoder's zero-fill stands,
@@ -621,12 +690,67 @@ enum ClassifiedKind<'a> {
 /// fields is carried forward. `datagram_len` is the length the datagram
 /// actually arrived with, which the configured maximum judges; it is not
 /// required to match the negotiated length, and it never sizes the reply.
+///
+/// The two timing fields are deliberately separate and are not interchangeable.
+/// `received_at` is the core's own paired userspace instant and is the sole
+/// authority for everything about this request that is a same-host question:
+/// idle expiry, rate allowance, the maximum-duration deadline, and the
+/// monotonic timestamps a reply may carry. `receive_wall_ns` is only the
+/// wall-clock arrival value a reply may *report*, which is the kernel's reading
+/// where the transport observed a usable one. Keeping it out of `ClockSample`
+/// is the point: a kernel wall reading has no monotonic counterpart, and pairing
+/// it with `received_at.mono_ns` would claim two different physical instants
+/// were one sample.
 #[derive(Debug, Clone, Copy)]
 struct EchoRequest {
     token: u64,
     sequence: u32,
     datagram_len: usize,
     received_at: ClockSample,
+    receive_wall_ns: i64,
+}
+
+/// Largest lag behind the core's own receive sample that a kernel receive
+/// timestamp may show and still be used as a measurement endpoint.
+///
+/// This is a sanity guard rather than an expected kernel-to-userspace wakeup
+/// latency, which is orders of magnitude smaller. A reading this far behind the
+/// server's own sample most likely reflects a realtime clock discontinuity or
+/// otherwise unusable metadata, and falling back to a value this server knows it
+/// read is better than publishing a bad cross-host timing endpoint. The client
+/// applies the same bound to its own receive metadata.
+pub(crate) const MAX_KERNEL_RX_LAG: Duration = Duration::from_secs(1);
+
+/// The wall instant an echo reply should report as the request's arrival time.
+///
+/// A kernel receive timestamp is taken before the socket queue and the runtime's
+/// wakeup, so preferring it removes that delay from the upstream one-way delay a
+/// client computes. It is used only when it is plausible *for this datagram*: it
+/// must convert into the wire's signed-nanosecond vocabulary, it cannot be later
+/// than the sample that observed the same datagram, and it may not lag that
+/// sample by more than [`MAX_KERNEL_RX_LAG`]. The bound is inclusive.
+///
+/// Anything else falls back to the userspace wall reading. A failed check is
+/// never a reason to drop the datagram, refuse a reply or disturb session state:
+/// implausible metadata means the server measures as it did before the kernel
+/// offered any.
+///
+/// The comparison goes through `i128` because the difference of two `i64`
+/// nanosecond values can exceed `i64`.
+pub(crate) fn preferred_receive_wall_ns(
+    kernel_rx_timestamp: Option<SystemTime>,
+    received_at: ClockSample,
+) -> i64 {
+    let userspace_wall_ns = received_at.wall_ns;
+    let Some(kernel_wall_ns) = kernel_rx_timestamp.and_then(wall_ns_of) else {
+        return userspace_wall_ns;
+    };
+    let lag_ns = i128::from(userspace_wall_ns) - i128::from(kernel_wall_ns);
+    if (0..=i128::from(saturating_ns(MAX_KERNEL_RX_LAG))).contains(&lag_ns) {
+        kernel_wall_ns
+    } else {
+        userspace_wall_ns
+    }
 }
 
 /// Builds the timestamp fields a session negotiated, and only those.
@@ -650,20 +774,65 @@ struct EchoRequest {
 /// receive instant must not be later than its send instant and the wall clock
 /// can be stepped backwards between the two readings. See
 /// [`ClockSample::not_after`]; the correction is confined to this one reply.
-fn timestamp_fields(params: &Params, received: ClockSample, sent: ClockSample) -> TimestampFields {
+///
+/// `receive_wall_ns` is the wall instant a reported arrival time should use —
+/// [`preferred_receive_wall_ns`], so the kernel's reading where there was a
+/// usable one and the userspace sample's own otherwise. It reaches exactly two
+/// fields, `recv_wall` under [`StampAt::Receive`] and under [`StampAt::Both`],
+/// and it is held to the send reading by the same rule the paired sample is.
+/// Everything else keeps the paired userspace samples:
+///
+/// - **Monotonic never moves.** A kernel wall reading has no monotonic
+///   counterpart, and inventing one would be precision the kernel never
+///   reported. So under [`Clock::Both`] a `recv_wall`/`recv_mono` pair may
+///   describe two different physical instants. That is a deliberate wire
+///   policy — each field is honest about the domain it names, and nothing
+///   computes across the two — and it is why the core does not model them as
+///   one sample.
+/// - **A midpoint is untouched.** It is the mean of the receive and send
+///   instants, so substituting only the wall receive endpoint would move
+///   `midpoint_wall` earlier by half the kernel-to-userspace delay: apparent
+///   upstream delay would improve by exactly as much as apparent downstream
+///   delay worsened, `midpoint_wall` and `midpoint_mono` would stop describing
+///   the same midpoint, and no server residency interval is recoverable from a
+///   midpoint to make up for it.
+/// - **[`StampAt::Send`] and [`StampAt::None`] report no arrival time at all**,
+///   so an observation cannot reach them.
+///
+/// One consequence is intended and worth stating: under [`Clock::Wall`] with
+/// [`StampAt::Both`], the interval a client computes from the two reported
+/// instants now spans from the kernel's arrival reading rather than from the
+/// server's wakeup, so it includes the kernel-to-userspace portion of the
+/// server's residency. Under [`Clock::Both`] the monotonic pair still yields the
+/// unchanged userspace interval.
+fn timestamp_fields(
+    params: &Params,
+    received: ClockSample,
+    sent: ClockSample,
+    receive_wall_ns: i64,
+) -> TimestampFields {
     let received = received.not_after(sent);
+    // The reported arrival wall value obeys the same ordering rule, and needs
+    // its own application of it: it may not have come from `received`, so a
+    // backward wall step between the kernel's reading and the send sample would
+    // otherwise leave the reply claiming it was received after it was sent.
+    let receive_wall_ns = receive_wall_ns.min(sent.wall_ns);
     let per_clock = |sample: ClockSample| {
         (
             params.clock.has_wall().then_some(sample.wall_ns),
             params.clock.has_mono().then_some(sample.mono_ns),
         )
     };
+    let arrival = (
+        params.clock.has_wall().then_some(receive_wall_ns),
+        params.clock.has_mono().then_some(received.mono_ns),
+    );
     let absent = (None, None);
     let (recv, midpoint, send) = match params.stamp_at {
         StampAt::None => (absent, absent, absent),
-        StampAt::Receive => (per_clock(received), absent, absent),
+        StampAt::Receive => (arrival, absent, absent),
         StampAt::Send => (absent, absent, per_clock(sent)),
-        StampAt::Both => (per_clock(received), absent, per_clock(sent)),
+        StampAt::Both => (arrival, absent, per_clock(sent)),
         StampAt::Midpoint => (absent, per_clock(received.midpoint(sent)), absent),
     };
     TimestampFields {

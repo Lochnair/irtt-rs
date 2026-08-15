@@ -8,9 +8,18 @@
 //!
 //! This is the clock counterpart of [`TokenSource`](crate::token::TokenSource)
 //! and nothing more. It is **not** a runtime abstraction, not a transport
-//! boundary and not a pluggable product API: it is crate-private, the public
-//! constructor still takes only a [`ServerConfig`](crate::ServerConfig), and
-//! callers never pass timestamps into the core.
+//! boundary and not a pluggable product API: it is crate-private and the public
+//! constructor still takes only a [`ServerConfig`](crate::ServerConfig).
+//!
+//! The public [`ServerCore::handle_datagram`](crate::ServerCore::handle_datagram)
+//! entry point takes no timestamp: the core samples every instant it reports.
+//! The Tokio runtime uses a crate-private entry point that may additionally hand
+//! over a kernel-observed wall receive time for one datagram, which this module
+//! contributes only the [`wall_ns_of`] conversion for. Whether such an
+//! observation is usable, and which reply field it may reach, is measurement
+//! policy and lives in the core — this stays the module that reads clocks, not
+//! one that models transport metadata. A [`ClockSample`] remains one paired
+//! userspace instant and never carries a kernel reading.
 
 use std::{
     fmt,
@@ -123,6 +132,28 @@ fn wall_ns() -> i64 {
     }
 }
 
+/// An observed instant as nanoseconds since the Unix epoch, or `None` when it
+/// does not fit the wire's signed-nanosecond field.
+///
+/// This is the conversion for an instant the server did **not** read from its
+/// own [`ClockSource`] — today, a kernel receive timestamp the transport
+/// observed. It reports unrepresentability rather than saturating, because a
+/// clamped instant is indistinguishable from a real one at the boundary and
+/// would then be compared against a genuine sample as though it were plausible.
+/// A local reading has no such problem and keeps [`saturating_ns`].
+///
+/// The negation cannot fail for any [`SystemTime`] a host can hold: it is
+/// reachable only from a value already inside `i64`, and only `i64::MIN` has no
+/// negation. It is checked anyway so that no path here can panic.
+pub(crate) fn wall_ns_of(at: SystemTime) -> Option<i64> {
+    match at.duration_since(UNIX_EPOCH) {
+        Ok(since_epoch) => i64::try_from(since_epoch.as_nanos()).ok(),
+        Err(before_epoch) => i64::try_from(before_epoch.duration().as_nanos())
+            .ok()
+            .and_then(i64::checked_neg),
+    }
+}
+
 /// A duration as nanoseconds, saturating rather than panicking.
 ///
 /// This is the crate's one [`Duration`] → wire-nanoseconds conversion, used for
@@ -214,5 +245,26 @@ mod tests {
     fn a_duration_beyond_the_wire_field_saturates_rather_than_panicking() {
         assert_eq!(saturating_ns(Duration::from_nanos(1_500)), 1_500);
         assert_eq!(saturating_ns(Duration::MAX), i64::MAX);
+    }
+
+    #[test]
+    fn an_observed_instant_converts_or_reports_that_it_cannot() {
+        assert_eq!(
+            wall_ns_of(UNIX_EPOCH + Duration::from_nanos(1_500)),
+            Some(1_500)
+        );
+        assert_eq!(wall_ns_of(UNIX_EPOCH), Some(0));
+
+        // Before the epoch is negative, not a wrap and not a rejection.
+        assert_eq!(
+            wall_ns_of(UNIX_EPOCH - Duration::from_nanos(1_500)),
+            Some(-1_500)
+        );
+
+        // Beyond the field, in either direction, is `None` rather than a
+        // clamped value that would then read as an ordinary instant.
+        let beyond = Duration::from_nanos(u64::MAX) + Duration::from_secs(1);
+        assert_eq!(wall_ns_of(UNIX_EPOCH + beyond), None);
+        assert_eq!(wall_ns_of(UNIX_EPOCH - beyond), None);
     }
 }

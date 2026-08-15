@@ -229,14 +229,21 @@ impl Server {
                         len,
                         peer,
                         reply_source,
-                        // Observed by the transport and deliberately unused.
-                        // The core samples its own receive instant, and this
-                        // is where a kernel-observed arrival time stops until a
-                        // follow-up change decides how it should enter the core
-                        // — feeding it in here would change protocol timing.
-                        kernel_rx_timestamp: _kernel_rx_timestamp,
+                        // Handed to the core with the datagram it describes, as
+                        // an explicit per-datagram input. The core samples its
+                        // own receive instant regardless and decides whether
+                        // this one is usable; nothing here judges it, and there
+                        // is no "next receive" state between the two.
+                        kernel_rx_timestamp,
                     } = received;
-                    if let Some(reply) = self.core.handle_datagram(peer, &self.recv_buffer[..len])? {
+                    // `reply_source` stays on this side of the boundary: which
+                    // of the host's addresses a request arrived on is transport
+                    // state, not session policy.
+                    if let Some(reply) = self.core.handle_received_datagram(
+                        peer,
+                        &self.recv_buffer[..len],
+                        kernel_rx_timestamp,
+                    )? {
                         if !self.prepare_reply_traffic_class(reply.traffic_class()) {
                             continue;
                         }

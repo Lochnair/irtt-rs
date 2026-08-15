@@ -16,6 +16,7 @@ mod close;
 mod echo;
 mod fill;
 mod hmac;
+mod kernel_rx;
 mod lifecycle;
 mod negotiation;
 mod no_test;
