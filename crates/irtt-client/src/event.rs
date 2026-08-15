@@ -348,7 +348,11 @@ pub struct OneWayDelaySample {
     /// Server-to-client delay.
     ///
     /// This is computed from the server send wall time and the client receive
-    /// wall time when both are available.
+    /// wall time when both are available. The client receive endpoint is the
+    /// kernel receive timestamp reported with the datagram when one is
+    /// available and plausible for this receive, and the userspace receive wall
+    /// time otherwise. RTT is unaffected and remains a userspace monotonic
+    /// measurement.
     pub server_to_client: Option<SignedDuration>,
 }
 
@@ -377,5 +381,11 @@ pub struct PacketMeta {
     pub traffic_class: Option<u8>,
     pub dscp: Option<u8>,
     pub ecn: Option<u8>,
+    /// Kernel software receive timestamp reported with the datagram, where the
+    /// platform provides one.
+    ///
+    /// This is the raw observed value, reported whether or not it was accepted
+    /// as the downstream one-way delay endpoint. It is a kernel software
+    /// timestamp, not a NIC hardware ingress time.
     pub kernel_rx_timestamp: Option<std::time::SystemTime>,
 }
