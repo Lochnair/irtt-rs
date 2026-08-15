@@ -28,6 +28,7 @@ enum ServerBehavior {
     Echo,
     NoTest,
     PeerClose,
+    InvalidOpen,
     DelayedEcho(Duration),
     DeferredBurst(usize),
     NoisyOpen(usize),
@@ -152,6 +153,10 @@ fn start_server_with_gates(
         let mut negotiated = decode_open_params(&buffer[..open_len], key.as_deref());
         if let Some(gate) = &open_gate {
             gate.arrive_and_wait();
+        }
+        if matches!(behavior, ServerBehavior::InvalidOpen) {
+            socket.send_to(&[0_u8], peer).unwrap();
+            return;
         }
         if let Some(interval) = interval {
             negotiated.interval_ns = i64::try_from(interval.as_nanos()).unwrap();
@@ -645,6 +650,10 @@ fn dynamic_identical_open_target_preserves_session_without_pending_event() {
     });
     let acknowledgement = runtime.block_on(receipt).unwrap();
     assert_eq!(acknowledgement.status.targets[0].target, instance);
+    assert_eq!(acknowledgement.status.targets.len(), 1);
+    assert!(!observations.lock().unwrap().iter().any(|(event, _)| {
+        matches!(event, ManagedEvent::TargetFinished { outcome } if outcome.target == instance)
+    }));
     drive_task_until(&runtime, &mut task, |task| {
         task.targets[0].counters.packets_sent > sent
     });
@@ -662,6 +671,75 @@ fn dynamic_identical_open_target_preserves_session_without_pending_event() {
             .count(),
         1
     );
+}
+
+#[test]
+fn dynamic_identical_terminal_target_restarts_without_duplicate_outcome_at_live_limit() {
+    let server = start_server(ServerBehavior::InvalidOpen, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.max_live_target_generations = 1;
+    let configured = target("same", server.addr);
+    let (mut task, handle) = ManagedClient::task(managed, vec![configured.clone()]).unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    task.event_observations = Some(Arc::clone(&observations));
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+
+    drive_task_until(&runtime, &mut task, |task| {
+        matches!(task.targets[0].state, TargetState::Terminal)
+    });
+    let old = task.targets[0].instance.clone();
+    assert!(task.targets[0].desired);
+    assert_eq!(handle.status().desired_target_count, 1);
+    assert_eq!(handle.status().terminal_target_count, 1);
+    let original_outcome = task.history.recent.back().unwrap().clone();
+    assert_eq!(original_outcome.target, old);
+    assert!(matches!(
+        original_outcome.end_reason,
+        ManagedTargetEndReason::Failed(_)
+    ));
+
+    let receipt = handle.update_targets(vec![configured]).unwrap();
+    drive_task_until(&runtime, &mut task, |task| {
+        task.applied_command_sequence == 1
+    });
+    let acknowledgement = runtime.block_on(receipt).unwrap();
+    assert_eq!(acknowledgement.sequence, 1);
+    assert_eq!(acknowledgement.status.desired_target_count, 1);
+    assert_eq!(acknowledgement.status.terminal_target_count, 0);
+    assert_eq!(acknowledgement.status.targets.len(), 1);
+    let new = acknowledgement.status.targets[0].target.clone();
+    assert!(new.generation > old.generation);
+    assert_eq!(
+        acknowledgement.status.targets[0].lifecycle,
+        ManagedTargetLifecycle::Pending
+    );
+    assert_eq!(task.targets.len(), 1);
+    assert_eq!(task.targets[0].instance, new);
+    assert!(task.targets[0].desired);
+    assert!(!matches!(task.targets[0].state, TargetState::Terminal));
+    assert!(observations.lock().unwrap().iter().any(|(event, _)| {
+        matches!(event, ManagedEvent::TargetStateChanged { target, lifecycle: ManagedTargetLifecycle::Pending } if *target == new)
+    }));
+    assert_eq!(task.history.recent.len(), 1);
+    assert_eq!(task.history.recent[0], original_outcome);
+    assert_eq!(
+        observations
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(event, _)| {
+                matches!(event, ManagedEvent::TargetFinished { outcome } if outcome.target == old)
+            })
+            .count(),
+        1
+    );
+
+    let stop = handle.stop();
+    runtime.block_on(task);
+    runtime.block_on(stop);
+    server.finish();
 }
 
 #[test]
@@ -718,9 +796,11 @@ fn dynamic_replacement_counts_sync_and_async_live_generations() {
         vec![ManagedTargetConfig::new("same", "127.0.0.1:9")],
     )
     .unwrap();
-    let acknowledgement = pending
-        .apply_targets(vec![ManagedTargetConfig::new("same", "127.0.0.1:10")])
-        .unwrap();
+    let mut changed_auth = ManagedTargetConfig::new("same", "127.0.0.1:9");
+    changed_auth.auth = Some(ClientAuthConfig {
+        hmac_key: Some(vec![1, 2, 3]),
+    });
+    let acknowledgement = pending.apply_targets(vec![changed_auth]).unwrap();
     assert_eq!(acknowledgement.status.targets.len(), 1);
     assert_eq!(acknowledgement.status.targets[0].target.generation, 2);
     assert!(matches!(

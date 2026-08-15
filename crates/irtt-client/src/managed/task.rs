@@ -531,6 +531,10 @@ fn synchronously_retireable(state: &TargetState) -> bool {
     }
 }
 
+fn runtime_satisfies_target(runtime: &TargetRuntime, target: &ManagedTargetConfig) -> bool {
+    runtime.desired && !matches!(runtime.state, TargetState::Terminal) && runtime.config == *target
+}
+
 #[derive(Default)]
 struct OutcomeHistory {
     limit: usize,
@@ -996,7 +1000,11 @@ impl ManagedClientTask {
         }
         let mut retirements = Vec::new();
         for (index, runtime) in self.targets.iter().enumerate() {
-            if !runtime.desired || prepared.iter().any(|(target, _)| target == &runtime.config) {
+            if !runtime.desired
+                || prepared
+                    .iter()
+                    .any(|(target, _)| runtime_satisfies_target(runtime, target))
+            {
                 continue;
             }
             let reason = if prepared
@@ -1020,7 +1028,7 @@ impl ManagedClientTask {
             if self
                 .targets
                 .iter()
-                .any(|runtime| runtime.desired && runtime.config == target)
+                .any(|runtime| runtime_satisfies_target(runtime, &target))
             {
                 continue;
             }
