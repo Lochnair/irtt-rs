@@ -72,8 +72,9 @@ fn list_columns_succeeds_without_target() {
 }
 
 #[test]
-fn single_target_default_table_omits_target_and_accepts_pacing() {
+fn single_target_default_table_includes_target_and_accepts_pacing() {
     let server = InTreeServer::start();
+    let target = server.addr.to_string();
 
     let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
         .args([
@@ -85,7 +86,7 @@ fn single_target_default_table_omits_target_and_accepts_pacing() {
             "burst",
             "--header",
             "always",
-            &server.addr.to_string(),
+            &target,
         ])
         .output()
         .unwrap();
@@ -99,8 +100,173 @@ fn single_target_default_table_omits_target_and_accepts_pacing() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
-    let header = stdout.lines().next().unwrap_or_default();
-    assert!(!header.split_whitespace().any(|column| column == "target"));
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    assert_eq!(header.split_whitespace().next(), Some("target"));
+    assert!(
+        lines.any(|line| line.split_whitespace().next() == Some(target.as_str())),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn single_labeled_target_default_table_includes_target() {
+    let server = InTreeServer::start();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--header",
+            "always",
+            "--target",
+            &format!("eu={}", server.addr),
+        ])
+        .output()
+        .unwrap();
+
+    drop(server);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    assert_eq!(header.split_whitespace().next(), Some("target"));
+    assert!(
+        lines.any(|line| line.split_whitespace().next() == Some("eu")),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn single_labeled_target_default_csv_includes_target_and_event_wall_ns() {
+    let server = InTreeServer::start();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--format",
+            "csv",
+            "--header",
+            "always",
+            "--target",
+            &format!("eu={}", server.addr),
+        ])
+        .output()
+        .unwrap();
+
+    drop(server);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    assert!(header.starts_with("target,event,"), "{header}");
+    assert!(
+        header.split(',').any(|column| column == "event_wall_ns"),
+        "{header}"
+    );
+    assert!(lines.any(|line| line.starts_with("eu,")), "{stdout}");
+}
+
+#[test]
+fn single_positional_target_default_csv_includes_target_as_positional_label() {
+    let server = InTreeServer::start();
+    let target = server.addr.to_string();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--format",
+            "csv",
+            "--header",
+            "always",
+            &target,
+        ])
+        .output()
+        .unwrap();
+
+    drop(server);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    assert!(header.starts_with("target,event,"), "{header}");
+    assert!(
+        lines.any(|line| line.starts_with(&format!("{target},"))),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn multi_target_default_table_includes_both_labels() {
+    let a = InTreeServer::start();
+    let b = InTreeServer::start();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "40ms",
+            "--interval",
+            "10ms",
+            "--header",
+            "always",
+            "--target",
+            &format!("a={}", a.addr),
+            "--target",
+            &format!("b={}", b.addr),
+        ])
+        .output()
+        .unwrap();
+
+    drop(a);
+    drop(b);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    assert_eq!(header.split_whitespace().next(), Some("target"));
+    let rows: Vec<&str> = lines.collect();
+    assert!(
+        rows.iter()
+            .any(|line| line.split_whitespace().next() == Some("a")),
+        "{stdout}"
+    );
+    assert!(
+        rows.iter()
+            .any(|line| line.split_whitespace().next() == Some("b")),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -138,6 +304,112 @@ fn single_target_custom_target_column_renders_positional_label() {
         stdout
             .lines()
             .any(|line| line.starts_with(&format!("{target},"))),
+        "{stdout}"
+    );
+}
+
+#[test]
+fn custom_columns_remain_authoritative_and_omit_target() {
+    let server = InTreeServer::start();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--format",
+            "csv",
+            "--columns",
+            "seq,rtt",
+            "--header",
+            "always",
+            &server.addr.to_string(),
+        ])
+        .output()
+        .unwrap();
+
+    drop(server);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let header = stdout.lines().next().unwrap_or_default();
+    assert_eq!(header, "seq,rtt");
+}
+
+#[test]
+fn columns_default_keyword_includes_target_for_single_target() {
+    let server = InTreeServer::start();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--format",
+            "csv",
+            "--columns",
+            "default",
+            "--header",
+            "always",
+            "--target",
+            &format!("eu={}", server.addr),
+        ])
+        .output()
+        .unwrap();
+
+    drop(server);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let mut lines = stdout.lines();
+    let header = lines.next().unwrap_or_default();
+    assert!(header.starts_with("target,event,"), "{header}");
+    assert!(lines.any(|line| line.starts_with("eu,")), "{stdout}");
+}
+
+#[test]
+fn single_labeled_target_default_jsonl_includes_target() {
+    let server = InTreeServer::start();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "30ms",
+            "--interval",
+            "10ms",
+            "--format",
+            "jsonl",
+            "--target",
+            &format!("eu={}", server.addr),
+        ])
+        .output()
+        .unwrap();
+
+    drop(server);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.contains("\"target\":\"eu\"")),
         "{stdout}"
     );
 }
