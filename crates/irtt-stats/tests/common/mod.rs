@@ -100,6 +100,50 @@ pub fn reply_with_received_stats(
     event
 }
 
+/// Builds a send event with the supplied send-call duration and timer error.
+pub fn sent_with_timings(
+    seq: u32,
+    sent_at: ClientTimestamp,
+    send_call_us: u64,
+    timer_error_us: u64,
+) -> ClientEvent {
+    let mut event = sent(seq, sent_at);
+    let ClientEvent::EchoSent {
+        send_call,
+        timer_error,
+        ..
+    } = &mut event
+    else {
+        unreachable!();
+    };
+    *send_call = Duration::from_micros(send_call_us);
+    *timer_error = Duration::from_micros(timer_error_us);
+    event
+}
+
+/// Builds a normal reply reporting exactly the supplied server processing time.
+pub fn reply_with_processing(seq: u32, raw_ms: u64, processing_ms: u64) -> ClientEvent {
+    let mut event = unadjusted_reply(seq, raw_ms);
+    let ClientEvent::EchoReply { server_timing, .. } = &mut event else {
+        unreachable!();
+    };
+    if let Some(timing) = server_timing.as_mut() {
+        timing.processing = Some(Duration::from_millis(processing_ms));
+    }
+    event
+}
+
+/// Builds a normal reply from a session that supplied no server timestamps, so
+/// no server processing measurement exists.
+pub fn reply_without_server_timing(seq: u32, raw_ms: u64) -> ClientEvent {
+    let mut event = unadjusted_reply(seq, raw_ms);
+    let ClientEvent::EchoReply { server_timing, .. } = &mut event else {
+        unreachable!();
+    };
+    *server_timing = None;
+    event
+}
+
 pub fn unadjusted_late_reply(seq: u32, raw_ms: u64) -> ClientEvent {
     late_reply_from(unadjusted_reply(seq, raw_ms))
 }

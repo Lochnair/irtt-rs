@@ -23,17 +23,23 @@ const GROWTH_FACTOR: u64 = 2;
 /// Approximate per-entry control overhead for the hashed containers.
 const HASH_ENTRY_OVERHEAD: u64 = 1;
 
-/// Exact-sample vectors that retain one value per measurable unique reply.
+/// Exact timing samples an ordinary successful probe can retain.
 ///
-/// In [`SampleMode::Exact`] these are the primary, raw, and adjusted RTT
-/// metrics, the three IPDV metrics, and the two one-way delay metrics.
-/// `send_call`, `timer_error`, and `server_processing` do not retain exact
-/// samples in any mode.
+/// In [`SampleMode::Exact`] every public timing metric retains its samples, so
+/// one probe that is sent and answered can add one `i128` to each of them:
+/// send call and timer error from the send, and primary, raw, and adjusted
+/// RTT, the three IPDV metrics, the two one-way delays, and server processing
+/// from the reply. [`SampleMode::RunningOnly`] retains none of them.
 ///
-/// The adjusted-RTT, one-way, and send/receive IPDV metrics only receive a
-/// sample when the negotiated session supplies the corresponding optional
-/// measurement, so counting all eight is the upper bound.
-const EXACT_SAMPLE_VECS_PER_REPLY: u64 = 8;
+/// Adjusted RTT, one-way delay, send/receive IPDV, and server processing only
+/// receive a sample when the negotiated session supplies the corresponding
+/// optional measurement, so counting all eleven is the upper bound.
+///
+/// This count must track the metrics `CoreStats::new` builds with exact
+/// retention. `exact_mode_retains_one_sample_per_counted_metric` below counts
+/// the metrics a fully measured probe actually retains, so the two cannot
+/// drift apart unnoticed.
+pub(crate) const EXACT_SAMPLES_PER_PROBE: u64 = 11;
 
 /// Normalized events a probe usually contributes to a rolling window: one send
 /// event and one unique reply event.
@@ -51,13 +57,14 @@ pub(crate) fn estimated_retained_bytes(config: &StatsConfig, probe_count: u64) -
         .saturating_mul(GROWTH_FACTOR)
 }
 
-/// Exact mode retains one sample per metric and one IPDV tracker entry for
-/// every measurable reply, so its storage grows with the probe count.
+/// Exact mode retains one sample per timing metric and one IPDV tracker entry
+/// for every ordinary successful probe, so its storage grows with the probe
+/// count.
 fn exact_bytes(probe_count: u64) -> u64 {
-    let per_reply = EXACT_SAMPLE_VECS_PER_REPLY
+    let per_probe = EXACT_SAMPLES_PER_PROBE
         .saturating_mul(size_of::<i128>() as u64)
         .saturating_add(ipdv_tracker_bytes_per_sample());
-    probe_count.saturating_mul(per_reply)
+    probe_count.saturating_mul(per_probe)
 }
 
 /// Running-only mode retains no exact samples and bounds the IPDV tracker at a
@@ -100,7 +107,136 @@ fn rolling_bytes_per_event() -> u64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant, UNIX_EPOCH};
+
+    use irtt_client::{
+        ClientEvent, ClientTimestamp, OneWayDelaySample, PacketMeta, ReceivedStatsSample,
+        RttSample, ServerTiming, SignedDuration,
+    };
+
     use super::*;
+    use crate::{Snapshot, StatsCollector, TimeStats};
+
+    /// Every public timing metric a snapshot exposes.
+    fn timing_metrics(snapshot: &Snapshot) -> Vec<&TimeStats> {
+        vec![
+            &snapshot.send_call,
+            &snapshot.timer_error,
+            &snapshot.rtt.primary,
+            &snapshot.rtt.raw,
+            &snapshot.rtt.adjusted,
+            &snapshot.ipdv.round_trip,
+            &snapshot.ipdv.send,
+            &snapshot.ipdv.receive,
+            &snapshot.one_way_delay.send_delay,
+            &snapshot.one_way_delay.receive_delay,
+            &snapshot.server_processing.processing,
+        ]
+    }
+
+    fn timestamp(offset_ms: u64) -> ClientTimestamp {
+        ClientTimestamp {
+            mono: Instant::now() + Duration::from_millis(offset_ms),
+            wall: UNIX_EPOCH + Duration::from_millis(offset_ms),
+        }
+    }
+
+    fn sent(seq: u32) -> ClientEvent {
+        let sent_at = timestamp(u64::from(seq) * 10);
+        ClientEvent::EchoSent {
+            seq,
+            remote: "127.0.0.1:2112".parse().unwrap(),
+            scheduled_at: sent_at.mono,
+            sent_at,
+            bytes: 32,
+            send_call: Duration::from_micros(10 + u64::from(seq)),
+            timer_error: Duration::from_micros(2 + u64::from(seq)),
+        }
+    }
+
+    /// A reply carrying every optional measurement, so one probe exercises the
+    /// upper bound the estimate assumes.
+    fn fully_measured_reply(seq: u32) -> ClientEvent {
+        let sent_at = timestamp(u64::from(seq) * 10);
+        let raw = Duration::from_millis(10 + u64::from(seq));
+        let received_at = ClientTimestamp {
+            mono: sent_at.mono + raw,
+            wall: sent_at.wall + raw,
+        };
+        let base_ns = i64::from(seq) * 10_000_000;
+        ClientEvent::EchoReply {
+            seq,
+            remote: "127.0.0.1:2112".parse().unwrap(),
+            sent_at,
+            received_at,
+            rtt: RttSample {
+                raw,
+                adjusted: Some(SignedDuration::from_duration(raw)),
+                effective: SignedDuration::from_duration(raw),
+            },
+            server_timing: Some(ServerTiming {
+                receive_mono_ns: Some(base_ns + 1_000_000),
+                send_mono_ns: Some(base_ns + 2_000_000),
+                receive_wall_ns: Some(base_ns + 1_000_000),
+                send_wall_ns: Some(base_ns + 2_000_000),
+                midpoint_mono_ns: None,
+                midpoint_wall_ns: None,
+                processing: Some(Duration::from_millis(1 + u64::from(seq))),
+            }),
+            one_way: Some(OneWayDelaySample {
+                client_to_server: Some(SignedDuration::from_nanos(1_000_000 + i128::from(seq))),
+                server_to_client: Some(SignedDuration::from_nanos(2_000_000 + i128::from(seq))),
+            }),
+            received_stats: Some(ReceivedStatsSample {
+                count: Some(seq + 1),
+                window: Some(0xff),
+            }),
+            bytes: 64,
+            packet_meta: PacketMeta::default(),
+        }
+    }
+
+    /// Two probes fill every metric, including the IPDV pair metrics that need
+    /// adjacent replies.
+    fn fully_measured_snapshot(config: StatsConfig) -> Snapshot {
+        let mut collector = StatsCollector::new(config);
+        for seq in 0..2 {
+            collector.process(&sent(seq));
+            collector.process(&fully_measured_reply(seq));
+        }
+        collector.snapshot()
+    }
+
+    /// The estimate is only honest while it counts the metrics that actually
+    /// retain samples. Adding or removing an exact-retaining public timing
+    /// metric without revisiting [`EXACT_SAMPLES_PER_PROBE`] fails here.
+    #[test]
+    fn exact_mode_retains_one_sample_per_counted_metric() {
+        let snapshot = fully_measured_snapshot(StatsConfig::finite());
+        let with_medians = timing_metrics(&snapshot)
+            .into_iter()
+            .filter(|stats| stats.median_ns.is_some())
+            .count() as u64;
+
+        assert_eq!(
+            with_medians, EXACT_SAMPLES_PER_PROBE,
+            "the estimate counts {EXACT_SAMPLES_PER_PROBE} exact sample streams per probe, \
+             but {with_medians} public timing metrics retained samples"
+        );
+    }
+
+    #[test]
+    fn running_only_retains_no_exact_samples() {
+        let snapshot = fully_measured_snapshot(StatsConfig::continuous());
+
+        for stats in timing_metrics(&snapshot) {
+            assert!(stats.count > 0, "the fixture should populate every metric");
+            assert_eq!(
+                stats.median_ns, None,
+                "running-only mode retains no exact samples"
+            );
+        }
+    }
 
     #[test]
     fn per_sample_components_are_non_zero() {

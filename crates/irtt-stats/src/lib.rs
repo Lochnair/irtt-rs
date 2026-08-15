@@ -28,7 +28,8 @@ pub use time_stats::TimeStats;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Configuration for statistics collection.
 pub struct StatsConfig {
-    /// How timing samples are retained for median-capable metrics.
+    /// How timing samples are retained, and so whether the cumulative snapshot
+    /// reports medians.
     pub samples: SampleMode,
     /// Number of recent normalized events retained for count-based rolling snapshots.
     ///
@@ -44,9 +45,10 @@ pub struct StatsConfig {
 impl StatsConfig {
     /// Returns the default configuration for finite runs.
     ///
-    /// Finite mode retains exact samples where needed for medians and keeps
-    /// unbounded adjacent-sequence IPDV tracking so late adjacent replies can
-    /// still complete IPDV pairs.
+    /// Finite mode retains exact samples for every timing metric, so each of
+    /// them reports a median in the cumulative snapshot once it has samples,
+    /// and keeps unbounded adjacent-sequence IPDV tracking so late adjacent
+    /// replies can still complete IPDV pairs.
     pub fn finite() -> Self {
         Self {
             samples: SampleMode::Exact,
@@ -58,9 +60,9 @@ impl StatsConfig {
 
     /// Returns a configuration for long-running use.
     ///
-    /// Continuous mode uses running statistics, does not retain exact samples
-    /// for medians, and bounds adjacent-sequence IPDV tracking for long-running
-    /// sessions.
+    /// Continuous mode uses running statistics, retains no exact samples so no
+    /// timing metric reports a median, and bounds adjacent-sequence IPDV
+    /// tracking for long-running sessions.
     pub fn continuous() -> Self {
         Self {
             samples: SampleMode::RunningOnly,
@@ -81,7 +83,7 @@ impl StatsConfig {
     ///
     /// # What is included
     ///
-    /// - Exact timing samples, for the metrics that retain them.
+    /// - Exact timing samples, for every metric that retains them.
     /// - Adjacent-sequence IPDV tracking state.
     /// - Count-based rolling storage, when [`StatsConfig::rolling_count`] is
     ///   set, assuming a probe contributes one send event and one unique
@@ -98,17 +100,18 @@ impl StatsConfig {
     ///
     /// # Sample mode
     ///
-    /// [`SampleMode::Exact`] retains one value per metric per measurable
-    /// reply and keeps unbounded IPDV state, so the estimate grows with
-    /// `probe_count`. [`SampleMode::RunningOnly`] retains no exact samples
-    /// and bounds its IPDV state, so the estimate reaches a ceiling and stops
-    /// growing.
+    /// [`SampleMode::Exact`] retains one value per timing metric per ordinary
+    /// successful probe and keeps unbounded IPDV state, so the estimate grows
+    /// with `probe_count`. [`SampleMode::RunningOnly`] retains no exact
+    /// samples and bounds its IPDV state, so the estimate reaches a ceiling
+    /// and stops growing.
     ///
     /// # Optional measurements
     ///
-    /// Adjusted RTT, one-way delay, and send/receive IPDV are only measured
-    /// when the negotiated session supplies the necessary timestamps. The
-    /// estimate assumes all of them are available, which is the upper bound.
+    /// Adjusted RTT, one-way delay, send/receive IPDV, and server processing
+    /// are only measured when the negotiated session supplies the necessary
+    /// timestamps. The estimate assumes all of them are available, which is
+    /// the upper bound.
     ///
     /// # Saturation
     ///
@@ -151,10 +154,19 @@ impl Default for StatsConfig {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Controls whether exact timing samples are retained.
+///
+/// This governs the cumulative snapshot from [`StatsCollector::snapshot`],
+/// where the choice applies uniformly to every timing metric, so that snapshot
+/// never mixes median-capable and median-incapable timing metrics. Rolling
+/// snapshots are recomputed with running statistics whatever this is set to;
+/// see [`StatsCollector::rolling_count`].
 pub enum SampleMode {
-    /// Keep only running statistics; exact medians are not available.
+    /// Keep only running statistics; medians are not available for any timing
+    /// metric, and retention stays bounded for long-running sessions.
     RunningOnly,
-    /// Retain exact samples for metrics that report exact medians.
+    /// Retain exact samples for every timing metric, so each one reports a
+    /// median once it has samples in the cumulative snapshot. Retention grows
+    /// with the probe count.
     Exact,
 }
 
@@ -193,20 +205,28 @@ impl StatsCollector {
     }
 
     /// Returns a snapshot of all events processed by this collector.
+    ///
+    /// This is the snapshot [`StatsConfig::samples`] applies to, so under
+    /// [`SampleMode::Exact`] every timing metric here reports a median once it
+    /// has samples.
     pub fn snapshot(&self) -> Snapshot {
         self.cumulative.snapshot()
     }
 
     /// Returns the configured count-based rolling snapshot, if enabled.
     ///
-    /// The snapshot is recomputed from the retained rolling events.
+    /// The snapshot is recomputed from the retained rolling events using
+    /// running statistics only, whatever [`StatsConfig::samples`] is set to,
+    /// so its timing metrics report no median. A rolling window is a bounded
+    /// recent view rather than the run's retained history.
     pub fn rolling_count(&self) -> Option<Snapshot> {
         self.rolling.count_snapshot()
     }
 
     /// Returns the configured time-based rolling snapshot, if enabled.
     ///
-    /// The snapshot is recomputed from the retained rolling events.
+    /// Like [`StatsCollector::rolling_count`], this is recomputed with running
+    /// statistics only and reports no medians.
     pub fn rolling_time(&self) -> Option<Snapshot> {
         self.rolling.time_snapshot()
     }

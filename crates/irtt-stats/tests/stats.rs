@@ -3,7 +3,8 @@ mod common;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use common::{
-    adjusted_reply, reply_with_received_stats, sent, ts, unadjusted_late_reply, unadjusted_reply,
+    adjusted_reply, reply_with_processing, reply_with_received_stats, reply_without_server_timing,
+    sent, sent_with_timings, ts, unadjusted_late_reply, unadjusted_reply,
 };
 use irtt_client::{
     ClientEvent, ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, SignedDuration,
@@ -11,6 +12,144 @@ use irtt_client::{
 use irtt_stats::{
     EventStatsUpdate, IpdvPairUpdate, LateReplyMode, SampleMode, StatsCollector, StatsConfig,
 };
+
+#[test]
+fn exact_mode_reports_a_send_call_median() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    for (seq, send_call_us) in [10_u64, 30, 20].into_iter().enumerate() {
+        collector.process(&sent_with_timings(
+            seq as u32,
+            ts(seq as u64 * 10),
+            send_call_us,
+            2,
+        ));
+    }
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.send_call.count, 3);
+    assert_eq!(snapshot.send_call.min_ns, Some(10_000));
+    assert_eq!(snapshot.send_call.max_ns, Some(30_000));
+    // Sorted 10, 20, 30 us: the median is the middle sample, not the mean.
+    assert_eq!(snapshot.send_call.median_ns, Some(20_000.0));
+}
+
+#[test]
+fn exact_mode_reports_a_timer_error_median() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    for (seq, timer_error_us) in [2_u64, 8, 4, 6].into_iter().enumerate() {
+        collector.process(&sent_with_timings(
+            seq as u32,
+            ts(seq as u64 * 10),
+            10,
+            timer_error_us,
+        ));
+    }
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.timer_error.count, 4);
+    // Sorted 2, 4, 6, 8 us: an even count averages the two middle samples.
+    assert_eq!(snapshot.timer_error.median_ns, Some(5_000.0));
+}
+
+#[test]
+fn exact_mode_reports_a_server_processing_median() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    for (seq, processing_ms) in [1_u64, 5, 3].into_iter().enumerate() {
+        collector.process(&reply_with_processing(seq as u32, 10, processing_ms));
+    }
+
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.server_processing.processing.count, 3);
+    assert_eq!(
+        snapshot.server_processing.processing.median_ns,
+        Some(3_000_000.0)
+    );
+}
+
+#[test]
+fn absent_server_processing_measurements_retain_no_samples() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    for seq in 0..3 {
+        collector.process(&reply_without_server_timing(seq, 10));
+    }
+
+    let snapshot = collector.snapshot();
+    // The replies measured RTT, so the run is not simply empty.
+    assert_eq!(snapshot.rtt.primary.count, 3);
+    assert!(snapshot.rtt.primary.median_ns.is_some());
+    // ...but a metric the server never supplied stays empty rather than
+    // gaining zero-valued samples.
+    assert_eq!(snapshot.server_processing.processing.count, 0);
+    assert_eq!(snapshot.server_processing.processing.median_ns, None);
+    assert_eq!(snapshot.server_processing.processing.total_ns, 0);
+}
+
+#[test]
+fn exact_mode_reports_medians_for_every_timing_metric_with_samples() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    for seq in 0..3 {
+        collector.process(&sent(seq, ts(u64::from(seq) * 10)));
+        collector.process(&adjusted_reply(
+            seq,
+            10 + u64::from(seq),
+            9 + i128::from(seq),
+        ));
+    }
+
+    let snapshot = collector.snapshot();
+    for (label, stats) in [
+        ("send call", &snapshot.send_call),
+        ("timer error", &snapshot.timer_error),
+        ("primary RTT", &snapshot.rtt.primary),
+        ("raw RTT", &snapshot.rtt.raw),
+        ("adjusted RTT", &snapshot.rtt.adjusted),
+        ("round-trip IPDV", &snapshot.ipdv.round_trip),
+        ("send IPDV", &snapshot.ipdv.send),
+        ("receive IPDV", &snapshot.ipdv.receive),
+        ("send delay", &snapshot.one_way_delay.send_delay),
+        ("receive delay", &snapshot.one_way_delay.receive_delay),
+        ("server processing", &snapshot.server_processing.processing),
+    ] {
+        assert!(stats.count > 0, "{label} should have samples");
+        assert!(
+            stats.median_ns.is_some(),
+            "{label} has samples, so exact mode should report its median"
+        );
+    }
+}
+
+#[test]
+fn running_only_tracks_send_side_and_processing_without_medians() {
+    let mut collector = StatsCollector::new(StatsConfig::continuous());
+    for (seq, value) in [10_u64, 30, 20].into_iter().enumerate() {
+        let seq = seq as u32;
+        collector.process(&sent_with_timings(
+            seq,
+            ts(u64::from(seq) * 10),
+            value,
+            value,
+        ));
+        collector.process(&reply_with_processing(seq, 10, 1 + u64::from(seq)));
+    }
+
+    let snapshot = collector.snapshot();
+    for (label, stats) in [
+        ("send call", &snapshot.send_call),
+        ("timer error", &snapshot.timer_error),
+        ("server processing", &snapshot.server_processing.processing),
+    ] {
+        assert_eq!(stats.count, 3, "{label} should still count its samples");
+        assert!(
+            stats.min_ns.is_some(),
+            "{label} should still track a minimum"
+        );
+        assert!(stats.mean_ns > 0.0, "{label} should still track a mean");
+        assert_eq!(
+            stats.median_ns, None,
+            "{label} retains no exact samples in running-only mode"
+        );
+    }
+}
 
 #[test]
 fn running_only_samples_avoid_finite_retention() {
@@ -492,6 +631,9 @@ fn matched_late_reply_counts_without_measuring_under_count_only() {
     assert_eq!(snapshot.one_way_delay.send_delay.count, 0);
     assert_eq!(snapshot.one_way_delay.receive_delay.count, 0);
     assert_eq!(snapshot.ipdv.round_trip.count, 0);
+    // The reply carried a processing time, but the policy withheld it, so
+    // exact retention has nothing to report a median from either.
+    assert_eq!(snapshot.server_processing.processing.median_ns, None);
 }
 
 #[test]
@@ -519,6 +661,45 @@ fn untracked_late_replies_stay_untracked_in_both_policies() {
         assert_eq!(snapshot.packets.late_packets, 1);
         assert_eq!(snapshot.packets.packets_received, 1);
         assert_eq!(snapshot.rtt.primary.count, 0);
+    }
+}
+
+#[test]
+fn rolling_snapshots_report_no_medians_even_in_exact_mode() {
+    let mut collector = StatsCollector::new(StatsConfig {
+        rolling_count: Some(8),
+        rolling_time: Some(Duration::from_secs(60)),
+        ..StatsConfig::finite()
+    });
+    for seq in 0..3 {
+        collector.process(&sent(seq, ts(u64::from(seq) * 10)));
+        collector.process(&adjusted_reply(
+            seq,
+            10 + u64::from(seq),
+            9 + i128::from(seq),
+        ));
+    }
+
+    // The cumulative snapshot keeps the exact-mode contract...
+    let cumulative = collector.snapshot();
+    assert!(cumulative.rtt.primary.median_ns.is_some());
+    assert!(cumulative.send_call.median_ns.is_some());
+    assert!(cumulative.server_processing.processing.median_ns.is_some());
+
+    // ...while a rolling window is a bounded recent view recomputed from
+    // running statistics, so it reports no median whatever the sample mode.
+    for rolling in [
+        collector.rolling_count().unwrap(),
+        collector.rolling_time().unwrap(),
+    ] {
+        assert!(
+            rolling.rtt.primary.count > 0,
+            "the window should have samples"
+        );
+        assert_eq!(rolling.rtt.primary.median_ns, None);
+        assert_eq!(rolling.send_call.median_ns, None);
+        assert_eq!(rolling.timer_error.median_ns, None);
+        assert_eq!(rolling.server_processing.processing.median_ns, None);
     }
 }
 
