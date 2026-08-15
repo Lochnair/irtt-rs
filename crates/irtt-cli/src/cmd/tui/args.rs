@@ -5,8 +5,8 @@ use clap::Parser;
 #[cfg(test)]
 use crate::shared::client::TimestampArg;
 use crate::shared::client::{
-    parse_labelled_target, parse_test_duration, prepare_managed_run, CommonClientArgs,
-    GroupPacingArg, LabelledTargetArg, ManagedRunSetup, TargetSelection,
+    parse_target, parse_test_duration, prepare_managed_run, CommonClientArgs, GroupPacingArg,
+    ManagedRunSetup, TargetArg, TargetSelection,
 };
 
 pub const DEFAULT_TUI_DURATION: Duration = Duration::ZERO;
@@ -14,23 +14,15 @@ pub const DEFAULT_TUI_DURATION: Duration = Duration::ZERO;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "irtt-tui", about = "Minimal IRTT-compatible TUI client")]
 pub struct TuiArgs {
-    /// Server address or host, with optional port. Repeat for multi-target mode.
+    /// Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.
     #[arg(
         value_name = "TARGET",
-        num_args = 0..,
-        required_unless_present = "labelled_targets",
-        long_help = "Server address or host, with optional port. Repeat the positional target for multi-target mode, for example: irtt-tui host-a:2112 host-b:2112."
+        num_args = 1..,
+        required = true,
+        value_parser = parse_target,
+        long_help = "Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.\n\nExplicit labels are used in the legend and status table.\n\nExamples:\n  irtt-tui host.example\n  irtt-tui eu=host.example\n  irtt-tui eu=host-a.example us=host-b.example"
     )]
-    pub targets: Vec<String>,
-
-    /// Explicit labelled target, as label=host:port. Repeat for multi-target mode.
-    #[arg(
-        long = "target",
-        value_name = "LABEL=TARGET",
-        value_parser = parse_labelled_target,
-        long_help = "Explicit labelled target, as label=host:port. Repeat for multi-target mode. The label is used in the legend and status table and must be unique."
-    )]
-    pub labelled_targets: Vec<LabelledTargetArg>,
+    pub targets: Vec<TargetArg>,
 
     /// Managed group pacing for multi-target mode.
     #[arg(
@@ -64,8 +56,7 @@ impl TuiArgs {
             &self.common,
             self.duration,
             TargetSelection {
-                positional: &self.targets,
-                labelled: &self.labelled_targets,
+                targets: &self.targets,
                 pacing: self.pacing,
             },
         )
@@ -115,8 +106,9 @@ mod tests {
     #[test]
     fn tui_parser_defaults_to_continuous_and_has_no_output_option() {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
-        assert_eq!(args.targets, ["127.0.0.1:2112"]);
-        assert!(args.labelled_targets.is_empty());
+        assert_eq!(args.targets.len(), 1);
+        assert_eq!(args.targets[0].label, None);
+        assert_eq!(args.targets[0].addr, "127.0.0.1:2112");
         assert_eq!(args.pacing, GroupPacingArg::Staggered);
         assert_eq!(args.duration, DEFAULT_TUI_DURATION);
         assert!(args.is_continuous());
@@ -146,14 +138,8 @@ mod tests {
     }
 
     #[test]
-    fn repeated_labelled_targets_parse() {
-        let args = parse(&[
-            "--target",
-            "ams=ams.example.com:2112",
-            "--target",
-            "sg=sg.example.com:2112",
-        ])
-        .unwrap();
+    fn repeated_labeled_targets_parse() {
+        let args = parse(&["ams=ams.example.com:2112", "sg=sg.example.com:2112"]).unwrap();
         let specs = args.prepare().unwrap().targets;
 
         assert_eq!(specs[0].label, "ams");
@@ -167,12 +153,12 @@ mod tests {
         // The TUI has no target-free mode, so this is rejected at parse time
         // rather than during preparation.
         assert!(parse(&[]).is_err());
-        assert!(parse(&["--target", "ams=ams.example.com:2112"]).is_ok());
+        assert!(parse(&["ams=ams.example.com:2112"]).is_ok());
     }
 
     #[test]
     fn duplicate_labels_are_rejected() {
-        let args = parse(&["host-a:2112", "--target", "host-a:2112=host-b:2112"]).unwrap();
+        let args = parse(&["host-a:2112", "host-a:2112=host-b:2112"]).unwrap();
         let err = args.prepare().unwrap_err();
 
         assert!(err.contains("duplicate target label"));
@@ -195,9 +181,13 @@ mod tests {
 
     #[test]
     fn invalid_labelled_target_syntax_is_rejected() {
-        assert!(parse(&["--target", "missing-equals"]).is_err());
-        assert!(parse(&["--target", "=127.0.0.1:2112"]).is_err());
-        assert!(parse(&["--target", "label="]).is_err());
+        assert!(parse(&["=127.0.0.1:2112"]).is_err());
+        assert!(parse(&["label="]).is_err());
+    }
+
+    #[test]
+    fn old_target_option_is_rejected() {
+        assert!(parse(&["--target", "eu=host.example"]).is_err());
     }
 
     #[test]
@@ -283,7 +273,7 @@ mod tests {
     #[test]
     fn tui_help_lists_multi_target_options() {
         let help = TuiArgs::command().render_help().to_string();
-        assert!(help.contains("--target <LABEL=TARGET>"));
+        assert!(!help.contains("--target "));
         assert!(help.contains("--pacing <PACING>"));
     }
 }

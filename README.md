@@ -78,12 +78,18 @@ Probe several targets concurrently:
 irtt-cli host-a:2112 host-b:2112
 ```
 
-Assign stable labels to targets:
+Every target argument accepts `[LABEL=]TARGET`. An optional `LABEL=` prefix assigns the logical
+target name used in output and the TUI; without it, the target string itself is used. Assign
+stable labels to targets:
 
 ```sh
-irtt-cli \
-    --target ams=ams.example.com:2112 \
-    --target sg=sg.example.com:2112
+irtt-cli ams=ams.example.com:2112 sg=sg.example.com:2112
+```
+
+Labeled and unlabeled targets can be freely mixed in one argument list:
+
+```sh
+irtt-cli host-a:2112 ams=ams.example.com:2112
 ```
 
 Multi-target sessions use staggered pacing by default. To send each target's probes together:
