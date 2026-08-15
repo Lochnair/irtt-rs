@@ -1,3 +1,21 @@
+//! Linux ancillary receive metadata.
+//!
+//! Receive kernel timing uses `SO_TIMESTAMPING` with `RX_SOFTWARE` +
+//! `SOFTWARE` (reported via `SCM_TIMESTAMPING`), not the older
+//! `SO_TIMESTAMPNS`/`SCM_TIMESTAMPNS`. Linux documents fallback quirks when
+//! `SO_TIMESTAMP[NS]` and `SO_TIMESTAMPING` are both enabled on one socket,
+//! so this establishes one unambiguous software-timestamp facility before
+//! TX-side timing is introduced in a follow-up change. `ReceiveMeta`'s
+//! semantics — an optional observed kernel receive wall time, used for
+//! downstream one-way delay only when plausible relative to the userspace
+//! receive sample — are unchanged by this.
+//!
+//! `SOF_TIMESTAMPING_TX_SOFTWARE` is never requested on the production
+//! socket in [`configure_receive_metadata`]. TX flag construction,
+//! `MSG_ERRQUEUE` parsing, and extended-error classification exist as
+//! test-only primitives in [`error_queue`] for a follow-up change to build
+//! on; production does not generate or drain TX timestamp records yet.
+
 use std::{
     io::{self, IoSliceMut},
     net::{SocketAddr, UdpSocket},
@@ -6,16 +24,40 @@ use std::{
 };
 
 use nix::sys::{
-    socket::{recvmsg, setsockopt, sockopt, ControlMessageOwned, MsgFlags, RecvMsg},
+    socket::{
+        cmsg_space, recvmsg, setsockopt, sockopt, ControlMessageOwned, MsgFlags, RecvMsg,
+        TimestampingFlag, Timestamps,
+    },
     time::TimeSpec,
 };
 
 use crate::{metadata::ReceiveMeta, receive::ReceivedDatagram, timing::ClientTimestamp};
 
-const CONTROL_LEN: usize = 128;
+#[cfg(test)]
+mod error_queue;
+
+/// `SO_TIMESTAMPING` flags requested on the production receive socket.
+///
+/// `SOF_TIMESTAMPING_RX_SOFTWARE` asks the kernel to generate a software
+/// receive timestamp for each datagram; `SOF_TIMESTAMPING_SOFTWARE` asks it
+/// to report that timestamp back via `SCM_TIMESTAMPING`. Mixing this API with
+/// the older `SO_TIMESTAMP`/`SO_TIMESTAMPNS` on the same socket has
+/// documented fallback quirks, so the client uses `SO_TIMESTAMPING`
+/// exclusively for receive timing. Hardware and TX-side flags are
+/// deliberately excluded: this socket is receive-only.
+const RX_TIMESTAMPING_FLAGS: TimestampingFlag = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
+    .union(TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE);
+
+/// Control buffer capacity for a normal receive: one `SCM_TIMESTAMPING`
+/// record (three `TimeSpec`s) plus one traffic-class record. Only one of
+/// `IP_TOS` (`u8`) or `IPV6_TCLASS` (`i32`) is ever requested on a given
+/// socket, but `cmsg_space` already rounds both up to the same aligned
+/// space, so sizing on the larger of the two costs nothing and covers
+/// either family.
+const CONTROL_LEN: usize = cmsg_space::<Timestamps>() + cmsg_space::<i32>();
 
 pub(crate) fn configure_receive_metadata(socket: &UdpSocket, remote: SocketAddr) -> io::Result<()> {
-    setsockopt(socket, sockopt::ReceiveTimestampns, &true)?;
+    setsockopt(socket, sockopt::Timestamping, &RX_TIMESTAMPING_FLAGS)?;
     let socket = socket2::SockRef::from(socket);
     if remote.is_ipv4() {
         socket.set_recv_tos_v4(true)
@@ -72,8 +114,8 @@ fn receive_meta<S>(msg: &RecvMsg<'_, '_, S>) -> ReceiveMeta {
 
     for cmsg in cmsgs {
         match cmsg {
-            ControlMessageOwned::ScmTimestampns(timestamp) => {
-                meta.kernel_rx_timestamp = system_time_from_timespec(timestamp);
+            ControlMessageOwned::ScmTimestampsns(timestamps) => {
+                meta.kernel_rx_timestamp = system_time_from_timespec(timestamps.system);
             }
             ControlMessageOwned::Ipv4Tos(tos) => {
                 meta.traffic_class = Some(tos);
@@ -264,13 +306,38 @@ mod tests {
         assert_eq!(&buf[..datagram.len], b"stamp");
         let Some(timestamp) = datagram.meta.kernel_rx_timestamp else {
             eprintln!(
-                "skipping kernel timestamp assertion: kernel did not provide SCM_TIMESTAMPNS"
+                "skipping kernel timestamp assertion: kernel did not provide SCM_TIMESTAMPING"
             );
             return;
         };
 
         let duration = timestamp.duration_since(UNIX_EPOCH).unwrap();
         assert!(duration.as_nanos() > 0);
+    }
+
+    #[test]
+    fn kernel_rx_timestamp_and_traffic_class_coexist() {
+        let (sender, receiver) = connected_ipv4_loopback_pair();
+        configure_receive_metadata(&receiver, sender.local_addr().unwrap()).unwrap();
+        apply_traffic_class_to_socket(&sender, receiver.local_addr().unwrap(), 184).unwrap();
+        sender.send(b"both").unwrap();
+
+        let mut buf = [0_u8; 16];
+        let datagram = recv_datagram(&receiver, &mut buf).unwrap();
+        assert_eq!(&buf[..datagram.len], b"both");
+
+        // Both cmsgs are requested on this socket; the parser must not
+        // depend on the order the kernel emits them in to observe either.
+        if datagram.meta.kernel_rx_timestamp.is_none() {
+            eprintln!("skipping combined assertion: kernel did not provide SCM_TIMESTAMPING");
+            return;
+        }
+        if datagram.meta.traffic_class.is_none() {
+            eprintln!("skipping combined assertion: kernel did not provide IP_TOS");
+            return;
+        }
+        assert!(datagram.meta.kernel_rx_timestamp.is_some());
+        assert_eq!(datagram.meta.traffic_class.unwrap() & 0xfc, 184);
     }
 
     #[test]
