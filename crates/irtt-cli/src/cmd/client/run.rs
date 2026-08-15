@@ -277,13 +277,13 @@ fn target_failure_messages(target: &ManagedTargetOutcome) -> Vec<String> {
     let mut messages = Vec::with_capacity(2);
     if let ManagedTargetEndReason::Failed(failure) = &target.end_reason {
         messages.push(format!(
-            "irtt-rs: target {} failed ({:?} {:?}): {}",
+            "irtt-rs: target {} failed ({} {}): {}",
             target.target.id, failure.phase, failure.kind, failure.message
         ));
     }
     if let Some(failure) = &target.cleanup_failure {
         messages.push(format!(
-            "irtt-rs: target {} cleanup failed ({:?} {:?}): {}",
+            "irtt-rs: target {} cleanup failed ({} {}): {}",
             target.target.id, failure.phase, failure.kind, failure.message
         ));
     }
@@ -480,8 +480,8 @@ mod tests {
         assert_eq!(
             target_failure_messages(&target),
             [
-                "irtt-rs: target edge failed (Receiving Protocol): primary failure",
-                "irtt-rs: target edge cleanup failed (Closing Socket): cleanup failure",
+                "irtt-rs: target edge failed (receiving protocol): primary failure",
+                "irtt-rs: target edge cleanup failed (closing socket): cleanup failure",
             ]
         );
     }

@@ -1,4 +1,4 @@
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
@@ -235,6 +235,20 @@ pub enum ManagedTargetFailurePhase {
     Closing,
 }
 
+impl fmt::Display for ManagedTargetFailurePhase {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Connecting => "connecting",
+            Self::Opening => "opening",
+            Self::Sending => "sending",
+            Self::Receiving => "receiving",
+            Self::Timing => "timing",
+            Self::Closing => "closing",
+        };
+        f.write_str(text)
+    }
+}
+
 /// Stable category for a target-local failure.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ManagedTargetFailureKind {
@@ -246,7 +260,29 @@ pub enum ManagedTargetFailureKind {
     Configuration,
     ResourceExhausted,
     InvalidState,
+    /// A failure that deliberately has no more specific category.
+    ///
+    /// This is a classification decision, not a fallback: every current
+    /// [`ClientError`] variant is classified explicitly, so nothing reaches
+    /// this category by default.
     Other,
+}
+
+impl fmt::Display for ManagedTargetFailureKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let text = match self {
+            Self::Resolve => "resolve",
+            Self::Socket => "socket",
+            Self::SocketOption => "socket option",
+            Self::Protocol => "protocol",
+            Self::Timeout => "timeout",
+            Self::Configuration => "configuration",
+            Self::ResourceExhausted => "resource exhausted",
+            Self::InvalidState => "invalid state",
+            Self::Other => "other",
+        };
+        f.write_str(text)
+    }
 }
 
 /// Durable target-local failure details.
@@ -350,6 +386,12 @@ pub enum ManagedDriverFailure {
     Internal { message: Arc<str> },
 }
 
+/// Map a [`ClientError`] onto its durable managed failure classification.
+///
+/// The match is deliberately exhaustive over every [`ClientError`] variant. A
+/// new variant must fail to compile here until its real classification is
+/// chosen, rather than silently degrading to
+/// [`ManagedTargetFailureKind::Other`].
 pub(crate) fn classify_client_error(
     phase: ManagedTargetFailurePhase,
     error: &ClientError,
@@ -375,17 +417,215 @@ pub(crate) fn classify_client_error(
         | ClientError::CounterOverflow { .. }
         | ClientError::DurationOverflow
         | ClientError::PendingLimitExceeded { .. } => ManagedTargetFailureKind::ResourceExhausted,
+        ClientError::DatagramLengthMismatch { .. } => ManagedTargetFailureKind::Socket,
+        #[cfg(feature = "tokio")]
+        ClientError::NoTokioRuntime => ManagedTargetFailureKind::InvalidState,
         ClientError::NotOpen
         | ClientError::AlreadyOpen
         | ClientError::AlreadyCompleted
         | ClientError::AlreadyClosed
         | ClientError::StalePreparedProbe { .. }
         | ClientError::PendingSequenceCollision { .. } => ManagedTargetFailureKind::InvalidState,
-        _ => ManagedTargetFailureKind::Other,
     };
     ManagedTargetFailure {
         phase,
         kind,
         message: Arc::from(error.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::TryReserveError, io};
+
+    use super::*;
+
+    fn io_error() -> io::Error {
+        io::Error::other("boom")
+    }
+
+    fn try_reserve_error() -> TryReserveError {
+        Vec::<u8>::new().try_reserve(usize::MAX).unwrap_err()
+    }
+
+    fn classification_cases() -> Vec<(ClientError, ManagedTargetFailureKind)> {
+        vec![
+            (
+                ClientError::Resolve {
+                    addr: "example.invalid:2112".to_owned(),
+                },
+                ManagedTargetFailureKind::Resolve,
+            ),
+            (
+                ClientError::Socket(io_error()),
+                ManagedTargetFailureKind::Socket,
+            ),
+            (
+                ClientError::DatagramLengthMismatch {
+                    expected: 64,
+                    actual: 32,
+                },
+                ManagedTargetFailureKind::Socket,
+            ),
+            (
+                ClientError::SocketOption {
+                    operation: "set read timeout",
+                    remote: "127.0.0.1:2112".parse().unwrap(),
+                    source: io_error(),
+                },
+                ManagedTargetFailureKind::SocketOption,
+            ),
+            (
+                ClientError::ReadTimeoutRestore { source: io_error() },
+                ManagedTargetFailureKind::SocketOption,
+            ),
+            (
+                ClientError::Protocol(irtt_proto::ProtoError::BadMagic),
+                ManagedTargetFailureKind::Protocol,
+            ),
+            (
+                ClientError::ProtocolVersionMismatch {
+                    requested: 1,
+                    received: 2,
+                },
+                ManagedTargetFailureKind::Protocol,
+            ),
+            (ClientError::ZeroToken, ManagedTargetFailureKind::Protocol),
+            (
+                ClientError::UnexpectedNoTestReply,
+                ManagedTargetFailureKind::Protocol,
+            ),
+            (
+                ClientError::NonZeroNoTestToken { token: 7 },
+                ManagedTargetFailureKind::Protocol,
+            ),
+            (
+                ClientError::ServerRejected,
+                ManagedTargetFailureKind::Protocol,
+            ),
+            (
+                ClientError::NegotiationRejected {
+                    reason: "duration".to_owned(),
+                },
+                ManagedTargetFailureKind::Protocol,
+            ),
+            (ClientError::OpenTimeout, ManagedTargetFailureKind::Timeout),
+            (
+                ClientError::InvalidConfig {
+                    reason: "interval".to_owned(),
+                },
+                ManagedTargetFailureKind::Configuration,
+            ),
+            (
+                ClientError::OpenTimeoutTooSmall {
+                    timeout: Duration::from_millis(1),
+                    minimum: Duration::from_millis(10),
+                },
+                ManagedTargetFailureKind::Configuration,
+            ),
+            (
+                ClientError::NoOpenTimeouts,
+                ManagedTargetFailureKind::Configuration,
+            ),
+            (
+                ClientError::AllocationFailed {
+                    operation: "pending probes",
+                    source: try_reserve_error(),
+                },
+                ManagedTargetFailureKind::ResourceExhausted,
+            ),
+            (
+                ClientError::CounterOverflow {
+                    counter: "packets_sent",
+                },
+                ManagedTargetFailureKind::ResourceExhausted,
+            ),
+            (
+                ClientError::DurationOverflow,
+                ManagedTargetFailureKind::ResourceExhausted,
+            ),
+            (
+                ClientError::PendingLimitExceeded { limit: 8 },
+                ManagedTargetFailureKind::ResourceExhausted,
+            ),
+            (
+                ClientError::NoTokioRuntime,
+                ManagedTargetFailureKind::InvalidState,
+            ),
+            (ClientError::NotOpen, ManagedTargetFailureKind::InvalidState),
+            (
+                ClientError::AlreadyOpen,
+                ManagedTargetFailureKind::InvalidState,
+            ),
+            (
+                ClientError::AlreadyCompleted,
+                ManagedTargetFailureKind::InvalidState,
+            ),
+            (
+                ClientError::AlreadyClosed,
+                ManagedTargetFailureKind::InvalidState,
+            ),
+            (
+                ClientError::StalePreparedProbe {
+                    prepared_seq: 3,
+                    next_wire_seq: 4,
+                },
+                ManagedTargetFailureKind::InvalidState,
+            ),
+            (
+                ClientError::PendingSequenceCollision { seq: 9 },
+                ManagedTargetFailureKind::InvalidState,
+            ),
+        ]
+    }
+
+    #[test]
+    fn every_client_error_classifies_to_its_documented_kind() {
+        for (error, expected) in classification_cases() {
+            let failure = classify_client_error(ManagedTargetFailurePhase::Opening, &error);
+            assert_eq!(
+                failure.kind, expected,
+                "unexpected classification for {error:?}"
+            );
+            assert_eq!(failure.phase, ManagedTargetFailurePhase::Opening);
+            assert_eq!(&*failure.message, error.to_string());
+        }
+    }
+
+    #[test]
+    fn classification_preserves_the_reported_phase() {
+        for phase in [
+            ManagedTargetFailurePhase::Connecting,
+            ManagedTargetFailurePhase::Opening,
+            ManagedTargetFailurePhase::Sending,
+            ManagedTargetFailurePhase::Receiving,
+            ManagedTargetFailurePhase::Timing,
+            ManagedTargetFailurePhase::Closing,
+        ] {
+            let failure = classify_client_error(phase, &ClientError::OpenTimeout);
+            assert_eq!(failure.phase, phase);
+        }
+    }
+
+    #[test]
+    fn phase_and_kind_display_without_debug_spelling() {
+        assert_eq!(
+            ManagedTargetFailurePhase::Connecting.to_string(),
+            "connecting"
+        );
+        assert_eq!(ManagedTargetFailurePhase::Closing.to_string(), "closing");
+        assert_eq!(
+            ManagedTargetFailureKind::SocketOption.to_string(),
+            "socket option"
+        );
+        assert_eq!(
+            ManagedTargetFailureKind::ResourceExhausted.to_string(),
+            "resource exhausted"
+        );
+        assert_eq!(
+            ManagedTargetFailureKind::InvalidState.to_string(),
+            "invalid state"
+        );
+        assert_eq!(ManagedTargetFailureKind::Other.to_string(), "other");
     }
 }
