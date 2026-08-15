@@ -131,6 +131,19 @@ pub(crate) fn classify(cmsgs: impl Iterator<Item = ControlMessageOwned>) -> Erro
     }
 }
 
+/// Reusable per-receive control buffer. `recvmsg` control data must satisfy
+/// `cmsghdr` alignment; a plain `[u8; N]` only guarantees byte alignment, so
+/// this mirrors the parent module's `ControlBuffer` rather than reading
+/// `cmsghdr`s out of unaligned storage.
+#[repr(align(8))]
+struct ErrorQueueControlBuffer([u8; ERROR_QUEUE_CONTROL_LEN]);
+
+impl ErrorQueueControlBuffer {
+    fn new() -> Self {
+        Self([0; ERROR_QUEUE_CONTROL_LEN])
+    }
+}
+
 /// Nonblocking drain of a single record from `fd`'s `MSG_ERRQUEUE`.
 ///
 /// Returns `Ok(None)` when the queue is empty (`EAGAIN`/`EWOULDBLOCK`).
@@ -140,12 +153,12 @@ pub(crate) fn classify(cmsgs: impl Iterator<Item = ControlMessageOwned>) -> Erro
 pub(crate) fn try_recv_error_queue_record(fd: RawFd) -> io::Result<Option<ErrorQueueRecord>> {
     let mut payload: [u8; 0] = [];
     let mut iov = [IoSliceMut::new(&mut payload)];
-    let mut control = [0_u8; ERROR_QUEUE_CONTROL_LEN];
+    let mut control = ErrorQueueControlBuffer::new();
 
     match recvmsg::<()>(
         fd,
         &mut iov,
-        Some(&mut control),
+        Some(&mut control.0),
         MsgFlags::MSG_ERRQUEUE | MsgFlags::MSG_DONTWAIT,
     ) {
         Ok(msg) => {
