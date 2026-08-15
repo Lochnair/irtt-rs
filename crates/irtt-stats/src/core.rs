@@ -32,7 +32,11 @@ pub(crate) struct CoreStats {
 
 impl CoreStats {
     pub(crate) fn new(sample_mode: SampleMode, late_replies: LateReplyMode) -> Self {
-        let sequence_limit = if sample_mode == SampleMode::Exact {
+        // One decision for every public timing metric: in exact mode they all
+        // retain their samples so they can all report an exact median. The
+        // retention estimate in `retention.rs` counts the same set.
+        let retain_exact = sample_mode == SampleMode::Exact;
+        let sequence_limit = if retain_exact {
             None
         } else {
             Some(CONTINUOUS_SEQUENCE_LIMIT)
@@ -41,17 +45,17 @@ impl CoreStats {
         Self {
             events: EventCounts::default(),
             packets: PacketCounts::default(),
-            send_call: TimeMetric::new(false),
-            timer_error: TimeMetric::new(false),
-            rtt_primary: TimeMetric::new(sample_mode == SampleMode::Exact),
-            rtt_raw: TimeMetric::new(sample_mode == SampleMode::Exact),
-            rtt_adjusted: TimeMetric::new(sample_mode == SampleMode::Exact),
-            ipdv_round_trip: TimeMetric::new(sample_mode == SampleMode::Exact),
-            ipdv_send: TimeMetric::new(sample_mode == SampleMode::Exact),
-            ipdv_receive: TimeMetric::new(sample_mode == SampleMode::Exact),
-            send_delay: TimeMetric::new(sample_mode == SampleMode::Exact),
-            receive_delay: TimeMetric::new(sample_mode == SampleMode::Exact),
-            server_processing: TimeMetric::new(false),
+            send_call: TimeMetric::new(retain_exact),
+            timer_error: TimeMetric::new(retain_exact),
+            rtt_primary: TimeMetric::new(retain_exact),
+            rtt_raw: TimeMetric::new(retain_exact),
+            rtt_adjusted: TimeMetric::new(retain_exact),
+            ipdv_round_trip: TimeMetric::new(retain_exact),
+            ipdv_send: TimeMetric::new(retain_exact),
+            ipdv_receive: TimeMetric::new(retain_exact),
+            send_delay: TimeMetric::new(retain_exact),
+            receive_delay: TimeMetric::new(retain_exact),
+            server_processing: TimeMetric::new(retain_exact),
             ipdv_tracker: IpdvTracker::new(sequence_limit),
             late_replies,
         }

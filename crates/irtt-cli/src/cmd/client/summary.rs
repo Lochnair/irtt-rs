@@ -218,6 +218,97 @@ mod tests {
         assert!(!output.contains("medians unavailable"));
     }
 
+    /// Returns the Median cell of the row with this label.
+    fn median_cell(output: &str, label: &str) -> String {
+        let row = output
+            .lines()
+            .find(|line| line.trim_start().starts_with(label))
+            .unwrap_or_else(|| panic!("summary should contain a {label:?} row:\n{output}"));
+        // Metric, Count, Min, Mean, Median, ...
+        // Counting from the right keeps multi-word labels out of the way.
+        row.split_whitespace()
+            .rev()
+            .nth(2)
+            .unwrap_or_else(|| panic!("row {row:?} should have a Median cell"))
+            .to_owned()
+    }
+
+    /// Collects probes whose send-call, timer-error, and server-processing
+    /// values each have a median distinct from their min, mean, and max, so
+    /// the rendered cell can only come from a real median calculation.
+    fn spread_finite_summary(config: StatsConfig) -> Snapshot {
+        let mut collector = StatsCollector::new(config);
+        for (seq, (send_call_us, timer_error_us, processing_us)) in
+            [(10_u64, 2_u64, 100_u64), (40, 12, 700), (20, 4, 300)]
+                .into_iter()
+                .enumerate()
+        {
+            let seq = seq as u32;
+            let offset = Duration::from_secs(1) + Duration::from_millis(u64::from(seq));
+            let sent_at = test_timestamp(offset);
+            let received_at = test_timestamp(offset + Duration::from_micros(1500));
+
+            collector.process(&ClientEvent::EchoSent {
+                seq,
+                remote: test_remote(),
+                scheduled_at: sent_at.mono,
+                sent_at,
+                bytes: 64,
+                send_call: Duration::from_micros(send_call_us),
+                timer_error: Duration::from_micros(timer_error_us),
+            });
+            collector.process(&ClientEvent::EchoReply {
+                seq,
+                remote: test_remote(),
+                sent_at,
+                received_at,
+                rtt: RttSample {
+                    raw: Duration::from_micros(1500),
+                    adjusted: None,
+                    effective: SignedDuration::from_nanos(1_500_000),
+                },
+                server_timing: Some(ServerTiming {
+                    receive_wall_ns: None,
+                    receive_mono_ns: None,
+                    send_wall_ns: None,
+                    send_mono_ns: None,
+                    midpoint_wall_ns: None,
+                    midpoint_mono_ns: None,
+                    processing: Some(Duration::from_micros(processing_us)),
+                }),
+                one_way: None,
+                received_stats: None,
+                bytes: 64,
+                packet_meta: PacketMeta::default(),
+            });
+        }
+        collector.snapshot()
+    }
+
+    #[test]
+    fn finite_summary_shows_medians_for_send_call_timer_error_and_processing() {
+        let output = format_summary(&spread_finite_summary(StatsConfig::finite()));
+
+        // Medians of 10/20/40, 2/4/12, and 100/300/700 µs. None of these
+        // equals the row's min, mean, or max.
+        assert_eq!(median_cell(&output, "send call"), "20.0µs");
+        assert_eq!(median_cell(&output, "timer error"), "4.0µs");
+        assert_eq!(median_cell(&output, "server processing"), "300.0µs");
+    }
+
+    #[test]
+    fn continuous_summary_still_shows_no_medians_for_those_rows() {
+        let output = format_summary(&spread_finite_summary(StatsConfig::continuous()));
+
+        for label in ["send call", "timer error", "server processing"] {
+            assert_eq!(
+                median_cell(&output, label),
+                "-",
+                "continuous mode retains no exact samples for {label}"
+            );
+        }
+    }
+
     #[test]
     fn verbose_summary_includes_raw_and_adjusted_rtt_rows() {
         let mut collector = StatsCollector::new(StatsConfig::finite());

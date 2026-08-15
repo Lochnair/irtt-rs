@@ -16,6 +16,9 @@ pub struct TimeStats {
     /// Arithmetic mean, in nanoseconds.
     pub mean_ns: f64,
     /// Median, in nanoseconds, when exact samples were retained.
+    ///
+    /// This is `None` when the collector was not configured to retain exact
+    /// samples, and also when it was but this metric received none.
     pub median_ns: Option<f64>,
     /// Sample variance, in nanoseconds squared.
     pub variance_ns2: f64,

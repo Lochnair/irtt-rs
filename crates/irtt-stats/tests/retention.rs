@@ -35,6 +35,25 @@ fn exact_mode_scales_linearly_with_probe_count() {
     assert_eq!(config.estimated_retained_bytes(1_000), single * 1_000);
 }
 
+/// Exact mode retains eleven `i128` timing streams per probe alongside its
+/// IPDV tracker state, so the timing samples alone are at least that much.
+///
+/// This checks the estimate against the storage it claims to model. It is an
+/// implementation test, not a stable public constant: the figure is free to
+/// move whenever the retention model does.
+#[test]
+fn exact_estimate_covers_every_retained_timing_sample() {
+    const EXACT_TIMING_STREAMS: u64 = 11;
+    let per_probe = StatsConfig::finite().estimated_retained_bytes(1);
+    let timing_sample_bytes = EXACT_TIMING_STREAMS * std::mem::size_of::<i128>() as u64;
+
+    assert!(
+        per_probe > timing_sample_bytes,
+        "the estimate should cover {EXACT_TIMING_STREAMS} retained timing samples plus \
+         IPDV tracker state, but a probe estimated only {per_probe} bytes"
+    );
+}
+
 #[test]
 fn enormous_probe_counts_saturate_instead_of_wrapping() {
     for config in [StatsConfig::finite(), StatsConfig::continuous()] {
