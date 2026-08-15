@@ -114,8 +114,10 @@ down. Nothing it does is visible on the wire.
 
 A reply must leave from the address its request was sent to, or a client reading
 from a connected socket discards it. An explicit-address listener satisfies that
-by construction and keeps the plain `recv_from`/`send_to` path — do not route it
-through ancillary machinery merely because the helper exists.
+by construction and asks for no destination metadata — do not give it any merely
+because the helper exists. It keeps the plain `recv_from`/`send_to` path
+everywhere except Linux, where it receives through `recvmsg` for the unrelated
+reason below and still sends with plain `send_to`.
 
 A wildcard listener does not, so it recovers each request's local destination
 and sends that reply from it. The supported targets are Linux, macOS and
@@ -160,6 +162,39 @@ address fails invisibly, as loss.
   own — every other source, IPv4 included, goes out with no interface set.
 - A send failure is per-packet loss, exactly as an ordinary `send_to` failure
   is. It never terminates the listener and never rolls back core state.
+
+## Kernel receive timestamps
+
+A Linux listener asks the kernel for a software receive timestamp
+(`SO_TIMESTAMPNS`) on every datagram and reports it as transport metadata. It is
+the mirror image of destination metadata, and the contrast is the point.
+
+- **Optional, not required.** Enabling it is best-effort and must never fail
+  construction: a listener without it answers every request exactly as it
+  otherwise would. Destination metadata failing a wildcard bind is correct;
+  timestamp setup failing anything is not.
+- **Its absence is never packet loss.** No timestamp, a timestamp truncated away
+  on an explicit listener, or one that describes no representable instant, all
+  mean the datagram is served with `kernel_rx_timestamp: None`. Only the
+  destination rules a datagram out, and only for the listener that needs one.
+- **Nothing consumes it yet.** It stops at the runtime boundary. Do not thread it
+  into `ServerCore`, add a timestamp argument or variant to `handle_datagram`,
+  stash it in a "next receive" side channel, or wrap the core's clock. How a
+  kernel-observed arrival time should enter the core is an open design question,
+  to be settled deliberately and not as a side effect of some other change.
+- **Do not map wall to monotonic.** It is a realtime reading with no monotonic
+  counterpart, and `ClockSample` is a paired userspace instant. Synthesizing the
+  missing half would invent precision the kernel never reported.
+- **Do not judge plausibility here.** Conversion is structural only. Whether a
+  representable reading is close enough to the server's own sample to measure
+  against belongs with whoever measures.
+- Linux only, and receive only. No macOS, FreeBSD or Windows implementation, and
+  no transmit timestamping, without a reason and agreement.
+- Control-buffer capacity is derived from the cmsg payload types and asserted at
+  compile time. Adding a control message means extending that derivation — an
+  undersized buffer sets `MSG_CTRUNC`, which is silent packet loss for a wildcard
+  listener. Never parse cmsgs positionally or stop at the first match: the kernel
+  orders them as it likes, and each kind is collected independently.
 
 ## Rejection is silence
 

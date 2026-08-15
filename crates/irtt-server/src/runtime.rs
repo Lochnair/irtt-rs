@@ -12,7 +12,7 @@ use thiserror::Error;
 use tokio::{net::UdpSocket, time::MissedTickBehavior};
 
 use crate::{
-    socket_io,
+    socket_io::{self, ReceivedDatagram},
     socket_options::{marks_with_ipv4_option, set_reply_traffic_class},
     ServerConfig, ServerCore, ServerError,
 };
@@ -122,6 +122,13 @@ impl Server {
                 .map_err(|source| ServerRuntimeError::SourceSelectionSetup { addr, source })?;
         }
 
+        // Kernel receive timestamps, for every listener and strictly after the
+        // mandatory setup above so a refusal here can neither hide nor stand in
+        // for a wildcard listener's failure to secure its reply sources. This
+        // one is allowed to fail: it buys accuracy, not correctness, and a
+        // server that cannot have it is still a correct server.
+        let _ = socket_io::try_configure_kernel_rx_timestamp(&socket);
+
         Ok(Self {
             socket,
             core: ServerCore::new(config),
@@ -218,7 +225,17 @@ impl Server {
                         Err(source) if source.kind() == io::ErrorKind::Interrupted => continue,
                         Err(source) => return Err(ServerRuntimeError::Receive { source }),
                     };
-                    let (len, peer) = (received.len, received.peer);
+                    let ReceivedDatagram {
+                        len,
+                        peer,
+                        reply_source,
+                        // Observed by the transport and deliberately unused.
+                        // The core samples its own receive instant, and this
+                        // is where a kernel-observed arrival time stops until a
+                        // follow-up change decides how it should enter the core
+                        // — feeding it in here would change protocol timing.
+                        kernel_rx_timestamp: _kernel_rx_timestamp,
+                    } = received;
                     if let Some(reply) = self.core.handle_datagram(peer, &self.recv_buffer[..len])? {
                         if !self.prepare_reply_traffic_class(reply.traffic_class()) {
                             continue;
@@ -227,7 +244,7 @@ impl Server {
                             &self.socket,
                             reply.bytes(),
                             peer,
-                            received.reply_source,
+                            reply_source,
                         );
                         tokio::pin!(send);
                         let sent = loop {
