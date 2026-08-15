@@ -31,8 +31,6 @@ use crate::shared::client::{
 
 use irtt_stats::{StatsCollector, StatsConfig};
 
-const FINITE_STATS_BYTES_PER_PROBE: u64 = 500;
-
 const MIB: u64 = 1024 * 1024;
 
 const GIB: u64 = 1024 * MIB;
@@ -356,9 +354,12 @@ fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option
         return None;
     }
     let target_count = u64::try_from(target_count).unwrap_or(u64::MAX);
-    let estimated_bytes = expected_probe_count(args.duration, args.interval)
-        .saturating_mul(FINITE_STATS_BYTES_PER_PROBE)
-        .saturating_mul(target_count);
+    let total_probe_count =
+        expected_probe_count(args.duration, args.interval).saturating_mul(target_count);
+    // Ask the stats crate what the configuration this run will actually use
+    // retains; the CLI owns the probe count and the thresholds, not the
+    // retention model.
+    let estimated_bytes = stats_config(false).estimated_retained_bytes(total_probe_count);
     if estimated_bytes < FINITE_STATS_MEMORY_WARNING_BYTES {
         return None;
     }
@@ -385,11 +386,10 @@ mod tests {
     };
     use std::sync::Arc;
 
-    #[test]
-    fn finite_stats_memory_warning_accounts_for_target_count() {
+    fn long_finite_args() -> ClientArgs {
         use clap::Parser;
 
-        let args = ClientArgs::try_parse_from([
+        ClientArgs::try_parse_from([
             "irtt-cli",
             "--duration",
             "4200s",
@@ -397,33 +397,46 @@ mod tests {
             "100ms",
             "127.0.0.1:2112",
         ])
-        .unwrap();
+        .unwrap()
+    }
+
+    /// Smallest target count whose aggregate estimate reaches the warning
+    /// threshold, derived from the stats crate's own estimate rather than from
+    /// any bytes-per-probe assumption held here.
+    fn first_warning_target_count(args: &ClientArgs) -> usize {
+        let probes = expected_probe_count(args.duration, args.interval);
+        (1..=1024)
+            .find(|targets| {
+                let total = probes.saturating_mul(*targets as u64);
+                stats_config(false).estimated_retained_bytes(total)
+                    >= FINITE_STATS_MEMORY_WARNING_BYTES
+            })
+            .expect("a long finite run should cross the warning threshold within 1024 targets")
+    }
+
+    #[test]
+    fn finite_stats_memory_warning_accounts_for_target_count() {
+        let args = long_finite_args();
+        let crossing = first_warning_target_count(&args);
 
         assert!(
-            finite_stats_memory_warning(&args, 1).is_none(),
-            "a single target's estimate should stay below the warning threshold"
+            crossing > 1,
+            "this run should need more than one target to cross the threshold, \
+             otherwise the test proves nothing about target-count accounting"
         );
         assert!(
-            finite_stats_memory_warning(&args, 7).is_some(),
-            "seven targets' aggregate estimate should cross the warning threshold"
+            finite_stats_memory_warning(&args, crossing - 1).is_none(),
+            "an aggregate estimate below the threshold should not warn"
+        );
+        assert!(
+            finite_stats_memory_warning(&args, crossing).is_some(),
+            "an aggregate estimate at the threshold should warn"
         );
     }
 
     #[test]
     fn finite_stats_memory_warning_saturates_target_count_multiplication() {
-        use clap::Parser;
-
-        let args = ClientArgs::try_parse_from([
-            "irtt-cli",
-            "--duration",
-            "4200s",
-            "--interval",
-            "100ms",
-            "127.0.0.1:2112",
-        ])
-        .unwrap();
-
-        assert!(finite_stats_memory_warning(&args, usize::MAX).is_some());
+        assert!(finite_stats_memory_warning(&long_finite_args(), usize::MAX).is_some());
     }
 
     #[test]

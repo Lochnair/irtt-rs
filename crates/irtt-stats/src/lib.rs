@@ -15,6 +15,7 @@ mod core;
 mod ipdv;
 mod loss;
 mod normalization;
+mod retention;
 mod rolling;
 mod time_stats;
 
@@ -67,6 +68,55 @@ impl StatsConfig {
             rolling_time: None,
             late_replies: LateReplyMode::Measure,
         }
+    }
+
+    /// Returns an approximate estimate of the bytes a [`StatsCollector`] with
+    /// this configuration retains after processing `probe_count` probes.
+    ///
+    /// This is a planning aid — it exists so callers can warn about a run
+    /// before starting it — and deliberately not allocator accounting. It is
+    /// derived from the structures this crate retains and a fixed
+    /// capacity-headroom factor for the amortized-doubling containers those
+    /// structures use, so it errs toward overestimating.
+    ///
+    /// # What is included
+    ///
+    /// - Exact timing samples, for the metrics that retain them.
+    /// - Adjacent-sequence IPDV tracking state.
+    /// - Count-based rolling storage, when [`StatsConfig::rolling_count`] is
+    ///   set, assuming a probe contributes one send event and one unique
+    ///   reply event.
+    ///
+    /// # What is excluded
+    ///
+    /// - Time-based rolling storage. [`StatsConfig::rolling_time`] retains
+    ///   whatever arrives inside its window, which cannot be bounded from a
+    ///   probe count alone without assuming traffic timing, so it does not
+    ///   contribute to this estimate.
+    /// - Everything outside this crate: sockets, client session state,
+    ///   rendered output, and caller structures.
+    ///
+    /// # Sample mode
+    ///
+    /// [`SampleMode::Exact`] retains one value per metric per measurable
+    /// reply and keeps unbounded IPDV state, so the estimate grows with
+    /// `probe_count`. [`SampleMode::RunningOnly`] retains no exact samples
+    /// and bounds its IPDV state, so the estimate reaches a ceiling and stops
+    /// growing.
+    ///
+    /// # Optional measurements
+    ///
+    /// Adjusted RTT, one-way delay, and send/receive IPDV are only measured
+    /// when the negotiated session supplies the necessary timestamps. The
+    /// estimate assumes all of them are available, which is the upper bound.
+    ///
+    /// # Saturation
+    ///
+    /// The result is deterministic and computed with saturating arithmetic, so
+    /// an enormous `probe_count` saturates at [`u64::MAX`] rather than
+    /// wrapping or panicking.
+    pub fn estimated_retained_bytes(&self, probe_count: u64) -> u64 {
+        retention::estimated_retained_bytes(self, probe_count)
     }
 }
 

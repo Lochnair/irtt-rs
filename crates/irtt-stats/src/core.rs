@@ -9,7 +9,7 @@ use crate::{
     PacketCounts, RttStats, SampleMode, ServerProcessingStats, Snapshot,
 };
 
-const CONTINUOUS_SEQUENCE_LIMIT: usize = 4096;
+pub(crate) const CONTINUOUS_SEQUENCE_LIMIT: usize = 4096;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct CoreStats {
