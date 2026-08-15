@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet, TryReserveError, VecDeque},
-    time::Instant,
+    time::{Instant, SystemTime},
 };
 
 use crate::{error::ClientError, timing::ClientTimestamp};
@@ -10,6 +10,12 @@ pub(crate) struct PendingProbe {
     pub wire_seq: u32,
     pub sent_at: ClientTimestamp,
     pub timeout_at: Instant,
+    /// Observed Linux kernel TX_SOFTWARE wall timestamp for this probe's
+    /// send, when the socket has TX timestamping enabled and a matching
+    /// `MSG_ERRQUEUE` record has been drained. Dormant metadata only: no
+    /// measurement in this change reads it. `sent_at` remains authoritative
+    /// for RTT, timeout, and current one-way delay.
+    pub kernel_tx_timestamp: Option<SystemTime>,
 }
 
 #[derive(Debug)]
@@ -158,6 +164,14 @@ impl PendingMap {
         self.map.len()
     }
 
+    /// Mutable access to a still-pending probe by wire sequence, without
+    /// disturbing its position in the timeout order. Used to attach an
+    /// observed kernel TX timestamp to a probe that has not yet completed or
+    /// timed out.
+    pub fn get_mut(&mut self, wire_seq: u32) -> Option<&mut PendingProbe> {
+        self.map.get_mut(&wire_seq).map(|entry| &mut entry.probe)
+    }
+
     #[cfg(any(feature = "tokio", test))]
     pub fn next_timeout_deadline(&self) -> Option<Instant> {
         self.first
@@ -266,6 +280,13 @@ impl TimedOutMap {
         removed
     }
 
+    /// Mutable access to a still-retained timed-out probe by wire sequence,
+    /// without disturbing eviction order. Used to attach an observed kernel
+    /// TX timestamp that arrives after the probe has already timed out.
+    pub fn get_mut(&mut self, wire_seq: u32) -> Option<&mut PendingProbe> {
+        self.map.get_mut(&wire_seq)
+    }
+
     pub fn clear(&mut self) {
         self.map.clear();
         self.insertion_order.clear();
@@ -367,6 +388,7 @@ mod tests {
             wire_seq: seq,
             sent_at: ts(timeout_at - Duration::from_secs(1)),
             timeout_at,
+            kernel_tx_timestamp: None,
         }
     }
 

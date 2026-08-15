@@ -24,7 +24,7 @@ use crate::{
     config::ClientConfig,
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
-    receive::try_recv_tokio_datagram,
+    receive::{drain_tx_timestamps, try_enable_tx_timestamping, try_recv_tokio_datagram},
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
         PreparedProbe, SessionMachine, TimeoutBatch, MAX_OPEN_PACKET_SIZE,
@@ -222,6 +222,9 @@ pub struct AsyncClient {
     applied_traffic_class: Option<u8>,
     prepared_open: Option<PreparedOpenRequest>,
     prepared_probe: Option<PreparedProbe>,
+    /// See `Client::tx_timestamping_enabled` in `client.rs` for the
+    /// invariant this tracks; it is the same adapter-owned capability flag.
+    tx_timestamping_enabled: bool,
     #[cfg(test)]
     test_hooks: AsyncClientTestHooks,
 }
@@ -250,6 +253,7 @@ impl AsyncClient {
             applied_traffic_class: None,
             prepared_open: Some(prepared_open),
             prepared_probe: None,
+            tx_timestamping_enabled: false,
             #[cfg(test)]
             test_hooks: AsyncClientTestHooks::default(),
         })
@@ -297,6 +301,7 @@ impl AsyncClient {
 
     /// Poll protocol timeouts using the caller's monotonic timestamp.
     pub fn poll_timeouts_at(&mut self, now: Instant) -> Result<Vec<ClientEvent>, ClientError> {
+        self.drain_tx_timestamps()?;
         self.machine.poll_timeouts_at(now)
     }
 
@@ -305,6 +310,7 @@ impl AsyncClient {
         now: Instant,
         limit: usize,
     ) -> Result<TimeoutBatch, ClientError> {
+        self.drain_tx_timestamps()?;
         self.machine.poll_timeouts_bounded_at(now, limit)
     }
 
@@ -566,6 +572,9 @@ impl AsyncClient {
             if let Err(error) = validate_datagram_length(expected_bytes, bytes) {
                 return Poll::Ready(Err(error));
             }
+            if let Err(error) = self.drain_tx_timestamps() {
+                return Poll::Ready(Err(error));
+            }
             events.push(echo_sent_event(
                 self.remote,
                 sent,
@@ -605,6 +614,14 @@ impl AsyncClient {
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
                 Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
             };
+
+            // One final bounded drain before processing the reply, so a TX
+            // timestamp that raced the reply is still associated with its
+            // probe before that probe is looked up and possibly removed
+            // below.
+            if let Err(error) = self.drain_tx_timestamps() {
+                return Poll::Ready(Err(error));
+            }
 
             let events = match self.machine.process_received_echo_packet(
                 &self.recv_buffer[..datagram.len],
@@ -884,7 +901,21 @@ impl AsyncClient {
         self.schedule = prepared.schedule;
         self.applied_traffic_class = prepared.negotiated_traffic_class;
         self.prepared_open = None;
+        self.tx_timestamping_enabled = try_enable_tx_timestamping(&self.socket);
         outcome
+    }
+
+    /// See `Client::drain_tx_timestamps` in `client.rs`: same bounded,
+    /// nonblocking, best-effort drain, adapted to the Tokio socket.
+    fn drain_tx_timestamps(&mut self) -> Result<(), ClientError> {
+        if !self.tx_timestamping_enabled {
+            return Ok(());
+        }
+        let machine = &mut self.machine;
+        drain_tx_timestamps(&self.socket, |id, timestamp| {
+            machine.record_kernel_tx_timestamp(id, timestamp);
+        })
+        .map_err(ClientError::Socket)
     }
 
     fn poll_open_cleanup(

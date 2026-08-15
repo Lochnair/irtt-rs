@@ -14,7 +14,7 @@ use crate::{
     config::{ClientConfig, RecvBudget},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
-    receive::recv_datagram,
+    receive::{drain_tx_timestamps, recv_datagram, try_enable_tx_timestamping},
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, ProbeSent,
         SessionMachine, MAX_OPEN_PACKET_SIZE,
@@ -104,6 +104,13 @@ pub struct Client {
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
     applied_traffic_class: Option<u8>,
+    /// Whether the socket's `SO_TIMESTAMPING` flags carry `TX_SOFTWARE` +
+    /// `OPT_ID` + `OPT_TSONLY`. Always `false` off Linux, without the
+    /// `ancillary` feature, or before the best-effort post-Open upgrade;
+    /// tracked here (adapter-owned capability, not protocol state) so
+    /// unnecessary error-queue drains are skipped once it is known there is
+    /// nothing to drain.
+    tx_timestamping_enabled: bool,
     #[cfg(test)]
     test_hooks: ClientTestHooks,
     #[cfg(test)]
@@ -133,6 +140,7 @@ impl Client {
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
             applied_traffic_class: None,
+            tx_timestamping_enabled: false,
             #[cfg(test)]
             test_hooks: ClientTestHooks::default(),
             #[cfg(test)]
@@ -267,6 +275,11 @@ impl Client {
             Err(err) => return Err(ClientError::Socket(err)),
         };
 
+        // One final bounded drain before processing the reply, so a TX
+        // timestamp that raced the reply is still associated with its probe
+        // before that probe is looked up and possibly removed below.
+        self.drain_tx_timestamps()?;
+
         let events = self.runtime.process_received_echo_packet(
             &self.recv_buffer[..datagram.len],
             datagram.received_at,
@@ -313,6 +326,7 @@ impl Client {
     ///
     /// `now` is monotonic time only; wall-clock time is not used for timeout expiry.
     pub fn poll_timeouts_at(&mut self, now: Instant) -> Result<Vec<ClientEvent>, ClientError> {
+        self.drain_tx_timestamps()?;
         self.runtime.poll_timeouts_at(now)
     }
 
@@ -430,6 +444,7 @@ impl Client {
         #[cfg(test)]
         let bytes = reported_bytes.unwrap_or(bytes);
         validate_datagram_length(expected_bytes, bytes)?;
+        self.drain_tx_timestamps()?;
 
         events.push(echo_sent_event(
             remote,
@@ -610,6 +625,7 @@ impl Client {
             let outcome = self.runtime.commit_open(machine);
             self.schedule = schedule;
             self.applied_traffic_class = Some(negotiated_traffic_class);
+            self.tx_timestamping_enabled = try_enable_tx_timestamping(&self.socket);
             Ok(outcome)
         } else {
             debug_assert!(schedule.is_none());
@@ -619,8 +635,26 @@ impl Client {
             let outcome = self.runtime.commit_open(machine);
             self.schedule = None;
             self.applied_traffic_class = None;
+            self.tx_timestamping_enabled = try_enable_tx_timestamping(&self.socket);
             Ok(outcome)
         }
+    }
+
+    /// Best-effort, bounded, nonblocking drain of the socket's
+    /// `MSG_ERRQUEUE`. A no-op unless [`Self::apply_prepared_open`]
+    /// successfully upgraded the socket to TX timestamping. Any TX
+    /// timestamp found is handed to the session machine to attach to its
+    /// matching probe; a genuine socket/network error found on the queue is
+    /// surfaced through the normal socket-error path.
+    fn drain_tx_timestamps(&mut self) -> Result<(), ClientError> {
+        if !self.tx_timestamping_enabled {
+            return Ok(());
+        }
+        let runtime = &mut self.runtime;
+        drain_tx_timestamps(&self.socket, |id, timestamp| {
+            runtime.record_kernel_tx_timestamp(id, timestamp);
+        })
+        .map_err(ClientError::Socket)
     }
 
     fn restore_dscp_best_effort(&self, previous_traffic_class: Option<u8>) {

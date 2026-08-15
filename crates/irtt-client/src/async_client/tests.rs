@@ -741,6 +741,7 @@ fn public_timeout_polling_remains_exhaustive() {
                     wall: SystemTime::UNIX_EPOCH,
                 },
                 timeout_at: now - Duration::from_secs(1),
+                kernel_tx_timestamp: None,
             });
         }
 

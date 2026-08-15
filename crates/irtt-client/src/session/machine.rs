@@ -366,6 +366,7 @@ impl SessionMachine {
                 wire_seq: preflight.seq,
                 sent_at,
                 timeout_at,
+                kernel_tx_timestamp: None,
             },
             next_wire_seq: preflight.next_wire_seq,
             next_packets_sent: preflight.next_packets_sent,
@@ -389,6 +390,35 @@ impl SessionMachine {
             seq,
             sent_at,
             bytes,
+        }
+    }
+
+    /// Record an observed Linux kernel TX timestamp for `wire_seq`, the
+    /// automatic `SOF_TIMESTAMPING_OPT_ID` the kernel assigned when the
+    /// datagram was submitted.
+    ///
+    /// `wire_seq` doubles as that correlation ID: both counters start at
+    /// zero for a session's first timestamped send and advance by exactly
+    /// one only on a confirmed successful submission, so they stay
+    /// identical for the life of one open session (see the client crate's
+    /// `AGENTS.md` for the full invariant).
+    ///
+    /// Updates a still-pending or already-timed-out probe in place. Never
+    /// resurrects a completed, evicted, or unknown probe, and never touches
+    /// `sent_at`, timeout/loss/reply state, or any counter — this is purely
+    /// dormant metadata attachment. A probe that already has a timestamp
+    /// keeps it: first usable observation wins, so a later duplicate cannot
+    /// silently overwrite it.
+    pub(crate) fn record_kernel_tx_timestamp(&mut self, wire_seq: u32, timestamp: SystemTime) {
+        let MachineState::Open(session) = &mut self.state else {
+            return;
+        };
+        if let Some(probe) = session.pending.get_mut(wire_seq) {
+            probe.kernel_tx_timestamp.get_or_insert(timestamp);
+            return;
+        }
+        if let Some(probe) = session.timed_out.get_mut(wire_seq) {
+            probe.kernel_tx_timestamp.get_or_insert(timestamp);
         }
     }
 
@@ -1053,6 +1083,7 @@ impl SessionMachine {
             wire_seq: 0,
             sent_at: now,
             timeout_at: now.mono,
+            kernel_tx_timestamp: None,
         });
         session.completed.insert(0);
     }
@@ -1789,6 +1820,7 @@ mod tests {
                 wire_seq: seq,
                 sent_at,
                 timeout_at: sent_at.mono + Duration::from_secs(1),
+                kernel_tx_timestamp: None,
             });
         }
 
@@ -1828,6 +1860,7 @@ mod tests {
             wire_seq: 0,
             sent_at: timestamp(now - Duration::from_secs(1)),
             timeout_at: now,
+            kernel_tx_timestamp: None,
         };
         let session = active_mut(&mut machine);
         session.next_wire_seq = 0;
@@ -1916,6 +1949,7 @@ mod tests {
             wire_seq: 0,
             sent_at,
             timeout_at: sent_at.mono + Duration::from_secs(1),
+            kernel_tx_timestamp: None,
         });
         session.next_wire_seq = 1;
         machine
@@ -1930,6 +1964,7 @@ mod tests {
             wire_seq: 0,
             sent_at,
             timeout_at: sent_at.mono + Duration::from_secs(1),
+            kernel_tx_timestamp: None,
         });
         session.next_wire_seq = 1;
         machine
@@ -2216,5 +2251,313 @@ mod tests {
             send_sample.server_to_client,
             Some(SignedDuration::from_nanos(15_000_000))
         );
+    }
+
+    // Kernel TX timestamp correlation (`record_kernel_tx_timestamp`).
+    //
+    // These probe `SessionMachine`'s private association state directly.
+    // The kernel TX timestamp is dormant metadata in this change: none of
+    // these tests assert anything about RTT/OWD/IPDV output, only about
+    // where `PendingProbe::kernel_tx_timestamp` ends up.
+
+    fn tx_ts(offset_secs: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(offset_secs)
+    }
+
+    fn send_probe(machine: &mut SessionMachine, sent_at: ClientTimestamp) -> u32 {
+        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
+        machine.commit_probe_sent(commit, prepared.bytes.len()).seq
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_attaches_to_pending_probe() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq = send_probe(&mut machine, timestamp(now));
+
+        machine.record_kernel_tx_timestamp(seq, tx_ts(1));
+
+        assert_eq!(
+            active_mut(&mut machine)
+                .pending
+                .get_mut(seq)
+                .unwrap()
+                .kernel_tx_timestamp,
+            Some(tx_ts(1))
+        );
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_for_unknown_id_does_nothing() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq = send_probe(&mut machine, timestamp(now));
+
+        // No probe was ever sent for sequence 41; recording against it must
+        // not panic, allocate a phantom entry, or affect the real probe.
+        machine.record_kernel_tx_timestamp(41, tx_ts(9));
+
+        assert!(active_mut(&mut machine)
+            .pending
+            .get_mut(seq)
+            .unwrap()
+            .kernel_tx_timestamp
+            .is_none());
+        assert_eq!(active(&machine).pending.len(), 1);
+    }
+
+    #[test]
+    fn kernel_tx_timestamps_associate_correctly_when_observed_out_of_order() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq10 = send_probe(&mut machine, timestamp(now));
+        let seq11 = send_probe(&mut machine, timestamp(now));
+        let seq12 = send_probe(&mut machine, timestamp(now));
+        assert_eq!((seq10, seq11, seq12), (0, 1, 2));
+
+        // Linux does not guarantee MSG_ERRQUEUE dequeue order matches send
+        // order; observe them out of order (12, 10, 11).
+        machine.record_kernel_tx_timestamp(seq12, tx_ts(12));
+        machine.record_kernel_tx_timestamp(seq10, tx_ts(10));
+        machine.record_kernel_tx_timestamp(seq11, tx_ts(11));
+
+        let session = active_mut(&mut machine);
+        assert_eq!(
+            session.pending.get_mut(seq10).unwrap().kernel_tx_timestamp,
+            Some(tx_ts(10))
+        );
+        assert_eq!(
+            session.pending.get_mut(seq11).unwrap().kernel_tx_timestamp,
+            Some(tx_ts(11))
+        );
+        assert_eq!(
+            session.pending.get_mut(seq12).unwrap().kernel_tx_timestamp,
+            Some(tx_ts(12))
+        );
+    }
+
+    #[test]
+    fn first_valid_kernel_tx_timestamp_wins_over_a_later_duplicate() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq = send_probe(&mut machine, timestamp(now));
+
+        machine.record_kernel_tx_timestamp(seq, tx_ts(1));
+        machine.record_kernel_tx_timestamp(seq, tx_ts(2));
+
+        assert_eq!(
+            active_mut(&mut machine)
+                .pending
+                .get_mut(seq)
+                .unwrap()
+                .kernel_tx_timestamp,
+            Some(tx_ts(1))
+        );
+    }
+
+    #[test]
+    fn probe_timeout_preserves_an_existing_kernel_tx_timestamp() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq = send_probe(&mut machine, timestamp(now));
+        machine.record_kernel_tx_timestamp(seq, tx_ts(1));
+
+        let events = machine
+            .poll_timeouts_at(now + Duration::from_secs(2))
+            .unwrap();
+        assert!(matches!(events.as_slice(), [ClientEvent::EchoLoss { .. }]));
+
+        let session = active_mut(&mut machine);
+        assert!(!session.pending.contains(seq));
+        assert_eq!(
+            session.timed_out.get_mut(seq).unwrap().kernel_tx_timestamp,
+            Some(tx_ts(1))
+        );
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_arriving_after_timeout_attaches_to_timed_out_probe() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq = send_probe(&mut machine, timestamp(now));
+
+        machine
+            .poll_timeouts_at(now + Duration::from_secs(2))
+            .unwrap();
+        assert!(active(&machine).timed_out.contains(seq));
+
+        machine.record_kernel_tx_timestamp(seq, tx_ts(3));
+
+        assert_eq!(
+            active_mut(&mut machine)
+                .timed_out
+                .get_mut(seq)
+                .unwrap()
+                .kernel_tx_timestamp,
+            Some(tx_ts(3))
+        );
+    }
+
+    #[test]
+    fn measurable_late_reply_retains_the_kernel_tx_timestamp() {
+        let now = Instant::now();
+        let mut machine = machine_with_timed_out_probe(owd_sent_at(now));
+        machine.record_kernel_tx_timestamp(0, tx_ts(4));
+        assert_eq!(
+            active_mut(&mut machine)
+                .timed_out
+                .get_mut(0)
+                .unwrap()
+                .kernel_tx_timestamp,
+            Some(tx_ts(4))
+        );
+
+        // The reply is measurable (a late reply with a retained sent_at);
+        // OWD/RTT still come from sent_at only, per NO_OWD_CHANGE, but the
+        // dormant kernel timestamp must have already been retained above
+        // and this call must not disturb that.
+        let events = process_owd_reply(
+            &mut machine,
+            owd_timestamps(),
+            kernel_rx_meta(25_000_000),
+            owd_received_at(now),
+        );
+        assert!(matches!(events.as_slice(), [ClientEvent::LateReply { .. }]));
+    }
+
+    #[test]
+    fn completed_probe_ignores_a_later_kernel_tx_timestamp() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq = send_probe(&mut machine, timestamp(now));
+        let reply = EchoReply {
+            flags: 0,
+            token: active(&machine).token,
+            sequence: seq,
+            recv_count: None,
+            recv_window: None,
+            timestamps: TimestampFields::default(),
+            payload: Vec::new(),
+        };
+        machine
+            .process_echo_reply(
+                reply,
+                64,
+                ClientTimestamp {
+                    mono: now,
+                    wall: SystemTime::now(),
+                },
+                ReceiveMeta::default(),
+            )
+            .unwrap();
+        assert!(active(&machine).completed.contains(seq));
+        assert!(!active(&machine).pending.contains(seq));
+
+        // Must not resurrect the probe into either map.
+        machine.record_kernel_tx_timestamp(seq, tx_ts(5));
+
+        let session = active_mut(&mut machine);
+        assert!(session.pending.get_mut(seq).is_none());
+        assert!(session.timed_out.get_mut(seq).is_none());
+    }
+
+    #[test]
+    fn evicted_timed_out_probe_ignores_a_later_kernel_tx_timestamp() {
+        let mut machine = open_machine(1, Duration::from_secs(1));
+        let now = Instant::now();
+        let first = send_probe(&mut machine, timestamp(now));
+        machine
+            .poll_timeouts_at(now + Duration::from_secs(2))
+            .unwrap();
+        assert!(active(&machine).timed_out.contains(first));
+
+        // capacity 1: sending and timing out a second probe evicts the first
+        // from the bounded TimedOutMap.
+        let second = send_probe(&mut machine, timestamp(now + Duration::from_secs(2)));
+        machine
+            .poll_timeouts_at(now + Duration::from_secs(4))
+            .unwrap();
+        assert!(active(&machine).timed_out.contains(second));
+        assert!(!active(&machine).timed_out.contains(first));
+
+        // Recording against the evicted ID must not panic or resurrect it.
+        machine.record_kernel_tx_timestamp(first, tx_ts(6));
+        assert!(active_mut(&mut machine).timed_out.get_mut(first).is_none());
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_recording_is_a_no_op_once_closed() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        let now = Instant::now();
+        let seq = send_probe(&mut machine, timestamp(now));
+        let prepared = machine.prepare_close().unwrap();
+        let commit = prepared.commit;
+        machine.commit_local_close(commit, timestamp(now));
+        assert!(machine.is_terminal());
+
+        // Recording after close must not panic (there is no open session to
+        // index into) and must remain inert.
+        machine.record_kernel_tx_timestamp(seq, tx_ts(7));
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_ids_wrap_like_wire_seq() {
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        active_mut(&mut machine).next_wire_seq = u32::MAX;
+        let now = Instant::now();
+        let last = send_probe(&mut machine, timestamp(now));
+        let wrapped = send_probe(&mut machine, timestamp(now));
+        assert_eq!(last, u32::MAX);
+        assert_eq!(wrapped, 0);
+
+        machine.record_kernel_tx_timestamp(u32::MAX, tx_ts(1));
+        machine.record_kernel_tx_timestamp(0, tx_ts(2));
+
+        let session = active_mut(&mut machine);
+        assert_eq!(
+            session
+                .pending
+                .get_mut(u32::MAX)
+                .unwrap()
+                .kernel_tx_timestamp,
+            Some(tx_ts(1))
+        );
+        assert_eq!(
+            session.pending.get_mut(0).unwrap().kernel_tx_timestamp,
+            Some(tx_ts(2))
+        );
+    }
+
+    #[test]
+    fn kernel_tx_timestamp_presence_does_not_change_rtt_or_owd() {
+        let mono = Instant::now();
+        let mut without = machine_with_pending_probe(owd_sent_at(mono));
+        let mut with = machine_with_pending_probe(owd_sent_at(mono));
+        with.record_kernel_tx_timestamp(0, tx_ts(1));
+
+        let without_events = process_owd_reply(
+            &mut without,
+            owd_timestamps(),
+            kernel_rx_meta(25_000_000),
+            owd_received_at(mono),
+        );
+        let with_events = process_owd_reply(
+            &mut with,
+            owd_timestamps(),
+            kernel_rx_meta(25_000_000),
+            owd_received_at(mono),
+        );
+
+        let without_reply = match without_events.as_slice() {
+            [ClientEvent::EchoReply { rtt, one_way, .. }] => (*rtt, *one_way),
+            other => panic!("expected one EchoReply, got {other:?}"),
+        };
+        let with_reply = match with_events.as_slice() {
+            [ClientEvent::EchoReply { rtt, one_way, .. }] => (*rtt, *one_way),
+            other => panic!("expected one EchoReply, got {other:?}"),
+        };
+        assert_eq!(without_reply, with_reply);
     }
 }
