@@ -150,10 +150,14 @@ timestamp was observed, the upstream endpoint falls back to `sent_at.wall`
 maximum-lag bound: unlike the kernel receive side, legitimate client
 send-to-reply time can exceed a second.
 
-`sent_at` remains the sole input to RTT and the downstream
-(`server_to_client`) one-way delay, exactly as before this capability
-existed; `TX_SOFTWARE` is still a software kernel timestamp near the driver
-handoff, not a NIC hardware transmit time. `irtt-stats`'s `ReplySample`
+`sent_at` remains the RTT endpoint and the userspace fallback for the
+upstream (`client_to_server`) one-way delay, exactly as before this
+capability existed. It is not an input to the downstream
+(`server_to_client`) one-way delay, which is derived solely from
+`ReceiveMeta::preferred_receive_wall` and the negotiated server send
+timestamp — unaffected by this capability or by F-04. `TX_SOFTWARE` is
+still a software kernel timestamp near the driver handoff, not a NIC
+hardware transmit time. `irtt-stats`'s `ReplySample`
 copies public `sent_at` straight into `client_send_mono`/`client_send_wall_ns`,
 which `send_ipdv_ns` compares across probes for the upstream IPDV component —
 so that component shifts endpoint along with `sent_at` itself (pre-send vs.

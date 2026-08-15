@@ -110,7 +110,20 @@ pub(crate) fn normalize_event(event: &ClientEvent) -> Option<StatsEvent> {
             at: received_at.mono,
             bytes: *bytes,
         }),
-        ClientEvent::EchoLoss { timeout_at, .. } => Some(StatsEvent::Loss { at: *timeout_at }),
+        ClientEvent::EchoLoss {
+            sent_at,
+            timeout_at,
+            ..
+        } => Some(StatsEvent::Loss {
+            // `timeout_at` is anchored to the pre-send probe timestamp (see
+            // irtt-client's AGENTS.md), so it can precede this same probe's
+            // own post-send `sent_at` when a probe_timeout is small relative
+            // to the send-call duration. Rolling-window eviction assumes
+            // events are pushed in non-decreasing `at()` order, so clamp to
+            // `sent_at` to preserve that invariant without changing the
+            // public `timeout_at` value on the event itself.
+            at: (*timeout_at).max(sent_at.mono),
+        }),
         ClientEvent::Warning { at, .. } => Some(StatsEvent::Warning { at: at.mono }),
         ClientEvent::SessionStarted { .. }
         | ClientEvent::NoTestCompleted { .. }
@@ -218,5 +231,30 @@ mod tests {
         assert_eq!(system_time_ns(after), Some(7));
         let now = SystemTime::now();
         assert!(system_time_ns(now).is_some());
+    }
+
+    #[test]
+    fn loss_windowing_timestamp_is_clamped_to_its_own_sent_at() {
+        let base = Instant::now();
+        let sent_at = ClientTimestamp {
+            mono: base + Duration::from_millis(50),
+            wall: UNIX_EPOCH + Duration::from_millis(50),
+        };
+        // The pre-send-anchored `timeout_at` can precede this same probe's
+        // own post-send `sent_at` when probe_timeout is small relative to
+        // the send-call duration (see irtt-client's AGENTS.md). Rolling-
+        // window eviction assumes non-decreasing event timestamps, so the
+        // windowing `at()` must not regress behind the probe's own Sent
+        // event even though the public `timeout_at` field legitimately can.
+        let timeout_at = base + Duration::from_millis(10);
+
+        let event = ClientEvent::EchoLoss {
+            seq: 0,
+            sent_at,
+            timeout_at,
+        };
+
+        let normalized = normalize_event(&event).expect("loss event normalizes");
+        assert_eq!(normalized.at(), sent_at.mono);
     }
 }
