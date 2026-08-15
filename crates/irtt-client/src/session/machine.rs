@@ -699,7 +699,13 @@ impl SessionMachine {
             if let Some(pending) = session.pending.remove(wire_seq) {
                 let rtt = compute_rtt(&pending.sent_at, &now, &reply.timestamps);
                 let server_timing = build_server_timing(&reply.timestamps);
-                let one_way = compute_one_way(&pending.sent_at, &now, &meta, &reply.timestamps);
+                let one_way = compute_one_way(
+                    &pending.sent_at,
+                    &now,
+                    pending.kernel_tx_timestamp,
+                    &meta,
+                    &reply.timestamps,
+                );
                 let received_stats = build_received_stats(&reply);
                 let is_late = session
                     .highest_received_seq
@@ -748,7 +754,13 @@ impl SessionMachine {
             } else if let Some(timed_out) = session.timed_out.remove(wire_seq) {
                 let rtt = compute_rtt(&timed_out.sent_at, &now, &reply.timestamps);
                 let server_timing = build_server_timing(&reply.timestamps);
-                let one_way = compute_one_way(&timed_out.sent_at, &now, &meta, &reply.timestamps);
+                let one_way = compute_one_way(
+                    &timed_out.sent_at,
+                    &now,
+                    timed_out.kernel_tx_timestamp,
+                    &meta,
+                    &reply.timestamps,
+                );
                 let received_stats = build_received_stats(&reply);
                 let highest_seen = session.highest_received_seq.unwrap_or(wire_seq);
                 update_highest_received(&mut session.highest_received_seq, wire_seq);
@@ -968,23 +980,53 @@ fn build_server_timing(ts: &TimestampFields) -> Option<ServerTiming> {
     })
 }
 
+/// Selects the client send wall-clock endpoint for upstream one-way delay.
+///
+/// Prefers the correlated Linux kernel `TX_SOFTWARE` timestamp — a software
+/// timestamp near the driver handoff, not physical NIC departure — when it
+/// is locally plausible: it must not precede `sent_at` and must not follow
+/// `received_at`, both on the client's own wall clock. Comparing only these
+/// two same-client anchors means the check detects local causal-ordering
+/// inconsistency (e.g. a backward wall-clock step), not every possible
+/// wall-clock discontinuity, and it deliberately does not compare against
+/// the remote server's wall clock: cross-host clock offset is a
+/// synchronization property of the resulting delay, not evidence that this
+/// endpoint is invalid. There is no maximum lag bound — unlike scheduler
+/// wakeup delay on the receive side, legitimate send-to-receive time can
+/// exceed a second. Falls back to `sent_at` when the kernel timestamp is
+/// absent or fails this check; the raw observation on `PendingProbe` is
+/// never mutated by a fallback here.
+fn preferred_send_wall(
+    sent_at: SystemTime,
+    kernel_tx_timestamp: Option<SystemTime>,
+    received_at: SystemTime,
+) -> SystemTime {
+    match kernel_tx_timestamp {
+        Some(kernel_tx) if sent_at <= kernel_tx && kernel_tx <= received_at => kernel_tx,
+        _ => sent_at,
+    }
+}
+
 /// Computes both one-way delay directions from wall-clock endpoints.
 ///
-/// The upstream direction always uses the client's send wall time. The
-/// downstream direction uses [`ReceiveMeta::preferred_receive_wall`], which
-/// prefers a plausible kernel receive timestamp over the userspace receive
-/// wall sample; the kernel timestamp is never used for the upstream direction
-/// or for RTT.
+/// The upstream direction prefers a locally plausible correlated kernel
+/// `TX_SOFTWARE` send timestamp over the userspace pre-send sample; see
+/// [`preferred_send_wall`]. The downstream direction uses
+/// [`ReceiveMeta::preferred_receive_wall`], which prefers a plausible kernel
+/// receive timestamp over the userspace receive wall sample. Neither kernel
+/// timestamp is ever used for RTT.
 pub(crate) fn compute_one_way(
     sent_at: &ClientTimestamp,
     received_at: &ClientTimestamp,
+    kernel_tx_timestamp: Option<SystemTime>,
     meta: &ReceiveMeta,
     ts: &TimestampFields,
 ) -> Option<OneWayDelaySample> {
     let server_recv_wall = ts.recv_wall.or(ts.midpoint_wall);
     let server_send_wall = ts.send_wall.or(ts.midpoint_wall);
 
-    let client_send_ns = unix_epoch_ns_i64(sent_at.wall);
+    let client_send_wall = preferred_send_wall(sent_at.wall, kernel_tx_timestamp, received_at.wall);
+    let client_send_ns = unix_epoch_ns_i64(client_send_wall);
     let client_recv_ns = unix_epoch_ns_i64(meta.preferred_receive_wall(received_at.wall));
 
     let c2s = server_recv_wall
@@ -2531,11 +2573,13 @@ mod tests {
     }
 
     #[test]
-    fn kernel_tx_timestamp_presence_does_not_change_rtt_or_owd() {
+    fn kernel_tx_timestamp_changes_only_upstream_one_way_delay() {
         let mono = Instant::now();
         let mut without = machine_with_pending_probe(owd_sent_at(mono));
         let mut with = machine_with_pending_probe(owd_sent_at(mono));
-        with.record_kernel_tx_timestamp(0, tx_ts(1));
+        // Plausible: strictly between sent_at and received_at on the
+        // client's own wall clock.
+        with.record_kernel_tx_timestamp(0, owd_wall(2_000_000));
 
         let without_events = process_owd_reply(
             &mut without,
@@ -2558,6 +2602,279 @@ mod tests {
             [ClientEvent::EchoReply { rtt, one_way, .. }] => (*rtt, *one_way),
             other => panic!("expected one EchoReply, got {other:?}"),
         };
-        assert_eq!(without_reply, with_reply);
+
+        // RTT is a purely monotonic userspace measurement.
+        assert_eq!(without_reply.0, with_reply.0, "RTT must be unaffected");
+        // Downstream delay is governed solely by the kernel RX selection.
+        assert_eq!(
+            without_reply.1.unwrap().server_to_client,
+            with_reply.1.unwrap().server_to_client,
+            "downstream delay must be unaffected"
+        );
+        // Upstream delay is the one thing the kernel TX timestamp changes.
+        assert_ne!(
+            without_reply.1.unwrap().client_to_server,
+            with_reply.1.unwrap().client_to_server
+        );
+        assert_eq!(
+            with_reply.1.unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(3_000_000))
+        );
+    }
+
+    // Upstream one-way delay: preferred client send wall selection.
+    //
+    // `preferred_send_wall` is exercised directly first (pure plausibility
+    // logic), then through `compute_one_way`/`process_echo_reply` to pin the
+    // end-to-end measurement behavior described in the client crate's
+    // `AGENTS.md`.
+
+    fn send_wall_ms(offset_ms: u64) -> SystemTime {
+        UNIX_EPOCH + Duration::from_millis(offset_ms)
+    }
+
+    #[test]
+    fn preferred_send_wall_without_kernel_timestamp_uses_sent_at() {
+        let sent_at = send_wall_ms(1_000);
+        let received_at = send_wall_ms(1_040);
+        assert_eq!(preferred_send_wall(sent_at, None, received_at), sent_at);
+    }
+
+    #[test]
+    fn preferred_send_wall_uses_kernel_timestamp_strictly_between_bounds() {
+        let sent_at = send_wall_ms(1_000);
+        let kernel_tx = send_wall_ms(1_005);
+        let received_at = send_wall_ms(1_040);
+        assert_eq!(
+            preferred_send_wall(sent_at, Some(kernel_tx), received_at),
+            kernel_tx
+        );
+    }
+
+    #[test]
+    fn preferred_send_wall_accepts_kernel_timestamp_equal_to_sent_at() {
+        let sent_at = send_wall_ms(1_000);
+        let received_at = send_wall_ms(1_040);
+        assert_eq!(
+            preferred_send_wall(sent_at, Some(sent_at), received_at),
+            sent_at
+        );
+    }
+
+    #[test]
+    fn preferred_send_wall_accepts_kernel_timestamp_equal_to_received_at() {
+        let sent_at = send_wall_ms(1_000);
+        let received_at = send_wall_ms(1_040);
+        assert_eq!(
+            preferred_send_wall(sent_at, Some(received_at), received_at),
+            received_at
+        );
+    }
+
+    #[test]
+    fn preferred_send_wall_rejects_kernel_timestamp_earlier_than_sent_at() {
+        let sent_at = send_wall_ms(1_000);
+        let kernel_tx = sent_at - Duration::from_nanos(1);
+        let received_at = send_wall_ms(1_040);
+        assert_eq!(
+            preferred_send_wall(sent_at, Some(kernel_tx), received_at),
+            sent_at
+        );
+    }
+
+    #[test]
+    fn preferred_send_wall_rejects_kernel_timestamp_later_than_received_at() {
+        let sent_at = send_wall_ms(1_000);
+        let received_at = send_wall_ms(1_040);
+        let kernel_tx = received_at + Duration::from_nanos(1);
+        assert_eq!(
+            preferred_send_wall(sent_at, Some(kernel_tx), received_at),
+            sent_at
+        );
+    }
+
+    #[test]
+    fn preferred_send_wall_handles_extreme_timestamps_without_panicking() {
+        let sent_at = send_wall_ms(1_000);
+        let received_at = send_wall_ms(1_040);
+        let far_future = UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)) * 4;
+        let before_epoch = UNIX_EPOCH - Duration::from_secs(u64::from(u32::MAX));
+
+        assert_eq!(
+            preferred_send_wall(sent_at, Some(far_future), received_at),
+            sent_at
+        );
+        assert_eq!(
+            preferred_send_wall(sent_at, Some(before_epoch), received_at),
+            sent_at
+        );
+        assert_eq!(
+            preferred_send_wall(before_epoch, None, received_at),
+            before_epoch
+        );
+    }
+
+    fn upstream_probe(sent_wall: SystemTime, mono: Instant) -> SessionMachine {
+        machine_with_pending_probe(ClientTimestamp {
+            mono,
+            wall: sent_wall,
+        })
+    }
+
+    fn upstream_reply(
+        machine: &mut SessionMachine,
+        server_recv_wall_ms: u64,
+        received_wall: SystemTime,
+        mono: Instant,
+    ) -> Vec<ClientEvent> {
+        let timestamps = TimestampFields {
+            recv_wall: Some(
+                i64::try_from(Duration::from_millis(server_recv_wall_ms).as_nanos()).unwrap(),
+            ),
+            ..Default::default()
+        };
+        let received_at = ClientTimestamp {
+            mono: mono + Duration::from_millis(40),
+            wall: received_wall,
+        };
+        process_owd_reply(machine, timestamps, ReceiveMeta::default(), received_at)
+    }
+
+    #[test]
+    fn upstream_one_way_delay_prefers_plausible_kernel_tx_time() {
+        let mono = Instant::now();
+        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(15_000_000))
+        );
+    }
+
+    #[test]
+    fn upstream_one_way_delay_falls_back_without_kernel_tx() {
+        let mono = Instant::now();
+        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(20_000_000))
+        );
+    }
+
+    #[test]
+    fn upstream_one_way_delay_falls_back_for_kernel_tx_earlier_than_sent_at() {
+        let mono = Instant::now();
+        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(999));
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(20_000_000))
+        );
+    }
+
+    #[test]
+    fn upstream_one_way_delay_falls_back_for_kernel_tx_later_than_received_at() {
+        let mono = Instant::now();
+        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_041));
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(20_000_000))
+        );
+    }
+
+    #[test]
+    fn upstream_one_way_delay_measurable_late_reply_uses_the_retained_kernel_tx_time() {
+        let mono = Instant::now();
+        let mut machine = machine_with_timed_out_probe(ClientTimestamp {
+            mono,
+            wall: send_wall_ms(1_000),
+        });
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        assert!(matches!(events.as_slice(), [ClientEvent::LateReply { .. }]));
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(15_000_000))
+        );
+    }
+
+    #[test]
+    fn upstream_one_way_delay_untracked_late_reply_stays_unmeasurable() {
+        let mono = Instant::now();
+        let mut machine = open_machine(4, Duration::from_secs(1));
+        active_mut(&mut machine).highest_received_seq = Some(5);
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        match events.as_slice() {
+            [ClientEvent::LateReply { one_way, .. }] => assert!(one_way.is_none()),
+            other => panic!("expected an untracked LateReply, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn upstream_one_way_delay_applies_against_a_server_midpoint_timestamp() {
+        let mono = Instant::now();
+        let mut machine = upstream_probe(send_wall_ms(100), mono);
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(105));
+
+        let timestamps = TimestampFields {
+            midpoint_wall: Some(120_000_000),
+            ..Default::default()
+        };
+        let received_at = ClientTimestamp {
+            mono: mono + Duration::from_millis(40),
+            wall: send_wall_ms(140),
+        };
+        let events = process_owd_reply(
+            &mut machine,
+            timestamps,
+            ReceiveMeta::default(),
+            received_at,
+        );
+
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(15_000_000))
+        );
+    }
+
+    #[test]
+    fn upstream_one_way_delay_remains_unavailable_for_send_only_server_timestamps() {
+        let mono = Instant::now();
+        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
+
+        let timestamps = TimestampFields {
+            send_wall: Some(1_010_000_000),
+            ..Default::default()
+        };
+        let received_at = ClientTimestamp {
+            mono: mono + Duration::from_millis(40),
+            wall: send_wall_ms(1_040),
+        };
+        let events = process_owd_reply(
+            &mut machine,
+            timestamps,
+            ReceiveMeta::default(),
+            received_at,
+        );
+
+        assert_eq!(reply_one_way(&events).unwrap().client_to_server, None);
     }
 }
