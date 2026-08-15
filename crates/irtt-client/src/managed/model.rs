@@ -198,16 +198,32 @@ pub enum ManagedEndReason {
 }
 
 /// Durable outcome for one target generation.
+///
+/// These counters are durable: unlike [`ManagedEvent`], which is a lossy
+/// presentation stream, they account for everything the target observed.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedTargetOutcome {
     pub target: TargetInstance,
     pub server_addr: Arc<str>,
     pub remote: Option<SocketAddr>,
     pub end_reason: ManagedTargetEndReason,
+    /// Probes the underlying client reported as sent.
     pub packets_sent: u64,
+    /// Unique echo replies that arrived in order and before their probe timed
+    /// out.
+    ///
+    /// A unique reply that arrives behind an already-received sequence, or
+    /// after its own probe timed out, is counted by `late` instead.
     pub replies_received: u64,
+    /// Replies for a sequence that had already been answered.
     pub duplicates: u64,
+    /// Late replies: those arriving behind an already-received sequence
+    /// (reordering) or after their own probe timed out.
+    ///
+    /// This counts every late reply, whether or not the client could still
+    /// match it to retained send state.
     pub late: u64,
+    /// Warning events observed for this target.
     pub warning_events: u64,
     pub cleanup_failure: Option<ManagedTargetFailure>,
 }
