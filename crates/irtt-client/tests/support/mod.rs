@@ -4,12 +4,12 @@ mod in_tree_server;
 mod real_irtt;
 
 use std::{
-    io::ErrorKind,
+    io::{self, ErrorKind},
     net::{SocketAddr, UdpSocket},
     process::Command,
     sync::mpsc,
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
 
 use irtt_client::{Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, SocketConfig};
@@ -448,32 +448,64 @@ where
     FakeServer { addr, rx, done }
 }
 
-/// A fake server's `recv_from`, retrying an interrupted syscall
-/// (`EINTR`/`ErrorKind::Interrupted`) instead of panicking on it.
+/// A `recv_from` that retries an interrupted syscall
+/// (`EINTR`/`ErrorKind::Interrupted`) instead of failing outright, keeping
+/// one absolute deadline across any number of interruptions exactly like the
+/// production blocking receive fix this test file exists to guard: each
+/// retry re-applies only the *remaining* time against the socket's
+/// currently configured read timeout, so a signal storm cannot turn this
+/// into an unbounded wait. The configured timeout is restored before
+/// returning so a later call is unaffected by an earlier interruption here.
+fn recv_from_retrying_interrupted(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr)> {
+    let configured_timeout = socket.read_timeout()?;
+    let deadline = configured_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    let mut timeout_narrowed = false;
+
+    let result = loop {
+        match socket.recv_from(buf) {
+            Ok(received) => break Ok(received),
+            Err(err) if err.kind() == ErrorKind::Interrupted => {
+                if let Some(deadline) = deadline {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break Err(io::Error::from(ErrorKind::TimedOut));
+                    };
+                    if remaining.is_zero() {
+                        break Err(io::Error::from(ErrorKind::TimedOut));
+                    }
+                    if let Err(err) = socket.set_read_timeout(Some(remaining)) {
+                        break Err(err);
+                    }
+                    timeout_narrowed = true;
+                }
+            }
+            Err(err) => break Err(err),
+        }
+    };
+
+    if timeout_narrowed {
+        socket.set_read_timeout(configured_timeout)?;
+    }
+    result
+}
+
 fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0_u8; 8192];
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, peer)) => return (buf[..size].to_vec(), peer),
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err) => panic!("fake server recv_from failed: {err}"),
-        }
+    match recv_from_retrying_interrupted(socket, &mut buf) {
+        Ok((size, peer)) => (buf[..size].to_vec(), peer),
+        Err(err) => panic!("fake server recv_from failed: {err}"),
     }
 }
 
-/// Like [`recv_request`], but any non-interrupting error (including a
-/// configured read timeout) means "nothing more to receive" rather than a
-/// failure. An interrupted syscall carries no such information and is
-/// retried instead of being misclassified as quiet.
+/// Like [`recv_request`], but any error, including a configured read
+/// timeout, means "nothing more to receive" rather than a failure.
 fn recv_request_timeout(socket: &UdpSocket) -> Option<Vec<u8>> {
     let mut buf = [0_u8; 8192];
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, _)) => return Some(buf[..size].to_vec()),
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-    }
+    recv_from_retrying_interrupted(socket, &mut buf)
+        .ok()
+        .map(|(size, _)| buf[..size].to_vec())
 }
 
 fn assert_started(outcome: OpenOutcome) -> NegotiatedParams {

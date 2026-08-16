@@ -4,7 +4,7 @@
 mod in_tree_server;
 
 use std::{
-    io::{ErrorKind, Read},
+    io::{self, ErrorKind, Read},
     net::{SocketAddr, UdpSocket},
     process::{Command, Output, Stdio},
     sync::mpsc,
@@ -1177,35 +1177,68 @@ fn start_open_failure_server_inner(
     FakeServer { addr, done }
 }
 
-/// A fake server's `recv_from`, retrying an interrupted syscall
-/// (`EINTR`/`ErrorKind::Interrupted`) instead of panicking on it: real
+/// A `recv_from` that retries an interrupted syscall
+/// (`EINTR`/`ErrorKind::Interrupted`) instead of failing outright: real
 /// signal delivery (e.g. process-group signals during CI) can interrupt a
 /// blocking receive here without there being anything actually wrong.
+///
+/// Keeps one absolute deadline across any number of interruptions, exactly
+/// like the production blocking receive fix this test file exists to guard:
+/// each retry re-applies only the *remaining* time against the socket's
+/// currently configured read timeout, so a signal storm cannot turn this
+/// into an unbounded wait. The configured timeout is restored before
+/// returning so a later call is unaffected by an earlier interruption here.
+fn recv_from_retrying_interrupted(
+    socket: &UdpSocket,
+    buf: &mut [u8],
+) -> io::Result<(usize, SocketAddr)> {
+    let configured_timeout = socket.read_timeout()?;
+    let deadline = configured_timeout.and_then(|timeout| Instant::now().checked_add(timeout));
+    let mut timeout_narrowed = false;
+
+    let result = loop {
+        match socket.recv_from(buf) {
+            Ok(received) => break Ok(received),
+            Err(err) if err.kind() == ErrorKind::Interrupted => {
+                if let Some(deadline) = deadline {
+                    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                        break Err(io::Error::from(ErrorKind::TimedOut));
+                    };
+                    if remaining.is_zero() {
+                        break Err(io::Error::from(ErrorKind::TimedOut));
+                    }
+                    if let Err(err) = socket.set_read_timeout(Some(remaining)) {
+                        break Err(err);
+                    }
+                    timeout_narrowed = true;
+                }
+            }
+            Err(err) => break Err(err),
+        }
+    };
+
+    if timeout_narrowed {
+        socket.set_read_timeout(configured_timeout)?;
+    }
+    result
+}
+
 fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0_u8; 2048];
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, peer)) => return (buf[..size].to_vec(), peer),
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(err) => panic!("fake server recv_from failed: {err}"),
-        }
+    match recv_from_retrying_interrupted(socket, &mut buf) {
+        Ok((size, peer)) => (buf[..size].to_vec(), peer),
+        Err(err) => panic!("fake server recv_from failed: {err}"),
     }
 }
 
-/// Like [`recv_request`], but treats any non-interrupting error (including a
-/// configured read timeout) as "nothing more to receive" rather than a
-/// failure, since callers use this to detect the peer going quiet. An
-/// interrupted syscall carries no such information and is retried instead of
-/// being misclassified as quiet.
+/// Like [`recv_request`], but treats any error, including a configured read
+/// timeout, as "nothing more to receive" rather than a failure, since
+/// callers use this to detect the peer going quiet.
 fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
     let mut buf = [0_u8; 2048];
-    loop {
-        match socket.recv_from(&mut buf) {
-            Ok((size, peer)) => return Some((buf[..size].to_vec(), peer)),
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            Err(_) => return None,
-        }
-    }
+    recv_from_retrying_interrupted(socket, &mut buf)
+        .ok()
+        .map(|(size, peer)| (buf[..size].to_vec(), peer))
 }
 
 fn open_reply(flags: u8, token: u64, params: &Params) -> Vec<u8> {

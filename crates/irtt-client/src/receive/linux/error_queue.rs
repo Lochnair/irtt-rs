@@ -153,14 +153,18 @@ impl ErrorQueueControlBuffer {
 
 /// Nonblocking drain of a single record from `fd`'s `MSG_ERRQUEUE`.
 ///
-/// Returns `Ok(None)` when the queue is empty (`EAGAIN`/`EWOULDBLOCK`) or
-/// when this one read was interrupted (`EINTR`). TX timestamp capture is
-/// optional best-effort metadata, not a network operation: an interrupted
-/// read here is not a socket/network error and must not become one, so it is
-/// treated as no record obtained on this drain rather than retried in a
-/// loop. The bounded caller in [`super::drain_tx_timestamps`] naturally
-/// revisits the queue on its next call, which is how every other record is
-/// picked up too.
+/// Returns `Ok(None)` when the queue is empty (`EAGAIN`/`EWOULDBLOCK`) — the
+/// caller in [`super::drain_tx_timestamps`] stops its drain there, exactly
+/// as it always has. An interrupted read (`EINTR`) is different: it says
+/// nothing about whether the queue is empty, so treating it the same as
+/// `EWOULDBLOCK` could end a drain early and strand a still-queued record
+/// past the point its matching probe is looked up and removed (see the
+/// crate's `AGENTS.md`). TX timestamp capture is optional best-effort
+/// metadata, not a network operation, so an interruption here must also
+/// never become a socket/network error; instead it is reported as
+/// [`ErrorQueueRecord::Ignored`], which consumes one attempt of the bounded
+/// caller's existing per-drain work budget and lets the loop immediately
+/// retry the same slot rather than stopping or spinning unboundedly.
 /// `SOF_TIMESTAMPING_OPT_TSONLY` notifications carry no meaningful payload,
 /// so a zero-length iovec is enough: correlation is by `id`, never by
 /// payload content.
@@ -181,7 +185,8 @@ pub(crate) fn try_recv_error_queue_record(fd: RawFd) -> io::Result<Option<ErrorQ
                 .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
             Ok(Some(classify(cmsgs)))
         }
-        Err(Errno::EWOULDBLOCK | Errno::EINTR) => Ok(None),
+        Err(Errno::EWOULDBLOCK) => Ok(None),
+        Err(Errno::EINTR) => Ok(Some(ErrorQueueRecord::Ignored)),
         Err(errno) => Err(io::Error::from(errno)),
     }
 }
