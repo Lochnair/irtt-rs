@@ -4,6 +4,7 @@ mod in_tree_server;
 mod real_irtt;
 
 use std::{
+    io::ErrorKind,
     net::{SocketAddr, UdpSocket},
     process::Command,
     sync::mpsc,
@@ -447,17 +448,31 @@ where
     FakeServer { addr, rx, done }
 }
 
+/// A fake server's `recv_from`, retrying an interrupted syscall
+/// (`EINTR`/`ErrorKind::Interrupted`) instead of panicking on it.
 fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0_u8; 8192];
-    let (size, peer) = socket.recv_from(&mut buf).unwrap();
-    (buf[..size].to_vec(), peer)
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, peer)) => return (buf[..size].to_vec(), peer),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => panic!("fake server recv_from failed: {err}"),
+        }
+    }
 }
 
+/// Like [`recv_request`], but any non-interrupting error (including a
+/// configured read timeout) means "nothing more to receive" rather than a
+/// failure. An interrupted syscall carries no such information and is
+/// retried instead of being misclassified as quiet.
 fn recv_request_timeout(socket: &UdpSocket) -> Option<Vec<u8>> {
     let mut buf = [0_u8; 8192];
-    match socket.recv_from(&mut buf) {
-        Ok((size, _)) => Some(buf[..size].to_vec()),
-        Err(_) => None,
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, _)) => return Some(buf[..size].to_vec()),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
     }
 }
 

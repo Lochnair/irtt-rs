@@ -4,7 +4,7 @@
 mod in_tree_server;
 
 use std::{
-    io::Read,
+    io::{ErrorKind, Read},
     net::{SocketAddr, UdpSocket},
     process::{Command, Output, Stdio},
     sync::mpsc,
@@ -1177,18 +1177,35 @@ fn start_open_failure_server_inner(
     FakeServer { addr, done }
 }
 
+/// A fake server's `recv_from`, retrying an interrupted syscall
+/// (`EINTR`/`ErrorKind::Interrupted`) instead of panicking on it: real
+/// signal delivery (e.g. process-group signals during CI) can interrupt a
+/// blocking receive here without there being anything actually wrong.
 fn recv_request(socket: &UdpSocket) -> (Vec<u8>, SocketAddr) {
     let mut buf = [0_u8; 2048];
-    let (size, peer) = socket.recv_from(&mut buf).unwrap();
-    (buf[..size].to_vec(), peer)
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, peer)) => return (buf[..size].to_vec(), peer),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(err) => panic!("fake server recv_from failed: {err}"),
+        }
+    }
 }
 
+/// Like [`recv_request`], but treats any non-interrupting error (including a
+/// configured read timeout) as "nothing more to receive" rather than a
+/// failure, since callers use this to detect the peer going quiet. An
+/// interrupted syscall carries no such information and is retried instead of
+/// being misclassified as quiet.
 fn recv_request_timeout(socket: &UdpSocket) -> Option<(Vec<u8>, SocketAddr)> {
     let mut buf = [0_u8; 2048];
-    socket
-        .recv_from(&mut buf)
-        .ok()
-        .map(|(size, peer)| (buf[..size].to_vec(), peer))
+    loop {
+        match socket.recv_from(&mut buf) {
+            Ok((size, peer)) => return Some((buf[..size].to_vec(), peer)),
+            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
+            Err(_) => return None,
+        }
+    }
 }
 
 fn open_reply(flags: u8, token: u64, params: &Params) -> Vec<u8> {

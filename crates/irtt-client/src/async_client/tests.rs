@@ -884,6 +884,53 @@ fn receive_retries_false_readiness_and_shares_packet_classification() {
 }
 
 #[test]
+fn receive_retries_interrupted_syscall_and_shares_packet_classification() {
+    let server = start_server(move |socket, tx| {
+        let (params, peer) = open_session(&socket, &tx, None);
+        let (probe_packet, _) = recv_packet(&socket, &tx);
+        let sequence = echo_request_sequence(&probe_packet, None);
+        socket
+            .send_to(
+                &echo_reply(&params, sequence, TOKEN, flags::FLAG_REPLY, None),
+                peer,
+            )
+            .unwrap();
+    });
+
+    runtime().block_on(async {
+        let mut client = opened_client(server.addr, 0).await;
+        client.send_probe().await.unwrap();
+        client.test_hooks.inject_recv_interrupted.set(2);
+
+        assert!(matches!(
+            client.recv().await.unwrap().as_slice(),
+            [ClientEvent::EchoReply { seq: 0, .. }]
+        ));
+    });
+    assert_eq!(server.finish().len(), 2);
+}
+
+#[test]
+fn open_retries_interrupted_syscall_within_the_same_attempt() {
+    let server = start_open_server(None, 0);
+    runtime().block_on(async {
+        let mut client = AsyncClient::connect(config(server.addr, None, 0))
+            .await
+            .unwrap();
+        client.test_hooks.inject_recv_interrupted.set(3);
+
+        assert!(matches!(
+            client.open().await,
+            Ok(OpenOutcome::Started { .. })
+        ));
+        // Only one open request reached the server: interruptions were
+        // absorbed inside the single open attempt, with no retransmit.
+        assert_eq!(client.test_hooks.send_attempts.get(), 1);
+    });
+    server.finish();
+}
+
+#[test]
 fn peer_close_dscp_failure_preserves_events_and_logical_ownership() {
     let server = start_peer_close_server();
     runtime().block_on(async {

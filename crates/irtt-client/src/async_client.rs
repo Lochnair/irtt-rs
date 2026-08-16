@@ -41,6 +41,19 @@ use crate::{
 /// so one managed target cannot retain the current-thread runtime.
 const OPEN_POLL_WORK_BUDGET: usize = 64;
 
+/// Maximum immediately available receive work performed by one
+/// [`AsyncClient::poll_recv`] poll.
+///
+/// A `WouldBlock` readiness false positive is naturally bounded: `try_io`
+/// clears the reactor's readiness on `WouldBlock`, so the next
+/// `poll_recv_ready` genuinely awaits a fresh edge. An `Interrupted`
+/// (`EINTR`) nonblocking `recvmsg` does not clear that readiness — the
+/// syscall was interrupted, not told there was nothing to read — so without
+/// an explicit bound a sustained signal delivery rate could otherwise retry
+/// in a tight loop on this executor thread. Bounding both cases the same way
+/// this crate already bounds open-attempt work keeps that impossible.
+const RECV_POLL_WORK_BUDGET: usize = 64;
+
 #[cfg(test)]
 use crate::client::ProbeSendTimestamps;
 
@@ -174,6 +187,11 @@ struct AsyncClientTestHooks {
     sends: RefCell<VecDeque<InjectedSend>>,
     send_attempts: Cell<usize>,
     receive_would_block: Cell<usize>,
+    /// Number of subsequent receive attempts (`poll_open` or `poll_recv`)
+    /// that should report `io::ErrorKind::Interrupted` instead of performing
+    /// a real nonblocking receive, deterministically exercising interrupted-
+    /// syscall retry behavior.
+    inject_recv_interrupted: Cell<usize>,
     fail_open_dscp: Cell<bool>,
     fail_cleanup_send: Cell<bool>,
     fail_peer_close_dscp: Cell<bool>,
@@ -204,6 +222,18 @@ impl AsyncClientTestHooks {
 
     fn take_probe_timestamps(&self) -> Option<ProbeSendTimestamps> {
         self.probe_timestamps.borrow_mut().pop_front()
+    }
+
+    /// Consumes one pending injected interruption, if any, reporting whether
+    /// the caller should report `io::ErrorKind::Interrupted` instead of
+    /// attempting a real receive.
+    fn take_injected_interrupted(&self) -> bool {
+        let remaining = self.inject_recv_interrupted.get();
+        if remaining == 0 {
+            return false;
+        }
+        self.inject_recv_interrupted.set(remaining - 1);
+        true
     }
 }
 
@@ -408,9 +438,26 @@ impl AsyncClient {
                 Poll::Ready(Ok(true)) => {}
             }
 
+            #[cfg(test)]
+            if self.test_hooks.take_injected_interrupted() {
+                continue;
+            }
             let datagram = match try_recv_tokio_datagram(&self.socket, &mut state.buffer) {
                 Ok(datagram) => datagram,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                // WouldBlock is a readiness false positive; Interrupted
+                // (EINTR) is a transient nonblocking-recvmsg interruption.
+                // Both retry through the surrounding `OPEN_POLL_WORK_BUDGET`-
+                // bounded loop above, which re-checks readiness before the
+                // next attempt and yields back to the executor once that
+                // budget is exhausted.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
                 Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
             };
             if datagram.received_at.mono > state.deadline() {
@@ -613,7 +660,7 @@ impl AsyncClient {
             return Poll::Ready(Err(error));
         }
 
-        loop {
+        for _ in 0..RECV_POLL_WORK_BUDGET {
             match self.socket.poll_recv_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
@@ -628,9 +675,23 @@ impl AsyncClient {
                     .set(self.test_hooks.receive_would_block.get() - 1);
                 continue;
             }
+            #[cfg(test)]
+            if self.test_hooks.take_injected_interrupted() {
+                continue;
+            }
             let datagram = match try_recv_tokio_datagram(&self.socket, &mut self.recv_buffer) {
                 Ok(datagram) => datagram,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+                // See `RECV_POLL_WORK_BUDGET`: both a readiness false
+                // positive and an interrupted nonblocking recvmsg retry
+                // within this bounded loop rather than failing the receive.
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                    ) =>
+                {
+                    continue
+                }
                 Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
             };
 
@@ -659,6 +720,12 @@ impl AsyncClient {
             }
             return Poll::Ready(Ok(events));
         }
+
+        // Truncated known immediate receive work, exactly as `poll_open`
+        // does: arrange for another poll even if no new socket-readiness
+        // edge occurs, rather than spinning this executor thread further.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     pub(crate) fn poll_close(
