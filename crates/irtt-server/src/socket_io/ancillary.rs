@@ -152,6 +152,18 @@ pub(super) async fn receive_bound(
     receive_ancillary(socket, buffer, false).await
 }
 
+/// Consecutive interrupted (`EINTR`) nonblocking receives tolerated before
+/// this receive loop explicitly yields to the runtime.
+///
+/// `try_io` only clears the reactor's readiness state on `WouldBlock`; an
+/// `Interrupted` result leaves it untouched, so `socket.readable().await`
+/// can resolve immediately again without a genuine new readiness edge. Under
+/// a sustained signal delivery rate that could otherwise retry in a tight
+/// loop without ever suspending this task. Yielding periodically bounds that
+/// without treating the interruption as any kind of failure or terminating
+/// the listener.
+const INTERRUPTED_YIELD_THRESHOLD: u32 = 64;
+
 /// `require_destination` is the listener's own wildcard-ness. It decides both
 /// what this receive must recover and how severe a truncated control buffer is.
 async fn receive_ancillary(
@@ -159,12 +171,24 @@ async fn receive_ancillary(
     buffer: &mut [u8],
     require_destination: bool,
 ) -> io::Result<Option<ReceivedDatagram>> {
+    let mut consecutive_interrupted = 0_u32;
     loop {
         socket.readable().await?;
         match socket.try_io(Interest::READABLE, || {
             receive_once(socket, buffer, require_destination)
         }) {
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                consecutive_interrupted = 0;
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                consecutive_interrupted += 1;
+                if consecutive_interrupted >= INTERRUPTED_YIELD_THRESHOLD {
+                    consecutive_interrupted = 0;
+                    tokio::task::yield_now().await;
+                }
+                continue;
+            }
             result => return result,
         }
     }

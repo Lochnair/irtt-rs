@@ -65,6 +65,63 @@ fn open_retries_after_first_timeout() {
 }
 
 #[test]
+fn open_survives_interrupted_receive_within_same_attempt() {
+    let server = start_fake_server(|socket, tx| {
+        let (first, peer) = recv_request(&socket, &tx);
+        let params = Params::decode(&first[4..]).unwrap();
+        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None);
+        socket.send_to(&reply, peer).unwrap();
+    });
+    let config = ClientConfig {
+        open_timeouts: vec![Duration::from_millis(500)],
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    // Several interrupted receive attempts before the real reply arrives
+    // must not be treated as a timeout, must not retransmit the open
+    // request, and must not advance to a next configured attempt.
+    client.test_hooks.inject_recv_interrupted.set(5);
+
+    let outcome = client.open().unwrap();
+    assert_open_started(outcome);
+    // Exactly one request reached the server: interruptions were absorbed
+    // inside the single configured attempt.
+    assert_eq!(server.rx.iter().take(1).count(), 1);
+    server.join();
+}
+
+#[test]
+fn open_interrupted_receive_does_not_extend_the_attempt_deadline() {
+    // A fake server that never replies: with a short attempt timeout, the
+    // real question is whether interruptions can push the effective wait
+    // past the configured deadline. They must not: the deadline stays
+    // absolute across any number of interruptions.
+    let server = start_fake_server(|socket, tx| {
+        let _ = recv_request(&socket, &tx);
+    });
+    let config = ClientConfig {
+        open_timeouts: vec![Duration::from_millis(200)],
+        ..default_test_config(server.addr)
+    };
+    let mut client = Client::connect(config).unwrap();
+    // Each interruption carries no timing information of its own, so the
+    // loop must keep re-checking the real deadline rather than treating an
+    // interruption as "more time available" or a reason to fail outright.
+    client.test_hooks.inject_recv_interrupted.set(20);
+
+    let started = Instant::now();
+    let result = client.open();
+    let elapsed = started.elapsed();
+
+    assert!(matches!(result, Err(ClientError::OpenTimeout)));
+    assert!(
+        elapsed < Duration::from_millis(800),
+        "interrupted receives must not extend the attempt deadline, took {elapsed:?}"
+    );
+    server.join();
+}
+
+#[test]
 fn open_timeout_after_all_timeouts() {
     let server = timeout_server(Duration::from_millis(700));
     let config = ClientConfig {

@@ -153,7 +153,18 @@ impl ErrorQueueControlBuffer {
 
 /// Nonblocking drain of a single record from `fd`'s `MSG_ERRQUEUE`.
 ///
-/// Returns `Ok(None)` when the queue is empty (`EAGAIN`/`EWOULDBLOCK`).
+/// Returns `Ok(None)` when the queue is empty (`EAGAIN`/`EWOULDBLOCK`) — the
+/// caller in [`super::drain_tx_timestamps`] stops its drain there, exactly
+/// as it always has. An interrupted read (`EINTR`) is different: it says
+/// nothing about whether the queue is empty, so treating it the same as
+/// `EWOULDBLOCK` could end a drain early and strand a still-queued record
+/// past the point its matching probe is looked up and removed (see the
+/// crate's `AGENTS.md`). TX timestamp capture is optional best-effort
+/// metadata, not a network operation, so an interruption here must also
+/// never become a socket/network error; instead it is reported as
+/// [`ErrorQueueRecord::Ignored`], which consumes one attempt of the bounded
+/// caller's existing per-drain work budget and lets the loop immediately
+/// retry the same slot rather than stopping or spinning unboundedly.
 /// `SOF_TIMESTAMPING_OPT_TSONLY` notifications carry no meaningful payload,
 /// so a zero-length iovec is enough: correlation is by `id`, never by
 /// payload content.
@@ -175,6 +186,7 @@ pub(crate) fn try_recv_error_queue_record(fd: RawFd) -> io::Result<Option<ErrorQ
             Ok(Some(classify(cmsgs)))
         }
         Err(Errno::EWOULDBLOCK) => Ok(None),
+        Err(Errno::EINTR) => Ok(Some(ErrorQueueRecord::Ignored)),
         Err(errno) => Err(io::Error::from(errno)),
     }
 }

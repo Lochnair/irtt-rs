@@ -14,7 +14,7 @@ use crate::{
     config::{ClientConfig, RecvBudget},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
-    receive::{drain_tx_timestamps, recv_datagram, try_enable_tx_timestamping},
+    receive::{drain_tx_timestamps, recv_datagram, try_enable_tx_timestamping, ReceivedDatagram},
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, ProbeSent,
         SessionMachine, MAX_OPEN_PACKET_SIZE,
@@ -69,6 +69,10 @@ struct ClientTestHooks {
     fail_dscp_restore: Cell<bool>,
     last_restored_read_timeout: Cell<Option<Duration>>,
     prepared_active_session_before_dscp: Cell<bool>,
+    /// Number of subsequent receive attempts that should report
+    /// `io::ErrorKind::Interrupted` before a real receive is attempted.
+    /// Decremented on every injected receive; `0` means inject nothing.
+    inject_recv_interrupted: Cell<usize>,
 }
 
 #[cfg(test)]
@@ -264,18 +268,40 @@ impl Client {
         self.recv_once_inner()
     }
 
-    fn recv_once_inner(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
-        let datagram = match recv_datagram(&self.socket, &mut self.recv_buffer) {
-            Ok(datagram) => datagram,
-            Err(err)
-                if matches!(
-                    err.kind(),
-                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-                ) =>
-            {
-                return Ok(vec![]);
+    /// Receive one datagram into `self.recv_buffer`. In test builds, a
+    /// pending `inject_recv_interrupted` count reports
+    /// `io::ErrorKind::Interrupted` instead of performing a real receive,
+    /// deterministically exercising interrupted-syscall retry behavior.
+    fn recv_datagram_once(&mut self) -> Result<ReceivedDatagram, io::Error> {
+        #[cfg(test)]
+        {
+            let remaining = self.test_hooks.inject_recv_interrupted.get();
+            if remaining > 0 {
+                self.test_hooks.inject_recv_interrupted.set(remaining - 1);
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
             }
-            Err(err) => return Err(ClientError::Socket(err)),
+        }
+        recv_datagram(&self.socket, &mut self.recv_buffer)
+    }
+
+    /// Same as [`Self::recv_datagram_once`], receiving into a caller-supplied
+    /// buffer instead of `self.recv_buffer` (used before the negotiated
+    /// receive buffer size is known, i.e. during Open).
+    fn recv_datagram_once_into(&self, buf: &mut [u8]) -> Result<ReceivedDatagram, io::Error> {
+        #[cfg(test)]
+        {
+            let remaining = self.test_hooks.inject_recv_interrupted.get();
+            if remaining > 0 {
+                self.test_hooks.inject_recv_interrupted.set(remaining - 1);
+                return Err(io::Error::from(io::ErrorKind::Interrupted));
+            }
+        }
+        recv_datagram(&self.socket, buf)
+    }
+
+    fn recv_once_inner(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+        let Some(datagram) = self.recv_datagram_retrying_interrupted()? else {
+            return Ok(vec![]);
         };
 
         // One final bounded drain before processing the reply, so a TX
@@ -295,6 +321,71 @@ impl Client {
             }
         }
         Ok(events)
+    }
+
+    /// Receive one datagram, transparently retrying an interrupted syscall
+    /// (`io::ErrorKind::Interrupted`, e.g. `EINTR`) without treating it as a
+    /// genuine socket error, timeout, or empty receive.
+    ///
+    /// One logical receive keeps one timeout budget: when a receive timeout
+    /// is configured, an absolute deadline is computed once here and each
+    /// retry after an interruption restores the socket's remaining time
+    /// against that same deadline, so repeated interruptions cannot extend
+    /// this receive past its configured timeout. An unconfigured timeout
+    /// (`None`) keeps blocking indefinitely after an interruption, matching
+    /// its no-timeout contract. The socket's read timeout is restored to the
+    /// caller-configured value before returning, so a later call in the same
+    /// `recv_available` budget is unaffected by an earlier interruption here.
+    fn recv_datagram_retrying_interrupted(
+        &mut self,
+    ) -> Result<Option<ReceivedDatagram>, ClientError> {
+        let configured_timeout = self.runtime.config().socket_config.recv_timeout;
+        let deadline = match configured_timeout {
+            Some(timeout) => Some(
+                Instant::now()
+                    .checked_add(timeout)
+                    .ok_or(ClientError::DurationOverflow)?,
+            ),
+            None => None,
+        };
+        let mut timeout_narrowed = false;
+
+        let result = loop {
+            match self.recv_datagram_once() {
+                Ok(datagram) => break Ok(Some(datagram)),
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break Ok(None);
+                }
+                Err(err) if err.kind() == io::ErrorKind::Interrupted => {
+                    if let Some(deadline) = deadline {
+                        let Some(remaining) = deadline.checked_duration_since(Instant::now())
+                        else {
+                            break Ok(None);
+                        };
+                        if remaining.is_zero() {
+                            break Ok(None);
+                        }
+                        if let Err(err) = self.socket.set_read_timeout(Some(remaining)) {
+                            break Err(ClientError::Socket(err));
+                        }
+                        timeout_narrowed = true;
+                    }
+                }
+                Err(err) => break Err(ClientError::Socket(err)),
+            }
+        };
+
+        if timeout_narrowed {
+            if let Err(err) = self.socket.set_read_timeout(configured_timeout) {
+                return Err(ClientError::Socket(err));
+            }
+        }
+        result
     }
 
     /// Receive and classify datagrams until a receive produces no events or the
@@ -496,12 +587,22 @@ impl Client {
                 }
                 self.socket.set_read_timeout(Some(remaining))?;
 
-                let datagram = match recv_datagram(&self.socket, &mut buf) {
+                let datagram = match self.recv_datagram_once_into(&mut buf) {
                     Ok(datagram) => datagram,
+                    // WouldBlock/TimedOut mean the attempt's own deadline
+                    // elapsed; Interrupted (EINTR) means the syscall was
+                    // merely interrupted and carries no timing information of
+                    // its own. Both retry through the same loop, which
+                    // recomputes `remaining` and re-applies it as the read
+                    // timeout on every iteration — so an interruption resumes
+                    // within this same absolute deadline rather than
+                    // resetting or extending it.
                     Err(err)
                         if matches!(
                             err.kind(),
-                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            io::ErrorKind::WouldBlock
+                                | io::ErrorKind::TimedOut
+                                | io::ErrorKind::Interrupted
                         ) =>
                     {
                         if Instant::now() >= deadline {
