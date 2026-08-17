@@ -11,5 +11,7 @@ ci = "github"
 installers = []
 # Target platforms to build apps for (Rust target-triple syntax)
 targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-unknown-linux-musl", "x86_64-pc-windows-msvc"]
-# Features to pass to cargo build
-features = ["full"]
+# Scope dist's tag matching to irtt-cli releases only: irtt-proto/irtt-client/
+# irtt-server/irtt-stats are libraries published to crates.io and tagged for
+# provenance, but must not trigger cargo-dist or produce a GitHub Release.
+tag-namespace = "irtt-cli"
