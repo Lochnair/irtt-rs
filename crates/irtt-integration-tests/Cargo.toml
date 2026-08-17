@@ -1,0 +1,12 @@
+[package]
+name = "irtt-integration-tests"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+irtt-client = { workspace = true, features = ["ancillary", "tokio"] }
+irtt-server.workspace = true
+irtt-proto.workspace = true
+tokio = { version = "1.53.1", default-features = false, features = ["rt", "net", "time", "sync", "macros"] }

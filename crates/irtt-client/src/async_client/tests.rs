@@ -14,7 +14,7 @@ use irtt_proto::{
 };
 use tokio::runtime::{Builder, Runtime};
 
-#[path = "../../tests/support/in_tree_server.rs"]
+#[path = "in_tree_server_support.rs"]
 mod in_tree_server;
 
 use super::*;
