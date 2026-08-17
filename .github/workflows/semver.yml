@@ -4,7 +4,11 @@ on:
   workflow_dispatch:
   push:
     tags:
-      - "v*.*.*"
+      - "irtt-proto/v*.*.*"
+      - "irtt-client/v*.*.*"
+      - "irtt-server/v*.*.*"
+      - "irtt-stats/v*.*.*"
+      - "irtt-cli/v*.*.*"
 
 permissions:
   contents: read
