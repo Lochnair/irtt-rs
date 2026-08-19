@@ -13,3 +13,6 @@ categories = ["network-programming"]
 
 [dependencies]
 irtt-client.workspace = true
+
+[dev-dependencies]
+proptest = "1.11.0"

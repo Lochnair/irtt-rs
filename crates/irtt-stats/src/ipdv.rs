@@ -235,4 +235,59 @@ mod tests {
             assert!(tracker.completed_pairs.len() <= limit, "seq {seq}");
         }
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            /// The hand-written `ipdv_tracker_bounded_mode_limits_sequence_state`
+            /// test above only exercises a strictly increasing `0..512`
+            /// sequence. Real traffic can duplicate, skip, or otherwise not
+            /// strictly increase sequence numbers (see the client's
+            /// `LateReply`/`DuplicateReply` handling), so this generates
+            /// arbitrary, possibly-repeated, possibly-non-monotonic sequence
+            /// streams and checks the same bounds still hold after every
+            /// insert: `samples` and `sample_order` never exceed the
+            /// configured limit and stay in lockstep, and `completed_pairs`
+            /// never exceeds `samples.len()` (a successful entry can only
+            /// persist once both its endpoint samples are present, see
+            /// `try_pair`, so it is always a subset of the live sample keys).
+            #[test]
+            fn bounded_tracker_state_never_exceeds_the_limit(
+                limit in 1usize..8,
+                seqs in prop::collection::vec(0u32..40, 0..300),
+            ) {
+                let mut tracker = IpdvTracker::new(Some(limit));
+                for seq in seqs {
+                    tracker.insert(ipdv_sample(seq, i128::from(seq)));
+                    prop_assert!(tracker.samples.len() <= limit);
+                    prop_assert_eq!(tracker.sample_order.len(), tracker.samples.len());
+                    prop_assert!(tracker.completed_pairs.len() <= tracker.samples.len());
+                }
+            }
+
+            /// A pair for a given adjacent `(seq - 1, seq)` boundary is only
+            /// ever emitted once, however many times `insert` is called
+            /// (including for already-seen or unrelated sequences in
+            /// between). This is the unbounded case, so eviction cannot be
+            /// the reason a pair fails to repeat.
+            #[test]
+            fn each_adjacent_pair_is_emitted_at_most_once(
+                seqs in prop::collection::vec(0u32..12, 0..200),
+            ) {
+                let mut tracker = IpdvTracker::new(None);
+                let mut seen_pairs = std::collections::HashSet::new();
+                for seq in seqs {
+                    for pair in tracker.insert(ipdv_sample(seq, i128::from(seq))) {
+                        let key = (pair.previous_seq, pair.current_seq);
+                        prop_assert!(
+                            seen_pairs.insert(key),
+                            "pair {key:?} emitted more than once"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }
