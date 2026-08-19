@@ -3097,4 +3097,690 @@ mod tests {
             Some(SignedDuration::from_nanos(12_000_000))
         );
     }
+
+    /// Model-based tests for `SessionMachine`'s open-session operation
+    /// contract: probe sends, reply classification, timeouts, and close.
+    ///
+    /// ## Reference-model boundary
+    ///
+    /// The open handshake itself (accept/reject, run-mode, version and
+    /// token checks) is deliberately out of scope here: it already has
+    /// focused deterministic coverage above in `mod tests`, and every
+    /// generated case here starts from an already-`Open` session built the
+    /// same way `open_machine` above builds one, by constructing
+    /// `MachineState::Open` directly. What *is* generated and checked
+    /// against an independent reference model is the combinatorial space
+    /// that only exists once a session is open: interleaved probe sends,
+    /// valid/duplicate/late/unknown/wrong-token replies, peer and local
+    /// close, bounded and unbounded timeout polling, and `u32` wire-sequence
+    /// wraparound.
+    ///
+    /// The reference [`Model`] tracks only state the public contract
+    /// documents: open/closed(local)/closed(peer) state, the next wire
+    /// sequence and total sent-packet counters (mirroring
+    /// `SessionMachine::packets_sent`), which sequences are pending, timed
+    /// out, or completed (this drives the exact
+    /// `EchoReply`/`LateReply`/`DuplicateReply`/`Warning` classification
+    /// documented on `ClientEvent`), each pending probe's timeout deadline
+    /// (documented on `ClientEvent::EchoLoss::timeout_at`), and the highest
+    /// accepted in-window sequence used for late-reply classification. It
+    /// deliberately does *not* model the bounded FIFO eviction that
+    /// `PendingMap`/`TimedOutMap`/`CompletedSet` apply once
+    /// `max_pending_probes` is exceeded: that is a private capacity policy
+    /// with its own focused unit tests in `probe.rs`, not part of this
+    /// contract. Every generated case here uses a `max_pending_probes` far
+    /// larger than the generated operation count, so capacity/eviction
+    /// behavior never confounds the classification assertions made here.
+    ///
+    /// `u32` sequence wraparound is exercised by seeding a session's
+    /// starting wire sequence near `u32::MAX` through direct construction,
+    /// the same way `open_machine` above builds an open session without
+    /// running the handshake. The repository's `AGENTS.md` testing policy
+    /// names "sequence wrap" as a sanctioned reason to construct state
+    /// directly rather than drive billions of real sends.
+    mod model_properties {
+        use std::collections::{HashSet, VecDeque};
+
+        use proptest::prelude::*;
+        use proptest::test_runner::TestCaseError;
+
+        use super::*;
+        use irtt_proto::{encode_echo_reply, ReceivedStats, StampAt};
+
+        const TOKEN: u64 = 0x1122_3344_5566_7788;
+        const WRONG_TOKEN: u64 = 0x8877_6655_4433_2211;
+        const PROBE_TIMEOUT: Duration = Duration::from_millis(30);
+        /// Far larger than the generated operation count (`1..=OP_LIMIT`),
+        /// so pending/timed-out/completed bounded eviction never triggers;
+        /// see the module doc comment.
+        const MAX_PENDING_PROBES: usize = 4096;
+        const OP_LIMIT: usize = 50;
+        const CASES: u32 = 256;
+
+        fn model_config() -> ClientConfig {
+            ClientConfig {
+                received_stats: ReceivedStats::None,
+                stamp_at: StampAt::None,
+                clock: Clock::Wall,
+                probe_timeout: PROBE_TIMEOUT,
+                max_pending_probes: MAX_PENDING_PROBES,
+                run_mode: RunMode::Normal,
+                ..ClientConfig::default()
+            }
+        }
+
+        /// Builds an already-`Open` session directly, the same way `mod
+        /// tests`'s `open_machine` does, starting its wire sequence at
+        /// `start_seq` instead of always zero. See the module doc comment
+        /// for why this bypasses the open handshake and for the sequence
+        /// seeding rationale.
+        fn open_machine_for_model(start_seq: u32) -> (SessionMachine, Params) {
+            let config = model_config();
+            let remote = "127.0.0.1:2112".parse().unwrap();
+            let mut machine = SessionMachine::new(config, remote).unwrap();
+            let params = machine.requested.clone();
+            let negotiated = NegotiatedParams {
+                params: params.clone(),
+                restrictions: Vec::new(),
+            };
+            machine.state = MachineState::Open(Box::new(ActiveSession {
+                token: TOKEN,
+                negotiated,
+                local_close_packet: encode_request(RequestToEncode::Close { token: TOKEN }, None)
+                    .unwrap()
+                    .into_boxed_slice(),
+                next_wire_seq: start_seq,
+                highest_received_seq: None,
+                packets_sent: 0,
+                pending: PendingMap::new(MAX_PENDING_PROBES),
+                timed_out: TimedOutMap::new(MAX_PENDING_PROBES),
+                completed: CompletedSet::new(MAX_PENDING_PROBES),
+            }));
+            (machine, params)
+        }
+
+        fn build_echo_reply(params: &Params, token: u64, seq: u32, close: bool) -> Vec<u8> {
+            let mut flags_value = flags::FLAG_REPLY;
+            if close {
+                flags_value |= flags::FLAG_CLOSE;
+            }
+            let reply = EchoReply {
+                flags: flags_value,
+                token,
+                sequence: seq,
+                recv_count: None,
+                recv_window: None,
+                timestamps: TimestampFields::default(),
+                payload: Vec::new(),
+            };
+            encode_echo_reply(&reply, params, None).unwrap()
+        }
+
+        /// Independently-authored mirror of the sequence-space half-window
+        /// "after" comparison (RFC 1982 style), used only to predict
+        /// expected late/in-window classification. Deliberately not a call
+        /// into `super::sequence_is_after`/`sequence_is_before`, so a bug in
+        /// the production comparator is not automatically invisible to this
+        /// model.
+        fn seq_after(candidate: u32, current: u32) -> bool {
+            candidate != current && candidate.wrapping_sub(current) < (1 << 31)
+        }
+
+        fn seq_before(candidate: u32, current: u32) -> bool {
+            seq_after(current, candidate)
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ModelState {
+            Open,
+            ClosedLocal,
+            ClosedPeer,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum ExpectedEvent {
+            EchoReply(u32),
+            LateReply(u32),
+            DuplicateReply(u32),
+            WarnWrongToken,
+            WarnUntracked,
+            SessionClosed,
+        }
+
+        /// The independent reference model. See the module doc comment for
+        /// its deliberate boundary against `SessionMachine`'s private state.
+        struct Model {
+            state: ModelState,
+            next_wire_seq: u32,
+            packets_sent: u64,
+            pending: VecDeque<(u32, Instant)>,
+            timed_out: HashSet<u32>,
+            completed: HashSet<u32>,
+            highest_received_seq: Option<u32>,
+        }
+
+        impl Model {
+            fn new(start_seq: u32) -> Self {
+                Self {
+                    state: ModelState::Open,
+                    next_wire_seq: start_seq,
+                    packets_sent: 0,
+                    pending: VecDeque::new(),
+                    timed_out: HashSet::new(),
+                    completed: HashSet::new(),
+                    highest_received_seq: None,
+                }
+            }
+
+            fn pending_remove(&mut self, seq: u32) -> bool {
+                if let Some(pos) = self.pending.iter().position(|&(s, _)| s == seq) {
+                    self.pending.remove(pos);
+                    true
+                } else {
+                    false
+                }
+            }
+
+            fn sorted_pending(&self) -> Vec<u32> {
+                let mut v: Vec<u32> = self.pending.iter().map(|&(s, _)| s).collect();
+                v.sort_unstable();
+                v
+            }
+
+            fn sorted_timed_out(&self) -> Vec<u32> {
+                let mut v: Vec<u32> = self.timed_out.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+
+            fn sorted_completed(&self) -> Vec<u32> {
+                let mut v: Vec<u32> = self.completed.iter().copied().collect();
+                v.sort_unstable();
+                v
+            }
+
+            /// Resolves a generated [`ReplyTarget`] to a concrete sequence
+            /// number against the model's *current* membership. When the
+            /// requested bucket is empty this falls back to the raw index as
+            /// a literal (likely-unknown) sequence, so every `ReplyTarget`
+            /// variant remains a valid, meaningful generator input
+            /// regardless of what has happened so far.
+            fn resolve(&self, target: ReplyTarget) -> u32 {
+                fn pick(v: &[u32], i: u32) -> u32 {
+                    if v.is_empty() {
+                        i
+                    } else {
+                        v[(i as usize) % v.len()]
+                    }
+                }
+                match target {
+                    ReplyTarget::Pending(i) => pick(&self.sorted_pending(), i),
+                    ReplyTarget::TimedOut(i) => pick(&self.sorted_timed_out(), i),
+                    ReplyTarget::Completed(i) => pick(&self.sorted_completed(), i),
+                    ReplyTarget::Unknown(seq) => seq,
+                }
+            }
+
+            fn update_highest(&mut self, seq: u32) {
+                self.highest_received_seq = Some(match self.highest_received_seq {
+                    None => seq,
+                    Some(h) if seq_after(seq, h) => seq,
+                    Some(h) => h,
+                });
+            }
+
+            fn apply_send(&mut self, seq: u32, timeout_at: Instant) {
+                assert_eq!(
+                    seq, self.next_wire_seq,
+                    "model/machine wire sequence desync"
+                );
+                self.pending.push_back((seq, timeout_at));
+                self.next_wire_seq = self.next_wire_seq.wrapping_add(1);
+                self.packets_sent += 1;
+            }
+
+            fn apply_poll(&mut self, now: Instant, limit: usize) -> (Vec<u32>, bool) {
+                let mut expired = Vec::new();
+                while expired.len() < limit {
+                    let Some(&(seq, timeout_at)) = self.pending.front() else {
+                        break;
+                    };
+                    if timeout_at > now {
+                        break;
+                    }
+                    self.pending.pop_front();
+                    self.timed_out.insert(seq);
+                    expired.push(seq);
+                }
+                let more_due = self
+                    .pending
+                    .front()
+                    .is_some_and(|&(_, timeout_at)| timeout_at <= now);
+                (expired, more_due)
+            }
+
+            /// Mirrors `SessionMachine::process_echo_reply`'s classification
+            /// exactly (see that function's branches), mutating this model
+            /// the same way. Returns the event kinds a correct
+            /// implementation must produce, in order.
+            fn reply(&mut self, seq: u32, wrong_token: bool, close: bool) -> Vec<ExpectedEvent> {
+                if wrong_token {
+                    // A wrong-token reply is rejected before the close flag
+                    // is ever inspected, so `close` has no effect here.
+                    return vec![ExpectedEvent::WarnWrongToken];
+                }
+                let mut events = Vec::new();
+                if self.pending_remove(seq) {
+                    let is_late = self
+                        .highest_received_seq
+                        .is_some_and(|h| seq_before(seq, h));
+                    self.update_highest(seq);
+                    self.completed.insert(seq);
+                    events.push(if is_late {
+                        ExpectedEvent::LateReply(seq)
+                    } else {
+                        ExpectedEvent::EchoReply(seq)
+                    });
+                } else if self.completed.contains(&seq) {
+                    self.update_highest(seq);
+                    events.push(ExpectedEvent::DuplicateReply(seq));
+                } else if self.timed_out.remove(&seq) {
+                    self.update_highest(seq);
+                    self.completed.insert(seq);
+                    events.push(ExpectedEvent::LateReply(seq));
+                } else if self
+                    .highest_received_seq
+                    .is_some_and(|h| seq_before(seq, h))
+                {
+                    events.push(ExpectedEvent::LateReply(seq));
+                } else {
+                    events.push(ExpectedEvent::WarnUntracked);
+                }
+                if close {
+                    self.state = ModelState::ClosedPeer;
+                    events.push(ExpectedEvent::SessionClosed);
+                }
+                events
+            }
+        }
+
+        fn classify_real(events: &[ClientEvent]) -> Vec<ExpectedEvent> {
+            events
+                .iter()
+                .map(|event| match event {
+                    ClientEvent::EchoReply { seq, .. } => ExpectedEvent::EchoReply(*seq),
+                    ClientEvent::LateReply { seq, .. } => ExpectedEvent::LateReply(*seq),
+                    ClientEvent::DuplicateReply { seq, .. } => ExpectedEvent::DuplicateReply(*seq),
+                    ClientEvent::Warning {
+                        kind: WarningKind::WrongToken,
+                        ..
+                    } => ExpectedEvent::WarnWrongToken,
+                    ClientEvent::Warning {
+                        kind: WarningKind::UntrackedReply,
+                        ..
+                    } => ExpectedEvent::WarnUntracked,
+                    ClientEvent::SessionClosed { .. } => ExpectedEvent::SessionClosed,
+                    other => panic!("unexpected event from an open session: {other:?}"),
+                })
+                .collect()
+        }
+
+        fn is_already_closed<T: std::fmt::Debug>(result: &Result<T, ClientError>) -> bool {
+            matches!(result, Err(ClientError::AlreadyClosed))
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        struct Observable {
+            is_open: bool,
+            is_terminal: bool,
+            is_peer_closed: bool,
+            packets_sent: u64,
+            pending_is_empty: bool,
+        }
+
+        fn observe(machine: &SessionMachine) -> Observable {
+            Observable {
+                is_open: machine.is_open(),
+                is_terminal: machine.is_terminal(),
+                is_peer_closed: machine.is_peer_closed(),
+                packets_sent: machine.packets_sent(),
+                pending_is_empty: machine.pending_is_empty(),
+            }
+        }
+
+        fn check_generic_invariants(
+            machine: &SessionMachine,
+            model: &Model,
+        ) -> Result<(), TestCaseError> {
+            prop_assert_eq!(machine.is_open(), model.state == ModelState::Open);
+            prop_assert_eq!(
+                machine.is_terminal(),
+                matches!(
+                    model.state,
+                    ModelState::ClosedLocal | ModelState::ClosedPeer
+                )
+            );
+            prop_assert_eq!(
+                machine.is_peer_closed(),
+                model.state == ModelState::ClosedPeer
+            );
+            prop_assert_eq!(machine.packets_sent(), model.packets_sent);
+            if model.state == ModelState::Open {
+                prop_assert_eq!(machine.pending_is_empty(), model.pending.is_empty());
+            } else {
+                prop_assert!(machine.pending_is_empty());
+            }
+            Ok(())
+        }
+
+        /// Drives the full real send transaction: prepare, preflight,
+        /// finalize, commit. Mirrors how `Client`/`AsyncClient` drive
+        /// `SessionMachine` around a real socket send, using `now` for both
+        /// the pre-send anchor and the post-send `sent_at` sample since no
+        /// real send elapses time here.
+        fn do_send(
+            machine: &mut SessionMachine,
+            now: ClientTimestamp,
+        ) -> Result<ProbeSent, ClientError> {
+            let prepared = machine
+                .prepare_probe()?
+                .expect("prepare_probe always returns Some when Ok");
+            let preflight = machine.preflight_probe_commit(&prepared)?;
+            let commit = machine.finalize_probe_commit(preflight, now)?;
+            let bytes = prepared.bytes.len();
+            Ok(machine.commit_probe_sent(commit, now, bytes))
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum ReplyTarget {
+            Pending(u32),
+            TimedOut(u32),
+            Completed(u32),
+            Unknown(u32),
+        }
+
+        #[derive(Debug, Clone, Copy)]
+        enum Op {
+            Send,
+            StaleProbe,
+            PrepareAbandon,
+            Reply {
+                target: ReplyTarget,
+                wrong_token: bool,
+                close: bool,
+            },
+            PollTimeouts,
+            PollTimeoutsBounded(u8),
+            AdvanceClock(u16),
+            LocalClose,
+            ReopenAttempt,
+        }
+
+        fn op_strategy() -> impl Strategy<Value = Op> {
+            let reply_target = prop_oneof![
+                any::<u32>().prop_map(ReplyTarget::Pending),
+                any::<u32>().prop_map(ReplyTarget::TimedOut),
+                any::<u32>().prop_map(ReplyTarget::Completed),
+                any::<u32>().prop_map(ReplyTarget::Unknown),
+            ];
+            prop_oneof![
+                4 => Just(Op::Send),
+                1 => Just(Op::StaleProbe),
+                1 => Just(Op::PrepareAbandon),
+                5 => (reply_target, any::<bool>(), any::<bool>()).prop_map(
+                    |(target, wrong_token, close)| Op::Reply {
+                        target,
+                        wrong_token,
+                        close,
+                    }
+                ),
+                2 => Just(Op::PollTimeouts),
+                1 => (0u8..=6).prop_map(Op::PollTimeoutsBounded),
+                4 => (0u16..=120).prop_map(Op::AdvanceClock),
+                1 => Just(Op::LocalClose),
+                1 => Just(Op::ReopenAttempt),
+            ]
+        }
+
+        /// Biased toward `0` (the common case) and toward the last few
+        /// values before `u32::MAX` (so a handful of sends from here cross
+        /// the wraparound boundary), with a uniformly random third case for
+        /// general coverage.
+        fn start_seq_strategy() -> impl Strategy<Value = u32> {
+            prop_oneof![
+                2 => Just(0u32),
+                3 => (u32::MAX - 4)..=u32::MAX,
+                2 => any::<u32>(),
+            ]
+        }
+
+        fn apply_op(
+            machine: &mut SessionMachine,
+            model: &mut Model,
+            params: &Params,
+            now: &mut ClientTimestamp,
+            op: Op,
+        ) -> Result<(), TestCaseError> {
+            match op {
+                Op::Send => {
+                    let result = do_send(machine, *now);
+                    match model.state {
+                        ModelState::Open => {
+                            let sent = result.expect(
+                                "open session send should succeed within chosen capacity bounds",
+                            );
+                            prop_assert_eq!(sent.seq, model.next_wire_seq);
+                            let timeout_at = now
+                                .mono
+                                .checked_add(PROBE_TIMEOUT)
+                                .expect("no overflow at test timescales");
+                            model.apply_send(sent.seq, timeout_at);
+                        }
+                        _ => prop_assert!(
+                            is_already_closed(&result),
+                            "expected AlreadyClosed, got {:?}",
+                            result
+                        ),
+                    }
+                }
+                Op::StaleProbe => {
+                    if model.state != ModelState::Open {
+                        let result = machine.prepare_probe();
+                        prop_assert!(
+                            is_already_closed(&result),
+                            "expected AlreadyClosed, got {:?}",
+                            result
+                        );
+                    } else {
+                        let prepared_a = machine
+                            .prepare_probe()
+                            .unwrap()
+                            .expect("open session prepares probes");
+                        prop_assert_eq!(prepared_a.seq, model.next_wire_seq);
+
+                        let sent = do_send(machine, *now).expect(
+                            "intervening send should succeed within chosen capacity bounds",
+                        );
+                        prop_assert_eq!(sent.seq, prepared_a.seq);
+                        let timeout_at = now
+                            .mono
+                            .checked_add(PROBE_TIMEOUT)
+                            .expect("no overflow at test timescales");
+                        model.apply_send(sent.seq, timeout_at);
+
+                        match machine.preflight_probe_commit(&prepared_a) {
+                            Err(ClientError::StalePreparedProbe {
+                                prepared_seq,
+                                next_wire_seq,
+                            }) => {
+                                prop_assert_eq!(prepared_seq, prepared_a.seq);
+                                prop_assert_eq!(next_wire_seq, model.next_wire_seq);
+                            }
+                            other => {
+                                prop_assert!(false, "expected StalePreparedProbe, got {:?}", other)
+                            }
+                        }
+                    }
+                }
+                Op::PrepareAbandon => {
+                    let before = observe(machine);
+                    let result = machine.prepare_probe();
+                    match model.state {
+                        ModelState::Open => {
+                            let prepared = result.unwrap().expect("open session prepares probes");
+                            prop_assert_eq!(prepared.seq, model.next_wire_seq);
+                            prop_assert!(!prepared.bytes.is_empty());
+                        }
+                        _ => prop_assert!(
+                            is_already_closed(&result),
+                            "expected AlreadyClosed, got {:?}",
+                            result
+                        ),
+                    }
+                    prop_assert_eq!(observe(machine), before);
+                }
+                Op::Reply {
+                    target,
+                    wrong_token,
+                    close,
+                } => {
+                    let seq = model.resolve(target);
+                    let token = if wrong_token { WRONG_TOKEN } else { TOKEN };
+                    let packet = build_echo_reply(params, token, seq, close);
+                    let result =
+                        machine.process_received_echo_packet(&packet, *now, ReceiveMeta::default());
+                    match model.state {
+                        ModelState::Open => {
+                            let events = result.expect("open session processes echo packets");
+                            let expected = model.reply(seq, wrong_token, close);
+                            prop_assert_eq!(classify_real(&events), expected);
+                        }
+                        _ => prop_assert!(
+                            is_already_closed(&result),
+                            "expected AlreadyClosed, got {:?}",
+                            result
+                        ),
+                    }
+                }
+                Op::PollTimeouts => {
+                    let result = machine.poll_timeouts_at(now.mono);
+                    match model.state {
+                        ModelState::Open => {
+                            let events = result.expect("open session polls succeed");
+                            let (expired, _more_due) = model.apply_poll(now.mono, usize::MAX);
+                            let real: Vec<u32> = events
+                                .iter()
+                                .map(|event| match event {
+                                    ClientEvent::EchoLoss { seq, .. } => *seq,
+                                    other => {
+                                        panic!("unexpected event from poll_timeouts_at: {other:?}")
+                                    }
+                                })
+                                .collect();
+                            prop_assert_eq!(real, expired);
+                        }
+                        _ => prop_assert!(
+                            is_already_closed(&result),
+                            "expected AlreadyClosed, got {:?}",
+                            result
+                        ),
+                    }
+                }
+                Op::PollTimeoutsBounded(limit) => {
+                    let result = machine.poll_timeouts_bounded_at(now.mono, limit as usize);
+                    match model.state {
+                        ModelState::Open => {
+                            let batch = result.expect("open session polls succeed");
+                            let (expired, more_due) = model.apply_poll(now.mono, limit as usize);
+                            let real: Vec<u32> = batch
+                                .events
+                                .iter()
+                                .map(|event| match event {
+                                    ClientEvent::EchoLoss { seq, .. } => *seq,
+                                    other => panic!(
+                                        "unexpected event from poll_timeouts_bounded_at: {other:?}"
+                                    ),
+                                })
+                                .collect();
+                            prop_assert_eq!(real, expired);
+                            prop_assert_eq!(batch.more_due, more_due);
+                        }
+                        _ => prop_assert!(
+                            is_already_closed(&result),
+                            "expected AlreadyClosed, got {:?}",
+                            result
+                        ),
+                    }
+                }
+                Op::AdvanceClock(millis) => {
+                    let delta = Duration::from_millis(u64::from(millis));
+                    now.mono += delta;
+                    now.wall += delta;
+                }
+                Op::LocalClose => match model.state {
+                    ModelState::Open => {
+                        let PreparedClose { commit, .. } = machine
+                            .prepare_close()
+                            .expect("open session can prepare close");
+                        let event = machine.commit_local_close(commit, *now);
+                        let is_session_closed = matches!(event, ClientEvent::SessionClosed { .. });
+                        prop_assert!(is_session_closed);
+                        model.state = ModelState::ClosedLocal;
+                    }
+                    _ => {
+                        let result = machine.prepare_close();
+                        prop_assert!(
+                            is_already_closed(&result),
+                            "expected AlreadyClosed, got {:?}",
+                            result
+                        );
+                    }
+                },
+                Op::ReopenAttempt => {
+                    let before = observe(machine);
+                    let result = machine.prepare_open_request();
+                    match model.state {
+                        ModelState::Open => {
+                            prop_assert!(matches!(result, Err(ClientError::AlreadyOpen)));
+                        }
+                        ModelState::ClosedLocal | ModelState::ClosedPeer => {
+                            prop_assert!(is_already_closed(&result));
+                        }
+                    }
+                    prop_assert_eq!(observe(machine), before);
+                }
+            }
+            check_generic_invariants(machine, model)
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig::with_cases(CASES))]
+
+            /// Drives a generated sequence of operations through both a real,
+            /// already-`Open` `SessionMachine` and an independent reference
+            /// [`Model`], asserting after every operation that the observable
+            /// state (open/terminal/peer-closed/packets-sent/pending-empty)
+            /// matches, every error returned matches the model's
+            /// expectation, and every event/classification produced for a
+            /// probe send, a reply, or a timeout poll matches the model's
+            /// prediction. No operation should ever panic.
+            #[test]
+            fn open_session_matches_reference_model(
+                start_seq in start_seq_strategy(),
+                ops in proptest::collection::vec(op_strategy(), 1..=OP_LIMIT),
+            ) {
+                let (mut machine, params) = open_machine_for_model(start_seq);
+                let mut model = Model::new(start_seq);
+                let mut now = ClientTimestamp {
+                    mono: Instant::now(),
+                    wall: SystemTime::now(),
+                };
+
+                check_generic_invariants(&machine, &model)?;
+                for op in ops {
+                    apply_op(&mut machine, &mut model, &params, &mut now, op)?;
+                }
+            }
+        }
+    }
 }
