@@ -1,0 +1,53 @@
+[package]
+name = "irtt-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.irtt-proto]
+path = "../crates/irtt-proto"
+
+# Use independent workspace for fuzzers
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "decode_request"
+path = "fuzz_targets/decode_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_open_reply"
+path = "fuzz_targets/decode_open_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_echo_reply"
+path = "fuzz_targets/decode_echo_reply.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_params"
+path = "fuzz_targets/decode_params.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "decode_varint"
+path = "fuzz_targets/decode_varint.rs"
+test = false
+doc = false
+bench = false

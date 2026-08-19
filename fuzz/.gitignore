@@ -1,0 +1,10 @@
+target
+artifacts
+coverage
+
+# The committed seed corpus under corpus/ is small and curated by hand; a
+# local `cargo fuzz run` grows each target's corpus directory far beyond
+# that, so ignore anything not already tracked instead of the directory
+# itself.
+corpus/*/*
+!corpus/*/

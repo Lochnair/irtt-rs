@@ -1,0 +1,59 @@
+name: Proto Fuzz Smoke
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Pinned for reproducibility; bump deliberately alongside `fuzz/Cargo.lock`.
+  CARGO_FUZZ_VERSION: 0.13.1
+
+jobs:
+  fuzz-smoke:
+    name: cargo fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install nightly Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          toolchain: nightly
+          cache-key: fuzz
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz --locked --version "${CARGO_FUZZ_VERSION}"
+
+      - name: Build all fuzz targets
+        run: cargo +nightly fuzz build
+        working-directory: fuzz
+
+      - name: Run bounded fuzz smoke for every target
+        # A single job building once and running each target sequentially
+        # avoids recompiling the fuzz workspace per target. Ten seconds per
+        # target is enough to catch a broken harness or an obvious
+        # regression; this is not meant to be exhaustive fuzzing.
+        run: |
+          set -euo pipefail
+          for target in decode_request decode_open_reply decode_echo_reply decode_params decode_varint; do
+            echo "::group::fuzz smoke: ${target}"
+            cargo +nightly fuzz run "${target}" -- \
+              -max_total_time=10 \
+              -timeout=5
+            echo "::endgroup::"
+          done
+        working-directory: fuzz
