@@ -29,11 +29,19 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install nightly Rust toolchain
+      - name: Install stable Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          toolchain: nightly
           cache-key: fuzz
+
+      - name: Install nightly Rust toolchain
+        # Installed alongside, but deliberately not made the directory
+        # default: cargo-fuzz itself is built with the default stable
+        # toolchain below, and only `fuzz build`/`fuzz run` are run with
+        # `+nightly`. Building cargo-fuzz's own dependency tree under a
+        # nightly override can trip build scripts (e.g. rustix) that gate
+        # unstable internal attributes on detecting a nightly compiler.
+        run: rustup toolchain install nightly --profile minimal --no-self-update
 
       - name: Install cargo-fuzz
         run: cargo install cargo-fuzz --locked --version "${CARGO_FUZZ_VERSION}"
