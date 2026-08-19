@@ -112,4 +112,43 @@ mod tests {
         encode_uvarint(24, &mut tag);
         assert_eq!(tag, [0x18]);
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        proptest! {
+            #[test]
+            fn uvarint_round_trips(value: u64) {
+                let mut encoded = Vec::new();
+                encode_uvarint(value, &mut encoded);
+                prop_assert!(!encoded.is_empty());
+                prop_assert!(encoded.len() <= 10);
+                let (decoded, used) = decode_uvarint(&encoded).unwrap();
+                prop_assert_eq!(decoded, value);
+                prop_assert_eq!(used, encoded.len());
+            }
+
+            #[test]
+            fn signed_varint_round_trips(value: i64) {
+                let mut encoded = Vec::new();
+                encode_varint(value, &mut encoded);
+                prop_assert!(!encoded.is_empty());
+                prop_assert!(encoded.len() <= 10);
+                let (decoded, used) = decode_varint(&encoded).unwrap();
+                prop_assert_eq!(decoded, value);
+                prop_assert_eq!(used, encoded.len());
+            }
+
+            #[test]
+            fn zigzag_round_trips_from_signed(value: i64) {
+                prop_assert_eq!(zigzag_decode(zigzag_encode(value)), value);
+            }
+
+            #[test]
+            fn zigzag_round_trips_from_unsigned(value: u64) {
+                prop_assert_eq!(zigzag_encode(zigzag_decode(value)), value);
+            }
+        }
+    }
 }

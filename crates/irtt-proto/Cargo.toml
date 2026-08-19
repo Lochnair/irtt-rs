@@ -16,3 +16,6 @@ hmac = "0.13"
 md-5 = "0.11"
 subtle = "2.6.1"
 thiserror = "2.0.20"
+
+[dev-dependencies]
+proptest = "1.11.0"
