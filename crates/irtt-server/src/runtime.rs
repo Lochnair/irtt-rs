@@ -109,6 +109,28 @@ impl Server {
         socket: UdpSocket,
         config: ServerConfig,
     ) -> Result<Self, ServerRuntimeError> {
+        Self::with_core(socket, ServerCore::new(config))
+    }
+
+    /// Test-only seam: builds a listener around an already-constructed core
+    /// instead of one this method would build from a [`ServerConfig`].
+    ///
+    /// This exists so a unit test can substitute a scripted
+    /// [`TokenSource`](crate::token::TokenSource) and make one listener in a
+    /// [`ServerSet`](crate::ServerSet) fail deterministically after it has
+    /// already bound and answered real traffic — the runtime otherwise offers
+    /// no way to make a core failure happen on command without OS-level
+    /// socket sabotage. Every other code path here — wildcard setup, kernel
+    /// timestamp configuration — is unchanged from [`Server::from_socket`].
+    #[cfg(test)]
+    pub(crate) fn from_socket_with_core(
+        socket: UdpSocket,
+        core: ServerCore,
+    ) -> Result<Self, ServerRuntimeError> {
+        Self::with_core(socket, core)
+    }
+
+    fn with_core(socket: UdpSocket, core: ServerCore) -> Result<Self, ServerRuntimeError> {
         let addr = socket
             .local_addr()
             .map_err(|source| ServerRuntimeError::LocalAddr { source })?;
@@ -131,7 +153,7 @@ impl Server {
 
         Ok(Self {
             socket,
-            core: ServerCore::new(config),
+            core,
             recv_buffer: vec![0; RECEIVE_BUFFER_LEN],
             listener_is_ipv4: marks_with_ipv4_option(addr),
             select_reply_source,
