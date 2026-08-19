@@ -764,4 +764,340 @@ mod tests {
         let encoded = [99];
         assert_eq!(Params::decode(&encoded), Err(ProtoError::TruncatedVarint));
     }
+
+    mod properties {
+        use super::*;
+        use proptest::prelude::*;
+
+        fn received_stats_strategy() -> impl Strategy<Value = ReceivedStats> {
+            prop_oneof![
+                Just(ReceivedStats::None),
+                Just(ReceivedStats::Count),
+                Just(ReceivedStats::Window),
+                Just(ReceivedStats::Both),
+            ]
+        }
+
+        fn stamp_at_strategy() -> impl Strategy<Value = StampAt> {
+            prop_oneof![
+                Just(StampAt::None),
+                Just(StampAt::Send),
+                Just(StampAt::Receive),
+                Just(StampAt::Both),
+                Just(StampAt::Midpoint),
+            ]
+        }
+
+        /// A `Clock` valid for direct construction, including `Unspecified`
+        /// (wire omission). Never produces an explicit zero on the wire; see
+        /// `explicit_clock_strategy` for that.
+        fn clock_strategy() -> impl Strategy<Value = Clock> {
+            prop_oneof![
+                Just(Clock::Unspecified),
+                Just(Clock::Wall),
+                Just(Clock::Monotonic),
+                Just(Clock::Both),
+            ]
+        }
+
+        /// A `Clock` value valid to encode *explicitly* on the wire (tag 7).
+        /// Excludes `Unspecified`/zero, which is only ever reached by omission.
+        fn explicit_clock_value_strategy() -> impl Strategy<Value = i64> {
+            1_i64..=3
+        }
+
+        fn server_fill_strategy() -> impl Strategy<Value = Option<ServerFill>> {
+            prop_oneof![
+                Just(None),
+                proptest::collection::vec(proptest::char::any(), 0..=8).prop_map(|chars| Some(
+                    ServerFill {
+                        value: chars.into_iter().collect(),
+                    }
+                )),
+            ]
+        }
+
+        fn params_strategy() -> impl Strategy<Value = Params> {
+            (
+                any::<i64>(),
+                any::<i64>(),
+                any::<i64>(),
+                any::<i64>(),
+                any::<i64>(),
+                received_stats_strategy(),
+                stamp_at_strategy(),
+                clock_strategy(),
+                server_fill_strategy(),
+            )
+                .prop_map(
+                    |(
+                        protocol_version,
+                        duration_ns,
+                        interval_ns,
+                        length,
+                        dscp,
+                        received_stats,
+                        stamp_at,
+                        clock,
+                        server_fill,
+                    )| Params {
+                        protocol_version,
+                        duration_ns,
+                        interval_ns,
+                        length,
+                        received_stats,
+                        stamp_at,
+                        clock,
+                        dscp,
+                        server_fill,
+                    },
+                )
+        }
+
+        fn encode_tagged_int(tag: u64, value: i64, out: &mut Vec<u8>) {
+            varint::encode_uvarint(tag, out);
+            varint::encode_varint(value, out);
+        }
+
+        fn encode_tagged_server_fill(value: &str, out: &mut Vec<u8>) {
+            varint::encode_uvarint(9, out);
+            varint::encode_uvarint(value.len() as u64, out);
+            out.extend_from_slice(value.as_bytes());
+        }
+
+        proptest! {
+            #[test]
+            fn valid_params_round_trip(params in params_strategy()) {
+                let encoded = params.encode();
+                let decoded = Params::decode(&encoded).unwrap();
+                prop_assert_eq!(decoded, params);
+            }
+
+            #[test]
+            fn encoded_param_presence_matches_omission_rules(params in params_strategy()) {
+                let encoded = params.encode();
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(&decoded.params, &params);
+
+                prop_assert_eq!(decoded.presence.protocol_version, params.protocol_version != 0);
+                prop_assert_eq!(decoded.presence.duration_ns, params.duration_ns != 0);
+                prop_assert_eq!(decoded.presence.interval_ns, params.interval_ns != 0);
+                prop_assert_eq!(decoded.presence.length, params.length != 0);
+                prop_assert_eq!(decoded.presence.dscp, params.dscp != 0);
+                prop_assert_eq!(
+                    decoded.presence.received_stats,
+                    params.received_stats != ReceivedStats::None
+                );
+                prop_assert_eq!(decoded.presence.stamp_at, params.stamp_at != StampAt::None);
+                prop_assert_eq!(decoded.presence.clock, params.clock != Clock::Unspecified);
+                prop_assert_eq!(decoded.presence.server_fill, params.server_fill.is_some());
+            }
+
+            #[test]
+            fn repeated_protocol_version_is_last_wins(first: i64, second: i64) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(1, first, &mut encoded);
+                encode_tagged_int(1, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.protocol_version, second);
+                prop_assert!(decoded.presence.protocol_version);
+            }
+
+            #[test]
+            fn repeated_duration_ns_is_last_wins(first: i64, second: i64) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(2, first, &mut encoded);
+                encode_tagged_int(2, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.duration_ns, second);
+                prop_assert!(decoded.presence.duration_ns);
+            }
+
+            #[test]
+            fn repeated_interval_ns_is_last_wins(first: i64, second: i64) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(3, first, &mut encoded);
+                encode_tagged_int(3, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.interval_ns, second);
+                prop_assert!(decoded.presence.interval_ns);
+            }
+
+            #[test]
+            fn repeated_length_is_last_wins(first: i64, second: i64) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(4, first, &mut encoded);
+                encode_tagged_int(4, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.length, second);
+                prop_assert!(decoded.presence.length);
+            }
+
+            #[test]
+            fn repeated_received_stats_is_last_wins(first in 0_i64..=3, second in 0_i64..=3) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(5, first, &mut encoded);
+                encode_tagged_int(5, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.received_stats, ReceivedStats::try_from(second).unwrap());
+                prop_assert!(decoded.presence.received_stats);
+            }
+
+            #[test]
+            fn repeated_stamp_at_is_last_wins(first in 0_i64..=4, second in 0_i64..=4) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(6, first, &mut encoded);
+                encode_tagged_int(6, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.stamp_at, StampAt::try_from(second).unwrap());
+                prop_assert!(decoded.presence.stamp_at);
+            }
+
+            #[test]
+            fn repeated_clock_is_last_wins(
+                first in explicit_clock_value_strategy(),
+                second in explicit_clock_value_strategy(),
+            ) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(7, first, &mut encoded);
+                encode_tagged_int(7, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.clock, Clock::try_from(second).unwrap());
+                prop_assert!(decoded.presence.clock);
+            }
+
+            #[test]
+            fn repeated_dscp_is_last_wins(first: i64, second: i64) {
+                let mut encoded = Vec::new();
+                encode_tagged_int(8, first, &mut encoded);
+                encode_tagged_int(8, second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(decoded.params.dscp, second);
+                prop_assert!(decoded.presence.dscp);
+            }
+
+            #[test]
+            fn repeated_server_fill_is_last_wins(
+                first in proptest::collection::vec(proptest::char::any(), 0..=8)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+                second in proptest::collection::vec(proptest::char::any(), 0..=8)
+                    .prop_map(|chars| chars.into_iter().collect::<String>()),
+            ) {
+                let mut encoded = Vec::new();
+                encode_tagged_server_fill(&first, &mut encoded);
+                encode_tagged_server_fill(&second, &mut encoded);
+                let decoded = Params::decode_with_presence(&encoded).unwrap();
+                prop_assert_eq!(
+                    decoded.params.server_fill,
+                    Some(ServerFill { value: second })
+                );
+                prop_assert!(decoded.presence.server_fill);
+            }
+
+            #[test]
+            fn unknown_scalar_tag_prefix_does_not_disturb_known_params(
+                params in params_strategy(),
+                unknown_tag in 10_u64..=u16::MAX as u64,
+                unknown_value: u64,
+            ) {
+                let mut prefixed = Vec::new();
+                varint::encode_uvarint(unknown_tag, &mut prefixed);
+                varint::encode_uvarint(unknown_value, &mut prefixed);
+                prefixed.extend_from_slice(&params.encode());
+
+                let decoded = Params::decode(&prefixed).unwrap();
+                prop_assert_eq!(decoded, params.clone());
+
+                let decoded_with_presence = Params::decode_with_presence(&prefixed).unwrap();
+                let expected_presence = Params::decode_with_presence(&params.encode()).unwrap().presence;
+                prop_assert_eq!(decoded_with_presence.presence, expected_presence);
+            }
+
+            #[test]
+            fn unknown_scalar_tag_suffix_does_not_disturb_known_params(
+                params in params_strategy(),
+                unknown_tag in 10_u64..=u16::MAX as u64,
+                unknown_value: u64,
+            ) {
+                let mut suffixed = params.encode();
+                varint::encode_uvarint(unknown_tag, &mut suffixed);
+                varint::encode_uvarint(unknown_value, &mut suffixed);
+
+                let decoded = Params::decode(&suffixed).unwrap();
+                prop_assert_eq!(decoded, params.clone());
+
+                let decoded_with_presence = Params::decode_with_presence(&suffixed).unwrap();
+                let expected_presence = Params::decode_with_presence(&params.encode()).unwrap().presence;
+                prop_assert_eq!(decoded_with_presence.presence, expected_presence);
+            }
+        }
+
+        /// Omitted-vs-explicit-zero presence, for the fields where explicit
+        /// zero is valid on the wire. `Clock` is deliberately excluded: an
+        /// explicit zero there is rejected outright, not merely "present with
+        /// the default value" (see `explicit_clock_zero_is_rejected`).
+        #[test]
+        fn omitted_vs_explicit_zero_presence_for_zero_valid_fields() {
+            let scalar_tags = [1_u64, 2, 3, 4, 8];
+            for tag in scalar_tags {
+                let omitted = Params::decode_with_presence(&[]).unwrap();
+                let mut explicit_zero = Vec::new();
+                encode_tagged_int(tag, 0, &mut explicit_zero);
+                let explicit = Params::decode_with_presence(&explicit_zero).unwrap();
+
+                assert_eq!(omitted.params, explicit.params);
+                assert_eq!(explicit.params, Params::default());
+
+                let (omitted_presence, explicit_presence) = match tag {
+                    1 => (
+                        omitted.presence.protocol_version,
+                        explicit.presence.protocol_version,
+                    ),
+                    2 => (omitted.presence.duration_ns, explicit.presence.duration_ns),
+                    3 => (omitted.presence.interval_ns, explicit.presence.interval_ns),
+                    4 => (omitted.presence.length, explicit.presence.length),
+                    8 => (omitted.presence.dscp, explicit.presence.dscp),
+                    _ => unreachable!(),
+                };
+                assert!(!omitted_presence);
+                assert!(explicit_presence);
+            }
+
+            let enum_tags = [5_u64, 6];
+            for tag in enum_tags {
+                let omitted = Params::decode_with_presence(&[]).unwrap();
+                let mut explicit_zero = Vec::new();
+                encode_tagged_int(tag, 0, &mut explicit_zero);
+                let explicit = Params::decode_with_presence(&explicit_zero).unwrap();
+
+                assert_eq!(omitted.params, explicit.params);
+
+                let (omitted_presence, explicit_presence) = match tag {
+                    5 => (
+                        omitted.presence.received_stats,
+                        explicit.presence.received_stats,
+                    ),
+                    6 => (omitted.presence.stamp_at, explicit.presence.stamp_at),
+                    _ => unreachable!(),
+                };
+                assert!(!omitted_presence);
+                assert!(explicit_presence);
+            }
+
+            // `Clock` deliberately breaks the pattern above: explicit zero is
+            // rejected rather than accepted-but-present.
+            let omitted = Params::decode_with_presence(&[]).unwrap();
+            assert_eq!(omitted.params.clock, Clock::Unspecified);
+            assert!(!omitted.presence.clock);
+            let mut explicit_clock_zero = Vec::new();
+            encode_tagged_int(7, 0, &mut explicit_clock_zero);
+            assert_eq!(
+                Params::decode_with_presence(&explicit_clock_zero),
+                Err(ProtoError::InvalidEnum {
+                    name: "Clock",
+                    value: 0,
+                })
+            );
+        }
+    }
 }
