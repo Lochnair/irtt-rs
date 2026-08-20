@@ -278,6 +278,54 @@ fn multi_target_default_table_includes_both_labels() {
 }
 
 #[test]
+fn multi_target_final_summary_preserves_cli_argument_order() {
+    // Labels are chosen so lexicographic (BTreeMap) order differs from the
+    // CLI argument order, to prove the final per-target summary headings
+    // follow the order targets were given on the command line rather than
+    // the internal label-keyed lookup map's iteration order.
+    let z = InTreeServer::start();
+    let a = InTreeServer::start();
+    let m = InTreeServer::start();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+        .args([
+            "--duration",
+            "40ms",
+            "--interval",
+            "10ms",
+            &format!("z={}", z.addr),
+            &format!("a={}", a.addr),
+            &format!("m={}", m.addr),
+        ])
+        .output()
+        .unwrap();
+
+    drop(z);
+    drop(a);
+    drop(m);
+
+    assert!(
+        output.status.success(),
+        "status={:?}\nstderr={}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let heading_position = |label: &str| {
+        stdout
+            .find(&format!("target: {label}"))
+            .unwrap_or_else(|| panic!("missing summary heading for target {label}\n{stdout}"))
+    };
+    let z_pos = heading_position("z");
+    let a_pos = heading_position("a");
+    let m_pos = heading_position("m");
+    assert!(
+        z_pos < a_pos && a_pos < m_pos,
+        "expected summary headings in CLI argument order z, a, m; got positions z={z_pos} a={a_pos} m={m_pos}\n{stdout}"
+    );
+}
+
+#[test]
 fn mixed_labeled_and_unlabeled_positional_targets_both_appear_in_output() {
     let a = InTreeServer::start();
     let b = InTreeServer::start();
