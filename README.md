@@ -139,7 +139,7 @@ Multi-target sessions use staggered pacing by default. To send each target's pro
 irtt-client host-a:2112 host-b:2112 --pacing burst
 ```
 
-Target labels are included in the default multi-target output.
+Target labels are included in the default multi-target output. Final per-target summaries are printed in the order targets were supplied on the command line, not the order in which they finish or their labels sort alphabetically.
 
 ## Output formats
 
