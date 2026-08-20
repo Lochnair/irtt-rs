@@ -323,7 +323,10 @@ pub enum ServerSetError {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
+    use crate::{token::TokenSource, ServerCore, ServerError};
 
     /// Which listener of a requested set has to be bound IPv6-only.
     ///
@@ -408,5 +411,163 @@ mod tests {
             ServerSet::bind([], ServerConfig::default()).await,
             Err(ServerSetError::NoListeners)
         ));
+    }
+
+    /// A token source that draws one value successfully and then fails every
+    /// later draw.
+    ///
+    /// This is the same seam the core's own tests already use to make token
+    /// allocation fail deterministically (see [`crate::token::TokenSource`]
+    /// and its `ScriptedTokens::failing`), specialized here so the *first*
+    /// open still succeeds: the listener built from it answers one real
+    /// exchange exactly like a healthy listener would, and only a second open
+    /// discovers the failure.
+    #[derive(Debug)]
+    struct FailAfterFirstToken(Option<u64>);
+
+    impl TokenSource for FailAfterFirstToken {
+        fn next_token(&mut self) -> Result<u64, ServerError> {
+            self.0.take().ok_or_else(|| ServerError::RandomSource {
+                reason: "test fault injection: exhausted after the first token".to_owned(),
+            })
+        }
+    }
+
+    const FIRST_TOKEN: u64 = 0xdead_beef_dead_beef;
+    const TEST_TIMEOUT: Duration = Duration::from_secs(5);
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+
+    fn loopback(port: u16) -> SocketAddr {
+        SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port))
+    }
+
+    fn requested_params() -> irtt_proto::Params {
+        irtt_proto::Params {
+            protocol_version: 1,
+            duration_ns: 10_000_000_000,
+            interval_ns: 100_000_000,
+            received_stats: irtt_proto::ReceivedStats::Both,
+            stamp_at: irtt_proto::StampAt::Both,
+            clock: irtt_proto::Clock::Both,
+            ..irtt_proto::Params::default()
+        }
+    }
+
+    async fn send_open(client: &UdpSocket, addr: SocketAddr) {
+        let request = irtt_proto::encode_request(
+            irtt_proto::RequestToEncode::Open {
+                params: &requested_params(),
+                no_test: false,
+            },
+            None,
+        )
+        .unwrap();
+        client.send_to(&request, addr).await.unwrap();
+    }
+
+    /// Sends one open request and returns its reply, or `None` if the
+    /// listener stayed silent within [`REPLY_TIMEOUT`].
+    async fn open(client: &UdpSocket, addr: SocketAddr) -> Option<irtt_proto::OpenReply> {
+        send_open(client, addr).await;
+        let mut buffer = [0u8; 4096];
+        match tokio::time::timeout(REPLY_TIMEOUT, client.recv_from(&mut buffer)).await {
+            Ok(received) => {
+                let (len, from) = received.unwrap();
+                assert_eq!(from, addr, "a reply came from the wrong listener");
+                Some(irtt_proto::decode_open_reply(&buffer[..len], None).unwrap())
+            }
+            Err(_) => None,
+        }
+    }
+
+    /// A fatal failure inside one listener, after every listener in the set
+    /// has already bound and answered real traffic, shuts its siblings down,
+    /// joins every task and fails the set — with no external shutdown ever
+    /// sent.
+    ///
+    /// The failure is injected the same way the core's own tests already
+    /// drive a token-allocation failure: a scripted
+    /// [`crate::token::TokenSource`] substituted for one listener's
+    /// [`crate::ServerCore`], through the test-only
+    /// [`Server::from_socket_with_core`]. That source draws one token
+    /// successfully, so the listener built from it answers a first open
+    /// exactly like its healthy sibling does — which is the startup/readiness
+    /// synchronization this test relies on: both are bound and actively
+    /// serving real traffic before anything is asked to fail, not merely
+    /// spawned. Only a *second* open against that listener draws its second
+    /// token, which the scripted source refuses, and that single draw is the
+    /// one injected fatal failure. Nothing about the socket, the receive loop
+    /// or the sibling listener is touched.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_mid_run_listener_failure_shuts_down_its_siblings_and_fails_the_set() {
+        let config = ServerConfig::default().with_min_send_interval(Duration::ZERO);
+
+        let failing_socket = UdpSocket::bind(loopback(0)).await.unwrap();
+        let failing_core = ServerCore::with_token_source(
+            config.clone(),
+            Box::new(FailAfterFirstToken(Some(FIRST_TOKEN))),
+        );
+        let failing = Server::from_socket_with_core(failing_socket, failing_core).unwrap();
+        let failing_addr = failing.local_addr().unwrap();
+
+        let healthy_socket = UdpSocket::bind(loopback(0)).await.unwrap();
+        let healthy = Server::from_socket(healthy_socket, config).unwrap();
+        let healthy_addr = healthy.local_addr().unwrap();
+
+        let set = ServerSet {
+            servers: vec![failing, healthy],
+            local_addrs: vec![failing_addr, healthy_addr],
+        };
+
+        // A shutdown future that never resolves: whatever stops the set has
+        // to come from the injected failure, not from this caller.
+        let run = tokio::spawn(set.run(std::future::pending::<()>()));
+
+        let client = UdpSocket::bind(loopback(0)).await.unwrap();
+
+        // Both listeners answer a first, ordinary open before anything fails.
+        let opened = open(&client, failing_addr)
+            .await
+            .expect("the failing listener is bound and serving before it fails");
+        assert_eq!(opened.token, FIRST_TOKEN);
+        assert!(
+            open(&client, healthy_addr).await.is_some(),
+            "the healthy listener is bound and serving too"
+        );
+
+        // The second open at the failing listener draws its second token,
+        // which the scripted source refuses. It terminates that listener
+        // before any reply could be built, so this exchange places no
+        // expectation on a reply.
+        send_open(&client, failing_addr).await;
+
+        let outcome = tokio::time::timeout(TEST_TIMEOUT, run)
+            .await
+            .expect("the set stopped on its own, with no external shutdown sent")
+            .expect("the supervising task did not panic");
+        match outcome {
+            Err(ServerSetError::ListenerRun { addr, source }) => {
+                assert_eq!(
+                    addr, failing_addr,
+                    "the failure names the listener that actually failed"
+                );
+                assert!(
+                    matches!(
+                        source,
+                        ServerRuntimeError::Core(ServerError::RandomSource { .. })
+                    ),
+                    "unexpected failure source: {source}"
+                );
+            }
+            other => panic!("expected the injected listener failure, got {other:?}"),
+        }
+
+        // The sibling did not linger after the failure: its task was joined
+        // and its socket released, exactly like the listener that failed —
+        // proof neither task nor socket was leaked.
+        for addr in [healthy_addr, failing_addr] {
+            std::net::UdpSocket::bind(addr)
+                .unwrap_or_else(|error| panic!("{addr} was not released: {error}"));
+        }
     }
 }
