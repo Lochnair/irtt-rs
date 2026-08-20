@@ -714,21 +714,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "irtt-cli"
-version = "0.5.0"
-dependencies = [
- "clap",
- "crossterm",
- "ctrlc",
- "irtt-client",
- "irtt-proto",
- "irtt-server",
- "irtt-stats",
- "ratatui",
- "tokio",
-]
-
-[[package]]
 name = "irtt-client"
 version = "0.5.0"
 dependencies = [
@@ -760,6 +745,21 @@ dependencies = [
  "proptest",
  "subtle",
  "thiserror 2.0.20",
+]
+
+[[package]]
+name = "irtt-rs"
+version = "0.6.0"
+dependencies = [
+ "clap",
+ "crossterm",
+ "ctrlc",
+ "irtt-client",
+ "irtt-proto",
+ "irtt-server",
+ "irtt-stats",
+ "ratatui",
+ "tokio",
 ]
 
 [[package]]

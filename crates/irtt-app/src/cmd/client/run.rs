@@ -392,7 +392,7 @@ mod tests {
         use clap::Parser;
 
         ClientArgs::try_parse_from([
-            "irtt-cli",
+            "irtt-client",
             "--duration",
             "4200s",
             "--interval",

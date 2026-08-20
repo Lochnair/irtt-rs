@@ -8,7 +8,7 @@ on:
       - "irtt-client/v*.*.*"
       - "irtt-server/v*.*.*"
       - "irtt-stats/v*.*.*"
-      - "irtt-cli/v*.*.*"
+      - "irtt-rs/v*.*.*"
 
 permissions:
   contents: read

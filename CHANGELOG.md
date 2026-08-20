@@ -88,6 +88,17 @@ release. The format is loosely based on
 - `LateReplyMode` (`Measure` / `CountOnly`) lets a consumer choose whether replies that arrive after their probe is considered late are still fully measured into the running statistics or only counted, without affecting the other samples.
 - `StatsConfig::estimated_retained_bytes(probe_count)` gives callers an API to estimate the memory a stats configuration will retain for a given probe count, ahead of actually running a session (used by `irtt-cli`'s multi-target memory-usage warning, see below).
 
+## irtt-rs
+
+### 0.6.0
+
+#### Changed
+
+- The application Cargo package was renamed from `irtt-cli` to `irtt-rs`, moving to `crates/irtt-app`. This is the application distribution package that produces the `irtt-rs`, `irtt-client`, `irtt-tui`, and `irtt-server` binaries; it is unrelated to the reusable `irtt-client` library crate, which keeps its existing name and version.
+- The `irtt-cli` executable was hard-renamed to `irtt-client` to avoid reading as an umbrella CLI now that the application also ships a first-class server. There is no `irtt-cli` compatibility binary or alias.
+- Dedicated binaries now have role-specific entry points (`irtt-client`, `irtt-tui`, `irtt-server`) instead of all funneling through the multicall dispatcher's argv0/subcommand logic. Each dedicated binary always runs its own role regardless of the name it is invoked or copied under, and no longer links code for the other applet roles it doesn't implement. The `irtt-rs` binary remains the feature-selectable multicall dispatcher and is the only binary that inspects argv0 or subcommands.
+- Future application releases move to the `irtt-rs/vX.Y.Z` tag namespace (previously `irtt-cli/vX.Y.Z`); see [Releasing](#releasing).
+
 ## irtt-cli
 
 ### 0.5.0
@@ -125,6 +136,8 @@ rather than in lockstep. Each crate's release is tagged as `<crate>/vX.Y.Z`
 from. `irtt-proto`, `irtt-client`, `irtt-server`, and `irtt-stats` are
 libraries published to [crates.io](https://crates.io); their tags exist to
 identify the exact source for a given crates.io release and do not produce a
-GitHub Release. `irtt-cli` is the only crate with prebuilt binary artifacts:
-pushing an `irtt-cli/vX.Y.Z` tag triggers [cargo-dist](https://opensource.axo.dev/cargo-dist/)
-to build and publish a GitHub Release with platform binaries.
+GitHub Release. The application package (`irtt-cli` through 0.5.0, `irtt-rs`
+from 0.6.0 onward) is the only package with prebuilt binary artifacts: pushing
+an `irtt-rs/vX.Y.Z` tag triggers [cargo-dist](https://opensource.axo.dev/cargo-dist/)
+to build and publish a GitHub Release with platform binaries. The historical
+`irtt-cli/v0.5.0` tag remains as released; it is not rewritten or replaced.

@@ -20,7 +20,7 @@ pub enum AppletDispatch {
 
 pub fn detect_applet_from_argv0(argv0: &str) -> Option<RequestedApplet> {
     match applet_basename(argv0) {
-        "irtt-cli" => Some(RequestedApplet::Client),
+        "irtt-client" => Some(RequestedApplet::Client),
         "irtt-tui" => Some(RequestedApplet::Tui),
         "irttd" | "irtt-server" => Some(RequestedApplet::Server),
         "irtt-rs" => None,
@@ -58,7 +58,7 @@ pub fn dispatch_from_argv(argv: Vec<OsString>) -> Result<AppletDispatch, String>
         "-h" | "--help" => Ok(AppletDispatch::Help(dispatcher_help())),
         "client" => Ok(AppletDispatch::Run {
             applet: RequestedApplet::Client,
-            argv: applet_argv("irtt-cli", &argv[2..]),
+            argv: applet_argv("irtt-client", &argv[2..]),
         }),
         "tui" => Ok(AppletDispatch::Run {
             applet: RequestedApplet::Tui,
@@ -111,7 +111,7 @@ fn server_applet_about() -> &'static str {
 }
 
 fn known_applet_binary_names() -> &'static str {
-    "irtt-rs, irtt-cli, irtt-tui, irtt-server"
+    "irtt-rs, irtt-client, irtt-tui, irtt-server"
 }
 
 fn applet_command_names() -> &'static str {
@@ -119,11 +119,11 @@ fn applet_command_names() -> &'static str {
 }
 
 fn dispatcher_after_help() -> String {
-    let mut help = "Recognized applet binary names: irtt-cli, irtt-tui, irtt-server".to_owned();
+    let mut help = "Recognized applet binary names: irtt-client, irtt-tui, irtt-server".to_owned();
 
     let mut missing = Vec::new();
     if !cfg!(feature = "client") {
-        missing.push("irtt-cli requires the client feature");
+        missing.push("irtt-client requires the client feature");
     }
     if !cfg!(feature = "server") {
         missing.push("irtt-server requires the server feature");
@@ -188,7 +188,7 @@ mod tests {
     #[test]
     fn applet_detection_maps_binary_names() {
         assert_eq!(
-            detect_applet_from_argv0("/usr/bin/irtt-cli"),
+            detect_applet_from_argv0("/usr/bin/irtt-client"),
             Some(RequestedApplet::Client)
         );
         assert_eq!(
@@ -204,6 +204,12 @@ mod tests {
     }
 
     #[test]
+    fn old_irtt_cli_binary_name_is_no_longer_a_recognized_applet() {
+        assert_eq!(detect_applet_from_argv0("irtt-cli"), None);
+        assert_eq!(detect_applet_from_argv0("/usr/bin/irtt-cli"), None);
+    }
+
+    #[test]
     fn applet_detection_ignores_the_platform_executable_suffix() {
         let exe = std::env::consts::EXE_SUFFIX;
 
@@ -212,7 +218,7 @@ mod tests {
             Some(RequestedApplet::Server)
         );
         assert_eq!(
-            detect_applet_from_argv0(&format!("irtt-cli{exe}")),
+            detect_applet_from_argv0(&format!("irtt-client{exe}")),
             Some(RequestedApplet::Client)
         );
 
@@ -288,7 +294,7 @@ mod tests {
                 .unwrap(),
             AppletDispatch::Run {
                 applet: RequestedApplet::Client,
-                argv: vec!["irtt-cli".into(), "host:2112".into()],
+                argv: vec!["irtt-client".into(), "host:2112".into()],
             }
         );
         assert_eq!(
@@ -311,7 +317,7 @@ mod tests {
     fn unknown_irtt_binary_name_is_an_error() {
         let err = dispatch_from_argv(vec!["/usr/bin/irtt-typo".into()]).unwrap_err();
         assert!(err.contains("unknown applet name 'irtt-typo'"));
-        assert!(err.contains("irtt-cli"));
+        assert!(err.contains("irtt-client"));
         if cfg!(feature = "tui") {
             assert!(err.contains("irtt-tui"));
         }

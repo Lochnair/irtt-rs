@@ -31,19 +31,19 @@ From a local checkout:
 ```sh
 git clone https://github.com/Lochnair/irtt-rs.git
 cd irtt-rs
-cargo install --path crates/irtt-cli
+cargo install --path crates/irtt-app
 ```
 
 This installs:
 
 * `irtt-rs`, the canonical multi-applet dispatcher
-* `irtt-cli`, the stream and text client
+* `irtt-client`, the stream and text client
 * `irtt-server`, the UDP server
 
 To also install the optional terminal UI:
 
 ```sh
-cargo install --path crates/irtt-cli --features tui
+cargo install --path crates/irtt-app --features tui
 ```
 
 ## Quick start
@@ -51,13 +51,13 @@ cargo install --path crates/irtt-cli --features tui
 Probe a server using the default settings:
 
 ```sh
-irtt-cli netperf-eu.bufferbloat.net:2112
+irtt-client netperf-eu.bufferbloat.net:2112
 ```
 
 Set the test duration and probe interval:
 
 ```sh
-irtt-cli netperf-eu.bufferbloat.net:2112 \
+irtt-client netperf-eu.bufferbloat.net:2112 \
     --duration 30s \
     --interval 100ms
 ```
@@ -65,7 +65,7 @@ irtt-cli netperf-eu.bufferbloat.net:2112 \
 Run continuously until interrupted:
 
 ```sh
-irtt-cli netperf-eu.bufferbloat.net:2112 --duration 0
+irtt-client netperf-eu.bufferbloat.net:2112 --duration 0
 ```
 
 Use `Ctrl-C` to stop gracefully.
@@ -75,7 +75,7 @@ Use `Ctrl-C` to stop gracefully.
 Probe several targets concurrently:
 
 ```sh
-irtt-cli host-a:2112 host-b:2112
+irtt-client host-a:2112 host-b:2112
 ```
 
 Every target argument accepts `[LABEL=]TARGET`. An optional `LABEL=` prefix assigns the logical
@@ -83,19 +83,19 @@ target name used in output and the TUI; without it, the target string itself is 
 stable labels to targets:
 
 ```sh
-irtt-cli ams=ams.example.com:2112 sg=sg.example.com:2112
+irtt-client ams=ams.example.com:2112 sg=sg.example.com:2112
 ```
 
 Labeled and unlabeled targets can be freely mixed in one argument list:
 
 ```sh
-irtt-cli host-a:2112 ams=ams.example.com:2112
+irtt-client host-a:2112 ams=ams.example.com:2112
 ```
 
 Multi-target sessions use staggered pacing by default. To send each target's probes together:
 
 ```sh
-irtt-cli host-a:2112 host-b:2112 --pacing burst
+irtt-client host-a:2112 host-b:2112 --pacing burst
 ```
 
 Target labels are included in the default multi-target output.
@@ -112,16 +112,16 @@ The CLI supports four event-row formats:
 Examples:
 
 ```sh
-irtt-cli <server> --format table
-irtt-cli <server> --format jsonl
-irtt-cli <server> --format csv \
+irtt-client <server> --format table
+irtt-client <server> --format jsonl
+irtt-client <server> --format csv \
     --columns event,seq,remote,effective_rtt_us
 ```
 
 For a stream containing only effective RTT values in microseconds:
 
 ```sh
-irtt-cli <server> \
+irtt-client <server> \
     --format tsv \
     --columns effective_rtt_us \
     --header never
@@ -130,7 +130,7 @@ irtt-cli <server> \
 List all available columns with:
 
 ```sh
-irtt-cli --list-columns
+irtt-client --list-columns
 ```
 
 Useful measurement fields include:
@@ -164,7 +164,7 @@ It runs continuously by default. A finite duration can be selected explicitly:
 irtt-tui <server> --duration 30s
 ```
 
-Multiple targets and pacing options work the same way as in `irtt-cli`:
+Multiple targets and pacing options work the same way as in `irtt-client`:
 
 ```sh
 irtt-tui host-a:2112 host-b:2112 --pacing burst
@@ -315,18 +315,18 @@ synchronous callers. Callers that already own Tokio can drive
 | ----------------------------------------- | ------------------------------------------------- |
 | `--no-default-features`                   | `irtt-rs`                                         |
 | `--no-default-features --features server` | `irtt-rs`, `irtt-server`                          |
-| Default features                          | `irtt-rs`, `irtt-cli`, `irtt-server`              |
-| `--features tui`                          | `irtt-rs`, `irtt-cli`, `irtt-server`, `irtt-tui`  |
-| `--all-features`                          | `irtt-rs`, `irtt-cli`, `irtt-server`, `irtt-tui`  |
+| Default features                          | `irtt-rs`, `irtt-client`, `irtt-server`           |
+| `--features tui`                          | `irtt-rs`, `irtt-client`, `irtt-server`, `irtt-tui` |
+| `--all-features`                          | `irtt-rs`, `irtt-client`, `irtt-server`, `irtt-tui` |
 
-`irtt-cli` requires the `client` feature, `irtt-server` the `server` feature,
+`irtt-client` requires the `client` feature, `irtt-server` the `server` feature,
 and `irtt-tui` the `tui` feature. The `irtt-rs` dispatcher is always built, and
 reports which applets the build actually contains.
 
 For available command-line options:
 
 ```sh
-irtt-cli --help
+irtt-client --help
 irtt-server --help
 irtt-tui --help
 ```
@@ -339,7 +339,7 @@ Common verification commands:
 cargo fmt --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p irtt-cli --all-features --release
+cargo build -p irtt-rs --all-features --release
 ```
 
 ## Project status

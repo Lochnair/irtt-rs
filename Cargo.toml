@@ -4,7 +4,7 @@ members = [
     "crates/irtt-client",
     "crates/irtt-server",
     "crates/irtt-stats",
-    "crates/irtt-cli",
+    "crates/irtt-app",
     "crates/irtt-integration-tests",
 ]
 resolver = "2"

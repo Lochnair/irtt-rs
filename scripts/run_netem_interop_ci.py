@@ -105,13 +105,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--irtt-rs-command",
-        default=str(REPO_ROOT / "target" / "debug" / "irtt-cli"),
-        help="Path or command for irtt-rs client (default: target/debug/irtt-cli).",
+        default=str(REPO_ROOT / "target" / "debug" / "irtt-client"),
+        help="Path or command for irtt-rs client (default: target/debug/irtt-client).",
     )
     parser.add_argument(
         "--skip-build",
         action="store_true",
-        help="Do not run cargo build -p irtt-cli before comparisons.",
+        help="Do not run cargo build -p irtt-rs --bin irtt-client before comparisons.",
     )
     parser.add_argument(
         "--sudo",
@@ -176,7 +176,10 @@ def main() -> int:
         upstream_irtt = resolve_command(args.upstream_irtt)
         irtt_rs_command = resolve_irtt_rs_command(args.irtt_rs_command)
         if not args.skip_build:
-            run_checked(["cargo", "build", "-p", "irtt-cli"], run_dir / "cargo-build")
+            run_checked(
+                ["cargo", "build", "-p", "irtt-rs", "--bin", "irtt-client"],
+                run_dir / "cargo-build",
+            )
 
         cleanup(args, quiet=True)
         setup_namespaces(args, run_dir)

@@ -32,7 +32,7 @@ DEFAULT_REMOTE_TARGETS = [
 ]
 DEFAULT_LOCAL_TARGET = ("127.0.0.1", "10s", "100ms", "local")
 DEFAULT_OUTPUT_ROOT = Path("target/interop-comparisons")
-DEFAULT_IRTT_RS_COMMAND = "target/debug/irtt-cli"
+DEFAULT_IRTT_RS_COMMAND = "target/debug/irtt-client"
 
 
 @dataclass
@@ -163,7 +163,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-build",
         action="store_true",
-        help="Do not run cargo build -p irtt-cli before comparisons.",
+        help="Do not run cargo build -p irtt-rs --bin irtt-client before comparisons.",
     )
     parser.add_argument(
         "--localhost-port",
@@ -335,8 +335,8 @@ def check_local_server(args: argparse.Namespace) -> tuple[bool, str]:
     )
 
 
-def preflight_build_irtt_cli(run_dir: Path) -> bool:
-    command = ["cargo", "build", "-p", "irtt-cli"]
+def preflight_build_irtt_client(run_dir: Path) -> bool:
+    command = ["cargo", "build", "-p", "irtt-rs", "--bin", "irtt-client"]
     started = utc_now()
     print(f"[{started}] preflight build: {shlex.join(command)}", flush=True)
     completed = subprocess.run(
@@ -1117,7 +1117,7 @@ def main() -> int:
             print(message, file=sys.stderr)
             cases = [case for case in cases if not case.is_local]
 
-    if cases and not args.skip_build and not preflight_build_irtt_cli(run_dir):
+    if cases and not args.skip_build and not preflight_build_irtt_client(run_dir):
         write_index(run_dir, [], local_error)
         return 1
 

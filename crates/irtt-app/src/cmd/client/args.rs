@@ -9,14 +9,14 @@ use clap::{Parser, ValueEnum};
 pub const DEFAULT_CLIENT_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "irtt-cli", about = "Minimal IRTT-compatible stream client")]
+#[command(name = "irtt-client", about = "Minimal IRTT-compatible stream client")]
 pub struct ClientArgs {
     /// Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.
     #[arg(
         value_name = "TARGET",
         num_args = 0..,
         value_parser = parse_target,
-        long_help = "Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.\n\nExamples:\n  irtt-cli host-a:2112 host-b:2112\n  irtt-cli eu=host-a:2112 us=host-b:2112\n  irtt-cli host-a:2112 eu=host-b:2112"
+        long_help = "Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.\n\nExamples:\n  irtt-client host-a:2112 host-b:2112\n  irtt-client eu=host-a:2112 us=host-b:2112\n  irtt-client host-a:2112 eu=host-b:2112"
     )]
     pub targets: Vec<TargetArg>,
 
@@ -149,7 +149,7 @@ mod tests {
     use irtt_proto::{Clock, ReceivedStats, StampAt};
 
     fn parse(args: &[&str]) -> Result<ClientArgs, clap::Error> {
-        let mut argv = vec!["irtt-cli"];
+        let mut argv = vec!["irtt-client"];
         argv.extend_from_slice(args);
         ClientArgs::try_parse_from(argv)
     }
