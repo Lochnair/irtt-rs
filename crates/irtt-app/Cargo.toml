@@ -1,7 +1,7 @@
 [package]
-name = "irtt-cli"
-version = "0.5.0"
-description = "Command-line IRTT-compatible client and server"
+name = "irtt-rs"
+version = "0.6.0"
+description = "IRTT-compatible client, TUI, and server applications"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -12,6 +12,7 @@ keywords = ["irtt", "networking", "latency", "rtt"]
 categories = ["command-line-utilities", "network-programming"]
 
 [lib]
+name = "irtt_app"
 doc = false
 
 [[bin]]
@@ -19,9 +20,12 @@ name = "irtt-rs"
 path = "src/bin/irtt-rs.rs"
 
 [[bin]]
-name = "irtt-cli"
-path = "src/bin/irtt-cli.rs"
+name = "irtt-client"
+path = "src/bin/irtt-client.rs"
 required-features = ["client"]
+# This applet shares its name with the irtt-client library crate, whose rustdoc
+# output it would otherwise collide with.
+doc = false
 
 [[bin]]
 name = "irtt-tui"

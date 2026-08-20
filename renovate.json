@@ -21,7 +21,7 @@
 
   "labels": ["dependencies"],
 
-  "ignorePaths": [".github/workflows/irtt-cli-release.yml"],
+  "ignorePaths": [".github/workflows/irtt-rs-release.yml"],
 
   "lockFileMaintenance": {
     "enabled": true,

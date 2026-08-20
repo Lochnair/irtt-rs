@@ -55,7 +55,7 @@ impl InterruptibleFakeServer {
 
 #[test]
 fn old_target_option_is_rejected_as_an_unknown_argument() {
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args(["--target", "eu=127.0.0.1:2112"])
         .output()
         .unwrap();
@@ -67,7 +67,7 @@ fn old_target_option_is_rejected_as_an_unknown_argument() {
 
 #[test]
 fn list_columns_succeeds_without_target() {
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .arg("--list-columns")
         .output()
         .unwrap();
@@ -88,7 +88,7 @@ fn single_target_default_table_includes_target_and_accepts_pacing() {
     let server = InTreeServer::start();
     let target = server.addr.to_string();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -125,7 +125,7 @@ fn single_target_default_table_includes_target_and_accepts_pacing() {
 fn single_labeled_target_default_table_includes_target() {
     let server = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -160,7 +160,7 @@ fn single_labeled_target_default_table_includes_target() {
 fn single_labeled_target_default_csv_includes_target_and_event_wall_ns() {
     let server = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -199,7 +199,7 @@ fn single_positional_target_default_csv_includes_target_as_positional_label() {
     let server = InTreeServer::start();
     let target = server.addr.to_string();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -237,7 +237,7 @@ fn multi_target_default_table_includes_both_labels() {
     let a = InTreeServer::start();
     let b = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "40ms",
@@ -287,7 +287,7 @@ fn multi_target_final_summary_preserves_cli_argument_order() {
     let a = InTreeServer::start();
     let m = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "40ms",
@@ -331,7 +331,7 @@ fn mixed_labeled_and_unlabeled_positional_targets_both_appear_in_output() {
     let b = InTreeServer::start();
     let unlabeled_addr = a.addr.to_string();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "40ms",
@@ -376,7 +376,7 @@ fn single_target_custom_target_column_renders_positional_label() {
     let server = InTreeServer::start();
     let target = server.addr.to_string();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -414,7 +414,7 @@ fn single_target_custom_target_column_renders_positional_label() {
 fn custom_columns_remain_authoritative_and_omit_target() {
     let server = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -448,7 +448,7 @@ fn custom_columns_remain_authoritative_and_omit_target() {
 fn columns_default_keyword_includes_target_for_single_target() {
     let server = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -484,7 +484,7 @@ fn columns_default_keyword_includes_target_for_single_target() {
 fn single_labeled_target_default_jsonl_includes_target() {
     let server = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "30ms",
@@ -517,7 +517,7 @@ fn single_labeled_target_default_jsonl_includes_target() {
 #[test]
 fn continuous_single_target_peer_close_exits_nonzero() {
     let server = start_peer_close_server(test_params(None, Duration::from_millis(10)));
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "0s",
@@ -553,7 +553,7 @@ fn continuous_single_target_peer_close_exits_nonzero() {
 fn continuous_single_target_interruption_drains_final_events_and_succeeds() {
     let params = test_params(None, Duration::from_millis(10));
     let server = start_interruptible_echo_server(params);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "0s",
@@ -611,7 +611,7 @@ fn multi_target_csv_emits_rows_for_both_labels() {
     let a = InTreeServer::start();
     let b = InTreeServer::start();
 
-    let output = Command::new(env!("CARGO_BIN_EXE_irtt-cli"))
+    let output = Command::new(env!("CARGO_BIN_EXE_irtt-client"))
         .args([
             "--duration",
             "40ms",
@@ -654,7 +654,7 @@ fn finite_multi_target_peer_close_is_accepted_as_completion() {
     let params = test_params(Some(Duration::from_millis(40)), Duration::from_millis(10));
     let a = start_peer_close_server(params.clone());
     let b = start_peer_close_server(params);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "40ms",
@@ -716,7 +716,7 @@ fn continuous_all_peer_closed_targets_exit_nonzero() {
             .send(())
             .expect("target B stopped waiting for peer-close release");
     });
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "0s",
@@ -766,7 +766,7 @@ fn continuous_partial_peer_close_preserves_queued_rows_and_reports_peer_close() 
     let (healthy_reply_tx, healthy_reply_rx) = mpsc::channel();
     let healthy = start_echo_server_with_first_reply(params.clone(), healthy_reply_tx);
     let peer_closed = start_gated_peer_close_server(params, vec![healthy_reply_rx]);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "0s",
@@ -820,7 +820,7 @@ fn continuous_mixed_peer_close_and_open_failure_exits_nonzero() {
     let failure = start_open_failure_server_with_signal(params.clone(), failure_tx);
     let healthy = start_echo_server_with_first_reply(params.clone(), healthy_reply_tx);
     let peer_closed = start_gated_peer_close_server(params, vec![failure_rx, healthy_reply_rx]);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "0s",
@@ -872,7 +872,7 @@ fn explicit_group_interruption_succeeds_without_peer_close_error() {
     let params = test_params(None, Duration::from_millis(10));
     let a = start_interruptible_echo_server(params.clone());
     let b = start_interruptible_echo_server(params);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "0s",
@@ -932,7 +932,7 @@ fn all_open_failures_exit_nonzero_with_diagnostics() {
     let params = test_params(None, Duration::from_millis(10));
     let a = start_open_failure_server(params.clone());
     let b = start_open_failure_server(params);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-cli"));
+    let mut command = Command::new(env!("CARGO_BIN_EXE_irtt-client"));
     command.args([
         "--duration",
         "0s",

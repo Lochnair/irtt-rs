@@ -13,7 +13,7 @@ upstream executable.
 Build `irtt-rs` and ensure an upstream `irtt` executable is available:
 
 ```sh
-cargo build -p irtt-cli
+cargo build -p irtt-rs --bin irtt-client
 go install github.com/heistp/irtt/cmd/irtt@v0.9.1
 ```
 
@@ -118,13 +118,13 @@ python3 scripts/run_netem_interop_ci.py \
 On Linux:
 
 ```sh
-cargo build -p irtt-cli
+cargo build -p irtt-rs --bin irtt-client
 go install github.com/heistp/irtt/cmd/irtt@v0.9.1
 python3 scripts/run_netem_interop_ci.py \
   --all \
   --skip-build \
   --upstream-irtt "$HOME/go/bin/irtt" \
-  --irtt-rs-command "$PWD/target/debug/irtt-cli"
+  --irtt-rs-command "$PWD/target/debug/irtt-client"
 ```
 
 Run one scenario:

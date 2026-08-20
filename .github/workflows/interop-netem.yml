@@ -46,8 +46,8 @@ jobs:
           go install "github.com/heistp/irtt/cmd/irtt@${IRTT_UPSTREAM_VERSION}"
           "$GOBIN/irtt" version
 
-      - name: Build irtt-rs CLI
-        run: cargo build -p irtt-cli --locked
+      - name: Build irtt-rs client
+        run: cargo build -p irtt-rs --bin irtt-client --locked
 
       - name: Run netem interop comparisons
         run: |
@@ -55,7 +55,7 @@ jobs:
             --all \
             --skip-build \
             --upstream-irtt "$GOBIN/irtt" \
-            --irtt-rs-command "$PWD/target/debug/irtt-cli"
+            --irtt-rs-command "$PWD/target/debug/irtt-client"
 
       - name: Append netem interop summary
         if: always()
