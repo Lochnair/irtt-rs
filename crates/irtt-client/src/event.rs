@@ -351,7 +351,13 @@ pub struct OneWayDelaySample {
     /// Client-to-server delay.
     ///
     /// This is computed from the client send wall time and the server receive
-    /// wall time when both are available.
+    /// wall time when both are available. The client send endpoint is the
+    /// correlated Linux kernel TX timestamp for this send when one is
+    /// available and plausible for this send, and the userspace post-send wall
+    /// time otherwise. The server receive endpoint is the server's kernel
+    /// receive timestamp when one is available and plausible, and its
+    /// userspace receive wall time otherwise. RTT is unaffected and remains a
+    /// userspace monotonic measurement.
     pub client_to_server: Option<SignedDuration>,
     /// Server-to-client delay.
     ///

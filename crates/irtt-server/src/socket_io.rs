@@ -32,11 +32,11 @@
 //! instant, is served normally with no timestamp. Nothing about which datagrams
 //! reach [`ServerCore`](crate::ServerCore) depends on it.
 //!
-//! **Nothing consumes it yet.** It is captured here so a follow-up change can
-//! decide how a kernel-observed arrival time enters the protocol core; today
-//! the core still samples its own receive instant and no protocol timing is
-//! affected. It is a software wall-clock reading only — not a NIC hardware
-//! timestamp, not monotonic, and not a transmit timestamp.
+//! [`ServerCore`](crate::ServerCore) prefers it over its own receive sample
+//! when reporting a request's receive instant, falling back to that sample
+//! when no plausible kernel reading is available; see
+//! `preferred_receive_wall_ns`. It is a software wall-clock reading only —
+//! not a NIC hardware timestamp, not monotonic, and not a transmit timestamp.
 
 use std::{io, net::SocketAddr, time::SystemTime};
 
