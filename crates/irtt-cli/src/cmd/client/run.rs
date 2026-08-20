@@ -176,15 +176,18 @@ pub fn run_stream(
     stream_output.print_final_summary = should_print_final_summary(continuous, interrupted);
     stream_output.show_running_only_summary_note =
         continuous && interrupted && stream_output.print_final_summary;
-    for (label, stats) in &stats {
+    for target in &setup.targets {
+        let target_stats = stats.get(&target.label).expect(
+            "every prepared target must have a stats collector inserted before the run begins",
+        );
         if multi_target
             && stream_output.print_final_summary
             && stream_output.config.prints_summary()
         {
             writeln!(stream_output.out)?;
-            writeln!(stream_output.out, "target: {label}")?;
+            writeln!(stream_output.out, "target: {}", target.label)?;
         }
-        stream_output.print_summary(stats)?;
+        stream_output.print_summary(target_stats)?;
     }
     stream_output.out.flush()?;
     if let Some(error) = terminal_error {
