@@ -72,6 +72,39 @@ irtt-client netperf-eu.bufferbloat.net:2112 --duration 0
 
 Use `Ctrl-C` to stop gracefully.
 
+### Continuous-mode memory
+
+`--duration 0` uses continuous statistics. Its retained application state does
+not grow without bound with elapsed run time or the number of probes: timing
+metrics keep running count/min/max/mean/variance values, not a complete
+timing-sample history. Consequently, exact medians are unavailable. The
+default continuous statistics configuration also enables no rolling
+event/history window; it keeps bounded adjacent-sequence IPDV state (4,096
+sequences) so nearby replies can still form IPDV pairs.
+
+Reply classification is bounded per target session. By default, each of the
+pending, timed-out, and completed/duplicate sequence stores has its own
+4,096-entry limit; this is not one shared 4,096-probe total. A full pending
+store makes the managed CLI/TUI fail and drain that target as resource
+exhausted; it does not wait for capacity to free. Timed-out and completed state
+evict their oldest entries, so a sufficiently old late reply can still be seen
+and counted but no longer has retained send state for measurements such as RTT
+or applicable one-way delay.
+
+The retained state scales with the number of configured targets and these
+fixed per-target limits, rather than total probes. CLI output is written as
+events arrive rather than accumulated. Its managed presentation stream is
+bounded and lossy (the applets configure 16,384 events), so a slow consumer can
+miss events and the CLI/TUI reports that resulting output/statistics may be
+incomplete. The TUI additionally keeps up to 100,000 graph samples per target
+and 80 recent messages. These are retained-application-state bounds, not a
+claim of a fixed process RSS ceiling: allocator behavior, output consumers,
+and operating-system resources remain outside them.
+
+For finite runs, the tradeoff is different: exact timing samples (and
+adjacent-sequence IPDV state) are retained to calculate exact medians, so
+statistics memory grows with probe count.
+
 ## Multiple targets
 
 Probe several targets concurrently:
