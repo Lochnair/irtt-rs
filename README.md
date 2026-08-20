@@ -1,26 +1,75 @@
 # irtt-rs
 
-`irtt-rs` is a Rust implementation of an IRTT-compatible client and server.
+`irtt-rs` is a Rust implementation of an IRTT-compatible client and server:
+finite or continuous UDP latency probing, plus the server side those probes
+run against.
 
-It provides command-line applets and reusable Rust libraries for finite or continuous latency probing, plus the server side those probes can run against. It is intended for interactive diagnostics, scripting, monitoring, and integration into applications such as network autorate controllers.
-
-This is not the upstream IRTT project. For the original implementation, protocol background, and broader documentation, see [heistp/irtt](https://github.com/heistp/irtt).
+This is not the upstream IRTT project. For the original implementation,
+protocol background, and broader documentation, see
+[heistp/irtt](https://github.com/heistp/irtt). The installed dispatcher is
+named `irtt-rs` rather than `irtt` to avoid conflicting with or being
+mistaken for it.
 
 ## Features
 
 * Finite and continuous probe sessions
-* Concurrent probing of multiple targets
-* Reusable client library with a structured event stream
-* Human-readable table output
-* CSV, TSV, and JSON Lines output for scripts and monitoring systems
-* Selectable output columns
-* Automatic final summaries for eligible table-output runs
+* Concurrent probing of multiple targets, with staggered or burst pacing
+* Reusable client library with a structured event stream (blocking, Tokio,
+  or managed)
+* Human-readable table output, plus CSV, TSV, and JSON Lines for scripts and
+  monitoring systems, with selectable output columns
 * Optional terminal UI
 * Reusable Tokio-native server library
-* UDP server applet with explicit bind and session policy options
+* UDP server applet with sensible zero-argument defaults and explicit bind
+  and session-policy options
 * Router-friendly multi-applet binary layout
 
-The installed dispatcher is named `irtt-rs` rather than `irtt` to avoid conflicting with or being mistaken for upstream IRTT.
+## Comparison with upstream IRTT
+
+`irtt-rs` is an independent, compatible reimplementation, not a successor or
+replacement for upstream IRTT — [heistp/irtt](https://github.com/heistp/irtt)
+remains the original implementation. Interoperability is a project goal; see
+[`docs/INTEROP_COMPARISON.md`](docs/INTEROP_COMPARISON.md) and
+[`docs/protocol/`](docs/protocol/) for the black-box interoperability
+methodology and protocol baseline this project verifies against. Choose
+between them based on the capabilities and deployment model you need.
+
+The table below was checked against upstream release
+[v0.9.2](https://github.com/heistp/irtt/releases/tag/v0.9.2) (2026-07-17).
+This project's own interop testing and protocol baseline are currently
+pinned to the prior release, v0.9.1; the wire protocol version number is
+unchanged between the two, but v0.9.2 has not itself been exercised against
+this project's interop harness.
+
+| Capability | irtt-rs | upstream IRTT (v0.9.2) |
+| --- | --- | --- |
+| Wire protocol | Protocol version 1, verified against upstream v0.9.1 | Protocol version 1 (unchanged in v0.9.2) |
+| Finite probing | Supported, default 10s | Supported, default 1m |
+| Continuous/indefinite operation | Supported (`--duration 0`); still computes running statistics (see below) | Supported via streaming mode (`-s`, added in v0.9.2); computes no statistics at all in that mode |
+| Statistics in continuous mode | Running count/min/max/mean/variance per target; exact medians unavailable; bounded IPDV tracking | None in streaming mode — raw/event output only, by design, to avoid unbounded memory |
+| Multi-target probing (one invocation) | Supported, with labels and staggered/burst pacing | Not supported — one remote address per invocation |
+| Terminal UI | `irtt-tui`, a live graph/dashboard applet | Not present |
+| Output formats | table, csv, tsv, jsonl, with selectable columns | Text summary, JSON (optionally gzip to file), and a fixed-field raw mode; no CSV/TSV and no column selection |
+| Client/server library API | Separate, independently versioned Rust crates (`irtt-client`, `irtt-server`) | One combined Go package exposing both roles |
+| Server: multiple listeners | `ServerSet` supervises several listeners in one process | `ListenAndServe` also serves multiple requested addresses |
+| Server: wildcard reply-source | Default behavior on Linux/macOS/FreeBSD; refused elsewhere rather than served incorrectly | Opt-in via `--set-src-ip`, with a documented per-packet allocation cost |
+| Server: zero-argument bind | Binds the wildcard address on both families by default, gated by the platform check above | Binds the wildcard address on both families by default; no documented platform gate |
+| Prebuilt release binaries | Published for six target triples | None published; install via `go install` or manual build |
+
+Upstream has capabilities this project does not implement: a `report`
+subcommand for replaying saved JSON results, benchmarking and
+timer/clock-diagnostic subcommands, client-side payload fill and
+don't-fragment/wait-strategy/timer-algorithm controls, an operator-configurable
+server-side fill policy (this project's server always honors a session's
+negotiated fill request, with a fixed fallback pattern, but has no equivalent
+to upstream's flags for restricting or overriding it), syslog logging, and
+bundled systemd/OpenRC service files.
+
+This project has capabilities upstream does not implement: multi-target
+probing with labels, the terminal UI, CSV/TSV output with selectable
+columns, a quantified and actively-warned memory-retention model for
+long-running client sessions, and best-effort Linux kernel-timestamp
+preference for its own send/receive endpoint.
 
 ## Installation
 
@@ -32,15 +81,10 @@ Install the latest release from crates.io:
 cargo install irtt-rs --locked
 ```
 
-This installs:
-
-* `irtt-rs`, the canonical multi-applet dispatcher
-* `irtt-client`, the stream and text client
-* `irtt-tui`, the terminal UI
-* `irtt-server`, the UDP server
-
-Each applet can also be built in isolation with `--no-default-features` plus
-the applet's own feature. For example, a lightweight client-only install:
+This installs the `irtt-rs` dispatcher plus dedicated `irtt-client`,
+`irtt-tui`, and `irtt-server` binaries. Each applet can also be built in
+isolation with `--no-default-features` plus the applet's own feature, for
+example a lightweight client-only install:
 
 ```sh
 cargo install irtt-rs --locked --no-default-features --features client
@@ -56,356 +100,80 @@ cargo install --path crates/irtt-app --locked
 
 ## Quick start
 
-Probe a server using the default settings:
+Probe a server:
 
 ```sh
-irtt-client netperf-eu.bufferbloat.net:2112
+irtt-client netperf-eu.bufferbloat.net:2112 --duration 30s --interval 100ms
 ```
 
-Set the test duration and probe interval:
-
-```sh
-irtt-client netperf-eu.bufferbloat.net:2112 \
-    --duration 30s \
-    --interval 100ms
-```
-
-Run continuously until interrupted:
+Probe continuously until interrupted (`Ctrl-C`):
 
 ```sh
 irtt-client netperf-eu.bufferbloat.net:2112 --duration 0
 ```
 
-Use `Ctrl-C` to stop gracefully.
-
-### Continuous-mode memory
-
-`--duration 0` uses continuous statistics. Its retained application state does
-not grow without bound with elapsed run time or the number of probes: timing
-metrics keep running count/min/max/mean/variance values, not a complete
-timing-sample history. Consequently, exact medians are unavailable. The
-default continuous statistics configuration also enables no rolling
-event/history window; it keeps bounded adjacent-sequence IPDV state (4,096
-sequences) so nearby replies can still form IPDV pairs.
-
-Reply classification is bounded per target session. By default, each of the
-pending, timed-out, and completed/duplicate sequence stores has its own
-4,096-entry limit; this is not one shared 4,096-probe total. A full pending
-store makes the managed CLI/TUI fail and drain that target as resource
-exhausted; it does not wait for capacity to free. Timed-out and completed state
-evict their oldest entries, so a sufficiently old late reply can still be seen
-and counted but no longer has retained send state for measurements such as RTT
-or applicable one-way delay.
-
-The retained state scales with the number of configured targets and these
-fixed per-target limits, rather than total probes. CLI output is written as
-events arrive rather than accumulated. Its managed presentation stream is
-bounded and lossy (the applets configure 16,384 events), so a slow consumer can
-miss events and the CLI/TUI reports that resulting output/statistics may be
-incomplete. The TUI additionally keeps up to 100,000 graph samples per target
-and 80 recent messages. These are retained-application-state bounds, not a
-claim of a fixed process RSS ceiling: allocator behavior, output consumers,
-and operating-system resources remain outside them.
-
-For finite runs, the tradeoff is different: exact timing samples (and
-adjacent-sequence IPDV state) are retained to calculate exact medians, so
-statistics memory grows with probe count.
-
-## Multiple targets
-
-Probe several targets concurrently:
+Watch the same session live in the terminal UI:
 
 ```sh
-irtt-client host-a:2112 host-b:2112
+irtt-tui netperf-eu.bufferbloat.net:2112
 ```
 
-Every target argument accepts `[LABEL=]TARGET`. An optional `LABEL=` prefix assigns the logical
-target name used in output and the TUI; without it, the target string itself is used. Assign
-stable labels to targets:
+Run a server with sensible defaults — no `--bind` needed:
 
 ```sh
-irtt-client ams=ams.example.com:2112 sg=sg.example.com:2112
+irtt-server
 ```
 
-Labeled and unlabeled targets can be freely mixed in one argument list:
+## Documentation
 
-```sh
-irtt-client host-a:2112 ams=ams.example.com:2112
-```
+* [`docs/irtt-client.md`](docs/irtt-client.md) — target syntax, output
+  formats and columns, measurement field definitions, finite/continuous
+  memory behavior, kernel timestamps.
+* [`docs/irtt-tui.md`](docs/irtt-tui.md) — controls, continuous default,
+  retained history.
+* [`docs/irtt-server.md`](docs/irtt-server.md) — bind defaults and
+  overrides, wildcard listener behavior, session policy, HMAC.
+* [`docs/irtt-rs.md`](docs/irtt-rs.md) — the multicall dispatcher, applet
+  binary names, feature-gated builds.
+* [docs.rs](https://docs.rs) for the library crates below.
+* [`docs/protocol/`](docs/protocol/) and
+  [`docs/INTEROP_COMPARISON.md`](docs/INTEROP_COMPARISON.md) for the wire
+  protocol specification and interoperability validation against upstream
+  `irtt`.
 
-Multi-target sessions use staggered pacing by default. To send each target's probes together:
+Every applet also documents its full option list with `--help`.
 
-```sh
-irtt-client host-a:2112 host-b:2112 --pacing burst
-```
+## Crates
 
-Target labels are included in the default multi-target output. Final per-target summaries are printed in the order targets were supplied on the command line, not the order in which they finish or their labels sort alphabetically.
+| Crate | crates.io | What it is |
+| --- | --- | --- |
+| [`irtt-rs`](crates/irtt-app) | [crates.io](https://crates.io/crates/irtt-rs) | Application package: the `irtt-rs`, `irtt-client`, `irtt-tui`, and `irtt-server` binaries |
+| [`irtt-client`](crates/irtt-client) | [crates.io](https://crates.io/crates/irtt-client) | Reusable client/session library ([docs.rs](https://docs.rs/irtt-client)) |
+| [`irtt-server`](crates/irtt-server) | [crates.io](https://crates.io/crates/irtt-server) | Reusable Tokio-native server library ([docs.rs](https://docs.rs/irtt-server)) |
+| [`irtt-stats`](crates/irtt-stats) | [crates.io](https://crates.io/crates/irtt-stats) | Statistics aggregation over `irtt-client` events ([docs.rs](https://docs.rs/irtt-stats)) |
+| [`irtt-proto`](crates/irtt-proto) | [crates.io](https://crates.io/crates/irtt-proto) | Low-level wire protocol encode/decode ([docs.rs](https://docs.rs/irtt-proto)) |
 
-## Output formats
-
-The CLI supports four event-row formats:
-
-* `table`: human-readable terminal output
-* `csv`: comma-separated output
-* `tsv`: tab-separated output
-* `jsonl`: one JSON object per event
-
-Examples:
-
-```sh
-irtt-client <server> --format table
-irtt-client <server> --format jsonl
-irtt-client <server> --format csv \
-    --columns event,seq,remote,effective_rtt_us
-```
-
-For a stream containing only effective RTT values in microseconds:
-
-```sh
-irtt-client <server> \
-    --format tsv \
-    --columns effective_rtt_us \
-    --header never
-```
-
-List all available columns with:
-
-```sh
-irtt-client --list-columns
-```
-
-Useful measurement fields include:
-
-* `raw_rtt_us`: client-observed send-to-receive RTT
-* `adjusted_rtt_us`: RTT adjusted for server processing when available
-* `effective_rtt_us`: adjusted RTT when available, otherwise raw RTT
-* `sd_us` and `rd_us`: send and receive one-way delay estimates
-* `ipdv_us`: inter-packet delay variation
-* `server_processing_us`: time spent processing the packet at the server
-
-Adjusted RTT can be negative when server processing exceeds the measured raw RTT. One-way delay estimates can be negative because of clock skew between the client and server.
-
-On Linux, `sd_us` and `rd_us` (and the underlying one-way delay samples) prefer a kernel-captured timestamp over userspace timing for this client's own send/receive endpoint where the platform and socket support it, reducing the effect of scheduling and queuing delay on these measurements. The peer's reported endpoint gets the same preference when it is the `irtt-server` applet running on Linux; against another IRTT-compatible server, whatever wall-clock value it reports is used as-is. This is a best-effort fallback: unsupported or implausible kernel timestamps fall back to userspace timing. `raw_rtt_us` always uses userspace timing and is unaffected; `adjusted_rtt_us`/`effective_rtt_us` can still shift slightly, since server processing time is derived from the same server receive endpoint.
-
-Default table output prints a final summary after completed finite runs and interrupted continuous runs when the run policy permits it. CSV, TSV, and JSON Lines output do not print this summary.
-
-A peer closing a finite CLI or TUI run is accepted as a terminal outcome. In
-continuous mode, peer closure exits nonzero unless the user requested
-interruption, allowing a supervisor to restart the client.
-
-## Terminal UI
-
-When built with the `tui` feature, `irtt-tui` provides a live cumulative dashboard:
-
-```sh
-irtt-tui <server>
-```
-
-It runs continuously by default. A finite duration can be selected explicitly:
-
-```sh
-irtt-tui <server> --duration 30s
-```
-
-Multiple targets and pacing options work the same way as in `irtt-client`:
-
-```sh
-irtt-tui host-a:2112 host-b:2112 --pacing burst
-```
-
-Quit with `q` or `Ctrl-C`.
-
-## Server
-
-The server applet requires at least one explicit bind address:
-
-```sh
-irtt-server --bind 127.0.0.1:2112
-```
-
-The same applet is reachable through the dispatcher:
-
-```sh
-irtt-rs server --bind 192.0.2.10:2112
-```
-
-Repeat `--bind` to serve several addresses from one process, in the order given:
-
-```sh
-irtt-server \
-    --bind 0.0.0.0:2112 \
-    --bind [::]:2112
-```
-
-Every invocation runs through the same multi-listener path, so one address is an
-ordinary set of one rather than a separate mode. The policy options below are
-applied to every listener, but the listeners are otherwise independent: each has
-its own sessions and tokens, so a session belongs to the address it was opened
-on and `--max-sessions` bounds each listener rather than the process. Binding is
-all or nothing — if any address cannot be bound, none are served — and a port of
-`0` selects an unused port per listener. If a listener fails while running, the
-others are shut down with it rather than leaving a service configured for two
-families answering on one.
-
-An explicit interface address works on every supported system. A wildcard bind
-such as `--bind 0.0.0.0:2112` reads each request's local destination from packet
-metadata and sends that request's reply from the same address, so a client on a
-multi-homed host is answered from the endpoint it contacted. That is implemented
-on Linux, macOS and FreeBSD; elsewhere a wildcard bind is refused rather than
-served from a routing-table source address a client would discard. Wildcard
-IPv4 and IPv6 listeners may share one port, as above.
-
-Each bound endpoint is printed on startup once every listener is up, which also
-resolves a port of `0`. `Ctrl-C` stops the server gracefully.
-
-Session policy is set with options that map directly onto the server library's
-configuration; anything left unset keeps the library default:
-
-```sh
-irtt-server \
-    --bind 192.0.2.10:2112 \
-    --max-sessions 512 \
-    --idle-timeout 30s
-```
-
-Two optional controls restrict what the server will provide a session, and both
-are off unless asked for:
-
-```sh
-irtt-server \
-    --bind 192.0.2.10:2112 \
-    --timestamp-allowance single \
-    --no-dscp
-```
-
-`--timestamp-allowance` takes `dual` (the default, honoring every requested
-placement), `single`, which provides at most one timestamp instant and answers a
-request for both receive and send timestamps with the midpoint, or `none`, which
-provides no timestamps. The requested clock source is never changed, so a single
-instant is still reported once per requested clock. `--no-dscp` negotiates any
-requested DSCP to zero, so clients are told their echo replies will be unmarked,
-and they are sent unmarked.
-
-To require authentication, pass the shared key both sides use:
-
-```sh
-irtt-server --bind 192.0.2.10:2112 --hmac secret
-```
-
-For the full option list:
-
-```sh
-irtt-server --help
-```
-
-## Library usage
-
-`irtt-client` exposes the client session and event layer independently of CLI formatting and statistics.
-
-Add it from crates.io:
-
-```toml
-[dependencies]
-irtt-client = { version = "0.5", features = ["tokio"] }
-```
-
-For development against an unpublished change, use a path dependency instead:
-
-```toml
-[dependencies]
-irtt-client = { path = "crates/irtt-client", features = ["tokio"] }
-```
-
-Minimal managed-client example for a synchronous frontend:
-
-```rust
-use std::time::Duration;
-
-use irtt_client::managed::{
-    BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy,
-    ManagedTargetConfig, TargetId,
-};
-use irtt_client::ClientConfig;
-
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ManagedClientConfig {
-        client: ClientConfig {
-            duration: Some(Duration::from_secs(10)),
-            interval: Duration::from_secs(1),
-            ..ClientConfig::default()
-        },
-        completion: ManagedCompletionPolicy::FinishWhenQuiescent,
-        ..ManagedClientConfig::default()
-    };
-    let targets = vec![ManagedTargetConfig::new(
-        TargetId::from("edge"),
-        "netperf-eu.bufferbloat.net:2112",
-    )];
-    let owner = BlockingManagedClient::start(config, targets)?;
-    let outcome = owner.join()?;
-    println!("session ended: {:?}", outcome.end_reason);
-
-    Ok(())
-}
-```
-
-For presentation events, use `BlockingManagedClient::start_with_subscription`,
-`ManagedEvent`, and `ManagedEventTryRecvError`, while consulting the durable
-`handle.status()` and final outcome for authoritative state. Presentation
-events are bounded and lossy, not reliable history. Dynamic desired-target
-updates are available through `ManagedClientHandle::update_targets`.
-
-`BlockingManagedClient` owns a dedicated Tokio runtime and thread for
-synchronous callers. Callers that already own Tokio can drive
-`ManagedClientTask` directly.
+Each library crate has its own crates.io README describing what it's for and
+when to use it instead of `irtt-client`/`irtt-server` directly.
 
 ## Binaries and features
 
-| Build                                       | Binaries                                            |
-| -------------------------------------------- | --------------------------------------------------- |
-| `--no-default-features`                     | `irtt-rs`                                           |
-| `--no-default-features --features client`   | `irtt-rs`, `irtt-client`                            |
-| `--no-default-features --features server`   | `irtt-rs`, `irtt-server`                            |
-| `--no-default-features --features tui`      | `irtt-rs`, `irtt-tui`                               |
-| Default features (or `--all-features`)      | `irtt-rs`, `irtt-client`, `irtt-tui`, `irtt-server`  |
-
-`irtt-client` requires the `client` feature, `irtt-server` the `server` feature,
-and `irtt-tui` the `tui` feature. The `irtt-rs` dispatcher is always built, and
-reports which applets the build actually contains.
-
-For available command-line options:
-
-```sh
-irtt-client --help
-irtt-server --help
-irtt-tui --help
-```
+| Build | Binaries |
+| --- | --- |
+| `--no-default-features` | `irtt-rs` |
+| `--no-default-features --features client` | `irtt-rs`, `irtt-client` |
+| `--no-default-features --features server` | `irtt-rs`, `irtt-server` |
+| `--no-default-features --features tui` | `irtt-rs`, `irtt-tui` |
+| Default features (or `--all-features`) | `irtt-rs`, `irtt-client`, `irtt-tui`, `irtt-server` |
 
 ## Development
 
-Common verification commands:
-
 ```sh
-cargo fmt --check
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo build -p irtt-rs --all-features --release
+cargo fmt --all -- --check
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
-## Project status
-
-The client, event stream, machine-readable output, multi-target execution, local statistics, and optional TUI are implemented.
-
-The server library and the server applet are implemented: open negotiation,
-session state, echo processing, per-session rate limiting, idle expiry, the
-maximum-duration close, HMAC authentication, the negotiated per-session reply
-traffic class, which is applied on sockets that support it, server fill,
-wildcard reply-source selection on Linux, macOS and FreeBSD, the optional
-timestamp and DSCP restriction controls, and serving several listeners from one
-process with independent sessions per listener.
-
-Server replies fill their payload with the negotiated ServerFill mode: `none`,
-which is zero-filled, `rand`, or `pattern:` with a repeating hexadecimal
-pattern. Every valid descriptor is honored; a descriptor the server cannot
-parse, and a client that expresses no fill preference at all, get the default
-`pattern:69727474`.
+See [`AGENTS.md`](AGENTS.md) for architecture, testing policy, and the
+clean-room provenance boundary this project maintains against upstream
+`irtt`.
