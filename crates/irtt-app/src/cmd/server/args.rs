@@ -1,7 +1,13 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    time::Duration,
+};
 
 use clap::{Parser, ValueEnum};
 use irtt_server::{ServerConfig, TimestampAllowance};
+
+/// The ordinary IRTT port, used to build the zero-argument default binds.
+const DEFAULT_PORT: u16 = 2112;
 
 // Every policy option is optional. An omitted option leaves the corresponding
 // `ServerConfig` default in place rather than restating it here, so library and
@@ -10,15 +16,14 @@ use irtt_server::{ServerConfig, TimestampAllowance};
 #[command(
     name = "irtt-server",
     about = "Minimal IRTT-compatible UDP server",
-    after_help = "Policy options left unset keep the irtt-server library defaults.\nRepeat --bind to serve multiple addresses in one process. All listeners use the same policy but keep independent session namespaces."
+    after_help = "With no --bind, the server listens on the wildcard IRTT port for both address families ([::]:2112 and 0.0.0.0:2112) where the platform supports wildcard reply-source selection.\nRepeat --bind to serve multiple addresses in one process; any explicit --bind replaces the default pair entirely. All listeners use the same policy but keep independent session namespaces."
 )]
 pub struct ServerArgs {
     /// Local UDP address to bind, as ADDR:PORT. Repeatable.
     #[arg(
         long,
-        required = true,
         value_name = "ADDR",
-        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nRepeat the option to serve several addresses from one process, in the order given. Every listener applies the same policy options, but each keeps its own sessions and tokens, so a session belongs to the address it was opened on. Binding is all or nothing: if any address cannot be bound, none are served.\n\nA wildcard bind such as 0.0.0.0:2112 answers each request from the address it was sent to, using per-packet destination metadata. That is supported on Linux, macOS and FreeBSD; on other systems a wildcard bind is refused and an explicit interface address is required.\n\nA port of 0 selects an unused port per listener, so two such binds get two different ports."
+        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nRepeat the option to serve several addresses from one process, in the order given. Every listener applies the same policy options, but each keeps its own sessions and tokens, so a session belongs to the address it was opened on. Binding is all or nothing: if any address cannot be bound, none are served.\n\nWith no --bind at all, the server binds the wildcard IRTT port on both address families, [::]:2112 then 0.0.0.0:2112, on platforms with wildcard reply-source support; elsewhere it fails and asks for an explicit address instead of guessing one. Any explicit --bind replaces that default pair rather than adding to it.\n\nA wildcard bind such as 0.0.0.0:2112 answers each request from the address it was sent to, using per-packet destination metadata. That is supported on Linux, macOS and FreeBSD; on other systems a wildcard bind is refused and an explicit interface address is required.\n\nA port of 0 selects an unused port per listener, so two such binds get two different ports."
     )]
     pub bind: Vec<SocketAddr>,
 
@@ -47,12 +52,12 @@ pub struct ServerArgs {
     )]
     pub max_packet_length: Option<usize>,
 
-    /// Floor on the negotiated send interval, and the allowance refill cadence.
+    /// Floor on the negotiated send interval.
     #[arg(
         long,
         value_name = "DURATION",
         value_parser = parse_duration_allow_zero,
-        long_help = "Floor on the send interval a session may negotiate, and the cadence its reply allowance refills at. The negotiated interval is still capped at a quarter of the idle timeout afterwards. Use 0 for no time-based throttling."
+        long_help = "Floor on the send interval a session may negotiate. The negotiated interval is still capped at a quarter of the idle timeout afterwards, so a value above that cap is not what actually gets negotiated.\n\nA session's reply allowance refills at the shorter of this floor and the interval it actually negotiated. Ordinarily that is this floor itself; it is the shorter, negotiated value only where the idle-timeout cap above pulled the negotiated interval below it. Use 0 for no time-based throttling."
     )]
     pub min_interval: Option<Duration>,
 
@@ -124,6 +129,20 @@ impl From<TimestampAllowanceArg> for TimestampAllowance {
 }
 
 impl ServerArgs {
+    /// The addresses this invocation binds: the requested `--bind` list, or
+    /// the wildcard IRTT port on both address families if none was given.
+    #[must_use]
+    pub fn resolve_binds(&self) -> Vec<SocketAddr> {
+        if self.bind.is_empty() {
+            vec![
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, DEFAULT_PORT)),
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, DEFAULT_PORT)),
+            ]
+        } else {
+            self.bind.clone()
+        }
+    }
+
     /// Builds the server configuration this invocation asks for.
     #[must_use]
     pub fn server_config(&self) -> ServerConfig {
@@ -236,12 +255,7 @@ mod tests {
     }
 
     #[test]
-    fn bind_is_required_and_parses_both_families() {
-        assert!(
-            parse(&[]).is_err(),
-            "a server with no address serves nothing"
-        );
-
+    fn bind_is_optional_and_parses_both_families() {
         let ipv4 = parse(&["--bind", "127.0.0.1:2112"]).unwrap();
         assert_eq!(ipv4.bind, [SocketAddr::from((Ipv4Addr::LOCALHOST, 2112))]);
 
@@ -253,6 +267,39 @@ mod tests {
         // Still one address per option: comma-separated syntax is not a thing
         // here, and accepting it silently would be worse than rejecting it.
         assert!(parse(&["--bind", "127.0.0.1:2112,[::1]:2112"]).is_err());
+    }
+
+    #[test]
+    fn no_explicit_bind_resolves_to_the_wildcard_default_pair() {
+        let args = parse(&[]).unwrap();
+        assert!(
+            args.bind.is_empty(),
+            "the empty list is the parsed representation of \"no explicit bind\""
+        );
+        assert_eq!(
+            args.resolve_binds(),
+            [
+                SocketAddr::from((Ipv6Addr::UNSPECIFIED, 2112)),
+                SocketAddr::from((Ipv4Addr::UNSPECIFIED, 2112)),
+            ],
+            "zero explicit binds means the ordinary port on both wildcard families, IPv6 first"
+        );
+    }
+
+    #[test]
+    fn an_explicit_bind_replaces_the_defaults_rather_than_augmenting_them() {
+        let args = parse(&["--bind", "127.0.0.1:2112"]).unwrap();
+        assert_eq!(
+            args.resolve_binds(),
+            [SocketAddr::from((Ipv4Addr::LOCALHOST, 2112))],
+            "one explicit bind means exactly that one listener, not that listener plus defaults"
+        );
+    }
+
+    #[test]
+    fn repeated_explicit_binds_are_unaffected_by_the_default_resolution() {
+        let args = parse(&["--bind", "127.0.0.1:2112", "--bind", "[::1]:2112"]).unwrap();
+        assert_eq!(args.resolve_binds(), args.bind);
     }
 
     #[test]

@@ -218,6 +218,40 @@ impl ServerSet {
     }
 }
 
+/// Whether `addr`'s address family has any local support on this host at
+/// all, independent of whether this particular address or port can be
+/// bound.
+///
+/// A [`ServerSetError::ListenerSetup`] failure can mean many different
+/// things — the port is already in use, permission is denied, this target
+/// has no safe wildcard reply-source path (see [`ServerRuntimeError`]) — and
+/// only one of them, the address family itself having no local support at
+/// all (for example IPv6 disabled on the host), is safe for a caller to work
+/// around by silently trying a different address instead. This checks only
+/// that, by actually binding the wildcard address of `addr`'s family on an
+/// ephemeral port: a bare socket of an unsupported family can still
+/// construct successfully on some systems (Linux administratively disables
+/// IPv6 per-interface, so `AF_INET6` sockets keep working while every bind
+/// fails with `EADDRNOTAVAIL`), so construction alone is not a reliable
+/// signal — only a real bind attempt is.
+#[must_use]
+pub fn address_family_available(addr: SocketAddr) -> bool {
+    let wildcard = if addr.is_ipv6() {
+        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))
+    };
+    let domain = if addr.is_ipv6() {
+        Domain::IPV6
+    } else {
+        Domain::IPV4
+    };
+    let Ok(socket) = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP)) else {
+        return false;
+    };
+    socket.bind(&SockAddr::from(wildcard)).is_ok()
+}
+
 /// Binds one listener, pre-configuring the socket where the bind itself depends
 /// on it.
 ///
