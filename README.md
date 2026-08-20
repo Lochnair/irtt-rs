@@ -26,12 +26,10 @@ The installed dispatcher is named `irtt-rs` rather than `irtt` to avoid conflict
 
 The build requires Rust 1.88 or newer.
 
-From a local checkout:
+Install the latest release from crates.io:
 
 ```sh
-git clone https://github.com/Lochnair/irtt-rs.git
-cd irtt-rs
-cargo install --path crates/irtt-app
+cargo install irtt-rs --locked
 ```
 
 This installs:
@@ -45,7 +43,15 @@ Each applet can also be built in isolation with `--no-default-features` plus
 the applet's own feature. For example, a lightweight client-only install:
 
 ```sh
-cargo install --path crates/irtt-app --no-default-features --features client
+cargo install irtt-rs --locked --no-default-features --features client
+```
+
+For development, or to install directly from a checkout:
+
+```sh
+git clone https://github.com/Lochnair/irtt-rs.git
+cd irtt-rs
+cargo install --path crates/irtt-app --locked
 ```
 
 ## Quick start
@@ -294,7 +300,14 @@ irtt-server --help
 
 `irtt-client` exposes the client session and event layer independently of CLI formatting and statistics.
 
-Add it from a local checkout:
+Add it from crates.io:
+
+```toml
+[dependencies]
+irtt-client = { version = "0.5", features = ["tokio"] }
+```
+
+For development against an unpublished change, use a path dependency instead:
 
 ```toml
 [dependencies]
