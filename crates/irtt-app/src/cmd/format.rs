@@ -12,6 +12,7 @@
 
 use std::time::Duration;
 
+#[cfg(feature = "client")]
 use irtt_client::SignedDuration;
 
 /// Rendering used wherever a scalar is unavailable.
@@ -61,6 +62,7 @@ pub(crate) fn format_optional_ns_i128(value: Option<i128>) -> String {
 }
 
 /// Format an optional nanosecond scalar, rendering `None` as [`ABSENT`].
+#[cfg(feature = "client")]
 pub(crate) fn format_optional_ns_f64(value: Option<f64>) -> String {
     value.map(format_ns_f64).unwrap_or_else(absent)
 }
@@ -71,6 +73,7 @@ pub(crate) fn format_duration(value: Duration) -> String {
 }
 
 /// Format a signed duration as a nanosecond scalar, preserving its sign.
+#[cfg(feature = "client")]
 pub(crate) fn format_signed_duration(value: SignedDuration) -> String {
     format_ns_i128(value.as_nanos())
 }
@@ -88,6 +91,7 @@ pub(crate) fn format_percent(value: f64) -> String {
 /// Format `value` as a percentage of `total`, capped at 100%.
 ///
 /// A zero total has no percentage to report and renders as [`ABSENT`].
+#[cfg(feature = "tui")]
 pub(crate) fn format_percent_ratio(value: u64, total: u64) -> String {
     if total == 0 {
         ABSENT.to_owned()
@@ -97,11 +101,13 @@ pub(crate) fn format_percent_ratio(value: u64, total: u64) -> String {
 }
 
 /// Format a scalar count.
+#[cfg(feature = "tui")]
 pub(crate) fn format_count(value: u64) -> String {
     value.to_string()
 }
 
 /// Format an optional scalar count, rendering `None` as [`ABSENT`].
+#[cfg(feature = "tui")]
 pub(crate) fn format_optional_count(value: Option<u64>) -> String {
     value.map(format_count).unwrap_or_else(absent)
 }
@@ -152,6 +158,11 @@ mod tests {
     fn durations_render_as_nanosecond_scalars() {
         assert_eq!(format_duration(Duration::from_millis(25)), "25.0ms");
         assert_eq!(format_duration(Duration::from_secs(1)), "1.000s");
+    }
+
+    #[test]
+    #[cfg(feature = "client")]
+    fn signed_durations_render_as_nanosecond_scalars() {
         assert_eq!(
             format_signed_duration(SignedDuration::from_nanos(-1_500)),
             "-1.5µs"
@@ -161,18 +172,33 @@ mod tests {
     #[test]
     fn absent_and_non_finite_scalars_render_as_a_placeholder() {
         assert_eq!(format_optional_ns_i128(None), ABSENT);
-        assert_eq!(format_optional_ns_f64(None), ABSENT);
-        assert_eq!(format_optional_count(None), ABSENT);
         assert_eq!(format_ns_f64(f64::NAN), ABSENT);
         assert_eq!(format_ns_f64(f64::INFINITY), ABSENT);
         assert_eq!(format_percent(f64::NAN), ABSENT);
+    }
+
+    #[test]
+    #[cfg(feature = "client")]
+    fn absent_optional_ns_f64_renders_as_a_placeholder() {
+        assert_eq!(format_optional_ns_f64(None), ABSENT);
+    }
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn absent_counts_and_ratios_render_as_a_placeholder() {
+        assert_eq!(format_optional_count(None), ABSENT);
         assert_eq!(format_percent_ratio(1, 0), ABSENT);
     }
 
     #[test]
-    fn percentages_and_counts_have_one_spelling() {
+    fn percentages_have_one_spelling() {
         assert_eq!(format_percent(0.0), "0.00%");
         assert_eq!(format_percent(12.345), "12.35%");
+    }
+
+    #[test]
+    #[cfg(feature = "tui")]
+    fn percent_ratios_and_counts_have_one_spelling() {
         assert_eq!(format_percent_ratio(1, 4), "25.00%");
         assert_eq!(format_percent_ratio(5, 4), "100.00%");
         assert_eq!(format_count(42), "42");

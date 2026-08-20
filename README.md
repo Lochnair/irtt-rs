@@ -26,12 +26,10 @@ The installed dispatcher is named `irtt-rs` rather than `irtt` to avoid conflict
 
 The build requires Rust 1.88 or newer.
 
-From a local checkout:
+Install the latest release from crates.io:
 
 ```sh
-git clone https://github.com/Lochnair/irtt-rs.git
-cd irtt-rs
-cargo install --path crates/irtt-app
+cargo install irtt-rs --locked
 ```
 
 This installs:
@@ -45,7 +43,15 @@ Each applet can also be built in isolation with `--no-default-features` plus
 the applet's own feature. For example, a lightweight client-only install:
 
 ```sh
-cargo install --path crates/irtt-app --no-default-features --features client
+cargo install irtt-rs --locked --no-default-features --features client
+```
+
+For development, or to install directly from a checkout:
+
+```sh
+git clone https://github.com/Lochnair/irtt-rs.git
+cd irtt-rs
+cargo install --path crates/irtt-app --locked
 ```
 
 ## Quick start
@@ -133,7 +139,7 @@ Multi-target sessions use staggered pacing by default. To send each target's pro
 irtt-client host-a:2112 host-b:2112 --pacing burst
 ```
 
-Target labels are included in the default multi-target output.
+Target labels are included in the default multi-target output. Final per-target summaries are printed in the order targets were supplied on the command line, not the order in which they finish or their labels sort alphabetically.
 
 ## Output formats
 
@@ -178,6 +184,8 @@ Useful measurement fields include:
 * `server_processing_us`: time spent processing the packet at the server
 
 Adjusted RTT can be negative when server processing exceeds the measured raw RTT. One-way delay estimates can be negative because of clock skew between the client and server.
+
+On Linux, `sd_us` and `rd_us` (and the underlying one-way delay samples) prefer a kernel-captured timestamp over userspace timing for this client's own send/receive endpoint where the platform and socket support it, reducing the effect of scheduling and queuing delay on these measurements. The peer's reported endpoint gets the same preference when it is the `irtt-server` applet running on Linux; against another IRTT-compatible server, whatever wall-clock value it reports is used as-is. This is a best-effort fallback: unsupported or implausible kernel timestamps fall back to userspace timing. `raw_rtt_us` always uses userspace timing and is unaffected; `adjusted_rtt_us`/`effective_rtt_us` can still shift slightly, since server processing time is derived from the same server receive endpoint.
 
 Default table output prints a final summary after completed finite runs and interrupted continuous runs when the run policy permits it. CSV, TSV, and JSON Lines output do not print this summary.
 
@@ -294,7 +302,14 @@ irtt-server --help
 
 `irtt-client` exposes the client session and event layer independently of CLI formatting and statistics.
 
-Add it from a local checkout:
+Add it from crates.io:
+
+```toml
+[dependencies]
+irtt-client = { version = "0.5", features = ["tokio"] }
+```
+
+For development against an unpublished change, use a path dependency instead:
 
 ```toml
 [dependencies]

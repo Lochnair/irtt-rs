@@ -236,7 +236,21 @@ impl ManagedClientHandle {
         ManagedStopReceipt::new(Arc::clone(&self.stop))
     }
 
-    /// Submit one complete desired target set without awaiting queue capacity.
+    /// Submit the complete desired target set, replacing any previous one.
+    ///
+    /// `targets` is not a delta: any live target whose id is missing from
+    /// `targets` is stopped and removed. A target that is still present with an
+    /// unchanged configuration continues undisturbed — it is not restarted and
+    /// does not get a new generation. A target present with a *changed*
+    /// configuration, or whose current generation already reached a terminal
+    /// state (e.g. failed, completed, or was closed by the peer), is treated as
+    /// a fresh start: it is retired and a new generation is created for it, even
+    /// if the configuration is byte-for-byte identical to the one that just
+    /// finished.
+    ///
+    /// This call enqueues the update without waiting for queue capacity; await
+    /// the returned [`ManagedCommandReceipt`] to observe whether — and how — it
+    /// was applied.
     pub fn update_targets(
         &self,
         targets: Vec<ManagedTargetConfig>,
