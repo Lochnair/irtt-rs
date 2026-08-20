@@ -356,8 +356,11 @@ pub struct OneWayDelaySample {
     /// available and plausible for this send, and the userspace post-send wall
     /// time otherwise. The server receive endpoint is the server's kernel
     /// receive timestamp when one is available and plausible, and its
-    /// userspace receive wall time otherwise. RTT is unaffected and remains a
-    /// userspace monotonic measurement.
+    /// userspace receive wall time otherwise. `RttSample::raw` is unaffected
+    /// and remains a userspace monotonic measurement, but `adjusted` and
+    /// `effective` can still shift: when the session negotiated wall-clock
+    /// timing rather than monotonic, server processing time is derived from
+    /// this same server receive endpoint.
     pub client_to_server: Option<SignedDuration>,
     /// Server-to-client delay.
     ///

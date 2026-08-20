@@ -185,7 +185,7 @@ Useful measurement fields include:
 
 Adjusted RTT can be negative when server processing exceeds the measured raw RTT. One-way delay estimates can be negative because of clock skew between the client and server.
 
-On Linux, `sd_us` and `rd_us` (and the underlying one-way delay samples) prefer kernel-captured send/receive timestamps over userspace timing where the platform and socket support them, reducing the effect of scheduling and queuing delay on these measurements. This is a best-effort fallback: unsupported or implausible kernel timestamps fall back to userspace timing. RTT always uses userspace timing and is unaffected.
+On Linux, `sd_us` and `rd_us` (and the underlying one-way delay samples) prefer kernel-captured send/receive timestamps over userspace timing where the platform and socket support them, reducing the effect of scheduling and queuing delay on these measurements. This is a best-effort fallback: unsupported or implausible kernel timestamps fall back to userspace timing. `raw_rtt_us` always uses userspace timing and is unaffected; `adjusted_rtt_us`/`effective_rtt_us` can still shift slightly, since server processing time is derived from the same server receive endpoint.
 
 Default table output prints a final summary after completed finite runs and interrupted continuous runs when the run policy permits it. CSV, TSV, and JSON Lines output do not print this summary.
 
