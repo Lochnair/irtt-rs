@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords = ["irtt", "networking", "latency", "server"]
 categories = ["network-programming"]
 
@@ -23,3 +23,13 @@ tokio = { version = "1.53.1", default-features = false, features = ["rt", "net",
 # source-selection path here; elsewhere a wildcard bind is refused.
 [target.'cfg(any(target_os = "linux", target_os = "macos", target_os = "freebsd"))'.dependencies]
 nix = { version = "0.31.3", default-features = false, features = ["net", "uio"] }
+
+[package.metadata.docs.rs]
+all-features = true
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+
+[[example]]
+name = "basic_server"
+
+[[example]]
+name = "multi_listener"

@@ -7,7 +7,7 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords = ["irtt", "networking", "latency", "rtt"]
 categories = ["network-programming"]
 
@@ -27,6 +27,21 @@ tokio = ["dep:tokio"]
 
 [package.metadata.docs.rs]
 all-features = true
+cargo-args = ["-Zunstable-options", "-Zrustdoc-scrape-examples"]
+
+[[example]]
+name = "blocking_client"
+doc-scrape-examples = true
+
+[[example]]
+name = "tokio_client"
+required-features = ["tokio"]
+doc-scrape-examples = true
+
+[[example]]
+name = "managed_client"
+required-features = ["tokio"]
+doc-scrape-examples = true
 
 [dev-dependencies]
 irtt-server.workspace = true

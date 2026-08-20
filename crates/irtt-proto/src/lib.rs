@@ -6,6 +6,10 @@
 //! crates such as `irtt-client` are responsible for session behavior and
 //! user-facing validation.
 //!
+//! Most applications should depend on `irtt-client` or `irtt-server` instead
+//! of this crate directly; use `irtt-proto` only when implementing another
+//! IRTT-compatible client or server that needs the raw packet layer itself.
+//!
 //! [`Params::decode`] rejects malformed or incompatible incoming parameter
 //! values, including invalid enum discriminants, malformed UTF-8, and oversized
 //! `server_fill` values. Direct construction followed by [`Params::encode`]

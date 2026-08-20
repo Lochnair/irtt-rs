@@ -32,6 +32,9 @@
 //! [`ServerConfig`] — `max_sessions` included — applies **per listener**, not
 //! per process.
 //!
+//! See `examples/` in the repository for a runnable single-listener and
+//! multi-listener example.
+//!
 //! # Rejection is silence
 //!
 //! The protocol defines no error reply, no reset and no NACK. Malformed,
@@ -129,4 +132,4 @@ pub use config::{
 pub use core::{OutboundDatagram, ServerCore};
 pub use error::ServerError;
 pub use runtime::{Server, ServerRuntimeError};
-pub use set::{ServerSet, ServerSetError};
+pub use set::{address_family_available, ServerSet, ServerSetError};

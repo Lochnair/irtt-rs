@@ -13,10 +13,19 @@
 //! also signed when the required wall-clock timestamps are available; negative
 //! values usually indicate client/server clock skew.
 //!
-//! [`Client`] is the runtime-free low-level blocking adapter. With the
-//! `tokio` feature, `AsyncClient` provides the corresponding Tokio adapter;
-//! [`managed`] contains the unified managed task/handle implementation,
-//! including the dedicated-runtime blocking frontend for synchronous callers.
+//! [`Client`] is the runtime-free low-level blocking adapter and requires no
+//! Tokio dependency at all; it is what a caller without a runtime, or that
+//! wants full control over its own event loop, should start from. With the
+//! `tokio` feature, `AsyncClient` provides the corresponding low-level Tokio
+//! adapter for a caller that owns a runtime and drives socket readiness
+//! itself. [`managed`] sits above both: `ManagedClientTask` /
+//! `ManagedClientHandle` (`tokio` feature) run and control one or more
+//! targets under a Tokio runtime, and `BlockingManagedClient` (`tokio`
+//! feature) wraps that in a synchronous owner backed by its own dedicated
+//! current-thread runtime for callers that want managed multi-target
+//! behavior without touching Tokio themselves.
+//!
+//! See `examples/` in the repository for a runnable example of each tier.
 //!
 #![forbid(unsafe_code)]
 
