@@ -19,7 +19,7 @@ homepage = "https://github.com/Lochnair/irtt-rs"
 [workspace.dependencies]
 irtt-proto = { version = "0.5.0", path = "crates/irtt-proto" }
 irtt-client = { version = "0.5.0", path = "crates/irtt-client" }
-irtt-server = { version = "0.5.0", path = "crates/irtt-server" }
+irtt-server = { version = "0.5.1", path = "crates/irtt-server" }
 irtt-stats = { version = "0.5.0", path = "crates/irtt-stats" }
 
 [profile.release]

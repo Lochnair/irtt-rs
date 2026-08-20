@@ -50,6 +50,12 @@ release. The format is loosely based on
 
 ## irtt-server
 
+### 0.5.1
+
+#### Added
+
+- New public `address_family_available()` helper (re-exported from `set`), for probing whether an address family can actually bind locally rather than merely constructing a socket for it. Used by the `irtt-rs` server applet to distinguish a genuinely unsupported address family from an ordinary bind failure when falling back from its default dual-family bind.
+
 ### 0.5.0
 
 #### Added
@@ -89,6 +95,16 @@ release. The format is loosely based on
 - `StatsConfig::estimated_retained_bytes(probe_count)` gives callers an API to estimate the memory a stats configuration will retain for a given probe count, ahead of actually running a session (used by `irtt-cli`'s multi-target memory-usage warning, see below).
 
 ## irtt-rs
+
+### 0.6.1
+
+#### Added
+
+- The `irtt-server` applet now has sensible zero-argument defaults: with no `--bind`, it binds the wildcard IRTT port on both address families (`[::]:2112` then `0.0.0.0:2112`) instead of requiring an explicit address, on platforms where wildcard reply-source selection is supported. Any explicit `--bind` fully replaces the default pair rather than adding to it.
+
+#### Changed
+
+- If one of the two default listeners fails because its address family has no local support on the host (e.g. IPv6 administratively disabled on an otherwise IPv4-capable host), the server now falls back to serving just the surviving family instead of failing outright. Any other failure reason (port in use, permission denied, no safe wildcard reply-source path) still fails startup as it would for an explicit `--bind`.
 
 ### 0.6.0
 
