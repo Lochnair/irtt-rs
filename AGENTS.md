@@ -82,42 +82,44 @@ Tokio must remain optional for `irtt-client`; default builds must remain runtime
 
 ## Testing policy
 
-Tests protect durable behavior, compatibility, and important invariants. They do not exist to maximize test count or coverage percentage.
+Tests protect durable behavior, compatibility, and important invariants. They do not exist to maximize test count or coverage percentage. Tests are maintained repository code: every persistent test adds review, CI, refactoring, and maintenance cost, so it must justify that cost.
 
-### Prefer behavior over internals
+### Test at the owning layer
 
-For client, managed-runtime, blocking, CLI, and TUI behavior, prefer normal-interface component/integration tests: real UDP/session exchange, emitted events/outcomes, negotiated params, multi-target lifecycle, process exit status, and user-visible diagnostics.
+Prefer production interfaces and component/integration tests at the lowest architectural layer that owns the complete behavior. Higher-level or process-level is not inherently better.
 
-One strong behavioral test is usually better than several tests of private helpers that reconstruct the same behavior.
+- `irtt-proto`: wire formats, codecs, validation, malformed input, and protocol boundaries.
+- `irtt-client`: client/session behavior, multi-target orchestration, burst/staggered pacing, scheduling, lifecycle, managed events, and target updates.
+- `irtt-server`: server/session behavior and server runtime/orchestration.
+- `irtt-stats`: statistics, loss/IPDV accounting, rolling windows, and retention bounds.
+- `irtt-rs` / `irtt-app`: behavior introduced by the application layer itself, such as argument-to-config mapping, presentation/formatting, app-specific diagnostics/exit policy, and genuine process/signal behavior.
 
-Do not add persistent tests merely because implementation code changed. Avoid tests that primarily:
+Do not move library behavior into application-binary tests merely to make it more end-to-end. For example, pacing and multi-target scheduling belong in `irtt-client` even though the CLI exposes them.
 
-- assert private fields, cursors, queue shapes, or exact internal representation;
-- mirror implementation steps line-for-line;
-- exercise branches/helpers solely for coverage;
+### Every persistent test must earn its place
+
+Before adding or retaining a test, be able to state the durable behavior, compatibility guarantee, regression, or invariant it protects. Other agents and humans will review tests on that basis. Do not add persistent tests merely because code changed, a branch exists, coverage would increase, or the test was useful during implementation.
+
+One strong behavioral test through a normal production interface is usually better than several tests of private helpers or reconstructed internals. Be especially skeptical of unit tests that depend on private functions, methods, structs, fields, or implementation sequence: harmless internal refactors should not require test rewrites.
+
+Avoid tests that primarily:
+
+- assert private representation or historical implementation details;
+- mirror implementation steps or exercise branches solely for coverage;
 - duplicate stronger coverage at another layer;
-- pin incidental scheduling/ordering that is not contractual;
+- pin exact human-readable wording unless that wording is itself contractual;
 - test standard-library/dependency behavior;
-- require production test-only observability for a fact naturally visible through packets/events/outcomes.
+- use subprocess machinery or test-only observability when the owning crate exposes the behavior directly.
 
-A harmless private refactor should not require widespread test rewrites unless a deliberately protected invariant changed.
+If a component/integration test through the owning crate's normal API protects the same durable behavior, prefer it unless a focused unit test materially improves precision, diagnosis, or coverage of a hard-to-observe invariant.
 
 ### Unit tests where they earn it
 
-Focused unit/table-driven tests are encouraged for stable pure or algorithmic behavior, especially:
-
-- `irtt-proto` layouts, codecs, vectors, HMAC, parsing, malformed input, and boundaries;
-- `irtt-stats` formulas, loss accounting, IPDV, rolling windows, and bounded state;
-- hand-rolled data structures and subtle pure invariants;
-- resource/liveness guarantees that cannot be observed reliably from a higher layer.
-
-If a unit test and a normal-interface test prove the same durable behavior, prefer the normal-interface test unless the unit test materially improves precision or diagnosis.
+Focused unit/table-driven tests are appropriate for stable pure or algorithmic behavior, especially protocol codecs/vectors, statistics formulas, hand-rolled data structures, and resource/liveness invariants that cannot be observed reliably from a higher-level production interface.
 
 ### Temporary implementation tests
 
-Temporary narrow tests are welcome while implementing/debugging a change to prove a hypothesis, reproduce a bug, or exercise a difficult state transition.
-
-Before finalizing, remove or consolidate them unless they independently protect a durable regression or invariant. A test being useful during development does not by itself justify permanent repository code.
+Temporary narrow tests are welcome while implementing/debugging a change to prove a hypothesis, reproduce a bug, or exercise a difficult state transition. Remove or consolidate them before finalizing unless they independently protect a durable regression or invariant.
 
 ### Resource/liveness tests and hooks
 
@@ -192,7 +194,7 @@ Report concisely:
 
 1. what changed;
 2. verification actually run and its result;
-3. meaningful tests added/updated/consolidated/removed;
+3. meaningful tests added/updated/consolidated/removed, with justification for each persistent test added or materially expanded;
 4. remaining risks, ambiguities, or follow-ups.
 
 Do not produce a giant changelog of incidental edits.
