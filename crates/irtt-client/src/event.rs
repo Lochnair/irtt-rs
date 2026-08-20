@@ -355,11 +355,14 @@ pub struct OneWayDelaySample {
     /// correlated Linux kernel TX timestamp for this send when one is
     /// available and plausible for this send, and the userspace post-send wall
     /// time otherwise. The server receive endpoint is whatever wall time the
-    /// peer reported; against this crate's own `irtt-server` on Linux, that is
-    /// its kernel receive timestamp when one is available and plausible, and
-    /// its userspace receive wall time otherwise. Against another
-    /// IRTT-compatible peer, the client has no way to know which clock source
-    /// produced it. `RttSample::raw` is unaffected and remains a userspace
+    /// peer reported; against this crate's own Tokio server runtime on Linux
+    /// (the `irtt-server` applet), that is its kernel receive timestamp when
+    /// one is available and plausible, and its userspace receive wall time
+    /// otherwise. Against another IRTT-compatible peer, or an application
+    /// driving `irtt_server::ServerCore::handle_datagram` directly, the
+    /// client has no way to know which clock source produced it — the public
+    /// `ServerCore` API never supplies a kernel timestamp of its own accord.
+    /// `RttSample::raw` is unaffected and remains a userspace
     /// monotonic measurement, but `adjusted` and `effective` can still shift:
     /// when the session negotiated wall-clock timing rather than monotonic,
     /// server processing time is derived from this same server receive
