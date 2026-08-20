@@ -26,6 +26,7 @@ pub struct ServerArgs {
     #[arg(
         long,
         value_name = "KEY",
+        value_parser = parse_hmac_key,
         long_help = "HMAC key, taken as the UTF-8 bytes of this argument.\n\nAuthentication is global: with a key configured, every request must carry a valid MAC and every reply is authenticated. Without one, authenticated requests are dropped. The key is visible in the process arguments."
     )]
     pub hmac: Option<String>,
@@ -158,6 +159,15 @@ impl ServerArgs {
         }
         config
     }
+}
+
+/// Rejects an empty HMAC key so a blank shell expansion cannot silently
+/// enable authentication with predictable, empty key material.
+fn parse_hmac_key(input: &str) -> Result<String, String> {
+    if input.is_empty() {
+        return Err("HMAC key must not be empty".to_owned());
+    }
+    Ok(input.to_owned())
 }
 
 /// Parses a duration whose zero is meaningful server policy.
@@ -402,6 +412,18 @@ mod tests {
         assert!(parse(&["--bind", "127.0.0.1:2112", "--min-interval", "20us"]).is_err());
         assert!(parse(&["--bind", "127.0.0.1:2112", "--max-duration", "2h"]).is_err());
         assert!(parse(&["--bind", "127.0.0.1:2112", "--idle-timeout", "ms"]).is_err());
+    }
+
+    #[test]
+    fn an_empty_hmac_key_is_rejected() {
+        let err = parse(&["--bind", "127.0.0.1:2112", "--hmac", ""]).unwrap_err();
+        assert!(err.to_string().contains("HMAC key must not be empty"));
+    }
+
+    #[test]
+    fn a_whitespace_only_hmac_key_is_accepted_literally() {
+        let config = bound(&["--hmac", " "]).server_config();
+        assert_eq!(config.hmac_key(), Some(b" ".as_slice()));
     }
 
     #[test]

@@ -297,6 +297,19 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_hmac_key_is_rejected() {
+        let err = parse(&["--hmac", "", "127.0.0.1:2112"]).unwrap_err();
+        assert!(err.to_string().contains("HMAC key must not be empty"));
+    }
+
+    #[test]
+    fn a_non_empty_hmac_key_is_accepted() {
+        let args = parse(&["--hmac", "secret", "127.0.0.1:2112"]).unwrap();
+        let config = args.prepare().unwrap().client;
+        assert_eq!(config.hmac_key, Some(b"secret".to_vec()));
+    }
+
+    #[test]
     fn output_format_summary_policy_is_table_only() {
         assert!(OutputFormat::Table.prints_summary());
         assert!(!OutputFormat::Csv.prints_summary());
