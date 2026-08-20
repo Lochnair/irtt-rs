@@ -7,12 +7,15 @@ license.workspace = true
 rust-version.workspace = true
 repository.workspace = true
 homepage.workspace = true
-readme.workspace = true
+readme = "README.md"
 keywords = ["irtt", "networking", "latency", "statistics"]
 categories = ["network-programming"]
 
 [dependencies]
 irtt-client.workspace = true
+
+[[example]]
+name = "finite_vs_continuous"
 
 [dev-dependencies]
 proptest = "1.11.0"

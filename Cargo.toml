@@ -15,7 +15,6 @@ license = "Apache-2.0"
 rust-version = "1.88"
 repository = "https://github.com/Lochnair/irtt-rs"
 homepage = "https://github.com/Lochnair/irtt-rs"
-readme = "README.md"
 
 [workspace.dependencies]
 irtt-proto = { version = "0.5.0", path = "crates/irtt-proto" }

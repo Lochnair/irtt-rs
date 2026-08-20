@@ -1,7 +1,24 @@
 //! Statistics aggregation for `irtt-client` events.
 //!
-//! The crate consumes `irtt-client` events and produces cumulative or rolling
-//! snapshots for reporting and integration code.
+//! [`StatsCollector`] consumes [`irtt_client::ClientEvent`] values through
+//! [`StatsCollector::process`] and produces a cumulative [`Snapshot`], plus
+//! optional count- and time-based rolling snapshots, for reporting and
+//! integration code.
+//!
+//! # Retention modes
+//!
+//! [`StatsConfig`] selects between two retention modes via [`SampleMode`].
+//! [`StatsConfig::finite`] ([`SampleMode::Exact`]) retains an exact sample per
+//! timing metric, so every metric reports an exact median once it has
+//! samples; retention grows with the number of probes processed. This is the
+//! default and suits a run with a known, bounded duration.
+//! [`StatsConfig::continuous`] ([`SampleMode::RunningOnly`]) keeps only
+//! running statistics — no exact median — and bounds its adjacent-sequence
+//! IPDV tracking, so memory stays bounded for a long-running or unbounded
+//! session. Rolling snapshots always use running statistics regardless of
+//! this setting.
+//!
+//! See `examples/` in the repository for a runnable comparison of both modes.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
