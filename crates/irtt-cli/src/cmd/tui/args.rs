@@ -271,6 +271,14 @@ mod tests {
     }
 
     #[test]
+    fn an_empty_hmac_key_is_rejected_via_the_shared_args() {
+        // CommonClientArgs is flattened into both the client and TUI parsers,
+        // so proving rejection once here covers both without duplicating it.
+        let err = parse(&["--hmac", "", "127.0.0.1:2112"]).unwrap_err();
+        assert!(err.to_string().contains("HMAC key must not be empty"));
+    }
+
+    #[test]
     fn tui_help_lists_multi_target_options() {
         let help = TuiArgs::command().render_help().to_string();
         assert!(!help.contains("--target "));

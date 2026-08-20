@@ -15,7 +15,7 @@ pub struct CommonClientArgs {
     pub length: u32,
 
     /// HMAC key.
-    #[arg(long)]
+    #[arg(long, value_parser = parse_hmac_key)]
     pub hmac: Option<String>,
 
     /// Clock mode to request.
@@ -187,6 +187,13 @@ pub fn parse_length(input: &str) -> Result<u32, String> {
         return Err(format!("packet length must be <= {MAX_UDP_PAYLOAD_LENGTH}"));
     }
     Ok(length)
+}
+
+pub fn parse_hmac_key(input: &str) -> Result<String, String> {
+    if input.is_empty() {
+        return Err("HMAC key must not be empty".to_owned());
+    }
+    Ok(input.to_owned())
 }
 
 pub fn parse_server_fill(input: &str) -> Result<String, String> {
