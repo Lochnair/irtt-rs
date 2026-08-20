@@ -38,12 +38,14 @@ This installs:
 
 * `irtt-rs`, the canonical multi-applet dispatcher
 * `irtt-client`, the stream and text client
+* `irtt-tui`, the terminal UI
 * `irtt-server`, the UDP server
 
-To also install the optional terminal UI:
+Each applet can also be built in isolation with `--no-default-features` plus
+the applet's own feature. For example, a lightweight client-only install:
 
 ```sh
-cargo install --path crates/irtt-app --features tui
+cargo install --path crates/irtt-app --no-default-features --features client
 ```
 
 ## Quick start
@@ -311,13 +313,13 @@ synchronous callers. Callers that already own Tokio can drive
 
 ## Binaries and features
 
-| Build                                     | Binaries                                          |
-| ----------------------------------------- | ------------------------------------------------- |
-| `--no-default-features`                   | `irtt-rs`                                         |
-| `--no-default-features --features server` | `irtt-rs`, `irtt-server`                          |
-| Default features                          | `irtt-rs`, `irtt-client`, `irtt-server`           |
-| `--features tui`                          | `irtt-rs`, `irtt-client`, `irtt-server`, `irtt-tui` |
-| `--all-features`                          | `irtt-rs`, `irtt-client`, `irtt-server`, `irtt-tui` |
+| Build                                       | Binaries                                            |
+| -------------------------------------------- | --------------------------------------------------- |
+| `--no-default-features`                     | `irtt-rs`                                           |
+| `--no-default-features --features client`   | `irtt-rs`, `irtt-client`                            |
+| `--no-default-features --features server`   | `irtt-rs`, `irtt-server`                            |
+| `--no-default-features --features tui`      | `irtt-rs`, `irtt-tui`                               |
+| Default features (or `--all-features`)      | `irtt-rs`, `irtt-client`, `irtt-tui`, `irtt-server`  |
 
 `irtt-client` requires the `client` feature, `irtt-server` the `server` feature,
 and `irtt-tui` the `tui` feature. The `irtt-rs` dispatcher is always built, and

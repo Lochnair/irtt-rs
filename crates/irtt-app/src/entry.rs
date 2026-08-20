@@ -1,14 +1,10 @@
-use std::{
-    env,
-    ffi::OsString,
-    process::ExitCode,
-    sync::{atomic::AtomicBool, Arc},
-};
+#[cfg(any(feature = "client", feature = "server", feature = "tui"))]
+use std::sync::{atomic::AtomicBool, Arc};
+use std::{env, ffi::OsString, process::ExitCode};
 
-use crate::{
-    applet::{dispatch_from_argv, AppletDispatch, RequestedApplet},
-    signal::install_signal_handler,
-};
+use crate::applet::{dispatch_from_argv, AppletDispatch, RequestedApplet};
+#[cfg(any(feature = "client", feature = "server", feature = "tui"))]
+use crate::signal::install_signal_handler;
 
 /// Entry point for the `irtt-rs` multicall dispatcher binary.
 ///
@@ -81,6 +77,7 @@ fn run_dispatcher_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Installs the shutdown signal handler shared by every applet and hands the
 /// resulting flag to `f`.
+#[cfg(any(feature = "client", feature = "server", feature = "tui"))]
 fn with_shutdown_flag(
     f: impl FnOnce(&AtomicBool) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
