@@ -23,7 +23,8 @@ pub struct ServerArgs {
     #[arg(
         long,
         value_name = "ADDR",
-        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nRepeat the option to serve several addresses from one process, in the order given. Every listener applies the same policy options, but each keeps its own sessions and tokens, so a session belongs to the address it was opened on. Binding is all or nothing: if any address cannot be bound, none are served.\n\nWith no --bind at all, the server binds the wildcard IRTT port on both address families, [::]:2112 then 0.0.0.0:2112, on platforms with wildcard reply-source support; elsewhere it fails and asks for an explicit address instead of guessing one. Any explicit --bind replaces that default pair rather than adding to it.\n\nA wildcard bind such as 0.0.0.0:2112 answers each request from the address it was sent to, using per-packet destination metadata. That is supported on Linux, macOS and FreeBSD; on other systems a wildcard bind is refused and an explicit interface address is required.\n\nA port of 0 selects an unused port per listener, so two such binds get two different ports."
+        env = "IRTT_SERVER_BIND",
+        long_help = "Local UDP address to bind, as ADDR:PORT, for example 127.0.0.1:2112 or [::1]:2112. Host names are not resolved.\n\nRepeat the option to serve several addresses from one process, in the order given. Every listener applies the same policy options, but each keeps its own sessions and tokens, so a session belongs to the address it was opened on. Binding is all or nothing: if any address cannot be bound, none are served.\n\nWith no --bind at all, the server binds the wildcard IRTT port on both address families, [::]:2112 then 0.0.0.0:2112, on platforms with wildcard reply-source support; elsewhere it fails and asks for an explicit address instead of guessing one. Any explicit --bind replaces that default pair rather than adding to it.\n\nA wildcard bind such as 0.0.0.0:2112 answers each request from the address it was sent to, using per-packet destination metadata. That is supported on Linux, macOS and FreeBSD; on other systems a wildcard bind is refused and an explicit interface address is required.\n\nA port of 0 selects an unused port per listener, so two such binds get two different ports.\n\nIRTT_SERVER_BIND sets the same thing for deployments that configure by environment (systemd, Docker, ...), and takes exactly one address, the same as one --bind. Leave it unset on ordinary hosts: the wildcard default above is already what you want there. A --bind on the command line overrides it entirely."
     )]
     pub bind: Vec<SocketAddr>,
 
@@ -32,7 +33,8 @@ pub struct ServerArgs {
         long,
         value_name = "KEY",
         value_parser = parse_hmac_key,
-        long_help = "HMAC key, taken as the UTF-8 bytes of this argument.\n\nAuthentication is global: with a key configured, every request must carry a valid MAC and every reply is authenticated. Without one, authenticated requests are dropped. The key is visible in the process arguments."
+        env = "IRTT_SERVER_HMAC",
+        long_help = "HMAC key, taken as the UTF-8 bytes of this argument.\n\nAuthentication is global: with a key configured, every request must carry a valid MAC and every reply is authenticated. Without one, authenticated requests are dropped. The key is visible in the process arguments, or in the environment as IRTT_SERVER_HMAC."
     )]
     pub hmac: Option<String>,
 
@@ -40,6 +42,7 @@ pub struct ServerArgs {
     #[arg(
         long,
         value_name = "COUNT",
+        env = "IRTT_SERVER_MAX_SESSIONS",
         long_help = "Maximum number of simultaneously live sessions per listener. Once a listener's table is full, a session-creating open to it is dropped silently; nothing is evicted. Zero refuses every session-creating open.\n\nThis is a per-listener bound, not a process-wide one: with two --bind options, each listener admits up to this many sessions."
     )]
     pub max_sessions: Option<usize>,
@@ -48,6 +51,7 @@ pub struct ServerArgs {
     #[arg(
         long,
         value_name = "BYTES",
+        env = "IRTT_SERVER_MAX_PACKET_LENGTH",
         long_help = "Maximum echo datagram size a session may negotiate, in bytes. A longer requested length is reduced during negotiation, an open whose mandatory field block would not fit is refused, and inbound echo requests are admitted against the same limit. This is a resource bound, not an MTU."
     )]
     pub max_packet_length: Option<usize>,
@@ -57,6 +61,7 @@ pub struct ServerArgs {
         long,
         value_name = "DURATION",
         value_parser = parse_duration_allow_zero,
+        env = "IRTT_SERVER_MIN_INTERVAL",
         long_help = "Floor on the send interval a session may negotiate. The negotiated interval is still capped at a quarter of the idle timeout afterwards, so a value above that cap is not what actually gets negotiated.\n\nA session's reply allowance refills at the shorter of this floor and the interval it actually negotiated. Ordinarily that is this floor itself; it is the shorter, negotiated value only where the idle-timeout cap above pulled the negotiated interval below it. Use 0 for no time-based throttling."
     )]
     pub min_interval: Option<Duration>,
@@ -65,6 +70,7 @@ pub struct ServerArgs {
     #[arg(
         long,
         value_name = "COUNT",
+        env = "IRTT_SERVER_BURST",
         long_help = "Echo replies one session may have answered before its allowance has to refill. Use 0 for no allowance at all, which rate-limits every echo request whatever the interval is."
     )]
     pub burst: Option<u32>,
@@ -74,6 +80,7 @@ pub struct ServerArgs {
         long,
         value_name = "DURATION",
         value_parser = parse_duration_allow_zero,
+        env = "IRTT_SERVER_IDLE_TIMEOUT",
         long_help = "Release a session after this long without a served or rate-limited echo request. The deadline runs from the open, and release is silent. Use 0 to expire a session at the next evaluation; it is not a way to disable expiry."
     )]
     pub idle_timeout: Option<Duration>,
@@ -83,6 +90,7 @@ pub struct ServerArgs {
         long,
         value_name = "DURATION",
         value_parser = parse_positive_duration,
+        env = "IRTT_SERVER_MAX_DURATION",
         long_help = "Maximum test duration a session may negotiate. A longer request is reduced to it, and a continuous request is answered with it. Omit this flag for no maximum; a maximum of zero cannot be expressed, because a negotiated duration of zero means continuous."
     )]
     pub max_duration: Option<Duration>,
@@ -92,6 +100,7 @@ pub struct ServerArgs {
         long,
         value_name = "MODE",
         value_enum,
+        env = "IRTT_SERVER_TIMESTAMP_ALLOWANCE",
         long_help = "How many timestamps this server will provide.\n\ndual: honor a request for send, receive, both or midpoint timestamps.\nsingle: provide at most one timestamp instant; a request for both is negotiated to midpoint.\nnone: provide no timestamps at all.\n\nThe requested clock source is never changed, only which instants are reported, so a single instant is still reported once per requested clock. Omit this flag to honor every requested placement."
     )]
     pub timestamp_allowance: Option<TimestampAllowanceArg>,
@@ -99,6 +108,7 @@ pub struct ServerArgs {
     /// Refuse to provide requested DSCP marking.
     #[arg(
         long,
+        env = "IRTT_SERVER_NO_DSCP",
         long_help = "Refuse to provide requested traffic-class marking. Any requested DSCP is negotiated to zero, so the client is told its echo replies will be unmarked, and they are sent unmarked. The session is not refused."
     )]
     pub no_dscp: bool,
@@ -241,11 +251,14 @@ mod tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+    use crate::cmd::server::env_lock::with_env_lock;
 
     fn parse(args: &[&str]) -> Result<ServerArgs, clap::Error> {
-        let mut argv = vec!["irtt-server"];
-        argv.extend_from_slice(args);
-        ServerArgs::try_parse_from(argv)
+        with_env_lock(|| {
+            let mut argv = vec!["irtt-server"];
+            argv.extend_from_slice(args);
+            ServerArgs::try_parse_from(argv)
+        })
     }
 
     fn bound(args: &[&str]) -> ServerArgs {
@@ -478,5 +491,111 @@ mod tests {
         assert!(parse(&["--bind", "127.0.0.1:2112", "--max-duration", "0"]).is_err());
         assert!(parse(&["--bind", "127.0.0.1:2112", "--max-duration", "0s"]).is_err());
         assert_eq!(bound(&[]).server_config().max_test_duration(), None);
+    }
+
+    /// Runs `body` with the given environment variables set, restoring
+    /// whatever was there before (present or absent) once `body` returns.
+    /// Held under `with_env_lock` for the whole span, including `body`, so a
+    /// `parse` call elsewhere never observes a partially-applied environment.
+    fn with_env<T>(vars: &[(&str, &str)], body: impl FnOnce() -> T) -> T {
+        with_env_lock(|| {
+            let previous: Vec<(&str, Option<String>)> = vars
+                .iter()
+                .map(|(k, _)| (*k, std::env::var(k).ok()))
+                .collect();
+            for (k, v) in vars {
+                std::env::set_var(k, v);
+            }
+            let result = body();
+            for (k, v) in previous {
+                match v {
+                    Some(v) => std::env::set_var(k, v),
+                    None => std::env::remove_var(k),
+                }
+            }
+            result
+        })
+    }
+
+    #[test]
+    fn environment_variables_supply_policy_when_no_flag_is_given() {
+        with_env(
+            &[
+                ("IRTT_SERVER_MAX_SESSIONS", "512"),
+                ("IRTT_SERVER_MAX_PACKET_LENGTH", "1472"),
+                ("IRTT_SERVER_MIN_INTERVAL", "20ms"),
+                ("IRTT_SERVER_BURST", "3"),
+                ("IRTT_SERVER_IDLE_TIMEOUT", "30s"),
+                ("IRTT_SERVER_MAX_DURATION", "2m"),
+                ("IRTT_SERVER_TIMESTAMP_ALLOWANCE", "single"),
+                ("IRTT_SERVER_HMAC", "secret"),
+                ("IRTT_SERVER_NO_DSCP", "true"),
+            ],
+            || {
+                let config = parse(&["--bind", "127.0.0.1:2112"])
+                    .unwrap()
+                    .server_config();
+                assert_eq!(config.max_sessions(), 512);
+                assert_eq!(config.max_packet_length(), 1472);
+                assert_eq!(config.min_send_interval(), Duration::from_millis(20));
+                assert_eq!(config.burst_allowance(), 3);
+                assert_eq!(config.idle_timeout(), Duration::from_secs(30));
+                assert_eq!(config.max_test_duration(), Some(Duration::from_secs(120)));
+                assert_eq!(config.timestamp_allowance(), TimestampAllowance::Single);
+                assert_eq!(config.hmac_key(), Some(b"secret".as_slice()));
+                assert!(!config.dscp_allowed());
+            },
+        );
+    }
+
+    #[test]
+    fn an_explicit_flag_overrides_the_environment() {
+        with_env(&[("IRTT_SERVER_MAX_SESSIONS", "512")], || {
+            let config = parse(&["--bind", "127.0.0.1:2112", "--max-sessions", "4"])
+                .unwrap()
+                .server_config();
+            assert_eq!(
+                config.max_sessions(),
+                4,
+                "the command-line value wins over the environment"
+            );
+        });
+    }
+
+    #[test]
+    fn the_environment_wins_over_the_built_in_default() {
+        with_env(&[("IRTT_SERVER_BURST", "9")], || {
+            let config = bound(&[]).server_config();
+            assert_eq!(
+                config.burst_allowance(),
+                9,
+                "an unset flag still falls back to the environment before the library default"
+            );
+        });
+    }
+
+    #[test]
+    fn irtt_server_bind_supplies_a_single_address_from_the_environment() {
+        with_env(&[("IRTT_SERVER_BIND", "127.0.0.1:2113")], || {
+            let args = parse(&[]).unwrap();
+            assert_eq!(args.bind, [SocketAddr::from((Ipv4Addr::LOCALHOST, 2113))]);
+        });
+    }
+
+    #[test]
+    fn an_explicit_bind_flag_overrides_irtt_server_bind() {
+        with_env(&[("IRTT_SERVER_BIND", "127.0.0.1:2113")], || {
+            let args = parse(&["--bind", "[::1]:2112"]).unwrap();
+            assert_eq!(args.bind, [SocketAddr::from((Ipv6Addr::LOCALHOST, 2112))]);
+        });
+    }
+
+    #[test]
+    fn leaving_irtt_server_bind_unset_keeps_the_wildcard_default() {
+        let args = parse(&[]).unwrap();
+        assert!(
+            args.bind.is_empty(),
+            "with no --bind and no IRTT_SERVER_BIND, resolve_binds still falls back to the wildcard pair"
+        );
     }
 }

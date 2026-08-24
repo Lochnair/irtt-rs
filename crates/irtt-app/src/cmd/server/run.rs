@@ -111,12 +111,15 @@ mod tests {
     use clap::Parser;
 
     use super::*;
+    use crate::cmd::server::env_lock::with_env_lock;
 
     /// The ordinary invocation, and the one that keeps the single-listener case
     /// on the same orchestration path as every other.
     #[test]
     fn an_already_requested_shutdown_binds_one_listener_and_returns() {
-        let args = ServerArgs::try_parse_from(["irtt-server", "--bind", "127.0.0.1:0"]).unwrap();
+        let args = with_env_lock(|| {
+            ServerArgs::try_parse_from(["irtt-server", "--bind", "127.0.0.1:0"]).unwrap()
+        });
         let shutdown_requested = AtomicBool::new(true);
 
         run_server(args, &shutdown_requested).unwrap();
@@ -124,23 +127,27 @@ mod tests {
 
     #[test]
     fn an_already_requested_shutdown_binds_every_listener_and_returns() {
-        let args = ServerArgs::try_parse_from([
-            "irtt-server",
-            "--bind",
-            "127.0.0.1:0",
-            "--bind",
-            "127.0.0.1:0",
-        ])
-        .unwrap();
+        let args = with_env_lock(|| {
+            ServerArgs::try_parse_from([
+                "irtt-server",
+                "--bind",
+                "127.0.0.1:0",
+                "--bind",
+                "127.0.0.1:0",
+            ])
+            .unwrap()
+        });
         let shutdown_requested = AtomicBool::new(true);
 
         run_server(args, &shutdown_requested).unwrap();
     }
 
     fn default_binds() -> Vec<SocketAddr> {
-        ServerArgs::try_parse_from(["irtt-server"])
-            .unwrap()
-            .resolve_binds()
+        with_env_lock(|| {
+            ServerArgs::try_parse_from(["irtt-server"])
+                .unwrap()
+                .resolve_binds()
+        })
     }
 
     #[test]
