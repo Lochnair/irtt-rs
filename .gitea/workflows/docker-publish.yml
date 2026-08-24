@@ -1,0 +1,99 @@
+name: Publish irtt-server image
+
+on:
+  push:
+    tags:
+      # This repo tags each crate independently (irtt-proto/vX, irtt-client/vX,
+      # ...); only the app package's tag corresponds to this image.
+      - "irtt-rs/v*"
+  workflow_dispatch:
+
+env:
+  IMAGE_NAME: irtt-server
+  IMAGE_OWNER: lochnair
+  GITEA_REGISTRY: git.lochnair.net
+  GHCR_REGISTRY: ghcr.io
+  # Pinned so a floating "latest" release doesn't silently change the build.
+  CRANE_VERSION: v0.20.2
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine image tags
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#irtt-rs/v}"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "tags=${version},latest" >> "$GITHUB_OUTPUT"
+          else
+            # Manual dispatch off a branch: tag by commit only, never touch
+            # "latest", so an ad-hoc build can't clobber the last release.
+            version="sha-$(git rev-parse --short HEAD)"
+            echo "version=${version}" >> "$GITHUB_OUTPUT"
+            echo "tags=${version}" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Cross-compilation is handled inside the Dockerfile via tonistiigi/xx
+      # (native builds, no emulation), but buildx still needs a driver that
+      # can assemble a multi-platform manifest list.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Gitea Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GITEA_REGISTRY }}
+          # The automatic per-job token comes back unauthorized for package
+          # writes on this instance, so use a PAT (scope: write:package) instead.
+          # (Secret names can't start with GITEA_/GITHUB_, hence REGISTRY_*.)
+          username: ${{ secrets.REGISTRY_USERNAME }}
+          password: ${{ secrets.REGISTRY_TOKEN }}
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.GHCR_REGISTRY }}
+          username: ${{ secrets.GHCR_USERNAME }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Build tag list
+        id: tags
+        run: |
+          IFS=',' read -ra tag_list <<< "${{ steps.meta.outputs.tags }}"
+          gitea_tags=""
+          for t in "${tag_list[@]}"; do
+            gitea_tags="${gitea_tags}${GITEA_REGISTRY}/${IMAGE_OWNER}/${IMAGE_NAME}:${t},"
+          done
+          echo "gitea=${gitea_tags%,}" >> "$GITHUB_OUTPUT"
+
+      # Gitea is the primary publish target: this is the only build. Every
+      # other registry gets an exact digest copy of this same image (see
+      # below), never a separate build, so the hash matches everywhere.
+      - name: Build and push to Gitea
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.tags.outputs.gitea }}
+
+      - name: Install crane
+        run: |
+          mkdir -p "${HOME}/.local/bin"
+          curl -sL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | tar -xz -C "${HOME}/.local/bin" crane
+          echo "${HOME}/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Duplicate image to GHCR (same digest, no rebuild)
+        run: |
+          source_ref="${GITEA_REGISTRY}/${IMAGE_OWNER}/${IMAGE_NAME}@${{ steps.build.outputs.digest }}"
+          IFS=',' read -ra tag_list <<< "${{ steps.meta.outputs.tags }}"
+          for t in "${tag_list[@]}"; do
+            crane copy "${source_ref}" "${GHCR_REGISTRY}/${IMAGE_OWNER}/${IMAGE_NAME}:${t}"
+          done
