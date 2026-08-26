@@ -50,6 +50,12 @@ release. The format is loosely based on
 
 ## irtt-server
 
+### 0.5.2
+
+#### Changed
+
+- `parse_hex_pattern`'s chunking now uses the stable `slice::as_chunks` API instead of `chunks_exact`; no behavior change.
+
 ### 0.5.1
 
 #### Added
@@ -95,6 +101,17 @@ release. The format is loosely based on
 - `StatsConfig::estimated_retained_bytes(probe_count)` gives callers an API to estimate the memory a stats configuration will retain for a given probe count, ahead of actually running a session (used by `irtt-cli`'s multi-target memory-usage warning, see below).
 
 ## irtt-rs
+
+### 0.6.2
+
+#### Added
+
+- Every `irtt-server` applet flag can now also be set via an `IRTT_SERVER_*` environment variable (`IRTT_SERVER_BIND`, `IRTT_SERVER_HMAC`, `IRTT_SERVER_MAX_SESSIONS`, `IRTT_SERVER_MAX_PACKET_LENGTH`, `IRTT_SERVER_MIN_INTERVAL`, `IRTT_SERVER_BURST`, `IRTT_SERVER_IDLE_TIMEOUT`, `IRTT_SERVER_MAX_DURATION`, `IRTT_SERVER_TIMESTAMP_ALLOWANCE`, `IRTT_SERVER_NO_DSCP`), for deployments that configure by environment (containers, orchestrators) instead of command-line flags. An explicit flag on the command line still overrides the corresponding variable.
+- A `Dockerfile` and Gitea Actions workflow publishing a minimal, statically linked `irtt-server` container image (cross-compiled for `amd64`/`arm64` via `tonistiigi/xx`, no QEMU) to this project's Gitea and GHCR container registries.
+
+#### Changed
+
+- The bundled `ctrlc` dependency now enables its `termination` feature, so the applet also handles `SIGTERM` (not just `SIGINT`) for graceful shutdown.
 
 ### 0.6.1
 

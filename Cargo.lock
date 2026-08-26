@@ -749,7 +749,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-rs"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "clap",
  "crossterm",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-server"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "getrandom 0.4.3",
  "irtt-proto",

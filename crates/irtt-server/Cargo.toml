@@ -1,6 +1,6 @@
 [package]
 name = "irtt-server"
-version = "0.5.1"
+version = "0.5.2"
 description = "IRTT-compatible Rust server library"
 edition.workspace = true
 license.workspace = true
