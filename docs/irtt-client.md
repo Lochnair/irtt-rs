@@ -45,6 +45,40 @@ once per interval instead. Final per-target summaries print in the order
 targets were supplied on the command line, not the order in which they
 finish or their labels sort alphabetically.
 
+## DYNAMIC TARGET SETS FROM STANDARD INPUT
+
+`--targets-stdin` is available only with continuous mode (`--duration 0`).
+Positional targets remain an initial desired set, and may be omitted to
+start empty:
+
+~~~sh
+irtt-client --duration 0 --targets-stdin
+irtt-client --duration 0 --targets-stdin ams=ams.example:2112
+~~~
+
+Each non-empty stdin record declares the complete desired target set, rather
+than a delta. A later record replaces an earlier set: targets absent from it
+are retired, unchanged target configurations retain their generation, and a
+changed address or HMAC setting creates a fresh generation. Under transient
+live-generation backpressure, only the latest unapplied desired set is kept.
+
+Commas frame targets in stdin records; escape a literal comma within one
+target as `\,`. Target parsing inside each element is otherwise the same as
+for positional arguments, including `@hmac=KEY` and `@hmac=`:
+
+~~~sh
+printf '%s\n' \
+  'ams=ams.example:2112,sg=sg.example:2112@hmac=sg-secret' \
+  'sg=sg.example:2112@hmac=sg-secret,nyc=nyc.example:2112' |
+  irtt-client --duration 0 --targets-stdin --hmac default-secret
+~~~
+
+The exact record `[]` selects an empty desired set. Empty records are
+ignored; whitespace is otherwise payload, not trimming. EOF requests a
+graceful stop. The stdin-controlled mode bounds each desired set to 128
+targets and retains at most 256 live target generations while replacements
+drain.
+
 ## FINITE VERSUS CONTINUOUS OPERATION
 
 `--duration` controls the run length:
@@ -200,6 +234,10 @@ In continuous mode, an uninterrupted peer closure is treated as an error —
 the client exits nonzero — so a process supervisor can restart it; an
 interrupted run (`Ctrl-C`) never reports peer closure as an error, whichever
 mode it was in.
+
+With `--targets-stdin`, peer closure is target-local: other desired targets
+and the stdin controller continue running. Including that target in a later
+complete set starts a fresh generation.
 
 ## EXIT STATUS
 

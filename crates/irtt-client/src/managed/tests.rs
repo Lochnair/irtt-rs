@@ -1577,6 +1577,37 @@ fn authenticated_peer_close_outcome() {
 }
 
 #[test]
+fn peer_close_leaves_other_explicitly_managed_targets_running() {
+    let closing = start_server(ServerBehavior::PeerClose, None);
+    let continuing = start_server(ServerBehavior::Echo, None);
+    let mut managed = config(ManagedPacing::Staggered);
+    managed.completion = ManagedCompletionPolicy::ExplicitStop;
+    managed.client.duration = None;
+    let (task, handle) = ManagedClient::task(
+        managed,
+        vec![
+            target("closing", closing.addr),
+            target("continuing", continuing.addr),
+        ],
+    )
+    .unwrap();
+    let runtime = runtime();
+    let mut task = Box::pin(task);
+
+    drive_task_until(&runtime, &mut task, |task| {
+        handle.status().peer_closed_target_outcomes == 1
+            && task.targets[1].counters.packets_sent != 0
+    });
+    assert_eq!(handle.status().lifecycle, ManagedLifecycle::Running);
+
+    let stop = handle.stop();
+    runtime.block_on(task);
+    runtime.block_on(stop);
+    closing.finish();
+    assert!(!probes(&continuing.finish()).is_empty());
+}
+
+#[test]
 fn peer_close_during_stop_drain_remains_authoritative() {
     let key = b"managed-drain-peer-close".to_vec();
     let server = start_server(ServerBehavior::PeerClose, Some(key.clone()));

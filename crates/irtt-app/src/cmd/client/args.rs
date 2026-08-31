@@ -20,6 +20,13 @@ pub struct ClientArgs {
     )]
     pub targets: Vec<TargetArg>,
 
+    /// Read complete desired target sets from standard input in continuous mode.
+    #[arg(
+        long,
+        long_help = "Read one complete desired target set per stdin line in continuous mode. Commas separate targets and backslash escapes commas within a target. [] selects an empty desired set. EOF stops the client gracefully."
+    )]
+    pub targets_stdin: bool,
+
     /// Managed group pacing for multi-target mode.
     #[arg(
         long,
@@ -86,12 +93,16 @@ impl ClientArgs {
     /// Targets are only required here. `--list-columns` returns before this is
     /// called, so listing columns still needs no target.
     pub fn prepare(&self) -> Result<ManagedRunSetup, String> {
+        if self.targets_stdin && !self.is_continuous() {
+            return Err("--targets-stdin requires --duration 0".to_owned());
+        }
         prepare_managed_run(
             &self.common,
             self.duration,
             TargetSelection {
                 targets: &self.targets,
                 pacing: self.pacing,
+                stdin_controlled: self.targets_stdin,
             },
         )
     }
@@ -166,6 +177,7 @@ mod tests {
         assert_eq!(args.format, OutputFormat::Table);
         assert_eq!(args.columns, None);
         assert_eq!(args.header, HeaderMode::Auto);
+        assert!(!args.targets_stdin);
         assert!(!args.is_continuous());
         assert_eq!(args.timestamp_mode(), TimestampArg::Both);
 
@@ -306,6 +318,21 @@ mod tests {
         let args = parse(&["--hmac", "secret", "127.0.0.1:2112"]).unwrap();
         let config = args.prepare().unwrap().client;
         assert_eq!(config.hmac_key, Some(b"secret".to_vec()));
+    }
+
+    #[test]
+    fn targets_stdin_requires_continuous_mode_and_allows_empty_initial_set() {
+        assert!(parse(&["--targets-stdin"]).unwrap().prepare().is_err());
+        let args = parse(&["--duration", "0", "--targets-stdin"]).unwrap();
+        let setup = args.prepare().unwrap();
+        assert!(setup.targets.is_empty());
+        assert!(setup.stdin_controlled);
+        let config = setup.managed_config();
+        assert_eq!(
+            config.completion,
+            irtt_client::managed::ManagedCompletionPolicy::ExplicitStop
+        );
+        assert_eq!(config.max_live_target_generations, 256);
     }
 
     #[test]

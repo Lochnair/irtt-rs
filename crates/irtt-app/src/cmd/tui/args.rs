@@ -58,6 +58,7 @@ impl TuiArgs {
             TargetSelection {
                 targets: &self.targets,
                 pacing: self.pacing,
+                stdin_controlled: false,
             },
         )
     }

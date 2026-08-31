@@ -22,6 +22,9 @@ use super::{
 
 /// Capacity of the lossy managed presentation event channel.
 pub const MANAGED_EVENT_CAPACITY: usize = 16_384;
+pub const STDIN_MAX_DESIRED_TARGETS: usize = 128;
+pub const STDIN_MAX_LIVE_TARGET_GENERATIONS: usize = 256;
+pub const STDIN_OUTCOME_HISTORY_LIMIT: usize = 256;
 
 /// Target and pacing arguments common to the client applets.
 ///
@@ -31,6 +34,7 @@ pub const MANAGED_EVENT_CAPACITY: usize = 16_384;
 pub struct TargetSelection<'a> {
     pub targets: &'a [TargetArg],
     pub pacing: GroupPacingArg,
+    pub stdin_controlled: bool,
 }
 
 /// Everything a managed run needs, prepared and validated together.
@@ -46,6 +50,8 @@ pub struct ManagedRunSetup {
     pub client: ClientConfig,
     /// Send coordination across active targets.
     pub pacing: ManagedPacing,
+    /// Whether this stream may replace its desired set from stdin.
+    pub stdin_controlled: bool,
 }
 
 impl ManagedRunSetup {
@@ -70,7 +76,7 @@ impl ManagedRunSetup {
     /// Managed driver configuration for this run.
     pub fn managed_config(&self) -> ManagedClientConfig {
         let target_count = self.target_count();
-        ManagedClientConfig {
+        let mut config = ManagedClientConfig {
             client: self.client.clone(),
             pacing: self.pacing,
             completion: ManagedCompletionPolicy::FinishWhenQuiescent,
@@ -78,7 +84,13 @@ impl ManagedRunSetup {
             outcome_history_limit: target_count,
             max_live_target_generations: target_count,
             ..ManagedClientConfig::default()
+        };
+        if self.stdin_controlled {
+            config.completion = ManagedCompletionPolicy::ExplicitStop;
+            config.outcome_history_limit = STDIN_OUTCOME_HISTORY_LIMIT;
+            config.max_live_target_generations = STDIN_MAX_LIVE_TARGET_GENERATIONS;
         }
+        config
     }
 }
 
@@ -91,12 +103,22 @@ pub fn prepare_managed_run(
     duration: Duration,
     selection: TargetSelection<'_>,
 ) -> Result<ManagedRunSetup, String> {
-    let specs = target_specs(selection.targets)?;
+    let specs = if selection.stdin_controlled {
+        if selection.targets.len() > STDIN_MAX_DESIRED_TARGETS {
+            return Err(format!(
+                "initial target set exceeds the {STDIN_MAX_DESIRED_TARGETS}-target limit"
+            ));
+        }
+        super::targets::target_specs_with_empty(selection.targets, true)?
+    } else {
+        target_specs(selection.targets)?
+    };
     let targets = prepare_managed_targets(specs)?;
     Ok(ManagedRunSetup {
         targets,
         client: common.to_client_config(duration),
         pacing: selection.pacing.into(),
+        stdin_controlled: selection.stdin_controlled,
     })
 }
 
@@ -131,7 +153,15 @@ mod tests {
         pacing: GroupPacingArg,
         duration: Duration,
     ) -> Result<ManagedRunSetup, String> {
-        prepare_managed_run(&common(&[]), duration, TargetSelection { targets, pacing })
+        prepare_managed_run(
+            &common(&[]),
+            duration,
+            TargetSelection {
+                targets,
+                pacing,
+                stdin_controlled: false,
+            },
+        )
     }
 
     #[test]
@@ -206,6 +236,7 @@ mod tests {
             TargetSelection {
                 targets: &targets,
                 pacing: GroupPacingArg::Staggered,
+                stdin_controlled: false,
             },
         )
         .unwrap();
