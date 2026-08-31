@@ -23,7 +23,7 @@ pub struct ClientArgs {
     /// Read complete desired target sets from standard input in continuous mode.
     #[arg(
         long,
-        long_help = "Read one complete desired target set per stdin line in continuous mode. Commas separate targets and backslash escapes commas within a target. [] selects an empty desired set. EOF stops the client gracefully."
+        long_help = "Read one complete desired target set per stdin line in continuous mode. Commas separate targets and backslash escapes commas within a target. [] selects an empty desired set. Records are limited to 64 KiB. EOF stops the client gracefully and may discard a revision that has not yet been acknowledged as applied."
     )]
     pub targets_stdin: bool,
 
@@ -41,7 +41,7 @@ pub struct ClientArgs {
         default_value = "10s",
         value_parser = parse_test_duration,
         help = "Test duration; use 0 for continuous mode",
-        long_help = "Test duration; use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary only when interrupted."
+        long_help = "Test duration; use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
     )]
     pub duration: Duration,
 

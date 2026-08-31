@@ -943,9 +943,218 @@ fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option
 mod tests {
     use super::*;
     use irtt_client::managed::{
-        ManagedTargetFailure, ManagedTargetFailureKind, ManagedTargetFailurePhase, TargetId,
+        ManagedLifecycle, ManagedTargetFailure, ManagedTargetFailureKind,
+        ManagedTargetFailurePhase, ManagedTargetLifecycle, ManagedTargetStatus, TargetId,
     };
-    use std::sync::Arc;
+    use std::{io::BufReader, io::Cursor, sync::Arc};
+
+    #[test]
+    fn stdin_record_reader_removes_only_line_framing() {
+        let mut reader = BufReader::with_capacity(2, Cursor::new(b" first \r\n\nthird\r"));
+        let mut buffer = Vec::with_capacity(MAX_STDIN_RECORD_BYTES + 1);
+
+        assert_eq!(
+            read_stdin_record(&mut reader, &mut buffer).unwrap(),
+            Some(" first ".to_owned())
+        );
+        assert_eq!(
+            read_stdin_record(&mut reader, &mut buffer).unwrap(),
+            Some(String::new())
+        );
+        assert_eq!(
+            read_stdin_record(&mut reader, &mut buffer).unwrap(),
+            Some("third\r".to_owned())
+        );
+        assert_eq!(read_stdin_record(&mut reader, &mut buffer).unwrap(), None);
+    }
+
+    #[test]
+    fn stdin_record_reader_rejects_over_limit_unterminated_record() {
+        let input = vec![b'x'; MAX_STDIN_RECORD_BYTES + 1];
+        let mut reader = BufReader::with_capacity(17, Cursor::new(input));
+        let mut buffer = Vec::with_capacity(MAX_STDIN_RECORD_BYTES + 1);
+
+        let error = read_stdin_record(&mut reader, &mut buffer).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("maximum size"));
+        assert!(buffer.len() <= MAX_STDIN_RECORD_BYTES + 1);
+    }
+
+    #[test]
+    fn newer_mailbox_value_survives_an_earlier_submitted_acknowledgement() {
+        let mailbox = StdinMailbox::default();
+        mailbox.publish(vec![ManagedTargetConfig::new("a", "127.0.0.1:2112")]);
+        let submitted = mailbox.latest().unwrap();
+        mailbox.publish(vec![ManagedTargetConfig::new("b", "127.0.0.1:2113")]);
+        let pending = mailbox.latest().unwrap();
+
+        mailbox.clear_if_current(submitted.revision);
+
+        assert_eq!(mailbox.latest().unwrap().revision, pending.revision);
+    }
+
+    #[test]
+    fn rejected_update_retries_after_status_publishes_during_acknowledgement() {
+        let mailbox = StdinMailbox::default();
+        mailbox.publish(Vec::new());
+        let target_set = mailbox.latest().unwrap();
+        let saturated = Arc::new(status_with_targets(&[TargetInstance {
+            id: TargetId::from("old"),
+            generation: 1,
+        }]));
+        let capacity_freed = Arc::new(status_with_targets(&[]));
+        // Capacity becomes available after the transaction rejected but before
+        // its acknowledgement reaches the controller. The rejection path must
+        // retain the pre-submission status, not this later snapshot.
+        let mut retry_after =
+            retry_after_capacity_rejection(&mailbox, &target_set, Arc::clone(&saturated));
+
+        assert!(retry_waits_for_status_change(
+            &mut retry_after,
+            &target_set,
+            &saturated
+        ));
+        assert!(!retry_waits_for_status_change(
+            &mut retry_after,
+            &target_set,
+            &capacity_freed
+        ));
+    }
+
+    #[test]
+    fn later_desired_set_supersedes_a_capacity_rejected_candidate_before_retry() {
+        let mailbox = StdinMailbox::default();
+        mailbox.publish(vec![ManagedTargetConfig::new("a", "127.0.0.1:2112")]);
+        let applied = mailbox.latest().unwrap();
+        mailbox.clear_if_current(applied.revision);
+
+        mailbox.publish(vec![ManagedTargetConfig::new("b", "127.0.0.1:2113")]);
+        let rejected = mailbox.latest().unwrap();
+        let saturated = Arc::new(status_with_targets(&[TargetInstance {
+            id: TargetId::from("old"),
+            generation: 1,
+        }]));
+        let mut retry_after = retry_after_capacity_rejection(&mailbox, &rejected, saturated);
+        mailbox.publish(vec![ManagedTargetConfig::new("c", "127.0.0.1:2114")]);
+        let replacement = mailbox.latest().unwrap();
+
+        assert!(!retry_waits_for_status_change(
+            &mut retry_after,
+            &replacement,
+            &Arc::new(status_with_targets(&[TargetInstance {
+                id: TargetId::from("old"),
+                generation: 1,
+            }]))
+        ));
+        assert!(retry_after.is_none());
+        assert_eq!(replacement.targets[0].id.as_str(), "c");
+        mailbox.clear_if_current(replacement.revision);
+        assert!(mailbox.latest().is_none());
+    }
+
+    #[test]
+    fn eof_and_shutdown_stop_without_waiting_for_the_stdin_reader() {
+        let mailbox = StdinMailbox::default();
+        let shutdown_requested = AtomicBool::new(false);
+        assert!(stdin_stop_request(&shutdown_requested, &mailbox).is_none());
+
+        mailbox.finish();
+        assert!(matches!(
+            stdin_stop_request(&shutdown_requested, &mailbox),
+            Some(StdinStop::Eof)
+        ));
+
+        let mailbox = StdinMailbox::default();
+        shutdown_requested.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(matches!(
+            stdin_stop_request(&shutdown_requested, &mailbox),
+            Some(StdinStop::Interrupted)
+        ));
+    }
+
+    fn status_with_targets(targets: &[TargetInstance]) -> ManagedStatus {
+        ManagedStatus {
+            lifecycle: ManagedLifecycle::Running,
+            stop_requested: false,
+            applied_command_sequence: 0,
+            desired_target_count: targets.len(),
+            connecting_target_count: 0,
+            opening_target_count: 0,
+            active_target_count: 0,
+            draining_target_count: 0,
+            closing_target_count: 0,
+            terminal_target_count: 0,
+            total_target_outcomes: 0,
+            successful_target_outcomes: 0,
+            failed_target_outcomes: 0,
+            peer_closed_target_outcomes: 0,
+            discarded_target_outcomes: 0,
+            targets: Arc::from(
+                targets
+                    .iter()
+                    .cloned()
+                    .map(|target| ManagedTargetStatus {
+                        target,
+                        desired: true,
+                        lifecycle: ManagedTargetLifecycle::Active,
+                        server_addr: Arc::from("127.0.0.1:2112"),
+                        remote: None,
+                    })
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice(),
+            ),
+            recent_target_outcomes: Arc::from([]),
+            final_outcome: None,
+        }
+    }
+
+    #[test]
+    fn dynamic_accounting_prunes_retired_generations_and_retains_only_shutdown_snapshot() {
+        let retired = TargetInstance {
+            id: TargetId::from("edge"),
+            generation: 1,
+        };
+        let replacement = TargetInstance {
+            id: TargetId::from("edge"),
+            generation: 2,
+        };
+        let live_status = status_with_targets(std::slice::from_ref(&replacement));
+        let empty_status = status_with_targets(&[]);
+        let mut stats = BTreeMap::from([
+            (retired.clone(), StatsCollector::new(stats_config(true))),
+            (replacement.clone(), StatsCollector::new(stats_config(true))),
+        ]);
+
+        reconcile_stdin_stats(&mut stats, &live_status, None);
+        assert_eq!(stats.keys().cloned().collect::<Vec<_>>(), [replacement]);
+
+        let summary_targets = snapshot_stdin_summary_targets(&mut stats, &live_status);
+        stats.insert(retired, StatsCollector::new(stats_config(true)));
+        reconcile_stdin_stats(&mut stats, &empty_status, Some(&summary_targets));
+
+        assert_eq!(
+            stats.keys().cloned().collect::<Vec<_>>(),
+            [TargetInstance {
+                id: TargetId::from("edge"),
+                generation: 2,
+            }]
+        );
+    }
+
+    #[test]
+    fn terminal_deduplication_is_bounded_under_target_churn() {
+        let mut terminal_targets = BoundedTargetSet::new(2);
+        let target = |generation| TargetInstance {
+            id: TargetId::from("edge"),
+            generation,
+        };
+
+        assert!(terminal_targets.insert(target(1)));
+        assert!(terminal_targets.insert(target(2)));
+        assert!(terminal_targets.insert(target(3)));
+        assert!(terminal_targets.insert(target(1)));
+        assert!(!terminal_targets.insert(target(3)));
+    }
 
     fn long_finite_args() -> ClientArgs {
         use clap::Parser;

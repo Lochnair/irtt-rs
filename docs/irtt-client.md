@@ -35,8 +35,21 @@ irtt-client --hmac default-secret eu=host-a:2112@hmac=eu-secret public=host-b:21
 Targets without `@hmac=` inherit the global `--hmac` value. `@hmac=KEY`
 overrides it for that target, and `@hmac=` explicitly disables HMAC for that
 target. The modifier uses `@`, not a shell command separator; quote an argument
-if its key needs shell quoting. A literal `@` immediately before `hmac=` in
-the target portion is written as `\@`.
+if its key needs shell quoting.
+
+Target syntax supports these backslash escapes in labels, addresses, and HMAC
+values: `\\` for a literal backslash, `\@` for a literal `@`, `\=` for a
+literal `=`, and `\;` for a literal semicolon. Escaping `@` is necessary in a
+label or address when it would otherwise begin `@hmac=`; escaping the first
+`=` is how an unlabeled target or a label can contain that character. An `=` in
+an HMAC value, including Base64 padding, does not need escaping. Positional
+target arguments may contain a raw comma; stdin target sets have the additional
+`\,` escape described below.
+
+Shells process unquoted backslashes and characters such as semicolons before
+the client sees them. Single-quote a target when it contains parser escapes,
+for example `'west\=edge=host\@hmac=literal@hmac=a\;b\\c'`, so the
+backslashes reach `irtt-client` unchanged.
 
 Multiple targets are probed concurrently. By default, a multi-target session
 uses **staggered** pacing, spacing active targets across the probe interval;
@@ -64,20 +77,37 @@ live-generation backpressure, only the latest unapplied desired set is kept.
 
 Commas frame targets in stdin records; escape a literal comma within one
 target as `\,`. Target parsing inside each element is otherwise the same as
-for positional arguments, including `@hmac=KEY` and `@hmac=`:
+for positional arguments, including the other escapes above, `@hmac=KEY`, and
+`@hmac=`. Use a persistent producer or keep a pipe/FIFO writer open while the
+client is being controlled. For example, in one terminal:
 
 ~~~sh
-printf '%s\n' \
-  'ams=ams.example:2112,sg=sg.example:2112@hmac=sg-secret' \
-  'sg=sg.example:2112@hmac=sg-secret,nyc=nyc.example:2112' |
-  irtt-client --duration 0 --targets-stdin --hmac default-secret
+mkfifo /tmp/irtt-targets
+irtt-client --duration 0 --targets-stdin --hmac default-secret \
+  < /tmp/irtt-targets
+~~~
+
+Then open the FIFO once from another terminal and keep that descriptor open
+while publishing complete desired sets:
+
+~~~sh
+exec 3> /tmp/irtt-targets
+printf '%s\n' 'ams=ams.example:2112,sg=sg.example:2112@hmac=sg-secret' >&3
+printf '%s\n' 'sg=sg.example:2112@hmac=sg-secret,nyc=nyc.example:2112' >&3
+# Publish more sets as needed, then send EOF and stop the client:
+exec 3>&-
 ~~~
 
 The exact record `[]` selects an empty desired set. Empty records are
-ignored; whitespace is otherwise payload, not trimming. EOF requests a
-graceful stop. The stdin-controlled mode bounds each desired set to 128
-targets and retains at most 256 live target generations while replacements
-drain.
+ignored; whitespace is otherwise payload, not trimming. EOF is immediate loss
+or closure of the control plane and requests a graceful stop. A desired-state
+revision that was read but has not yet been acknowledged as applied may be
+discarded when EOF is observed; EOF does not wait for a capacity-rejected
+revision to become applicable.
+
+The maximum stdin record payload is 64 KiB. Stdin-controlled mode bounds each
+desired set to 128 targets and retains at most 256 live target generations
+while replacements drain.
 
 ## FINITE VERSUS CONTINUOUS OPERATION
 
@@ -88,8 +118,9 @@ drain.
   (see [OUTPUT](#output) below — CSV, TSV, and JSON Lines never print one).
 - `--duration 0` is **continuous**: the client runs until interrupted
   (`Ctrl-C`). For table output, a final summary is printed only if the run
-  was interrupted; an uninterrupted continuous run (one that exits for
-  another reason) does not get one.
+  was interrupted. Stdin-controlled mode is the exception: EOF also requests
+  a graceful stop and prints the final retained summary. An uninterrupted
+  continuous run that exits for another reason does not get one.
 
 See [MEASUREMENTS AND MEMORY](#measurements-and-memory) below for why this
 distinction also determines what statistics can be computed and how much
