@@ -11,12 +11,12 @@ pub const DEFAULT_CLIENT_DURATION: Duration = Duration::from_secs(10);
 #[derive(Debug, Clone, Parser)]
 #[command(name = "irtt-client", about = "Minimal IRTT-compatible stream client")]
 pub struct ClientArgs {
-    /// Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.
+    /// Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode.
     #[arg(
         value_name = "TARGET",
         num_args = 0..,
         value_parser = parse_target,
-        long_help = "Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.\n\nExamples:\n  irtt-client host-a:2112 host-b:2112\n  irtt-client eu=host-a:2112 us=host-b:2112\n  irtt-client host-a:2112 eu=host-b:2112"
+        long_help = "Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode.\n\nExamples:\n  irtt-client host-a:2112 host-b:2112\n  irtt-client eu=host-a:2112 us=host-b:2112\n  irtt-client ams=host-a:2112@hmac=secret public=host-b:2112@hmac=\n\nA target without @hmac= inherits --hmac. @hmac= explicitly disables it for that target."
     )]
     pub targets: Vec<TargetArg>,
 
@@ -159,8 +159,7 @@ mod tests {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
 
         assert_eq!(args.targets.len(), 1);
-        assert_eq!(args.targets[0].label, None);
-        assert_eq!(args.targets[0].addr, "127.0.0.1:2112");
+        assert_eq!(args.prepare().unwrap().targets[0].label, "127.0.0.1:2112");
         assert_eq!(args.pacing, GroupPacingArg::Staggered);
         assert_eq!(args.duration, DEFAULT_CLIENT_DURATION);
         assert_eq!(args.interval, Duration::from_secs(1));
@@ -254,8 +253,8 @@ mod tests {
 
     #[test]
     fn invalid_labelled_target_syntax_is_rejected() {
-        assert!(parse(&["=127.0.0.1:2112"]).is_err());
-        assert!(parse(&["label="]).is_err());
+        assert!(parse(&["=127.0.0.1:2112"]).unwrap().prepare().is_err());
+        assert!(parse(&["label="]).unwrap().prepare().is_err());
     }
 
     #[test]

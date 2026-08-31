@@ -6,7 +6,7 @@ irtt-client - IRTT-compatible stream client
 
 ## SYNOPSIS
 
-`irtt-client` [*OPTIONS*] [*[LABEL=]TARGET*]...
+`irtt-client` [*OPTIONS*] [*[LABEL=]TARGET[@hmac=KEY]*]...
 
 `irtt-client` `--list-columns`
 
@@ -18,16 +18,25 @@ eligible runs.
 
 ## TARGETS
 
-Every target argument accepts `[LABEL=]TARGET`. An optional `LABEL=` prefix
-assigns the logical target name used in output; without it, the target
-string itself is used as the label. Labeled and unlabeled targets can be
-freely mixed in one argument list.
+Every target argument accepts `[LABEL=]TARGET[@hmac=KEY]`. An optional
+`LABEL=` prefix assigns the logical target name used in output; without it,
+the target string itself is used as the label. Labeled and unlabeled targets
+can be freely mixed in one argument list. Prefer explicit labels for
+long-running dynamic target sets: the label is the stable target identity
+across replacements.
 
 ```sh
 irtt-client host-a:2112
 irtt-client eu=host-a:2112 us=host-b:2112
 irtt-client host-a:2112 eu=host-b:2112
+irtt-client --hmac default-secret eu=host-a:2112@hmac=eu-secret public=host-b:2112@hmac=
 ```
+
+Targets without `@hmac=` inherit the global `--hmac` value. `@hmac=KEY`
+overrides it for that target, and `@hmac=` explicitly disables HMAC for that
+target. The modifier uses `@`, not a shell command separator; quote an argument
+if its key needs shell quoting. A literal `@` immediately before `hmac=` in
+the target portion is written as `\@`.
 
 Multiple targets are probed concurrently. By default, a multi-target session
 uses **staggered** pacing, spacing active targets across the probe interval;

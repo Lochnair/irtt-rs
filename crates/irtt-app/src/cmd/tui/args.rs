@@ -14,13 +14,13 @@ pub const DEFAULT_TUI_DURATION: Duration = Duration::ZERO;
 #[derive(Debug, Clone, Parser)]
 #[command(name = "irtt-tui", about = "Minimal IRTT-compatible TUI client")]
 pub struct TuiArgs {
-    /// Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.
+    /// Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode.
     #[arg(
         value_name = "TARGET",
         num_args = 1..,
         required = true,
         value_parser = parse_target,
-        long_help = "Server address/host, optionally prefixed with LABEL=. Repeat for multi-target mode.\n\nExplicit labels are used in the legend and status table.\n\nExamples:\n  irtt-tui host.example\n  irtt-tui eu=host.example\n  irtt-tui eu=host-a.example us=host-b.example"
+        long_help = "Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode.\n\nExplicit labels are used in the legend and status table. A target without @hmac= inherits --hmac; @hmac= disables it for that target.\n\nExamples:\n  irtt-tui host.example\n  irtt-tui eu=host.example\n  irtt-tui eu=host-a.example@hmac=secret us=host-b.example"
     )]
     pub targets: Vec<TargetArg>,
 
@@ -107,8 +107,7 @@ mod tests {
     fn tui_parser_defaults_to_continuous_and_has_no_output_option() {
         let args = parse(&["127.0.0.1:2112"]).unwrap();
         assert_eq!(args.targets.len(), 1);
-        assert_eq!(args.targets[0].label, None);
-        assert_eq!(args.targets[0].addr, "127.0.0.1:2112");
+        assert_eq!(args.prepare().unwrap().targets[0].label, "127.0.0.1:2112");
         assert_eq!(args.pacing, GroupPacingArg::Staggered);
         assert_eq!(args.duration, DEFAULT_TUI_DURATION);
         assert!(args.is_continuous());
@@ -181,8 +180,8 @@ mod tests {
 
     #[test]
     fn invalid_labelled_target_syntax_is_rejected() {
-        assert!(parse(&["=127.0.0.1:2112"]).is_err());
-        assert!(parse(&["label="]).is_err());
+        assert!(parse(&["=127.0.0.1:2112"]).unwrap().prepare().is_err());
+        assert!(parse(&["label="]).unwrap().prepare().is_err());
     }
 
     #[test]

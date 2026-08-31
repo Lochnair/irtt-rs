@@ -119,17 +119,11 @@ mod tests {
     }
 
     fn unlabeled(addr: &str) -> TargetArg {
-        TargetArg {
-            label: None,
-            addr: addr.to_owned(),
-        }
+        TargetArg::new(addr)
     }
 
     fn labeled(label: &str, addr: &str) -> TargetArg {
-        TargetArg {
-            label: Some(label.to_owned()),
-            addr: addr.to_owned(),
-        }
+        TargetArg::new(format!("{label}={addr}"))
     }
 
     fn prepare(
