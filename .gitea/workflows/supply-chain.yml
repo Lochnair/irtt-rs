@@ -16,6 +16,8 @@ permissions:
 
 env:
   ACTIONLINT_VERSION: 1.7.7
+  # Match the version embedded in the replaced cargo-deny Docker action.
+  CARGO_DENY_VERSION: 0.20.2
 
 jobs:
   cargo-deny:
@@ -44,12 +46,13 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked --version "${CARGO_DENY_VERSION}"
+
       - name: Run cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
-        with:
-          command: check
-          arguments: --all-features
-          command-arguments: ${{ matrix.checks }}
+        run: >-
+          cargo deny --manifest-path Cargo.toml --all-features check
+          ${{ matrix.checks }}
 
   actionlint:
     name: actionlint
