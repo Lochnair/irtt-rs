@@ -9,9 +9,12 @@ pub use args::{
     ClockArg, CommonClientArgs, ReceivedStatsArg, TimestampArg,
 };
 pub use config::{expected_probe_count, DEFAULT_RECV_TIMEOUT};
-pub use prepare::{prepare_managed_run, ManagedRunSetup, TargetSelection, MANAGED_EVENT_CAPACITY};
+pub use prepare::{
+    prepare_managed_run, ManagedRunSetup, TargetSelection, MANAGED_EVENT_CAPACITY,
+    STDIN_MAX_DESIRED_TARGETS, STDIN_MAX_LIVE_TARGET_GENERATIONS, STDIN_OUTCOME_HISTORY_LIMIT,
+};
 pub use session::is_shutdown_requested;
 pub use targets::{
-    parse_target, prepare_managed_targets, target_specs, GroupPacingArg, PreparedTarget, TargetArg,
-    TargetSpec,
+    parse_stdin_target_set, parse_target, prepare_managed_targets, target_specs, GroupPacingArg,
+    PreparedTarget, TargetArg, TargetSpec,
 };

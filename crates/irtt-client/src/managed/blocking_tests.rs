@@ -250,15 +250,11 @@ fn dynamic_update_reaches_background_worker() {
         .unwrap();
     let handle = owner.handle();
 
-    let acknowledgement = test_runtime().block_on(async {
-        timeout(
-            Duration::from_secs(2),
-            handle.update_targets(vec![target(&server)]).unwrap(),
-        )
-        .await
+    let acknowledgement = handle
+        .update_targets(vec![target(&server)])
         .unwrap()
-        .unwrap()
-    });
+        .blocking_wait()
+        .unwrap();
     assert_eq!(acknowledgement.sequence, 1);
     server.wait_probe();
     test_runtime().block_on(async {

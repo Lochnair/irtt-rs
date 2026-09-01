@@ -301,6 +301,19 @@ pub struct ManagedCommandReceipt {
     receiver: oneshot::Receiver<Result<ManagedCommandAcknowledgement, ManagedCommandApplyError>>,
 }
 
+impl ManagedCommandReceipt {
+    /// Block until the target-set transaction is applied or rejected.
+    ///
+    /// This is for synchronous callers such as [`BlockingManagedClient`]. It
+    /// must not be called from an asynchronous runtime; use the [`Future`]
+    /// implementation there instead.
+    pub fn blocking_wait(self) -> Result<ManagedCommandAcknowledgement, ManagedCommandApplyError> {
+        self.receiver
+            .blocking_recv()
+            .unwrap_or(Err(ManagedCommandApplyError::AcknowledgementDisconnected))
+    }
+}
+
 impl Future for ManagedCommandReceipt {
     type Output = Result<ManagedCommandAcknowledgement, ManagedCommandApplyError>;
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
