@@ -13,6 +13,10 @@ on:
 permissions:
   contents: read
 
+env:
+  CARGO_SEMVER_CHECKS_VERSION: 0.50.0
+  CARGO_SEMVER_CHECKS_SHA256: 52a65dc88dc53fa8b57d6087954eb52cda149ca03bcfca78ce3fdecd23f893c4
+
 jobs:
   semver:
     name: cargo-semver-checks
@@ -30,11 +34,19 @@ jobs:
         with:
           cache: false
 
-      # The action wrapper downloads through the GitHub API and uses the
-      # GitHub cache service. The underlying CLI is portable and preserves
-      # the existing wrapper's `feature-group: all-features` behavior.
+      # The CLI preserves the previous wrapper's `feature-group: all-features`
+      # behavior without its GitHub API/cache dependency.
       - name: Install cargo-semver-checks
-        run: cargo install cargo-semver-checks --locked
+        run: |
+          set -euo pipefail
+          archive="cargo-semver-checks-x86_64-unknown-linux-gnu.tar.gz"
+          curl --fail --show-error --location --retry 3 \
+            "https://github.com/obi1kenobi/cargo-semver-checks/releases/download/v${CARGO_SEMVER_CHECKS_VERSION}/${archive}" \
+            --output "$archive"
+          echo "${CARGO_SEMVER_CHECKS_SHA256}  ${archive}" | sha256sum --check --status -
+          tar -xzf "$archive" cargo-semver-checks
+          install -Dm755 cargo-semver-checks "${RUNNER_TEMP}/bin/cargo-semver-checks"
+          echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
       - name: Check semver compatibility
         run: cargo semver-checks check-release --all-features
