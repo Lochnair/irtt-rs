@@ -1,0 +1,40 @@
+name: Semver
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "irtt-proto/v*.*.*"
+      - "irtt-client/v*.*.*"
+      - "irtt-server/v*.*.*"
+      - "irtt-stats/v*.*.*"
+      - "irtt-rs/v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  semver:
+    name: cargo-semver-checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
+        with:
+          cache: false
+
+      # The action wrapper downloads through the GitHub API and uses the
+      # GitHub cache service. The underlying CLI is portable and preserves
+      # the existing wrapper's `feature-group: all-features` behavior.
+      - name: Install cargo-semver-checks
+        run: cargo install cargo-semver-checks --locked
+
+      - name: Check semver compatibility
+        run: cargo semver-checks check-release --all-features

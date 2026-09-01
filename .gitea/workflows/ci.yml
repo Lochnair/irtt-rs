@@ -7,7 +7,6 @@ on:
   pull_request:
     branches:
       - main
-  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -32,7 +31,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: rustfmt
-          cache-key: fmt
+          cache: false
 
       - name: Check formatting
         uses: actions-rust-lang/rustfmt@4066006ec54a31931b9b1fddfd38f2fdf2d27143 # v1
@@ -52,7 +51,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           components: clippy
-          cache-key: clippy
+          cache: false
 
       - name: Run clippy
         run: |
@@ -79,46 +78,22 @@ jobs:
       matrix:
         include:
           - task: check
-            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             musl: false
 
           - task: test
-            runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             musl: false
 
           - task: check
-            runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             musl: true
 
           - task: test
-            runner: ubuntu-24.04
             target: x86_64-unknown-linux-musl
             musl: true
 
-          - task: check
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            musl: false
-
-          - task: test
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-gnu
-            musl: false
-
-          - task: check
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            musl: true
-
-          - task: test
-            runner: ubuntu-24.04-arm
-            target: aarch64-unknown-linux-musl
-            musl: true
-
-    runs-on: ${{ matrix.runner }}
+    runs-on: ubuntu-latest
     timeout-minutes: 25
 
     steps:
@@ -137,7 +112,7 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
           target: ${{ matrix.target }}
-          cache-key: ${{ matrix.task }}-${{ matrix.target }}
+          cache: false
 
       - name: Run ${{ matrix.task }} with all features
         run: |
@@ -174,7 +149,7 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1
         with:
-          cache-key: docs
+          cache: false
 
       - name: Check docs
         run: |

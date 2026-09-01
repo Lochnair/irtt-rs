@@ -7,13 +7,15 @@ on:
   pull_request:
     branches:
       - main
-  merge_group:
   schedule:
     - cron: "41 2 * * 1"
   workflow_dispatch:
 
 permissions:
   contents: read
+
+env:
+  ACTIONLINT_VERSION: 1.7.7
 
 jobs:
   cargo-deny:
@@ -60,20 +62,26 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install actionlint
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v${ACTIONLINT_VERSION}
+
       - name: actionlint handwritten workflows
-        uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8
-        with:
-          files: >-
-            .github/workflows/actions-security.yml,
-            .github/workflows/ci.yml,
-            .github/workflows/interop-netem.yml,
-            .github/workflows/osv-scanner.yml,
-            .github/workflows/rust-clippy.yml,
-            .github/workflows/semver.yml,
-            .github/workflows/supply-chain.yml
+        # actionlint validates GitHub Actions syntax. It cannot parse Gitea's
+        # required absolute action URL in interop-netem.yml, so that workflow
+        # is checked by the Gitea runner instead.
+        run: |
+          "$(go env GOPATH)/bin/actionlint" \
+            .gitea/workflows/ci.yml \
+            .gitea/workflows/docker-publish.yml \
+            .gitea/workflows/fuzz.yml \
+            .gitea/workflows/semver.yml \
+            .gitea/workflows/supply-chain.yml \
+            .github/workflows/actions-security.yml \
+            .github/workflows/ci-arm.yml \
+            .github/workflows/osv-scanner.yml \
+            .github/workflows/rust-clippy.yml
 
       - name: actionlint generated release workflow
-        uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8
-        with:
-          files: .github/workflows/irtt-rs-release.yml
-          shellcheck: false
+        run: >-
+          "$(go env GOPATH)/bin/actionlint" -shellcheck=
+          .github/workflows/irtt-rs-release.yml

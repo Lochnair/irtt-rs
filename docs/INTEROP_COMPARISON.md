@@ -139,5 +139,5 @@ scenario contains the existing comparison harness output under
 `netem-summary.json` files. Server stdout/stderr are captured at the run root as
 `server.stdout` and `server.stderr`.
 
-On macOS, `ip netns` and `tc netem` are unavailable; use the GitHub Actions
+On macOS, `ip netns` and `tc netem` are unavailable; use the Gitea Actions
 workflow for netem coverage.

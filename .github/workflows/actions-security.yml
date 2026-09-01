@@ -16,34 +16,6 @@ permissions:
   contents: read
 
 jobs:
-  actionlint:
-    name: actionlint
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          persist-credentials: false
-
-      - name: actionlint handwritten workflows
-        uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8
-        with:
-          files: >-
-            .github/workflows/actions-security.yml,
-            .github/workflows/ci.yml,
-            .github/workflows/interop-netem.yml,
-            .github/workflows/osv-scanner.yml,
-            .github/workflows/rust-clippy.yml,
-            .github/workflows/semver.yml,
-            .github/workflows/supply-chain.yml
-
-      - name: actionlint generated release workflow
-        uses: raven-actions/actionlint@205b530c5d9fa8f44ae9ed59f341a0db994aa6f8
-        with:
-          files: .github/workflows/irtt-rs-release.yml
-          shellcheck: false
   zizmor:
     name: zizmor
     runs-on: ubuntu-latest
@@ -60,7 +32,13 @@ jobs:
         with:
           persist-credentials: false
 
+      # Zizmor's SARIF integration publishes GitHub Code Scanning results.
+      # It remains here while portable actionlint runs with Gitea CI, but scans
+      # both workflow directories through its GitHub Actions rule set.
       - name: Run zizmor
         uses: zizmorcore/zizmor-action@70fb788f84895a7701f5643d103d587e460b5c99 # v0.6.3
         with:
           persona: regular
+          inputs: |
+            .github/workflows
+            .gitea/workflows
