@@ -17,6 +17,8 @@ env:
   # Pinned for reproducibility; bump deliberately alongside `fuzz/Cargo.lock`.
   CARGO_FUZZ_VERSION: 0.13.1
   CARGO_FUZZ_SHA256: 86edc9b8f20c29ff07c3e5fcd67bc3f0784b3b960a5428635060f20d50555461
+  FUZZ_TOOLCHAIN: nightly-x86_64-unknown-linux-gnu
+  FUZZ_TARGET: x86_64-unknown-linux-gnu
 
 jobs:
   fuzz-smoke:
@@ -39,10 +41,10 @@ jobs:
         # Installed alongside, but deliberately not made the directory
         # default: cargo-fuzz itself is built with the default stable
         # toolchain below, and only `fuzz build`/`fuzz run` are run with
-        # `+nightly`. Building cargo-fuzz's own dependency tree under a
-        # nightly override can trip build scripts (e.g. rustix) that gate
+        # the GNU-host nightly below. Building cargo-fuzz's own dependency
+        # tree under a nightly override can trip build scripts (e.g. rustix) that gate
         # unstable internal attributes on detecting a nightly compiler.
-        run: rustup toolchain install nightly --profile minimal --no-self-update
+        run: rustup toolchain install "${FUZZ_TOOLCHAIN}" --profile minimal --no-self-update
 
       - name: Install cargo-fuzz
         run: |
@@ -57,7 +59,9 @@ jobs:
           echo "${RUNNER_TEMP}/bin" >> "$GITHUB_PATH"
 
       - name: Build all fuzz targets
-        run: cargo +nightly fuzz build
+        # libFuzzer sanitizers require dynamically linked GNU binaries; the
+        # runner's default Rust host can be static musl.
+        run: RUSTUP_TOOLCHAIN="${FUZZ_TOOLCHAIN}" cargo fuzz build --target "${FUZZ_TARGET}"
         working-directory: fuzz
 
       - name: Run bounded fuzz smoke for every target
@@ -69,7 +73,7 @@ jobs:
           set -euo pipefail
           for target in decode_request decode_open_reply decode_echo_reply decode_params decode_varint; do
             echo "::group::fuzz smoke: ${target}"
-            cargo +nightly fuzz run "${target}" -- \
+            RUSTUP_TOOLCHAIN="${FUZZ_TOOLCHAIN}" cargo fuzz run --target "${FUZZ_TARGET}" "${target}" -- \
               -max_total_time=10 \
               -timeout=5
             echo "::endgroup::"
