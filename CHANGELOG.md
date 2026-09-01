@@ -28,6 +28,12 @@ release. The format is loosely based on
 
 ## irtt-client
 
+### 0.5.1
+
+#### Added
+
+- `ManagedCommandReceipt::blocking_wait()` lets synchronous callers wait for a managed target-set update to be applied or rejected without entering an async runtime.
+
 ### 0.5.0
 
 #### Added
@@ -101,6 +107,17 @@ release. The format is loosely based on
 - `StatsConfig::estimated_retained_bytes(probe_count)` gives callers an API to estimate the memory a stats configuration will retain for a given probe count, ahead of actually running a session (used by `irtt-cli`'s multi-target memory-usage warning, see below).
 
 ## irtt-rs
+
+### 0.7.0
+
+#### Added
+
+- Client target arguments now support per-target HMAC configuration: append `@hmac=KEY` to override the global `--hmac` value for that target, or use `@hmac=` to explicitly disable HMAC for it. The target syntax supports context-aware escaping for literal delimiters.
+- Continuous client runs can now take complete desired target sets from standard input with `--targets-stdin`. Each non-empty record atomically replaces the current set, `[]` selects an empty set, and EOF requests a graceful stop. The controller retains only the newest unapplied record under transient replacement backpressure, with explicit bounds on record size, desired targets, and live target generations.
+
+#### Changed
+
+- A peer-initiated close is now target-local in stdin-controlled continuous runs: the controller and other desired targets keep running, and a later desired set can start that target again.
 
 ### 0.6.2
 

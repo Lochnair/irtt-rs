@@ -1,6 +1,6 @@
 [package]
 name = "irtt-client"
-version = "0.5.0"
+version = "0.5.1"
 description = "IRTT-compatible Rust client library"
 edition.workspace = true
 license.workspace = true
@@ -44,6 +44,8 @@ required-features = ["tokio"]
 doc-scrape-examples = true
 
 [dev-dependencies]
-irtt-server.workspace = true
+# Keep the packaged client testable against the latest published server while
+# workspace tests continue to exercise the local source through this path.
+irtt-server = { version = "0.5.1", path = "../irtt-server" }
 proptest = "1.11.0"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync"] }

@@ -1,6 +1,6 @@
 [package]
 name = "irtt-rs"
-version = "0.6.2"
+version = "0.7.0"
 description = "IRTT-compatible client, TUI, and server applications"
 edition.workspace = true
 license.workspace = true
