@@ -304,7 +304,7 @@ pub struct ManagedCommandReceipt {
 impl ManagedCommandReceipt {
     /// Block until the target-set transaction is applied or rejected.
     ///
-    /// This is for synchronous callers such as [`BlockingManagedClient`]. It
+    /// This is for synchronous callers such as [`crate::managed::BlockingManagedClient`]. It
     /// must not be called from an asynchronous runtime; use the [`Future`]
     /// implementation there instead.
     pub fn blocking_wait(self) -> Result<ManagedCommandAcknowledgement, ManagedCommandApplyError> {
