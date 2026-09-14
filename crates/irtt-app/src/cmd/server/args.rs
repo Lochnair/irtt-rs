@@ -106,10 +106,22 @@ pub struct ServerArgs {
     pub timestamp_allowance: Option<TimestampAllowanceArg>,
 
     /// Refuse to provide requested DSCP marking.
+    //
+    // `FalseyValueParser` rather than clap's default `bool` parser for a flag,
+    // which is what makes IRTT_SERVER_NO_DSCP usable from the environment at
+    // all. A flag's default parser accepts only the literals `true` and
+    // `false`, so the ordinary container/orchestrator spelling
+    // `IRTT_SERVER_NO_DSCP=1` did not enable the flag — it failed argument
+    // parsing and the server refused to start. Falsey semantics are clap's own
+    // documented recipe for a boolean environment flag: `0`, `false`, `no`,
+    // `n`, `off` and empty are off, anything else is on, and an absent
+    // variable is off as before. The command-line flag is unaffected: it still
+    // takes no value and still means "on".
     #[arg(
         long,
         env = "IRTT_SERVER_NO_DSCP",
-        long_help = "Refuse to provide requested traffic-class marking. Any requested DSCP is negotiated to zero, so the client is told its echo replies will be unmarked, and they are sent unmarked. The session is not refused."
+        value_parser = clap::builder::FalseyValueParser::new(),
+        long_help = "Refuse to provide requested traffic-class marking. Any requested DSCP is negotiated to zero, so the client is told its echo replies will be unmarked, and they are sent unmarked. The session is not refused.\n\nIRTT_SERVER_NO_DSCP sets the same thing from the environment: 0, false, no, n, off and an empty value leave marking enabled, and any other value disables it."
     )]
     pub no_dscp: bool,
 }
@@ -546,6 +558,43 @@ mod tests {
                 assert!(!config.dscp_allowed());
             },
         );
+    }
+
+    /// `IRTT_SERVER_NO_DSCP` is the one policy variable whose value is a
+    /// boolean rather than a number, a duration or a string, and the
+    /// container/orchestrator deployments this whole environment surface
+    /// exists for spell booleans `1`/`0`. clap's default parser for a flag
+    /// accepts only the literals `true`/`false` and turns everything else
+    /// into a *parse failure*, so `IRTT_SERVER_NO_DSCP=1` used to stop the
+    /// server from starting at all rather than enabling the flag. Falsey
+    /// semantics are what keeps that from being a startup failure.
+    #[test]
+    fn the_no_dscp_environment_variable_accepts_ordinary_boolean_spellings() {
+        for value in ["1", "true", "TRUE", "yes", "on", "enabled"] {
+            with_env(&[("IRTT_SERVER_NO_DSCP", value)], || {
+                let config = parse(&["--bind", "127.0.0.1:2112"])
+                    .expect("a truthy value must not fail argument parsing")
+                    .server_config();
+                assert!(!config.dscp_allowed(), "IRTT_SERVER_NO_DSCP={value}");
+            });
+        }
+
+        for value in ["0", "false", "no", "off", ""] {
+            with_env(&[("IRTT_SERVER_NO_DSCP", value)], || {
+                let config = parse(&["--bind", "127.0.0.1:2112"])
+                    .expect("a falsey value must not fail argument parsing")
+                    .server_config();
+                assert!(config.dscp_allowed(), "IRTT_SERVER_NO_DSCP={value}");
+            });
+        }
+    }
+
+    /// The command-line flag stays a flag: it takes no value, whatever the
+    /// environment parser accepts.
+    #[test]
+    fn the_no_dscp_flag_still_takes_no_command_line_value() {
+        assert!(parse(&["--bind", "127.0.0.1:2112", "--no-dscp=false"]).is_err());
+        assert!(!bound(&["--no-dscp"]).server_config().dscp_allowed());
     }
 
     #[test]
