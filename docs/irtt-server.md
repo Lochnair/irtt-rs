@@ -60,7 +60,8 @@ served.
 A port of `0` selects an unused port per listener, so two such binds get two
 different ports.
 
-With no `--bind` at all, see [Default bind](#default-bind) above.
+With no `--bind` at all, see [Description](#description) above for the
+default wildcard pair and the address-family fallback it allows.
 
 ### `--hmac KEY`
 
