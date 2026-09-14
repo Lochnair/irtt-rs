@@ -62,6 +62,14 @@ presentation bounds on top of the client's own statistics retention (see
 total memory is dominated by whichever of the two is larger for your target
 count.
 
+A **finite** `--duration` TUI run retains exact statistics samples exactly as
+`irtt-client(1)` does in finite mode, so its retained state grows with the
+probe count rather than approaching a bound. Unlike `irtt-client`, the TUI
+prints **no** memory warning when that estimate gets large: it owns the
+alternate screen, and a stderr warning there would be invisible or would
+corrupt the display. Size a long finite TUI run from the figures in
+`irtt-client(1)` MEASUREMENTS AND MEMORY, or use the continuous default.
+
 ## EXIT BEHAVIOR
 
 Quitting with `q` or `Ctrl-C` is an interrupted, successful exit. Otherwise,
