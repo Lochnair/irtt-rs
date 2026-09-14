@@ -136,6 +136,35 @@ and they are sent unmarked. The session is not refused.
 Durations everywhere in this command accept an integer followed by a unit:
 `ms`, `s`, or `m`.
 
+## ENVIRONMENT
+
+Every option above can also be supplied through an environment variable, for
+deployments that configure by environment rather than by command line
+(containers, orchestrators, unit files). A flag given on the command line
+overrides the corresponding variable entirely; an unset variable leaves the
+built-in default in place.
+
+| Variable | Option |
+| --- | --- |
+| `IRTT_SERVER_BIND` | `--bind`, one address only |
+| `IRTT_SERVER_HMAC` | `--hmac` |
+| `IRTT_SERVER_MAX_SESSIONS` | `--max-sessions` |
+| `IRTT_SERVER_MAX_PACKET_LENGTH` | `--max-packet-length` |
+| `IRTT_SERVER_MIN_INTERVAL` | `--min-interval` |
+| `IRTT_SERVER_BURST` | `--burst` |
+| `IRTT_SERVER_IDLE_TIMEOUT` | `--idle-timeout` |
+| `IRTT_SERVER_MAX_DURATION` | `--max-duration` |
+| `IRTT_SERVER_TIMESTAMP_ALLOWANCE` | `--timestamp-allowance` |
+| `IRTT_SERVER_NO_DSCP` | `--no-dscp` |
+
+`IRTT_SERVER_BIND` takes exactly one address, the same as a single `--bind`;
+there is no way to request several listeners from the environment. Serving
+more than one address needs repeated `--bind` options.
+
+`IRTT_SERVER_NO_DSCP` is the only boolean. `0`, `false`, `no`, `n`, `off` and
+an empty value leave traffic-class marking enabled; any other value disables
+it, and an unset variable leaves it enabled.
+
 ## OUTPUT
 
 Each bound endpoint is printed on startup, once every listener is up, which
