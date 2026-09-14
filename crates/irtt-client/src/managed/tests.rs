@@ -1895,6 +1895,78 @@ fn stagger_gate_tracks_active_membership() {
     second.finish();
 }
 
+/// The stagger gate must not fold each send's observed wakeup latency into
+/// every later slot.
+///
+/// The gate is the binding constraint on when the *group* may send next (see
+/// `next_deadline`), while each target's own schedule stays on an absolute
+/// grid anchored at its open. Re-anchoring the gate on every observed accept
+/// time therefore made the whole group's cadence drift later without bound:
+/// `EchoSent::timer_error` grew monotonically, and once the drift exceeded one
+/// interval `skip_missed_probe_slots_at` started dropping probe slots
+/// outright. Measured before this was fixed, a single-target 20 s run at a
+/// 50 ms interval sent 381 probes instead of 400.
+///
+/// This asserts the invariant directly rather than through a real-time run,
+/// because reproducing accumulation behaviorally needs seconds of wall clock
+/// and a jitter assumption. Two properties, both durable:
+///
+/// - while the pacer keeps up, N accepted sends advance the gate by exactly
+///   N spacings from the first anchor, whatever lateness each send is
+///   observed with;
+/// - a gate the pacer has fallen a full spacing behind re-anchors on the
+///   accept time instead, so a stranded gate cannot release a burst of
+///   catch-up sends.
+#[test]
+fn the_stagger_gate_advances_by_one_spacing_per_send_without_accumulating_lateness() {
+    // No socket is involved: the gate is driven directly and the task is never
+    // polled, so an unreachable address is all a valid target set needs here.
+    let (mut task, _) = ManagedClient::task(
+        config(ManagedPacing::Staggered),
+        vec![target("only", "127.0.0.1:9".parse().unwrap())],
+    )
+    .unwrap();
+
+    let spacing = Duration::from_millis(50);
+    let start = Instant::now();
+    let lateness = Duration::from_millis(3);
+
+    task.record_stagger_acceptance(
+        SendResult::Ready { accepted: true },
+        Some((1, spacing)),
+        start,
+    );
+    assert_eq!(task.send_gate, Some(start + spacing), "first send anchors");
+
+    // Every later send is observed `lateness` after the gate that released it.
+    // The gate must still advance one spacing per send from `start`, not
+    // `spacing + lateness`.
+    for slot in 1..=8_u32 {
+        let released_at = start + spacing * slot;
+        task.record_stagger_acceptance(
+            SendResult::Ready { accepted: true },
+            Some((1, spacing)),
+            released_at + lateness,
+        );
+        assert_eq!(
+            task.send_gate,
+            Some(start + spacing * (slot + 1)),
+            "slot {slot} accumulated observed lateness into the gate"
+        );
+    }
+
+    // A full spacing behind is no longer the same cadence, so the gate
+    // re-anchors rather than staying stranded in the past.
+    let stalled_gate = task.send_gate.expect("the gate is set");
+    let resumed_at = stalled_gate + spacing;
+    task.record_stagger_acceptance(
+        SendResult::Ready { accepted: true },
+        Some((1, spacing)),
+        resumed_at,
+    );
+    assert_eq!(task.send_gate, Some(resumed_at + spacing));
+}
+
 #[test]
 fn timeout_discovery_inspects_at_most_one_budget_of_targets() {
     let target_count = TIMEOUT_WORK_BUDGET + 1;

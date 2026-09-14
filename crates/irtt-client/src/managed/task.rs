@@ -1613,6 +1613,30 @@ impl ManagedClientTask {
         self.send_gate = self.send_gate.filter(|gate| *gate > now);
     }
 
+    /// The next stagger gate after a send was accepted at `accepted_at`.
+    ///
+    /// The gate advances on its **own** cadence rather than being re-anchored
+    /// on every observed accept time. Anchoring on `accepted_at` folds each
+    /// send's wakeup latency into the next slot and then into every slot after
+    /// it, so the gate — and with it the whole group's send cadence — drifts
+    /// later without bound while the per-target schedules stay on their
+    /// absolute grid. The drift is not hypothetical: it shows up as a
+    /// monotonically growing `EchoSent::timer_error` and, once it exceeds one
+    /// interval, as probe slots the schedule then skips.
+    ///
+    /// `accepted_at` is still the anchor in the two cases where continuing the
+    /// old cadence would be wrong: there is no previous gate, or the pacer has
+    /// fallen a full slot behind it. Re-anchoring there is what keeps a gate
+    /// stranded in the past from releasing a burst of catch-up sends once the
+    /// group starts moving again.
+    fn next_stagger_gate(&self, spacing: Duration, accepted_at: Instant) -> Option<Instant> {
+        let base = match self.send_gate {
+            Some(gate) if gate <= accepted_at && accepted_at.duration_since(gate) < spacing => gate,
+            _ => accepted_at,
+        };
+        base.checked_add(spacing)
+    }
+
     fn record_stagger_acceptance(
         &mut self,
         result: SendResult,
@@ -1626,7 +1650,7 @@ impl ManagedClientTask {
             return;
         };
         self.last_stagger_send = Some(accepted_at);
-        self.send_gate = accepted_at.checked_add(spacing);
+        self.send_gate = self.next_stagger_gate(spacing, accepted_at);
         #[cfg(test)]
         if let Some(observations) = &self.stagger_observations {
             observations.lock().unwrap().push((_active, spacing));
