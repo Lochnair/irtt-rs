@@ -158,3 +158,6 @@ jobs:
             --all-features \
             --no-deps \
             --locked
+
+      - name: Run doctests
+        run: cargo test --workspace --doc --all-features --locked
