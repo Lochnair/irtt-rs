@@ -8,10 +8,14 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
+arbitrary = "1.4.2"
 libfuzzer-sys = "0.4.13"
 
 [dependencies.irtt-proto]
 path = "../crates/irtt-proto"
+
+[dependencies.irtt-server]
+path = "../crates/irtt-server"
 
 # Use independent workspace for fuzzers
 [workspace]
@@ -48,6 +52,13 @@ bench = false
 [[bin]]
 name = "decode_varint"
 path = "fuzz_targets/decode_varint.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "server_core_datagrams"
+path = "fuzz_targets/server_core_datagrams.rs"
 test = false
 doc = false
 bench = false
