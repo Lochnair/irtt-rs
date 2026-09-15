@@ -91,6 +91,14 @@ impl ServerSet {
     /// An IPv4-mapped address such as `[::ffff:0.0.0.0]` is an IPv4 listener
     /// here, not an IPv6 one, matching how the runtime already reads it.
     ///
+    /// A lone explicit dual-stack `[::]:PORT` listener is not the recommended
+    /// configuration when reply DSCP/traffic-class marking for IPv4 peers
+    /// matters: Linux serves those peers as IPv4-mapped and cannot retain the
+    /// negotiated marking on their replies. Request the normal same-port
+    /// `[::]:PORT` and `0.0.0.0:PORT` pair instead. This method makes the IPv6
+    /// half IPv6-only for that pair only; a lone IPv6 listener retains its
+    /// normal socket behavior.
+    ///
     /// # Errors
     ///
     /// Returns [`ServerSetError::NoListeners`] if `addrs` is empty — a set

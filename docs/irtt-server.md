@@ -63,6 +63,15 @@ different ports.
 With no `--bind` at all, see [Description](#description) above for the
 default wildcard pair and the address-family fallback it allows.
 
+When reply DSCP/traffic-class marking for IPv4 peers matters, do not configure
+one explicit dual-stack `[::]:PORT` listener by itself. On Linux, IPv4 peers
+served through that socket are IPv4-mapped and their replies cannot retain the
+negotiated marking. Configure the ordinary paired `[::]:PORT` and
+`0.0.0.0:PORT` listeners instead; the IPv6 listener is made IPv6-only for that
+same-port pair, so each family uses the correct socket option. This is a
+configuration workaround, not a reason to force `IPV6_V6ONLY` for every lone
+IPv6 listener.
+
 ### `--hmac KEY`
 
 HMAC key, taken as the UTF-8 bytes of this argument. With a key configured,

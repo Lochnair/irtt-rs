@@ -500,13 +500,14 @@ session policy lives.
   unmarked reply into a *dropped* one, because an unappliable marking stops the
   send. Verify a platform before extending that list.
 - A genuinely dual-stack `[::]` listener still emits **unmarked** IPv4-mapped
-  replies, and this is known. It is not fixed by choosing the option per reply,
-  for the macOS reason above, and it predates wildcard source selection. Leave it
-  until it is worth its own slice, and do not "fix" it by weakening the rule that
-  an unappliable marking stops the send. The crate forbids unsafe code;
-  there is no raw `setsockopt` and no `sendmsg`/`cmsg` machinery. Keep the
-  target lists identical to the pinned `socket2` version's own gates — check
-  its source rather than copying another crate's older matrix.
+  replies on Linux. When reply DSCP/traffic-class marking for IPv4 peers
+  matters, configure the normal same-port `[::]:PORT` plus `0.0.0.0:PORT`
+  listener pair instead; `ServerSet` makes the IPv6 half IPv6-only for that
+  pair. Do not force `IPV6_V6ONLY` on every lone IPv6 listener, and do not
+  weaken the rule that an unappliable marking stops the send. The crate forbids
+  unsafe code; there is no raw `setsockopt` and no `sendmsg`/`cmsg` machinery.
+  Keep the target lists identical to the pinned `socket2` version's own gates
+  — check its source rather than copying another crate's older matrix.
 
 ## Rate, lifetime and server-initiated close
 
