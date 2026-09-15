@@ -171,6 +171,7 @@ when to use it instead of `irtt-client`/`irtt-server` directly.
 ```sh
 cargo fmt --all -- --check
 cargo test --workspace --locked
+cargo test --workspace --doc --all-features --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 ```
 
