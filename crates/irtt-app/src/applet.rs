@@ -22,7 +22,7 @@ pub fn detect_applet_from_argv0(argv0: &str) -> Option<RequestedApplet> {
     match applet_basename(argv0) {
         "irtt-client" => Some(RequestedApplet::Client),
         "irtt-tui" => Some(RequestedApplet::Tui),
-        "irttd" | "irtt-server" => Some(RequestedApplet::Server),
+        "irtt-server" => Some(RequestedApplet::Server),
         "irtt-rs" => None,
         _ => None,
     }
@@ -199,6 +199,7 @@ mod tests {
             detect_applet_from_argv0("irtt-server"),
             Some(RequestedApplet::Server)
         );
+        assert_eq!(detect_applet_from_argv0("irttd"), None);
         assert_eq!(detect_applet_from_argv0("irtt-rs"), None);
         assert_eq!(detect_applet_from_argv0("custom-name"), None);
     }
