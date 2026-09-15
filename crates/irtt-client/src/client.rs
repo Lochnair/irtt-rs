@@ -163,12 +163,13 @@ impl Client {
     ///
     /// On success, returns the negotiated open outcome and transitions the
     /// client into either an open probe session or completed no-test state.
-    /// Open attempts use [`ClientConfig::open_timeouts`]. Malformed, unrelated,
-    /// or unauthenticated datagrams are ignored until the current attempt's
-    /// absolute deadline, so one attempt may consume several datagrams without
+    /// Open attempts use [`ClientConfig::open_timeouts`]. Malformed or
+    /// unrelated datagrams are ignored until the current attempt's absolute
+    /// deadline, so one attempt may consume several datagrams without
     /// retransmitting. Silence or ignored traffic eventually produces
-    /// [`ClientError::OpenTimeout`], while authenticated incompatibility remains
-    /// terminal.
+    /// [`ClientError::OpenTimeout`]. A structurally recognizable malformed or
+    /// incompatible Open reply from the connected peer is terminal; when HMAC
+    /// is configured, that recognition additionally requires authentication.
     ///
     /// When a trusted reply allocates a token but later negotiation or socket
     /// preparation fails, the client sends a best-effort cleanup close and
@@ -523,11 +524,18 @@ impl Client {
             .unwrap_or_else(Instant::now);
         #[cfg(test)]
         if fail_send {
+            runtime.invalidate_kernel_tx_correlation();
             return Err(ClientError::Socket(io::Error::other(
                 "injected probe send failure",
             )));
         }
-        let bytes = socket.send(&prepared.bytes)?;
+        let bytes = match socket.send(&prepared.bytes) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                runtime.invalidate_kernel_tx_correlation();
+                return Err(ClientError::Socket(error));
+            }
+        };
         #[cfg(not(test))]
         let send_finished_at = Instant::now();
         #[cfg(test)]

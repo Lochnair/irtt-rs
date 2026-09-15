@@ -60,6 +60,7 @@ struct ActiveSession {
     pending: PendingMap,
     timed_out: TimedOutMap,
     completed: CompletedSet,
+    kernel_tx_correlation_valid: bool,
 }
 
 #[derive(Debug)]
@@ -423,15 +424,27 @@ impl SessionMachine {
         }
     }
 
+    /// Disable Linux kernel TX timestamp correlation after a probe send fails.
+    ///
+    /// A failed submission can consume a kernel `SOF_TIMESTAMPING_OPT_ID`
+    /// without advancing the wire sequence. Existing associated timestamps
+    /// remain valid observations; later error-queue timestamps cannot be
+    /// associated safely and are ignored for the rest of this session.
+    pub(crate) fn invalidate_kernel_tx_correlation(&mut self) {
+        if let MachineState::Open(session) = &mut self.state {
+            session.kernel_tx_correlation_valid = false;
+        }
+    }
+
     /// Record an observed Linux kernel TX timestamp for `wire_seq`, the
     /// automatic `SOF_TIMESTAMPING_OPT_ID` the kernel assigned when the
     /// datagram was submitted.
     ///
-    /// `wire_seq` doubles as that correlation ID: both counters start at
-    /// zero for a session's first timestamped send and advance by exactly
-    /// one only on a confirmed successful submission, so they stay
-    /// identical for the life of one open session (see the client crate's
-    /// `AGENTS.md` for the full invariant).
+    /// `wire_seq` normally matches that correlation ID after successful
+    /// sends. This is best effort rather than an invariant: a kernel ID can
+    /// theoretically be consumed by a send that later fails, leaving the
+    /// counters desynchronized. An unmatched or implausible ID is discarded;
+    /// the probe's userspace `sent_at` remains the fallback.
     ///
     /// Updates a still-pending or already-timed-out probe in place. Never
     /// resurrects a completed, evicted, or unknown probe, and never touches
@@ -443,6 +456,9 @@ impl SessionMachine {
         let MachineState::Open(session) = &mut self.state else {
             return;
         };
+        if !session.kernel_tx_correlation_valid {
+            return;
+        }
         if let Some(probe) = session.pending.get_mut(wire_seq) {
             probe.kernel_tx_timestamp.get_or_insert(timestamp);
             return;
@@ -636,6 +652,7 @@ impl SessionMachine {
             pending: PendingMap::new(self.config.max_pending_probes),
             timed_out: TimedOutMap::new(self.config.max_pending_probes),
             completed: CompletedSet::new(self.config.max_pending_probes),
+            kernel_tx_correlation_valid: true,
         }));
 
         let event = ClientEvent::SessionStarted {
@@ -1231,6 +1248,7 @@ mod tests {
             pending: PendingMap::new(max_pending_probes),
             timed_out: TimedOutMap::new(max_pending_probes),
             completed: CompletedSet::new(max_pending_probes),
+            kernel_tx_correlation_valid: true,
         }));
         machine
     }
@@ -2874,6 +2892,25 @@ mod tests {
     }
 
     #[test]
+    fn invalidated_kernel_tx_correlation_uses_userspace_send_time() {
+        let mono = Instant::now();
+        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
+
+        // A failed send can consume a kernel ID without advancing wire_seq.
+        // A later timestamp whose ID happens to match a pending wire sequence
+        // must not be associated after that gap.
+        machine.invalidate_kernel_tx_correlation();
+        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
+
+        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
+
+        assert_eq!(
+            reply_one_way(&events).unwrap().client_to_server,
+            Some(SignedDuration::from_nanos(20_000_000))
+        );
+    }
+
+    #[test]
     fn upstream_one_way_delay_falls_back_without_kernel_tx() {
         let mono = Instant::now();
         let mut machine = upstream_probe(send_wall_ms(1_000), mono);
@@ -3195,6 +3232,7 @@ mod tests {
                 pending: PendingMap::new(MAX_PENDING_PROBES),
                 timed_out: TimedOutMap::new(MAX_PENDING_PROBES),
                 completed: CompletedSet::new(MAX_PENDING_PROBES),
+                kernel_tx_correlation_valid: true,
             }));
             (machine, params)
         }

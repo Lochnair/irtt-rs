@@ -39,7 +39,8 @@ pub(crate) struct PendingProbe {
     /// eligible only for upstream one-way delay after local plausibility
     /// validation against `tx_not_before_wall` (see `compute_one_way`'s
     /// `preferred_send_wall`). `sent_at` remains the userspace fallback for
-    /// upstream one-way delay when this is absent or implausible.
+    /// upstream one-way delay when this is absent, implausible, or kernel-ID
+    /// correlation was invalidated by a failed probe submission.
     pub kernel_tx_timestamp: Option<SystemTime>,
 }
 

@@ -26,30 +26,30 @@ configuration (`try_enable_tx_timestamping` restores it explicitly) and
 timing falls back to userspace `sent_at` as it always has. TX capability
 failure is never a public error and is never logged from the library.
 
-### Correlation invariant: kernel ID == wire sequence
+### Best-effort kernel-ID correlation
 
-The client uses the kernel's automatic `OPT_ID` directly as the probe's wire
-sequence number — no separate correlation map. This is safe because:
+The client uses the kernel's automatic `OPT_ID` as the probe's wire-sequence
+correlation ID — no separate correlation map. On the normal successful-send
+path, both counters start at zero after Open and advance together. This is
+not a permanent identity: a kernel ID can theoretically be consumed while a
+send is being prepared and then survive a subsequent send failure, leaving
+kernel IDs one or more steps ahead of `next_wire_seq`. Do not restore an
+assumption that failed or nonblocking sends cannot cause that desynchrony.
 
-- **A failed/nonblocking send never consumes an ID.** Linux increments the
-  per-socket ID counter (`sk->sk_tskey`) speculatively while building a
-  datagram and rolls the increment back (`atomic_dec`) on every error path
-  out of `__ip_append_data`/`__ip6_append_data`
-  (`net/ipv4/ip_output.c`, `net/ipv6/ip6_output.c`), guarded by a local
-  `hold_tskey` flag. A `WouldBlock` `try_send` therefore can never leave a
-  gap in, or otherwise advance, the ID the kernel will assign to the next
-  *successful* submission. (`include/net/sock.h`'s `_sock_tx_timestamp`
-  performs the same increment for the non-corked path.) Client-side, the
-  existing send transaction only calls `commit_probe_sent` — which is the
-  only thing that advances `next_wire_seq` — after a successful socket send;
-  a `WouldBlock` result never reaches it.
-- **The two counters start together and advance together.** `wire_seq`
-  starts at 0 on every successful Open (`SessionMachine::commit_open` builds
-  a fresh `ActiveSession` with `next_wire_seq: 0`) and advances by exactly 1
-  only via `commit_probe_sent`, which only runs after a confirmed successful
-  send — the same condition under which the kernel's counter advances by 1.
-  TX timestamping is enabled only after that same successful Open and before
-  any probe is sent, so both counters' zero points line up exactly.
+The effect is confined to the optional timing enhancement. A kernel timestamp
+whose ID cannot be matched to a pending or retained timed-out probe is
+discarded, as is any implausible timestamp; `sent_at` remains the ordinary
+userspace fallback. **After every failed probe submission, disable kernel-ID
+correlation for the rest of that session.** A gap means an otherwise plausible
+later ID can name the wrong probe, so subsequent error-queue timestamps must
+be discarded rather than attached by ID. This is safe because:
+
+- **Normal successful sends track together.** `wire_seq` starts at 0 on every
+  successful Open (`SessionMachine::commit_open` builds a fresh
+  `ActiveSession` with `next_wire_seq: 0`) and advances by exactly 1 only via
+  `commit_probe_sent`, after a confirmed successful socket send. TX
+  timestamping is enabled after that same successful Open and before any probe
+  is sent, so the normal zero points line up.
 - **One socket, one session, no reopen.** `SessionMachine`'s state machine
   only reaches `Open` from `Connected`, and `commit_open`/`commit_local_close`
   never route back to `Connected`. A `Client`/`AsyncClient` cannot reopen a

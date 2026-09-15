@@ -608,8 +608,14 @@ impl AsyncClient {
                 // No sent_at measurement, no machine commit, no schedule
                 // commit: the transaction is fully discarded and retried
                 // with a fresh send_anchor on the next loop iteration.
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.machine.invalidate_kernel_tx_correlation();
+                    continue;
+                }
+                Err(error) => {
+                    self.machine.invalidate_kernel_tx_correlation();
+                    return Poll::Ready(Err(ClientError::Socket(error)));
+                }
             };
 
             #[cfg(not(test))]
