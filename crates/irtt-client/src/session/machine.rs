@@ -427,11 +427,11 @@ impl SessionMachine {
     /// automatic `SOF_TIMESTAMPING_OPT_ID` the kernel assigned when the
     /// datagram was submitted.
     ///
-    /// `wire_seq` doubles as that correlation ID: both counters start at
-    /// zero for a session's first timestamped send and advance by exactly
-    /// one only on a confirmed successful submission, so they stay
-    /// identical for the life of one open session (see the client crate's
-    /// `AGENTS.md` for the full invariant).
+    /// `wire_seq` normally matches that correlation ID after successful
+    /// sends. This is best effort rather than an invariant: a kernel ID can
+    /// theoretically be consumed by a send that later fails, leaving the
+    /// counters desynchronized. An unmatched or implausible ID is discarded;
+    /// the probe's userspace `sent_at` remains the fallback.
     ///
     /// Updates a still-pending or already-timed-out probe in place. Never
     /// resurrects a completed, evicted, or unknown probe, and never touches

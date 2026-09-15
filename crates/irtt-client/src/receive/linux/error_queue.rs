@@ -624,22 +624,14 @@ mod tests {
         ));
     }
 
-    // NOTE: a live test proving that a failed nonblocking `sendmsg` does not
-    // consume an automatic OPT_ID is not included here. Forcing a reliable,
-    // non-flaky `WouldBlock` on a connected loopback UDP socket (e.g. via
-    // socket-buffer saturation) has no deterministic OS-level mechanism
-    // available in this environment, and the repository's testing policy
-    // explicitly forbids faking coverage with sleep/saturation-based
-    // flakiness. That safety is instead established from Linux kernel
-    // source: `_sock_tx_timestamp` (include/net/sock.h) and
-    // `__ip_append_data`/`__ip6_append_data` (net/ipv4/ip_output.c,
-    // net/ipv6/ip6_output.c) increment `sk->sk_tskey` speculatively before
-    // a datagram is fully built and explicitly `atomic_dec` it back out on
-    // every error path (tracked via a local `hold_tskey` flag), so a failed
-    // send can never leave a gap in — or otherwise advance — the ID space
-    // the kernel hands out to successfully submitted datagrams. See the
-    // client crate's `AGENTS.md` for the full citation. The client-side
-    // half of this invariant (a `WouldBlock` `try_send` never advances the
-    // local wire-sequence counter used as the correlation ID) is covered by
-    // a deterministic test in the adapter module that injects `WouldBlock`.
+    // NOTE: There is no live test for whether a failed nonblocking `sendmsg`
+    // consumes an automatic OPT_ID. Forcing a reliable, non-flaky `WouldBlock`
+    // on a connected loopback UDP socket (for example through socket-buffer
+    // saturation) has no deterministic OS-level mechanism in this environment,
+    // and the repository's testing policy forbids sleep/saturation-based
+    // flakiness. The correlation is intentionally best effort: a kernel ID can
+    // theoretically be consumed by a send that later fails. The deterministic
+    // adapter test covers only the local half: an injected `WouldBlock` does
+    // not advance the local wire-sequence counter. Any later unmatched kernel
+    // timestamp is discarded and the userspace `sent_at` remains the fallback.
 }

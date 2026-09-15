@@ -12,14 +12,15 @@
 //! After a successful Open, the client adapter best-effort upgrades the
 //! socket from [`RX_TIMESTAMPING_FLAGS`] to [`error_queue::TX_TIMESTAMPING_FLAGS`]
 //! via [`try_enable_tx_timestamping`]. When that succeeds, the automatic
-//! `SOF_TIMESTAMPING_OPT_ID` counter the kernel assigns to each successfully
-//! submitted datagram is used directly as the probe's wire sequence number
-//! (see the client crate's `AGENTS.md` for the correlation invariant this
-//! relies on). [`drain_tx_timestamps`] performs a small bounded, nonblocking
-//! read of `MSG_ERRQUEUE` so the adapter can opportunistically collect those
-//! timestamps without ever waiting for one. The observed kernel TX wall time
-//! is retained as metadata only; it is not consumed by any measurement in
-//! this change.
+//! `SOF_TIMESTAMPING_OPT_ID` counter normally tracks the probe wire sequence
+//! after successful sends, so it is used as a best-effort correlation ID.
+//! A kernel ID can theoretically be consumed by a send that later fails,
+//! desynchronizing that correlation. [`drain_tx_timestamps`] discards
+//! unmatched or implausible records; the userspace `sent_at` timestamp remains
+//! the fallback. It performs a small bounded, nonblocking read of
+//! `MSG_ERRQUEUE` so the adapter can opportunistically collect timestamps
+//! without ever waiting for one. The observed kernel TX wall time is retained
+//! as metadata only; it is not consumed by any measurement in this change.
 
 use std::{
     io::{self, IoSliceMut},
