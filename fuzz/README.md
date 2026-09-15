@@ -23,7 +23,7 @@ of the root workspace, requires nightly Rust, and is not built by
 | `decode_echo_reply` | `decode_echo_reply` against a deterministic, bounded `Params` matrix, unauthenticated and HMAC-authenticated |
 | `decode_params`     | `Params::decode` and `Params::decode_with_presence`, plus an encode/decode round trip |
 | `decode_varint`     | `varint::decode_uvarint`/`decode_varint` and their round trip through `encode_uvarint`/`encode_varint` |
-| `server_core_datagrams` | A bounded mix of raw datagrams and production-encoded Open/Echo/Close requests against one `ServerCore`; it varies IPv4/IPv6 peers and session/HMAC configuration, authenticates keyed requests, reuses issued tokens, and asserts the session cap |
+| `server_core_datagrams` | A bounded mix of raw datagrams and production-encoded Open/Echo/Close requests against one `ServerCore`; it varies IPv4/IPv6 peers, session configuration, and bounded (up to 128-byte) HMAC keys, authenticates keyed requests, reuses issued tokens, and asserts the session cap |
 
 The invariant every target asserts is: **arbitrary bytes must never panic**.
 Returning `Err` is normal and expected; a successful decode is also normal.

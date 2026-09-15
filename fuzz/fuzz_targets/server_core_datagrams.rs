@@ -17,7 +17,7 @@ const MAX_INPUT_LEN: usize = 32 * 1024;
 const MAX_DATAGRAMS: usize = 16;
 const MAX_DATAGRAM_LEN: usize = 2 * 1024;
 const MAX_SESSIONS: u8 = 8;
-const FUZZ_HMAC_KEY: &[u8] = b"fuzz-server-core-key";
+const MAX_HMAC_KEY_LEN: usize = 128;
 
 #[derive(Clone)]
 struct FuzzSession {
@@ -35,11 +35,16 @@ fuzz_target!(|data: &[u8]| {
     let Ok(mut config) = config(&mut input) else {
         return;
     };
-    let hmac_key = input
-        .arbitrary::<bool>()
-        .ok()
-        .filter(|enabled| *enabled)
-        .map(|_| FUZZ_HMAC_KEY);
+    let hmac_key = match input.arbitrary::<bool>() {
+        Ok(true) => {
+            let Ok(length) = input.int_in_range(1..=MAX_HMAC_KEY_LEN) else {
+                return;
+            };
+            input.bytes(length).ok()
+        }
+        Ok(false) => None,
+        Err(_) => return,
+    };
     if let Some(key) = hmac_key {
         config = config.with_hmac_key(key);
     }
