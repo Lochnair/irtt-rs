@@ -1,4 +1,4 @@
-name: Proto Fuzz Smoke
+name: Fuzz Smoke
 
 on:
   push:
@@ -71,7 +71,7 @@ jobs:
         # regression; this is not meant to be exhaustive fuzzing.
         run: |
           set -euo pipefail
-          for target in decode_request decode_open_reply decode_echo_reply decode_params decode_varint; do
+          for target in decode_request decode_open_reply decode_echo_reply decode_params decode_varint server_core_datagrams; do
             echo "::group::fuzz smoke: ${target}"
             RUSTUP_TOOLCHAIN="${FUZZ_TOOLCHAIN}" cargo fuzz run --target "${FUZZ_TARGET}" "${target}" -- \
               -max_total_time=10 \

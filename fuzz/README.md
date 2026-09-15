@@ -1,6 +1,7 @@
-# `irtt-proto` fuzzing
+# `irtt-rs` fuzzing
 
-Coverage-guided fuzzing of `irtt-proto`'s wire decoders via
+Coverage-guided fuzzing of `irtt-proto` wire decoders and `irtt-server`'s public
+`ServerCore::handle_datagram` API via
 [`cargo-fuzz`](https://github.com/rust-fuzz/cargo-fuzz)/libFuzzer.
 
 This project is intentionally isolated from the normal stable/MSRV
@@ -22,14 +23,16 @@ of the root workspace, requires nightly Rust, and is not built by
 | `decode_echo_reply` | `decode_echo_reply` against a deterministic, bounded `Params` matrix, unauthenticated and HMAC-authenticated |
 | `decode_params`     | `Params::decode` and `Params::decode_with_presence`, plus an encode/decode round trip |
 | `decode_varint`     | `varint::decode_uvarint`/`decode_varint` and their round trip through `encode_uvarint`/`encode_varint` |
+| `server_core_datagrams` | A bounded sequence of datagrams against one `ServerCore`, with varied IPv4/IPv6 peers and session/HMAC configuration; it asserts the session cap after every datagram |
 
 The invariant every target asserts is: **arbitrary bytes must never panic**.
 Returning `Err` is normal and expected; a successful decode is also normal.
 
-Every target bounds its input to 128 KiB (`MAX_INPUT_LEN` in each harness) so
-libFuzzer spends its time exploring protocol structure rather than
-allocating/copying megabytes — production IRTT datagrams are UDP-sized, well
-under this bound.
+Every target bounds its input (`MAX_INPUT_LEN` in each harness) so libFuzzer
+spends its time exploring protocol structure rather than allocating/copying
+megabytes. `server_core_datagrams` additionally caps its sequence length and
+each individual datagram and configures the core to the same packet cap, so one
+libFuzzer input cannot become a tiny DoS benchmark.
 
 ## Running
 
