@@ -31,7 +31,7 @@ The build also produces dedicated binaries: `irtt-client`, `irtt-tui`, and
 what it is invoked or copied as — it does not consult argv0 dispatch logic.
 
 `irtt-rs` itself inspects argv0 first: if invoked (or symlinked/copied) under
-one of the recognized applet names — `irtt-client`, `irtt-tui`, `irttd`, or
+one of the recognized applet names — `irtt-client`, `irtt-tui`, or
 `irtt-server` — it runs that applet directly, without needing a subcommand.
 Any other name starting with `irtt-` (other than `irtt-rs` itself) is
 rejected as an unknown applet name before subcommand parsing is even
