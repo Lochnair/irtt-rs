@@ -163,12 +163,13 @@ impl Client {
     ///
     /// On success, returns the negotiated open outcome and transitions the
     /// client into either an open probe session or completed no-test state.
-    /// Open attempts use [`ClientConfig::open_timeouts`]. Malformed, unrelated,
-    /// or unauthenticated datagrams are ignored until the current attempt's
-    /// absolute deadline, so one attempt may consume several datagrams without
+    /// Open attempts use [`ClientConfig::open_timeouts`]. Malformed or
+    /// unrelated datagrams are ignored until the current attempt's absolute
+    /// deadline, so one attempt may consume several datagrams without
     /// retransmitting. Silence or ignored traffic eventually produces
-    /// [`ClientError::OpenTimeout`], while authenticated incompatibility remains
-    /// terminal.
+    /// [`ClientError::OpenTimeout`]. A malformed or incompatible reply that is
+    /// recognized as coming from the connected peer is terminal; when HMAC is
+    /// configured, that recognition additionally requires authentication.
     ///
     /// When a trusted reply allocates a token but later negotiation or socket
     /// preparation fails, the client sends a best-effort cleanup close and
