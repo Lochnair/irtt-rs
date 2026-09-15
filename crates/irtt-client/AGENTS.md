@@ -39,7 +39,10 @@ assumption that failed or nonblocking sends cannot cause that desynchrony.
 The effect is confined to the optional timing enhancement. A kernel timestamp
 whose ID cannot be matched to a pending or retained timed-out probe is
 discarded, as is any implausible timestamp; `sent_at` remains the ordinary
-userspace fallback. This is safe because:
+userspace fallback. **After every failed probe submission, disable kernel-ID
+correlation for the rest of that session.** A gap means an otherwise plausible
+later ID can name the wrong probe, so subsequent error-queue timestamps must
+be discarded rather than attached by ID. This is safe because:
 
 - **Normal successful sends track together.** `wire_seq` starts at 0 on every
   successful Open (`SessionMachine::commit_open` builds a fresh

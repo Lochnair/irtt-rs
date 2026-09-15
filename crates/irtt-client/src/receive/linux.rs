@@ -17,7 +17,9 @@
 //! A kernel ID can theoretically be consumed by a send that later fails,
 //! desynchronizing that correlation. [`drain_tx_timestamps`] discards
 //! unmatched or implausible records; the userspace `sent_at` timestamp remains
-//! the fallback. It performs a small bounded, nonblocking read of
+//! the fallback. After a probe send failure, correlation is disabled for that
+//! session so later IDs cannot be misattributed. It performs a small bounded,
+//! nonblocking read of
 //! `MSG_ERRQUEUE` so the adapter can opportunistically collect timestamps
 //! without ever waiting for one. The observed kernel TX wall time is retained
 //! as metadata only; it is not consumed by any measurement in this change.
