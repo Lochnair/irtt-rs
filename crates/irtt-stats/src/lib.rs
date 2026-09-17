@@ -66,6 +66,44 @@ impl StatsConfig {
     /// them reports a median in the cumulative snapshot once it has samples,
     /// and keeps unbounded adjacent-sequence IPDV tracking so late adjacent
     /// replies can still complete IPDV pairs.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use irtt_stats::{StatsCollector, StatsConfig};
+    ///
+    /// # use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    /// # use std::time::{Duration, Instant, SystemTime};
+    /// # use irtt_client::{ClientEvent, ClientTimestamp};
+    /// #
+    /// # fn sent(seq: u32, at_ms: u64, send_call_us: u64) -> ClientEvent {
+    /// #     let sent_at = ClientTimestamp {
+    /// #         mono: Instant::now() + Duration::from_millis(at_ms),
+    /// #         wall: SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+    /// #     };
+    /// #     ClientEvent::EchoSent {
+    /// #         seq,
+    /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
+    /// #         scheduled_at: sent_at.mono,
+    /// #         sent_at,
+    /// #         bytes: 64,
+    /// #         send_call: Duration::from_micros(send_call_us),
+    /// #         timer_error: Duration::from_micros(2),
+    /// #     }
+    /// # }
+    /// #
+    /// let mut collector = StatsCollector::new(StatsConfig::finite());
+    /// for (seq, send_call_us) in [10_u64, 30, 20].into_iter().enumerate() {
+    ///     collector.process(&sent(seq as u32, seq as u64 * 10, send_call_us));
+    /// }
+    ///
+    /// let snapshot = collector.snapshot();
+    /// // Finite mode retains exact samples, so the send-call metric reports an
+    /// // exact median once it has samples: the middle of the sorted
+    /// // 10, 20, 30 µs values, not their mean.
+    /// assert_eq!(snapshot.send_call.count, 3);
+    /// assert_eq!(snapshot.send_call.median_ns, Some(20_000.0));
+    /// ```
     pub fn finite() -> Self {
         Self {
             samples: SampleMode::Exact,
@@ -80,6 +118,44 @@ impl StatsConfig {
     /// Continuous mode uses running statistics, retains no exact samples so no
     /// timing metric reports a median, and bounds adjacent-sequence IPDV
     /// tracking for long-running sessions.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use irtt_stats::{StatsCollector, StatsConfig};
+    ///
+    /// # use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    /// # use std::time::{Duration, Instant, SystemTime};
+    /// # use irtt_client::{ClientEvent, ClientTimestamp};
+    /// #
+    /// # fn sent(seq: u32, at_ms: u64, send_call_us: u64) -> ClientEvent {
+    /// #     let sent_at = ClientTimestamp {
+    /// #         mono: Instant::now() + Duration::from_millis(at_ms),
+    /// #         wall: SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+    /// #     };
+    /// #     ClientEvent::EchoSent {
+    /// #         seq,
+    /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
+    /// #         scheduled_at: sent_at.mono,
+    /// #         sent_at,
+    /// #         bytes: 64,
+    /// #         send_call: Duration::from_micros(send_call_us),
+    /// #         timer_error: Duration::from_micros(2),
+    /// #     }
+    /// # }
+    /// #
+    /// let mut collector = StatsCollector::new(StatsConfig::continuous());
+    /// for seq in 0..3 {
+    ///     collector.process(&sent(seq, u64::from(seq) * 10, 10));
+    /// }
+    ///
+    /// let snapshot = collector.snapshot();
+    /// // Continuous mode still tracks running statistics — count, mean, min,
+    /// // and max — but retains no exact samples, so it reports no median.
+    /// assert_eq!(snapshot.send_call.count, 3);
+    /// assert!(snapshot.send_call.mean_ns > 0.0);
+    /// assert_eq!(snapshot.send_call.median_ns, None);
+    /// ```
     pub fn continuous() -> Self {
         Self {
             samples: SampleMode::RunningOnly,
@@ -135,6 +211,34 @@ impl StatsConfig {
     /// The result is deterministic and computed with saturating arithmetic, so
     /// an enormous `probe_count` saturates at [`u64::MAX`] rather than
     /// wrapping or panicking.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use irtt_stats::StatsConfig;
+    ///
+    /// // Finite retention grows with the probe count...
+    /// let finite = StatsConfig::finite();
+    /// assert!(
+    ///     finite.estimated_retained_bytes(1_000_000)
+    ///         > finite.estimated_retained_bytes(1_000)
+    /// );
+    ///
+    /// // ...while continuous retention is bounded, so a far longer run is no
+    /// // more expensive.
+    /// let continuous = StatsConfig::continuous();
+    /// assert_eq!(
+    ///     continuous.estimated_retained_bytes(1_000_000),
+    ///     continuous.estimated_retained_bytes(10_000_000),
+    /// );
+    /// assert!(
+    ///     continuous.estimated_retained_bytes(1_000_000)
+    ///         < finite.estimated_retained_bytes(1_000_000)
+    /// );
+    ///
+    /// // Enormous probe counts saturate rather than wrapping or panicking.
+    /// assert_eq!(finite.estimated_retained_bytes(u64::MAX), u64::MAX);
+    /// ```
     pub fn estimated_retained_bytes(&self, probe_count: u64) -> u64 {
         retention::estimated_retained_bytes(self, probe_count)
     }
@@ -192,6 +296,60 @@ pub enum SampleMode {
 ///
 /// A collector maintains cumulative statistics and, when configured, rolling
 /// windows. Rolling snapshots are recomputed from retained normalized events.
+///
+/// # Example
+///
+/// Feed a short stream of `irtt-client` events to a finite-mode collector and
+/// read back a cumulative snapshot:
+///
+/// ```
+/// use irtt_stats::{StatsCollector, StatsConfig};
+///
+/// # use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+/// # use std::time::{Duration, Instant, SystemTime};
+/// # use irtt_client::{ClientEvent, ClientTimestamp, RttSample, SignedDuration};
+/// #
+/// # /// A synthetic reply; a real session delivers these as `ClientEvent`s.
+/// # fn reply(seq: u32, rtt_ms: u64) -> ClientEvent {
+/// #     let remote = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112);
+/// #     let sent_at = ClientTimestamp {
+/// #         mono: Instant::now() + Duration::from_millis(u64::from(seq) * 10),
+/// #         wall: SystemTime::UNIX_EPOCH + Duration::from_millis(u64::from(seq) * 10),
+/// #     };
+/// #     let raw = Duration::from_millis(rtt_ms);
+/// #     ClientEvent::EchoReply {
+/// #         seq,
+/// #         remote,
+/// #         sent_at,
+/// #         received_at: ClientTimestamp {
+/// #             mono: sent_at.mono + raw,
+/// #             wall: sent_at.wall + raw,
+/// #         },
+/// #         rtt: RttSample {
+/// #             raw,
+/// #             adjusted: None,
+/// #             effective: SignedDuration::from_duration(raw),
+/// #         },
+/// #         server_timing: None,
+/// #         one_way: None,
+/// #         received_stats: None,
+/// #         bytes: 64,
+/// #         packet_meta: irtt_client::PacketMeta::default(),
+/// #     }
+/// # }
+/// #
+/// let mut collector = StatsCollector::new(StatsConfig::finite());
+/// for (seq, rtt_ms) in [10_u64, 30, 20].into_iter().enumerate() {
+///     collector.process(&reply(seq as u32, rtt_ms));
+/// }
+///
+/// let snapshot = collector.snapshot();
+/// assert_eq!(snapshot.events.echo_replies, 3);
+/// assert_eq!(snapshot.rtt.primary.count, 3);
+/// // Finite mode retains exact samples, so the round-trip metric reports an
+/// // exact median: the middle of the sorted 10, 20, 30 ms samples.
+/// assert_eq!(snapshot.rtt.primary.median_ns, Some(20_000_000.0));
+/// ```
 pub struct StatsCollector {
     cumulative: CoreStats,
     rolling: RollingEvents,
@@ -236,6 +394,53 @@ impl StatsCollector {
     /// running statistics only, whatever [`StatsConfig::samples`] is set to,
     /// so its timing metrics report no median. A rolling window is a bounded
     /// recent view rather than the run's retained history.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use irtt_stats::{StatsCollector, StatsConfig};
+    ///
+    /// # use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    /// # use std::time::{Duration, Instant, SystemTime};
+    /// # use irtt_client::{ClientEvent, ClientTimestamp};
+    /// #
+    /// # fn sent(seq: u32, at_ms: u64, send_call_us: u64) -> ClientEvent {
+    /// #     let sent_at = ClientTimestamp {
+    /// #         mono: Instant::now() + Duration::from_millis(at_ms),
+    /// #         wall: SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+    /// #     };
+    /// #     ClientEvent::EchoSent {
+    /// #         seq,
+    /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
+    /// #         scheduled_at: sent_at.mono,
+    /// #         sent_at,
+    /// #         bytes: 64,
+    /// #         send_call: Duration::from_micros(send_call_us),
+    /// #         timer_error: Duration::from_micros(2),
+    /// #     }
+    /// # }
+    /// #
+    /// let mut collector = StatsCollector::new(StatsConfig {
+    ///     rolling_count: Some(2),
+    ///     ..StatsConfig::finite()
+    /// });
+    /// collector.process(&sent(0, 0, 10));
+    /// collector.process(&sent(1, 10, 10));
+    /// collector.process(&sent(2, 20, 10));
+    ///
+    /// // The window keeps only the last two normalized events...
+    /// let rolling = collector.rolling_count().unwrap();
+    /// assert_eq!(rolling.packets.packets_sent, 2);
+    /// // ...and is recomputed with running statistics, so it reports no median
+    /// // even though the collector retains exact samples for its cumulative
+    /// // snapshot.
+    /// assert_eq!(rolling.send_call.median_ns, None);
+    ///
+    /// // The cumulative snapshot still sees every event.
+    /// let cumulative = collector.snapshot();
+    /// assert_eq!(cumulative.packets.packets_sent, 3);
+    /// assert_eq!(cumulative.send_call.median_ns, Some(10_000.0));
+    /// ```
     pub fn rolling_count(&self) -> Option<Snapshot> {
         self.rolling.count_snapshot()
     }
@@ -244,6 +449,47 @@ impl StatsCollector {
     ///
     /// Like [`StatsCollector::rolling_count`], this is recomputed with running
     /// statistics only and reports no medians.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use std::time::Duration;
+    ///
+    /// use irtt_stats::{StatsCollector, StatsConfig};
+    ///
+    /// # use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+    /// # use std::time::Instant;
+    /// # use irtt_client::{ClientEvent, ClientTimestamp};
+    /// #
+    /// # fn sent(seq: u32, at_ms: u64, send_call_us: u64) -> ClientEvent {
+    /// #     let sent_at = ClientTimestamp {
+    /// #         mono: Instant::now() + Duration::from_millis(at_ms),
+    /// #         wall: std::time::SystemTime::UNIX_EPOCH + Duration::from_millis(at_ms),
+    /// #     };
+    /// #     ClientEvent::EchoSent {
+    /// #         seq,
+    /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
+    /// #         scheduled_at: sent_at.mono,
+    /// #         sent_at,
+    /// #         bytes: 64,
+    /// #         send_call: Duration::from_micros(send_call_us),
+    /// #         timer_error: Duration::from_micros(2),
+    /// #     }
+    /// # }
+    /// #
+    /// let mut collector = StatsCollector::new(StatsConfig {
+    ///     rolling_time: Some(Duration::from_millis(15)),
+    ///     ..StatsConfig::finite()
+    /// });
+    /// collector.process(&sent(0, 0, 10));
+    /// collector.process(&sent(1, 10, 10));
+    /// collector.process(&sent(2, 30, 10));
+    ///
+    /// // A 15 ms window anchored at the latest event (30 ms) retains only the
+    /// // events from the last 15 ms — here just the final send.
+    /// let rolling = collector.rolling_time().unwrap();
+    /// assert_eq!(rolling.packets.packets_sent, 1);
+    /// ```
     pub fn rolling_time(&self) -> Option<Snapshot> {
         self.rolling.time_snapshot()
     }
