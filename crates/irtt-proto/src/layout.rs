@@ -135,6 +135,20 @@ pub fn echo_header_len(hmac: bool, params: &Params) -> usize {
 /// A ceiling on what a negotiated length may legitimately *be* — an MTU, a
 /// resource bound, a maximum packet size — is deliberately not here. That is
 /// server and runtime policy, and it belongs where the negotiation happens.
+///
+/// # Example
+///
+/// ```
+/// use irtt_proto::{echo_packet_len, Params};
+///
+/// // The default layout's mandatory field block is 16 bytes (header, token,
+/// // sequence), so a smaller requested length is floored up to it.
+/// assert_eq!(echo_packet_len(false, &Params::default()).unwrap(), 16);
+/// assert_eq!(
+///     echo_packet_len(false, &Params { length: 40, ..Params::default() }).unwrap(),
+///     40,
+/// );
+/// ```
 pub fn echo_packet_len(hmac: bool, params: &Params) -> Result<usize> {
     let header_len = echo_header_len(hmac, params);
     let requested = if params.length <= 0 {

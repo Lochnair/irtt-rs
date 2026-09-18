@@ -68,6 +68,23 @@ pub fn verify_hmac(key: &[u8], packet: &[u8], hmac_offset: usize) -> Result<()> 
 /// [`ProtoError::InvalidHmacOffset`] when the field is truncated, and
 /// [`ProtoError::BadHmac`] when the MAC does not match. The packet is never
 /// modified.
+///
+/// # Example
+///
+/// ```
+/// use irtt_proto::{encode_request, verify_packet_hmac, Params, RequestToEncode};
+///
+/// // Synthetic example key — use a real shared secret in production.
+/// let key = b"example key";
+/// let params = Params::with_protocol_defaults();
+/// let packet = encode_request(
+///     RequestToEncode::Open { params: &params, no_test: false },
+///     Some(key),
+/// ).unwrap();
+///
+/// verify_packet_hmac(key, &packet).unwrap();
+/// assert!(verify_packet_hmac(b"wrong key", &packet).is_err());
+/// ```
 pub fn verify_packet_hmac(key: &[u8], packet: &[u8]) -> Result<()> {
     let envelope = envelope::decode_structural(packet)?;
     if !envelope.hmac_present {
