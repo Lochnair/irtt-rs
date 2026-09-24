@@ -44,6 +44,42 @@ const POST_DEADLINE_RECEIVE_BUDGET: usize = TARGET_WORK_BUDGET;
 const MAX_BROADCAST_CHANNEL_CAPACITY: usize = usize::MAX >> 1;
 
 /// Entry point for constructing a unified Tokio managed task.
+///
+/// # Example
+///
+/// Construct the task and its separate control handle, subscribe before
+/// starting the task, then run it under the caller's Tokio runtime. A reachable
+/// server is required at runtime, so this example only type-checks.
+///
+/// ```no_run
+/// use irtt_client::{ClientConfig, ClientEvent};
+/// use irtt_client::managed::{
+///     ManagedClient, ManagedClientConfig, ManagedEvent, ManagedTargetConfig,
+/// };
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ManagedClientConfig {
+///     client: ClientConfig {
+///         duration: Some(std::time::Duration::from_secs(10)),
+///         ..ClientConfig::default()
+///     },
+///     ..ManagedClientConfig::default()
+/// };
+/// let targets = vec![ManagedTargetConfig::new("edge", "127.0.0.1:2112")];
+/// let (task, handle) = ManagedClient::task(config, targets)?;
+/// let mut events = handle.subscribe()?;
+/// let driver = tokio::spawn(task);
+///
+/// while let Ok(event) = events.recv().await {
+///     if let ManagedEvent::Client { event: ClientEvent::EchoReply { .. }, .. } = event {
+///         println!("received a probe reply");
+///     }
+/// }
+/// let outcome = driver.await?;
+/// println!("run ended: {:?}", outcome.end_reason);
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug, Default)]
 pub struct ManagedClient;
 

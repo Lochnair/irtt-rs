@@ -46,6 +46,31 @@ pub(crate) const DEFAULT_MAX_PENDING: usize = 4096;
 /// request and the local client behavior used to drive the UDP socket. Values
 /// that are negotiated by the server are available after opening the session
 /// through [`NegotiatedParams`](crate::NegotiatedParams).
+///
+/// # Example
+///
+/// Configure a finite run with larger probes and accept documented server
+/// restrictions. Use `duration: None` for continuous mode, or
+/// [`RunMode::NoTest`] for negotiation without probes.
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use irtt_client::{ClientConfig, NegotiationPolicy};
+///
+/// let config = ClientConfig {
+///     server_addr: "example.net:2112".into(),
+///     duration: Some(Duration::from_secs(10)),
+///     interval: Duration::from_millis(250),
+///     length: 1200,
+///     negotiation_policy: NegotiationPolicy::Loose,
+///     ..ClientConfig::default()
+/// };
+///
+/// assert_eq!(config.duration, Some(Duration::from_secs(10)));
+/// assert_eq!(config.interval, Duration::from_millis(250));
+/// assert_eq!(config.length, 1200);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
     /// Remote server name or address.
@@ -176,6 +201,29 @@ impl Default for ClientConfig {
 /// These settings affect how the client binds, resolves, and receives from the
 /// socket. They do not change the IRTT protocol parameters negotiated with the
 /// server.
+///
+/// # Example
+///
+/// Bind to a chosen local endpoint and set the outgoing IPv4 TTL:
+///
+/// ```
+/// use std::net::{Ipv4Addr, SocketAddr};
+///
+/// use irtt_client::{ClientConfig, SocketConfig};
+///
+/// let config = ClientConfig {
+///     socket_config: SocketConfig {
+///         bind_addr: Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
+///         ttl: Some(32),
+///         ipv4_only: true,
+///         ..SocketConfig::default()
+///     },
+///     ..ClientConfig::default()
+/// };
+///
+/// assert_eq!(config.socket_config.ttl, Some(32));
+/// assert!(config.socket_config.ipv4_only);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SocketConfig {
     /// Local address to bind before connecting the UDP socket.

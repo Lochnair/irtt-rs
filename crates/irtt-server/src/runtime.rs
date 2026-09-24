@@ -53,6 +53,28 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(1);
 /// [`ServerRuntimeError::WildcardSourceSelectionUnsupported`] — rather than
 /// served by a listener whose replies a client on a second address would
 /// silently discard. Explicit-address listeners are unaffected everywhere.
+///
+/// # Example
+///
+/// Bind one listener, inspect the resolved endpoint, and let the caller decide
+/// when serving ends. This example type-checks without opening a socket:
+///
+/// ```no_run
+/// use std::{net::{Ipv4Addr, SocketAddr}, time::Duration};
+///
+/// use irtt_server::{Server, ServerConfig};
+///
+/// # async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut server = Server::bind(
+///     SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+///     ServerConfig::default(),
+/// )
+/// .await?;
+/// println!("listening on {}", server.local_addr()?);
+/// server.run(tokio::time::sleep(Duration::from_secs(60))).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Server {
     socket: UdpSocket,

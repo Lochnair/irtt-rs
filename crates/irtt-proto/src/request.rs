@@ -88,6 +88,26 @@ pub enum DecodedRequestKind<'a> {
 /// the negotiated length is positive and wider than `usize`. A *negative*
 /// negotiated length is not an error: see [`echo_packet_len`], which floors it
 /// at the mandatory field block.
+///
+/// # Example
+///
+/// ```
+/// use irtt_proto::{encode_request, Params, RequestToEncode};
+///
+/// // An unauthenticated ECHO probe. `params` supplies the negotiated length,
+/// // which reserves four payload bytes beyond the 16-byte echo header.
+/// let params = Params { length: 20, ..Params::default() };
+/// let packet = encode_request(
+///     RequestToEncode::Echo {
+///         token: 0x1234_5678_9abc_def0,
+///         sequence: 7,
+///         params: &params,
+///         payload: &[1, 2, 3, 4],
+///     },
+///     None,
+/// ).unwrap();
+/// assert_eq!(packet.len(), 20);
+/// ```
 pub fn encode_request(request: RequestToEncode<'_>, hmac_key: Option<&[u8]>) -> Result<Vec<u8>> {
     match request {
         RequestToEncode::Open { params, no_test } => encode_open(params, no_test, hmac_key),
@@ -138,6 +158,21 @@ pub fn encode_request(request: RequestToEncode<'_>, hmac_key: Option<&[u8]>) -> 
 /// Returns [`ProtoError::PacketTooShort`], [`ProtoError::BadMagic`],
 /// [`ProtoError::ReservedFlags`], or [`ProtoError::UnexpectedFlag`] for
 /// `FLAG_REPLY`.
+///
+/// # Example
+///
+/// ```
+/// use irtt_proto::{decode_request, encode_request, DecodedRequestKind, RequestToEncode};
+///
+/// let packet = encode_request(
+///     RequestToEncode::Close { token: 0x1234_5678_9abc_def0 },
+///     None,
+/// ).unwrap();
+///
+/// let request = decode_request(&packet).unwrap();
+/// assert!(!request.hmac_present);
+/// assert_eq!(request.kind, DecodedRequestKind::Close { token: 0x1234_5678_9abc_def0 });
+/// ```
 pub fn decode_request(packet: &[u8]) -> Result<DecodedRequest<'_>> {
     let envelope = envelope::decode_structural(packet)?;
     if has(envelope.flags, FLAG_REPLY) {

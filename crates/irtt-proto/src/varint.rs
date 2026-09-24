@@ -1,3 +1,19 @@
+//! Variable-length integer encoding for IRTT wire values.
+//!
+//! Tags use an unsigned base-128 varint ([`encode_uvarint`]), and signed
+//! integers (such as parameter values) use the same encoding after a zigzag
+//! transform ([`encode_varint`]), which keeps small negative numbers compact.
+//!
+//! # Example
+//!
+//! ```
+//! use irtt_proto::varint::{decode_varint, encode_varint};
+//!
+//! let mut out = Vec::new();
+//! encode_varint(1_000_000_000, &mut out);
+//! assert_eq!(decode_varint(&out).unwrap(), (1_000_000_000, out.len()));
+//! ```
+
 use crate::{ProtoError, Result};
 
 pub fn encode_uvarint(mut value: u64, out: &mut Vec<u8>) {

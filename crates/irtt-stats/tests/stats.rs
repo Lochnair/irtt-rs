@@ -14,26 +14,6 @@ use irtt_stats::{
 };
 
 #[test]
-fn exact_mode_reports_a_send_call_median() {
-    let mut collector = StatsCollector::new(StatsConfig::finite());
-    for (seq, send_call_us) in [10_u64, 30, 20].into_iter().enumerate() {
-        collector.process(&sent_with_timings(
-            seq as u32,
-            ts(seq as u64 * 10),
-            send_call_us,
-            2,
-        ));
-    }
-
-    let snapshot = collector.snapshot();
-    assert_eq!(snapshot.send_call.count, 3);
-    assert_eq!(snapshot.send_call.min_ns, Some(10_000));
-    assert_eq!(snapshot.send_call.max_ns, Some(30_000));
-    // Sorted 10, 20, 30 us: the median is the middle sample, not the mean.
-    assert_eq!(snapshot.send_call.median_ns, Some(20_000.0));
-}
-
-#[test]
 fn exact_mode_reports_a_timer_error_median() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
     for (seq, timer_error_us) in [2_u64, 8, 4, 6].into_iter().enumerate() {

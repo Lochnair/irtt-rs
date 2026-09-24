@@ -42,6 +42,39 @@
 //! which reply kind to expect, and the two need genuinely different semantic
 //! context.
 //!
+//! # Example
+//!
+//! The normal path is directional: a sender encodes with [`encode_request`], a
+//! receiver classifies with [`decode_request`], and authentication is a
+//! separate step once the applicable key is known.
+//!
+//! ```
+//! use irtt_proto::{
+//!     decode_request, encode_request, verify_packet_hmac, DecodedRequestKind, Params,
+//!     RequestToEncode,
+//! };
+//!
+//! // Sender side: encode an authenticated open request.
+//! let params = Params::with_protocol_defaults();
+//! let key = b"example key";
+//! let packet = encode_request(
+//!     RequestToEncode::Open { params: &params, no_test: false },
+//!     Some(key),
+//! ).unwrap();
+//!
+//! // Receiver side: classify structurally, before any key is known.
+//! let request = decode_request(&packet).unwrap();
+//! assert!(request.hmac_present);
+//! let DecodedRequestKind::Open { no_test, params: encoded } = request.kind else {
+//!     panic!("expected an open request");
+//! };
+//! assert!(!no_test);
+//! assert_eq!(Params::decode(encoded).unwrap(), params);
+//!
+//! // Authentication is a separate step, once the applicable key is known.
+//! verify_packet_hmac(key, &packet).unwrap();
+//! ```
+//!
 #![forbid(unsafe_code)]
 
 pub mod echo;

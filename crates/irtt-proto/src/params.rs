@@ -16,6 +16,29 @@ pub const MAX_SERVER_FILL_BYTES: usize = 32;
 /// [`clock`](Params::clock) is [`Clock::Unspecified`], which is what an open
 /// request with an empty parameter payload means. It is not a set of sensible
 /// client settings; a client builds its request from its own configuration.
+///
+/// # Example
+///
+/// Construct a `Params`, encode it, and decode it back:
+///
+/// ```
+/// use irtt_proto::{Clock, Params, ReceivedStats, ServerFill, StampAt};
+///
+/// let params = Params {
+///     protocol_version: 1,
+///     duration_ns: 3_000_000_000,
+///     interval_ns: 1_000_000_000,
+///     length: 1472,
+///     received_stats: ReceivedStats::Both,
+///     stamp_at: StampAt::Both,
+///     clock: Clock::Both,
+///     server_fill: Some(ServerFill { value: "rand".to_owned() }),
+///     ..Params::default()
+/// };
+///
+/// let encoded = params.encode();
+/// assert_eq!(Params::decode(&encoded).unwrap(), params);
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct Params {
     pub protocol_version: i64,
@@ -87,6 +110,20 @@ impl Params {
     ///
     /// Presence means the tag appeared at least once. Repeated known tags keep
     /// last-value-wins, and unknown tags remain ignored and untracked.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use irtt_proto::Params;
+    ///
+    /// // Wire bytes: tag 2 (duration) carrying an explicit zero. Interval
+    /// // (tag 3) is absent, so both fields decode to zero but only one is
+    /// // reported present.
+    /// let decoded = Params::decode_with_presence(&[0x02, 0x00]).unwrap();
+    /// assert_eq!(decoded.params.duration_ns, 0);
+    /// assert!(decoded.presence.duration_ns);
+    /// assert!(!decoded.presence.interval_ns);
+    /// ```
     ///
     /// [`decode`]: Params::decode
     pub fn decode_with_presence(input: &[u8]) -> Result<DecodedParams> {

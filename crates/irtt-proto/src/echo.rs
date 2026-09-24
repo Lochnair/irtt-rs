@@ -60,6 +60,50 @@ pub struct TimestampFields {
     pub send_mono: Option<i64>,
 }
 
+/// Encodes an ECHO reply.
+///
+/// `params` supplies the negotiated layout and length, exactly as on the
+/// request side, and every optional field the layout requires must be present
+/// in `reply`: a `Some` where the layout has no field, or a `None` where it has
+/// one, is an error. `hmac_key` is authoritative: `Some(key)` sets `FLAG_HMAC`
+/// and signs the finished datagram.
+///
+/// # Errors
+///
+/// Returns [`ProtoError::MissingFlag`] or [`ProtoError::UnexpectedFlag`] when
+/// the reply does not carry exactly the packet-type flags this encoder
+/// requires, [`ProtoError::MissingField`] or [`ProtoError::UnexpectedField`]
+/// when `reply`'s optional fields do not match the negotiated layout, and
+/// [`ProtoError::PayloadTooLarge`] when the payload does not fit the negotiated
+/// length.
+///
+/// # Example
+///
+/// ```
+/// use irtt_proto::{
+///     decode_echo_reply, encode_echo_reply, EchoReply, Params, ReceivedStats,
+///     TimestampFields, FLAG_REPLY,
+/// };
+///
+/// // `received_stats` negotiates a receive counter; four payload bytes.
+/// let params = Params {
+///     length: 24,
+///     received_stats: ReceivedStats::Count,
+///     ..Params::default()
+/// };
+/// let reply = EchoReply {
+///     flags: FLAG_REPLY,
+///     token: 0x1234_5678_9abc_def0,
+///     sequence: 7,
+///     recv_count: Some(3),
+///     recv_window: None,
+///     timestamps: TimestampFields::default(),
+///     payload: vec![1, 2, 3, 4],
+/// };
+///
+/// let packet = encode_echo_reply(&reply, &params, None).unwrap();
+/// assert_eq!(decode_echo_reply(&packet, &params, None).unwrap(), reply);
+/// ```
 pub fn encode_echo_reply(
     reply: &EchoReply,
     params: &Params,

@@ -57,6 +57,29 @@ use crate::{Server, ServerConfig, ServerRuntimeError};
 /// whole set: a service configured for IPv4 and IPv6 must not quietly continue
 /// as IPv4 only. Every listener task is joined before `run` returns, so no task
 /// outlives it.
+///
+/// # Example
+///
+/// Bind independent listeners, inspect their resolved addresses, then serve
+/// them under one caller-owned shutdown future. This example type-checks
+/// without binding sockets:
+///
+/// ```no_run
+/// use std::{net::{Ipv4Addr, SocketAddr}, time::Duration};
+///
+/// use irtt_server::{ServerConfig, ServerSet};
+///
+/// # async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+/// let addrs = [
+///     SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+///     SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+/// ];
+/// let set = ServerSet::bind(addrs, ServerConfig::default()).await?;
+/// println!("listening on {:?}", set.local_addrs());
+/// set.run(tokio::time::sleep(Duration::from_secs(60))).await?;
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct ServerSet {
     servers: Vec<Server>,
