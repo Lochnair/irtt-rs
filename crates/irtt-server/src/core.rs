@@ -47,6 +47,32 @@ use crate::{
 /// a transport abstraction, and there is no blocking or alternate-runtime
 /// counterpart.
 ///
+/// # Example
+///
+/// The core can be driven directly with a normally encoded open request. It
+/// returns a reply to send and records the new session without performing I/O:
+///
+/// ```
+/// use std::net::{Ipv4Addr, SocketAddr};
+///
+/// use irtt_proto::{decode_open_reply, encode_request, Params, RequestToEncode};
+/// use irtt_server::{ServerConfig, ServerCore};
+///
+/// let peer = SocketAddr::from((Ipv4Addr::LOCALHOST, 40_000));
+/// let mut core = ServerCore::new(ServerConfig::default());
+/// let params = Params::with_protocol_defaults();
+/// let request = encode_request(
+///     RequestToEncode::Open { params: &params, no_test: false },
+///     None,
+/// )
+/// .unwrap();
+///
+/// let reply = core.handle_datagram(peer, &request).unwrap().unwrap();
+/// let open = decode_open_reply(reply.bytes(), None).unwrap();
+/// assert_ne!(open.token, 0);
+/// assert_eq!(core.session_count(), 1);
+/// ```
+///
 /// # Scope
 ///
 /// The core implements open handling, session creation and negotiation,

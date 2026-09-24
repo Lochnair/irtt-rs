@@ -98,6 +98,28 @@ pub enum TimestampAllowance {
 /// [`max_packet_length`](Self::max_packet_length) like every other reply, and
 /// `none` is zero-filled here rather than left as residue. An operator
 /// restriction can be added if a real use case turns up.
+///
+/// # Example
+///
+/// Configure a modest per-listener session budget and restrict timestamp
+/// placement while leaving DSCP marking disabled:
+///
+/// ```
+/// use std::time::Duration;
+///
+/// use irtt_server::{ServerConfig, TimestampAllowance};
+///
+/// let config = ServerConfig::default()
+///     .with_max_sessions(128)
+///     .with_idle_timeout(Duration::from_secs(30))
+///     .with_timestamp_allowance(TimestampAllowance::Single)
+///     .with_dscp_allowed(false);
+///
+/// assert_eq!(config.max_sessions(), 128);
+/// assert_eq!(config.idle_timeout(), Duration::from_secs(30));
+/// assert_eq!(config.timestamp_allowance(), TimestampAllowance::Single);
+/// assert!(!config.dscp_allowed());
+/// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     hmac_key: Option<Vec<u8>>,
