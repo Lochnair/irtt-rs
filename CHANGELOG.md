@@ -28,6 +28,12 @@ release. The format is loosely based on
 
 ## irtt-client
 
+### 0.5.2
+
+#### Fixed
+
+- Kernel transmit-timestamp correlation is now invalidated when a probe send fails, preventing a later timestamp from being matched to the wrong probe.
+
 ### 0.5.1
 
 #### Added
@@ -107,6 +113,12 @@ release. The format is loosely based on
 - `StatsConfig::estimated_retained_bytes(probe_count)` gives callers an API to estimate the memory a stats configuration will retain for a given probe count, ahead of actually running a session (used by `irtt-cli`'s multi-target memory-usage warning, see below).
 
 ## irtt-rs
+
+### 0.7.1
+
+#### Fixed
+
+- `IRTT_SERVER_NO_DSCP` now accepts ordinary boolean environment values such as `1` and `0`; falsey values leave DSCP marking enabled, while truthy values disable it. The `--no-dscp` command-line flag remains a flag without a value.
 
 ### 0.7.0
 
