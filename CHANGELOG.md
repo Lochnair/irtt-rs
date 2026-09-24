@@ -10,6 +10,12 @@ release. The format is loosely based on
 
 ## irtt-proto
 
+### 0.5.1
+
+#### Added
+
+- Added a crate-specific README and runnable API doctests to make the published crate's protocol types and codecs easier to discover and use.
+
 ### 0.5.0
 
 #### Added
@@ -62,6 +68,12 @@ release. The format is loosely based on
 
 ## irtt-server
 
+### 0.5.3
+
+#### Added
+
+- Added a crate-specific README and usage examples for single- and multi-listener servers, plus runnable API doctests.
+
 ### 0.5.2
 
 #### Changed
@@ -100,6 +112,12 @@ release. The format is loosely based on
 - Resource bounds are enforced by design (bounded session table, per-listener `max_sessions`, rate limiting, idle/max-duration expiry) rather than mirroring upstream `irtt`'s effectively unbounded session/per-peer behavior; this is a deliberate divergence, not an oversight, and is documented in `crates/irtt-server/AGENTS.md`.
 
 ## irtt-stats
+
+### 0.5.1
+
+#### Added
+
+- Added a crate-specific README, a finite-versus-continuous statistics example, and runnable API doctests for the published crate.
 
 ### 0.5.0
 

@@ -738,7 +738,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-proto"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "hmac",
  "md-5",
@@ -764,7 +764,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-server"
-version = "0.5.2"
+version = "0.5.3"
 dependencies = [
  "getrandom 0.4.3",
  "irtt-proto",
@@ -776,7 +776,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-stats"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "irtt-client",
  "proptest",
