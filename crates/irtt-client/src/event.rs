@@ -260,6 +260,19 @@ pub struct RttSample {
 /// processing time or comparing wall-clock timestamps from different hosts. It
 /// should not be used to represent raw elapsed wall-clock or monotonic time,
 /// which is non-negative and represented by [`Duration`].
+///
+/// # Example
+///
+/// Signed timing values retain a negative result instead of clamping clock
+/// skew or server processing adjustments to zero:
+///
+/// ```
+/// use irtt_client::SignedDuration;
+///
+/// let adjusted_rtt = SignedDuration::from_nanos(-250_000);
+/// assert!(adjusted_rtt.is_negative());
+/// assert_eq!(adjusted_rtt.as_micros(), -250);
+/// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SignedDuration {
     ns: i128,

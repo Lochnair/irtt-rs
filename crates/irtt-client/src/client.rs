@@ -103,6 +103,31 @@ use crate::{
 /// session, send probes, receive replies, poll timeouts, and close. Callers
 /// that do not need to own this loop can use the unified managed API in
 /// [`crate::managed`] when the `tokio` feature is enabled.
+///
+/// # Example
+///
+/// `Client` is the runtime-free adapter. The caller drives receives and timeout
+/// polling between sends; see the standalone example for a complete loop.
+/// This example type-checks without contacting a server:
+///
+/// ```no_run
+/// use irtt_client::{Client, ClientConfig};
+///
+/// # fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut client = Client::connect(ClientConfig::default())?;
+/// let outcome = client.open()?;
+/// println!("opened: {outcome:?}");
+/// let sent = client.send_probe()?;
+/// println!("sent: {sent:?}");
+/// let received = client.recv_once()?;
+/// println!("received: {received:?}");
+/// let timed_out = client.poll_timeouts()?;
+/// println!("timeouts: {timed_out:?}");
+/// let closed = client.close()?;
+/// println!("closed: {closed:?}");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct Client {
     runtime: SessionMachine,

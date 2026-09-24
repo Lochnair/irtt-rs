@@ -242,6 +242,31 @@ impl AsyncClientTestHooks {
 /// `AsyncClient` does not construct, own, or store a Tokio runtime. Its async
 /// methods are polled by the caller and require a current Tokio runtime with I/O
 /// and time enabled.
+///
+/// # Example
+///
+/// Use this low-level adapter when the application already owns Tokio and wants
+/// to drive the session lifecycle itself. This example type-checks without
+/// contacting a server.
+///
+/// ```no_run
+/// use irtt_client::{AsyncClient, ClientConfig};
+///
+/// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+/// let mut client = AsyncClient::connect(ClientConfig::default()).await?;
+/// let outcome = client.open().await?;
+/// println!("opened: {outcome:?}");
+/// let sent = client.send_probe().await?;
+/// println!("sent: {sent:?}");
+/// let received = client.recv().await?;
+/// println!("received: {received:?}");
+/// let timed_out = client.poll_timeouts()?;
+/// println!("timeouts: {timed_out:?}");
+/// let closed = client.close().await?;
+/// println!("closed: {closed:?}");
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct AsyncClient {
     socket: tokio::net::UdpSocket,
