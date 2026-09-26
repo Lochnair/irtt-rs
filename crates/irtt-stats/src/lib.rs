@@ -15,8 +15,9 @@
 //! [`StatsConfig::continuous`] ([`SampleMode::RunningOnly`]) keeps only
 //! running statistics — no exact median — and bounds its adjacent-sequence
 //! IPDV tracking, so memory stays bounded for a long-running or unbounded
-//! session. Rolling snapshots always use running statistics regardless of
-//! this setting.
+//! session. An enabled time-based rolling window has no item cap and is not
+//! hard-bounded; it expires only when new events arrive. Rolling snapshots
+//! always use running statistics regardless of this setting.
 //!
 //! See `examples/` in the repository for a runnable comparison of both modes.
 
@@ -34,13 +35,13 @@ mod loss;
 mod normalization;
 mod retention;
 mod rolling;
-mod time_stats;
 
 use core::CoreStats;
 pub use loss::LossStats;
+#[doc(inline)]
+pub use measurement_stats::TimeStats;
 use normalization::normalize_event;
 use rolling::RollingEvents;
-pub use time_stats::TimeStats;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 /// Configuration for statistics collection.
@@ -54,6 +55,10 @@ pub struct StatsConfig {
     /// and one unique reply event.
     pub rolling_count: Option<usize>,
     /// Time span of recent normalized events retained for time-based rolling snapshots.
+    ///
+    /// This window has no item cap, even in continuous mode. Its memory depends
+    /// on event volume inside the interval. Expiry occurs on insertion, anchored
+    /// at the latest event timestamp, not when a snapshot is read.
     pub rolling_time: Option<Duration>,
     /// Whether matched late replies contribute measurements.
     pub late_replies: LateReplyMode,
@@ -117,7 +122,8 @@ impl StatsConfig {
     ///
     /// Continuous mode uses running statistics, retains no exact samples so no
     /// timing metric reports a median, and bounds adjacent-sequence IPDV
-    /// tracking for long-running sessions.
+    /// tracking for long-running sessions. An explicitly enabled `rolling_time`
+    /// window is not hard-bounded; use `rolling_count` for bounded event storage.
     ///
     /// # Example
     ///

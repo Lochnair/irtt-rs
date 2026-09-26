@@ -12,6 +12,7 @@ keywords = ["irtt", "networking", "latency", "statistics"]
 categories = ["network-programming"]
 
 [dependencies]
+measurement-stats = "0.1.0"
 irtt-client.workspace = true
 
 [[example]]

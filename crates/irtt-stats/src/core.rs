@@ -1,9 +1,10 @@
 use std::time::Duration;
 
+use measurement_stats::TimeAccumulator;
+
 use crate::ipdv::{IpdvSample, IpdvTracker};
 use crate::loss::loss_stats;
 use crate::normalization::{ReplySample, StatsEvent};
-use crate::time_stats::TimeMetric;
 use crate::{
     EventCounts, EventStatsUpdate, IpdvPairUpdate, IpdvStats, LateReplyMode, OneWayDelayStats,
     PacketCounts, RttStats, SampleMode, ServerProcessingStats, Snapshot,
@@ -15,17 +16,17 @@ pub(crate) const CONTINUOUS_SEQUENCE_LIMIT: usize = 4096;
 pub(crate) struct CoreStats {
     events: EventCounts,
     packets: PacketCounts,
-    send_call: TimeMetric,
-    timer_error: TimeMetric,
-    rtt_primary: TimeMetric,
-    rtt_raw: TimeMetric,
-    rtt_adjusted: TimeMetric,
-    ipdv_round_trip: TimeMetric,
-    ipdv_send: TimeMetric,
-    ipdv_receive: TimeMetric,
-    send_delay: TimeMetric,
-    receive_delay: TimeMetric,
-    server_processing: TimeMetric,
+    send_call: TimeAccumulator,
+    timer_error: TimeAccumulator,
+    rtt_primary: TimeAccumulator,
+    rtt_raw: TimeAccumulator,
+    rtt_adjusted: TimeAccumulator,
+    ipdv_round_trip: TimeAccumulator,
+    ipdv_send: TimeAccumulator,
+    ipdv_receive: TimeAccumulator,
+    send_delay: TimeAccumulator,
+    receive_delay: TimeAccumulator,
+    server_processing: TimeAccumulator,
     ipdv_tracker: IpdvTracker,
     late_replies: LateReplyMode,
 }
@@ -42,20 +43,25 @@ impl CoreStats {
             Some(CONTINUOUS_SEQUENCE_LIMIT)
         };
 
+        let metric = || match sample_mode {
+            SampleMode::Exact => TimeAccumulator::exact_unbounded(),
+            SampleMode::RunningOnly => TimeAccumulator::running(),
+        };
+
         Self {
             events: EventCounts::default(),
             packets: PacketCounts::default(),
-            send_call: TimeMetric::new(retain_exact),
-            timer_error: TimeMetric::new(retain_exact),
-            rtt_primary: TimeMetric::new(retain_exact),
-            rtt_raw: TimeMetric::new(retain_exact),
-            rtt_adjusted: TimeMetric::new(retain_exact),
-            ipdv_round_trip: TimeMetric::new(retain_exact),
-            ipdv_send: TimeMetric::new(retain_exact),
-            ipdv_receive: TimeMetric::new(retain_exact),
-            send_delay: TimeMetric::new(retain_exact),
-            receive_delay: TimeMetric::new(retain_exact),
-            server_processing: TimeMetric::new(retain_exact),
+            send_call: metric(),
+            timer_error: metric(),
+            rtt_primary: metric(),
+            rtt_raw: metric(),
+            rtt_adjusted: metric(),
+            ipdv_round_trip: metric(),
+            ipdv_send: metric(),
+            ipdv_receive: metric(),
+            send_delay: metric(),
+            receive_delay: metric(),
+            server_processing: metric(),
             ipdv_tracker: IpdvTracker::new(sequence_limit),
             late_replies,
         }
@@ -227,8 +233,8 @@ impl CoreStats {
             events: self.events,
             packets,
             loss: loss_stats(packets),
-            send_call: self.send_call.stats(),
-            timer_error: self.timer_error.stats(),
+            send_call: self.send_call.snapshot(),
+            timer_error: self.timer_error.snapshot(),
             rtt: self.rtt_stats(),
             ipdv: self.ipdv_stats(),
             one_way_delay: self.one_way_delay_stats(),
@@ -238,30 +244,30 @@ impl CoreStats {
 
     fn rtt_stats(&self) -> RttStats {
         RttStats {
-            primary: self.rtt_primary.stats(),
-            raw: self.rtt_raw.stats(),
-            adjusted: self.rtt_adjusted.stats(),
+            primary: self.rtt_primary.snapshot(),
+            raw: self.rtt_raw.snapshot(),
+            adjusted: self.rtt_adjusted.snapshot(),
         }
     }
 
     fn ipdv_stats(&self) -> IpdvStats {
         IpdvStats {
-            round_trip: self.ipdv_round_trip.stats(),
-            send: self.ipdv_send.stats(),
-            receive: self.ipdv_receive.stats(),
+            round_trip: self.ipdv_round_trip.snapshot(),
+            send: self.ipdv_send.snapshot(),
+            receive: self.ipdv_receive.snapshot(),
         }
     }
 
     fn one_way_delay_stats(&self) -> OneWayDelayStats {
         OneWayDelayStats {
-            send_delay: self.send_delay.stats(),
-            receive_delay: self.receive_delay.stats(),
+            send_delay: self.send_delay.snapshot(),
+            receive_delay: self.receive_delay.snapshot(),
         }
     }
 
     fn server_processing_stats(&self) -> ServerProcessingStats {
         ServerProcessingStats {
-            processing: self.server_processing.stats(),
+            processing: self.server_processing.snapshot(),
         }
     }
 }

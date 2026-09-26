@@ -10,6 +10,11 @@ This crate does not open sessions or drive sockets. Feed it the `ClientEvent`
 stream produced by an `irtt-client` `Client`, `AsyncClient`, or managed
 session via `StatsCollector::process`, and read back a `Snapshot`.
 
+Generic timing accumulation and count-window storage come from
+`measurement-stats`. `TimeStats` remains available from `irtt_stats` as a
+re-export. Event interpretation, IPDV pairing, loss, and snapshot reconstruction
+remain here.
+
 A `StatsCollector` has one sequence/IPDV namespace and one packet count, both
 scoped to a single target. A managed session covering multiple targets needs
 one collector per target — as the `irtt-rs` CLI does — since a target's
@@ -25,6 +30,15 @@ bounded running statistics instead (no exact median) plus a bounded
 4096-entry adjacent-sequence IPDV store per target, for long-running or
 unbounded sessions. Rolling-window snapshots are always running-only and
 report no medians, whichever `StatsConfig` produced them.
+
+An enabled time-based rolling window has no event-count cap, including in
+continuous mode. It expires only on new events, anchored at their timestamps;
+reading a snapshot does not advance time. Use count-based rolling storage for a
+hard bound on retained events. The memory estimate excludes time-window storage.
+
+Exact snapshots sort a temporary copy of each metric's retained samples, adding
+O(n) scratch memory and O(n log n) computation for that metric. The retention
+estimate is not peak snapshot or allocator accounting.
 
 See `examples/` in the repository for a runnable comparison of both modes.
 
