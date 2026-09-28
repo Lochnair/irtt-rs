@@ -34,6 +34,12 @@ release. The format is loosely based on
 
 ## irtt-client
 
+### 0.5.3
+
+#### Added
+
+- `SocketConfig` can bind UDP sockets to a network interface and set a packet mark on Linux, Android, and Fuchsia, or select a routing FIB on FreeBSD.
+
 ### 0.5.2
 
 #### Fixed
