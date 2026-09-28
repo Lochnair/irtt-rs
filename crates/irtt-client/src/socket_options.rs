@@ -5,10 +5,63 @@ use std::{
 
 use socket2::SockRef;
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux"
+))]
+use socket2::Socket;
+
 use crate::{
     config::{MAX_DSCP_CODEPOINT, MAX_TTL},
     error::ClientError,
 };
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux"
+))]
+pub(crate) fn apply_routing_options(
+    socket: &Socket,
+    config: &crate::SocketConfig,
+    remote: SocketAddr,
+) -> Result<(), ClientError> {
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    {
+        if let Some(device) = &config.bind_to_device {
+            socket
+                .bind_device(Some(device.as_bytes()))
+                .map_err(|source| ClientError::SocketOption {
+                    operation: "bind socket to device",
+                    remote,
+                    source,
+                })?;
+        }
+        if let Some(mark) = config.mark {
+            socket
+                .set_mark(mark)
+                .map_err(|source| ClientError::SocketOption {
+                    operation: "set firewall mark",
+                    remote,
+                    source,
+                })?;
+        }
+    }
+    #[cfg(target_os = "freebsd")]
+    if let Some(fib) = config.fib {
+        socket
+            .set_fib(fib)
+            .map_err(|source| ClientError::SocketOption {
+                operation: "set FIB",
+                remote,
+                source,
+            })?;
+    }
+    Ok(())
+}
 
 /// Converts a public DSCP codepoint (`0..=`[`MAX_DSCP_CODEPOINT`]) into the
 /// raw IP TOS / Traffic Class byte it occupies the upper six bits of.

@@ -12,6 +12,14 @@ use crate::{
     socket_options::apply_ttl_to_socket,
 };
 
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "fuchsia",
+    target_os = "linux"
+))]
+use crate::socket_options::apply_routing_options;
+
 pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), ClientError> {
     if timeouts.is_empty() {
         return Err(ClientError::NoOpenTimeouts);
@@ -115,6 +123,13 @@ fn create_connected_udp_socket(
     remote: SocketAddr,
 ) -> Result<UdpSocket, ClientError> {
     let socket = create_prebind_udp_socket(config, remote)?;
+    #[cfg(any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "fuchsia",
+        target_os = "linux"
+    ))]
+    apply_routing_options(&socket, config, remote)?;
     let bind_addr = config.bind_addr.unwrap_or_else(|| {
         if remote.is_ipv4() {
             SocketAddr::from(([0, 0, 0, 0], 0))

@@ -231,6 +231,15 @@ pub struct SocketConfig {
     /// `None` binds to an unspecified address with an ephemeral port matching
     /// the selected remote address family.
     pub bind_addr: Option<SocketAddr>,
+    /// Network interface to bind this socket to (`SO_BINDTODEVICE`).
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    pub bind_to_device: Option<String>,
+    /// Firewall mark applied to outgoing packets (`SO_MARK`).
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    pub mark: Option<u32>,
+    /// FreeBSD FIB used for routing this socket (`SO_SETFIB`).
+    #[cfg(target_os = "freebsd")]
+    pub fib: Option<u32>,
     /// Optional IPv4 TTL or IPv6 hop limit applied to sent packets.
     ///
     /// `None` leaves the platform default unchanged. Values must fit in the
