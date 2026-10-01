@@ -22,6 +22,13 @@ binaries are built on.
   runtime, and `BlockingManagedClient` for synchronous callers, which owns its
   own dedicated current-thread runtime.
 
+`Client` and `AsyncClient` send one probe whenever called. They expose the
+negotiated parameters, pending-probe status, and timeout deadlines; callers
+own cadence and run duration. The managed driver provides fixed cadence,
+missed-slot handling, finite runs, and staggered or burst pacing. Low-level
+`EchoSent` events leave `scheduled_at` and `timer_error` absent; the managed
+driver supplies those schedule measurements.
+
 Tokio stays optional: the default build has no runtime and no Tokio
 dependency at all.
 

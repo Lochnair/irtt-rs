@@ -127,7 +127,8 @@ remains anchored to before the send, on purpose, so the existing pre-send
 timeout/overflow/no-send contract is unchanged. Only the *measurement*
 `sent_at` moved to after the send. A `WouldBlock` `try_send` (Tokio) never
 samples a `sent_at`, never calls `finalize_probe_commit`'s matching
-`commit_probe_sent`, and never advances the machine or schedule; each retry
+`commit_probe_sent`, and never advances the machine; the managed runner advances cadence only
+  after an accepted send; each retry
 gets its own fresh pre-send anchor, and only a successful attempt's anchor
 and `sent_at` are ever retained.
 
