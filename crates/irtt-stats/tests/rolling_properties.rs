@@ -129,11 +129,11 @@ fn build_event(op: &Op, seq: u32, clock_ms: u64, base: Instant) -> ClientEvent {
         Op::Send => ClientEvent::EchoSent {
             seq,
             remote: ADDR.parse().unwrap(),
-            scheduled_at: ts_at(base, clock_ms).mono,
+            scheduled_at: Some(ts_at(base, clock_ms).mono),
             sent_at: ts_at(base, clock_ms),
             bytes: 32,
             send_call: Duration::from_micros(10),
-            timer_error: Duration::from_micros(2),
+            timer_error: Some(Duration::from_micros(2)),
         },
         Op::Reply { raw_ms } => {
             let sent_at = ts_at(base, clock_ms.saturating_sub(u64::from(raw_ms)));

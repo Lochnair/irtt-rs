@@ -34,11 +34,11 @@ pub fn sent(seq: u32, sent_at: ClientTimestamp) -> ClientEvent {
     ClientEvent::EchoSent {
         seq,
         remote: "127.0.0.1:2112".parse().unwrap(),
-        scheduled_at: sent_at.mono,
+        scheduled_at: Some(sent_at.mono),
         sent_at,
         bytes: 32,
         send_call: Duration::from_micros(10),
-        timer_error: Duration::from_micros(2),
+        timer_error: Some(Duration::from_micros(2)),
     }
 }
 
@@ -117,7 +117,7 @@ pub fn sent_with_timings(
         unreachable!();
     };
     *send_call = Duration::from_micros(send_call_us);
-    *timer_error = Duration::from_micros(timer_error_us);
+    *timer_error = Some(Duration::from_micros(timer_error_us));
     event
 }
 

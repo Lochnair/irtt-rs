@@ -14,6 +14,27 @@ use irtt_stats::{
 };
 
 #[test]
+fn caller_paced_sends_do_not_fabricate_timer_error_samples() {
+    let mut collector = StatsCollector::new(StatsConfig::finite());
+    let mut event = sent(0, ts(0));
+    let ClientEvent::EchoSent {
+        scheduled_at,
+        timer_error,
+        ..
+    } = &mut event
+    else {
+        unreachable!()
+    };
+    *scheduled_at = None;
+    *timer_error = None;
+    collector.process(&event);
+    let snapshot = collector.snapshot();
+    assert_eq!(snapshot.packets.packets_sent, 1);
+    assert_eq!(snapshot.send_call.count, 1);
+    assert_eq!(snapshot.timer_error.count, 0);
+}
+
+#[test]
 fn exact_mode_reports_a_timer_error_median() {
     let mut collector = StatsCollector::new(StatsConfig::finite());
     for (seq, timer_error_us) in [2_u64, 8, 4, 6].into_iter().enumerate() {

@@ -198,7 +198,6 @@ impl PendingMap {
         self.map.get_mut(&wire_seq).map(|entry| &mut entry.probe)
     }
 
-    #[cfg(any(feature = "tokio", test))]
     pub fn next_timeout_deadline(&self) -> Option<Instant> {
         self.first
             .and_then(|wire_seq| self.map.get(&wire_seq))

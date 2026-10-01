@@ -18,7 +18,7 @@
 
 use std::time::{Duration, Instant};
 
-use irtt_client::{Client, ClientConfig, ClientEvent};
+use irtt_client::{Client, ClientConfig, ClientEvent, OpenOutcome};
 
 const RUN_DURATION: Duration = Duration::from_secs(2);
 
@@ -45,32 +45,42 @@ fn main() {
         }
     };
 
-    match client.open() {
-        Ok(outcome) => println!("session opened: {outcome:?}"),
+    let negotiated = match client.open() {
+        Ok(OpenOutcome::Started {
+            event, negotiated, ..
+        }) => {
+            println!("session opened: {event:?}");
+            negotiated
+        }
+        Ok(OpenOutcome::NoTestCompleted { event, .. }) => {
+            println!("{event:?}");
+            return;
+        }
         Err(err) => {
             eprintln!("open failed (is a server running at 127.0.0.1:2112?): {err}");
             return;
         }
-    }
+    };
 
-    // The run itself lasts `duration`, but a lost probe isn't classified as
-    // `EchoLoss` until `probe_timeout()` after it was sent; wait at least
-    // that much past the run's own end so a loss near the end can still be
-    // observed and printed before this example gives up and closes.
-    let deadline = Instant::now() + RUN_DURATION + client.probe_timeout();
-    while Instant::now() < deadline && !client.is_run_complete() {
-        // send_probe is caller-paced: only call it once its own schedule
-        // says a probe is due, rather than as fast as the loop spins.
-        if client
-            .next_send_deadline()
-            .is_some_and(|send_at| Instant::now() >= send_at)
-        {
-            // A failed send retains its prepared probe without advancing the
-            // schedule, so a persistent error (e.g. the interface going
-            // down) would otherwise make this loop retry silently until the
-            // safety deadline instead of reporting it.
+    // This loop owns cadence and duration. The transport sends whenever called.
+    let interval = Duration::from_nanos(negotiated.params.interval_ns as u64);
+    let start = Instant::now();
+    let end = start + Duration::from_nanos(negotiated.params.duration_ns as u64);
+    let deadline = end + client.probe_timeout();
+    let mut next_send = start;
+    while Instant::now() < deadline && !client.is_peer_closed() {
+        let now = Instant::now();
+        if now >= end && !client.has_pending_probes() {
+            break;
+        }
+        if now < end && now >= next_send {
             match client.send_probe() {
-                Ok(events) => events.iter().for_each(print_event),
+                Ok(events) => {
+                    events.iter().for_each(print_event);
+                    while next_send <= Instant::now() {
+                        next_send += interval;
+                    }
+                }
                 Err(err) => {
                     eprintln!("send failed: {err}");
                     break;
@@ -93,6 +103,9 @@ fn main() {
         }
     }
 
+    if client.is_peer_closed() {
+        return;
+    }
     match client.close() {
         Ok(events) => events.iter().for_each(print_event),
         Err(err) => eprintln!("close failed: {err}"),

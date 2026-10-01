@@ -82,80 +82,9 @@ fn normal_open_uses_negotiated_traffic_class_not_requested_dscp() {
     target_os = "redox",
     target_os = "solaris",
     target_os = "illumos",
-    target_os = "haiku",
+    target_os = "haiku"
 )))]
-fn failed_close_send_restores_negotiated_traffic_class_and_keeps_session_open() {
-    let mut params = default_params();
-    // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF).
-    params.dscp = 184;
-    let server = start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        socket
-            .send_to(
-                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
-                peer,
-            )
-            .unwrap();
-        let _ = recv_request(&socket, &tx);
-    });
-    let mut config = default_test_config(server.addr);
-    config.dscp = 46;
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-    client.test_hooks.fail_close_send.set(true);
-
-    let error = client.close().unwrap_err();
-
-    assert!(matches!(error, ClientError::Socket(_)));
-    assert!(client.runtime.is_open());
-    assert!(client.schedule.is_some());
-    assert_eq!(client.applied_traffic_class, Some(184));
-    assert_eq!(
-        socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
-        184
-    );
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-fn failed_close_keeps_send_error_primary_when_dscp_restoration_also_fails() {
-    let params = default_params();
-    let server = start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        socket
-            .send_to(
-                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
-                peer,
-            )
-            .unwrap();
-        let _ = recv_request(&socket, &tx);
-    });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-    assert_open_started(client.open().unwrap());
-    client.test_hooks.fail_close_send.set(true);
-    client.test_hooks.fail_dscp_restore.set(true);
-
-    let error = client.close().unwrap_err();
-
-    assert!(matches!(error, ClientError::Socket(_)));
-    assert!(error.to_string().contains("injected close send failure"));
-    assert!(client.runtime.is_open());
-    assert!(client.schedule.is_some());
-    assert_eq!(client.applied_traffic_class, Some(0));
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
-#[cfg(not(any(
-    target_os = "fuchsia",
-    target_os = "redox",
-    target_os = "solaris",
-    target_os = "illumos",
-    target_os = "haiku",
-)))]
-fn authenticated_peer_close_clears_schedule_and_negotiated_traffic_class() {
+fn authenticated_peer_close_clears_negotiated_traffic_class() {
     let mut params = default_params();
     // Raw wire TOS/Traffic Class byte for DSCP codepoint 46 (EF).
     params.dscp = 184;
@@ -198,7 +127,7 @@ fn authenticated_peer_close_clears_schedule_and_negotiated_traffic_class() {
             ClientEvent::SessionClosed { .. }
         ]
     ));
-    assert!(client.schedule.is_none());
+
     assert_eq!(client.applied_traffic_class, None);
     assert_eq!(
         socket_traffic_class(&client.socket, client.remote).unwrap(),

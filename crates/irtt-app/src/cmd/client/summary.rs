@@ -170,11 +170,11 @@ mod tests {
         collector.process(&ClientEvent::EchoSent {
             seq: 1,
             remote: test_remote(),
-            scheduled_at: sent_at.mono,
+            scheduled_at: Some(sent_at.mono),
             sent_at,
             bytes: 64,
             send_call: Duration::from_micros(10),
-            timer_error: Duration::from_micros(2),
+            timer_error: Some(Duration::from_micros(2)),
         });
         collector.process(&ClientEvent::EchoReply {
             seq: 1,
@@ -251,11 +251,11 @@ mod tests {
             collector.process(&ClientEvent::EchoSent {
                 seq,
                 remote: test_remote(),
-                scheduled_at: sent_at.mono,
+                scheduled_at: Some(sent_at.mono),
                 sent_at,
                 bytes: 64,
                 send_call: Duration::from_micros(send_call_us),
-                timer_error: Duration::from_micros(timer_error_us),
+                timer_error: Some(Duration::from_micros(timer_error_us)),
             });
             collector.process(&ClientEvent::EchoReply {
                 seq,

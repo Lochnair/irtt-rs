@@ -1,23 +1,6 @@
 use super::*;
 
 #[test]
-fn no_test_success_validates_params() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
-    let params = params_from_config(&config).unwrap();
-    let server = no_test_server(params.clone(), 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
-    assert!(client.next_send_deadline().is_none());
-    let negotiated = assert_no_test_completed(client.open().unwrap());
-    assert_eq!(negotiated.params, params);
-    assert!(client.next_send_deadline().is_none());
-    assert!(client.schedule.is_none());
-    assert_eq!(client.applied_traffic_class, None);
-    server.join();
-}
-
-#[test]
 fn no_test_rejects_non_close_open_reply() {
     let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
     config.run_mode = RunMode::NoTest;
@@ -44,32 +27,6 @@ fn no_test_rejects_non_close_open_reply() {
         u64::from_le_bytes(packets[1][4..12].try_into().unwrap()),
         TOKEN
     );
-    assert!(client.runtime.prepare_open_request().is_ok());
-    server.join();
-}
-
-#[test]
-fn no_test_cleanup_send_failure_preserves_unexpected_reply() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
-    let params = params_from_config(&config).unwrap();
-    let server = start_fake_server(move |socket, tx| {
-        let (_, peer) = recv_request(&socket, &tx);
-        socket
-            .send_to(
-                &open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, None),
-                peer,
-            )
-            .unwrap();
-    });
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
-    client.test_hooks.fail_cleanup_send.set(true);
-
-    assert!(matches!(
-        client.open(),
-        Err(ClientError::UnexpectedNoTestReply)
-    ));
     assert!(client.runtime.prepare_open_request().is_ok());
     server.join();
 }
@@ -154,5 +111,21 @@ fn open_fails_after_no_test_completed() {
     let mut client = Client::connect(config).unwrap();
     assert_no_test_completed(client.open().unwrap());
     assert!(matches!(client.open(), Err(ClientError::AlreadyCompleted)));
+    server.join();
+}
+
+#[test]
+fn no_test_success_validates_params() {
+    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+    config.run_mode = RunMode::NoTest;
+    let params = params_from_config(&config).unwrap();
+    let server = no_test_server(params.clone(), 0);
+    config.server_addr = server.addr.to_string();
+    let mut client = Client::connect(config).unwrap();
+
+    let negotiated = assert_no_test_completed(client.open().unwrap());
+    assert_eq!(negotiated.params, params);
+
+    assert_eq!(client.applied_traffic_class, None);
     server.join();
 }

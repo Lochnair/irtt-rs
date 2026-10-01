@@ -89,11 +89,11 @@ impl StatsConfig {
     /// #     ClientEvent::EchoSent {
     /// #         seq,
     /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
-    /// #         scheduled_at: sent_at.mono,
+    /// #         scheduled_at: Some(sent_at.mono),
     /// #         sent_at,
     /// #         bytes: 64,
     /// #         send_call: Duration::from_micros(send_call_us),
-    /// #         timer_error: Duration::from_micros(2),
+    /// #         timer_error: Some(Duration::from_micros(2)),
     /// #     }
     /// # }
     /// #
@@ -142,11 +142,11 @@ impl StatsConfig {
     /// #     ClientEvent::EchoSent {
     /// #         seq,
     /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
-    /// #         scheduled_at: sent_at.mono,
+    /// #         scheduled_at: Some(sent_at.mono),
     /// #         sent_at,
     /// #         bytes: 64,
     /// #         send_call: Duration::from_micros(send_call_us),
-    /// #         timer_error: Duration::from_micros(2),
+    /// #         timer_error: Some(Duration::from_micros(2)),
     /// #     }
     /// # }
     /// #
@@ -418,11 +418,11 @@ impl StatsCollector {
     /// #     ClientEvent::EchoSent {
     /// #         seq,
     /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
-    /// #         scheduled_at: sent_at.mono,
+    /// #         scheduled_at: Some(sent_at.mono),
     /// #         sent_at,
     /// #         bytes: 64,
     /// #         send_call: Duration::from_micros(send_call_us),
-    /// #         timer_error: Duration::from_micros(2),
+    /// #         timer_error: Some(Duration::from_micros(2)),
     /// #     }
     /// # }
     /// #
@@ -475,11 +475,11 @@ impl StatsCollector {
     /// #     ClientEvent::EchoSent {
     /// #         seq,
     /// #         remote: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 2112),
-    /// #         scheduled_at: sent_at.mono,
+    /// #         scheduled_at: Some(sent_at.mono),
     /// #         sent_at,
     /// #         bytes: 64,
     /// #         send_call: Duration::from_micros(send_call_us),
-    /// #         timer_error: Duration::from_micros(2),
+    /// #         timer_error: Some(Duration::from_micros(2)),
     /// #     }
     /// # }
     /// #

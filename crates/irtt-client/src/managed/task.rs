@@ -25,6 +25,8 @@ use crate::{
     ClientConfig, ClientError, ClientEvent, OpenOutcome,
 };
 
+use super::schedule::{instant_abs_diff, ProbeSchedule};
+
 use super::{
     classify_client_error, ManagedClientConfig, ManagedCommandAcknowledgement,
     ManagedCommandApplyError, ManagedCommandError, ManagedCompletionPolicy, ManagedConfigError,
@@ -504,6 +506,7 @@ impl TargetCounters {
 }
 
 struct TargetRuntime {
+    schedule: Option<ProbeSchedule>,
     instance: TargetInstance,
     config: ManagedTargetConfig,
     desired: bool,
@@ -991,6 +994,7 @@ impl ManagedClientTask {
             };
             created_instances.push(instance.clone());
             self.targets.push(TargetRuntime {
+                schedule: None,
                 instance,
                 server_addr: Arc::from(planned.target.server_addr.clone()),
                 config: planned.target,
@@ -1243,7 +1247,25 @@ impl ManagedClientTask {
                         self.targets[index].state = TargetState::Opening { client, open };
                         false
                     }
-                    Poll::Ready(Ok(OpenOutcome::Started { event, .. })) => {
+                    Poll::Ready(Ok(OpenOutcome::Started {
+                        event, negotiated, ..
+                    })) => {
+                        let ClientEvent::SessionStarted { at: opened_at, .. } = &event else {
+                            unreachable!("Started carries SessionStarted");
+                        };
+                        match ProbeSchedule::new(opened_at.mono, &negotiated) {
+                            Ok(schedule) => self.targets[index].schedule = Some(schedule),
+                            Err(error) => {
+                                return self.begin_open_session_failure(
+                                    index,
+                                    client,
+                                    ManagedTargetFailurePhase::Timing,
+                                    error,
+                                    now,
+                                    OpenSessionFailureCleanup::Close,
+                                )
+                            }
+                        }
                         self.publish_client_events(index, vec![event]);
                         if self.state == DriverState::Stopping
                             || self.effective_retirement(index).is_some()
@@ -1340,7 +1362,15 @@ impl ManagedClientTask {
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, None);
                     return false;
                 }
-                if client.is_run_complete() {
+                if self.targets[index]
+                    .schedule
+                    .as_mut()
+                    .is_some_and(|schedule| {
+                        schedule.permit_probe_at(now);
+                        schedule.is_finished()
+                    })
+                    && !client.has_pending_probes()
+                {
                     self.targets[index].sync_packets_sent(&client);
                     return self.begin_drain(
                         index,
@@ -1620,13 +1650,15 @@ impl ManagedClientTask {
             if !target.desired || target.retirement.is_some() {
                 continue;
             }
-            let TargetState::Active { client } = &target.state else {
+            let TargetState::Active { .. } = &target.state else {
                 continue;
             };
             active += 1;
-            let interval = client
-                .probe_interval()
-                .expect("active managed targets have a committed probe schedule");
+            let interval = target
+                .schedule
+                .as_ref()
+                .expect("active managed targets have a probe schedule")
+                .interval();
             minimum = minimum.into_iter().chain(Some(interval)).min();
         }
         minimum.map(|interval| (active, stagger_spacing(interval, active)))
@@ -1709,6 +1741,9 @@ impl ManagedClientTask {
             self.targets[index].state = state;
             return SendResult::NotAttempted;
         };
+        // A burst pass may span several slots; validate this target against
+        // fresh time rather than the pass's earlier scheduling snapshot.
+        let now = now.max(Instant::now());
         if client
             .next_probe_timeout_deadline()
             .is_some_and(|deadline| deadline <= now)
@@ -1717,7 +1752,21 @@ impl ManagedClientTask {
             self.targets[index].state = TargetState::Active { client };
             return SendResult::NotAttempted;
         }
-        if client
+        let schedule = self.targets[index]
+            .schedule
+            .as_mut()
+            .expect("active managed targets have a probe schedule");
+        if !schedule.permit_probe_at(now) {
+            self.targets[index].send_waiting = false;
+            if client.has_pending_probes() {
+                self.targets[index].state = TargetState::Active { client };
+                return SendResult::NotAttempted;
+            }
+            self.targets[index].sync_packets_sent(&client);
+            self.begin_drain(index, client, ManagedTargetEndReason::TestComplete, now);
+            return SendResult::Ready { accepted: false };
+        }
+        if schedule
             .next_send_deadline()
             .is_none_or(|deadline| deadline > now)
         {
@@ -1725,8 +1774,25 @@ impl ManagedClientTask {
             self.targets[index].state = TargetState::Active { client };
             return SendResult::NotAttempted;
         }
+        let schedule = self.targets[index].schedule.as_ref().unwrap();
+        let commit =
+            match schedule.preflight_managed_commit(schedule.next_send_deadline().unwrap(), now) {
+                Ok(commit) => commit,
+                Err(error) => {
+                    self.begin_open_session_failure(
+                        index,
+                        client,
+                        ManagedTargetFailurePhase::Timing,
+                        error,
+                        now,
+                        OpenSessionFailureCleanup::Drain,
+                    );
+                    return SendResult::Failed { accepted: false };
+                }
+            };
+        let scheduled_at = commit.scheduled_at;
         let before = client.packets_sent();
-        let result = client.poll_send_probe(cx);
+        let mut result = client.poll_send_probe(cx);
         let after = client.packets_sent();
         let accepted = after > before;
         let send_result = match &result {
@@ -1735,10 +1801,37 @@ impl ManagedClientTask {
             Poll::Ready(Err(_)) => SendResult::Failed { accepted },
         };
         self.record_stagger_acceptance(send_result, stagger_spacing, Instant::now());
-        let schedule_error = accepted
-            .then(|| client.skip_missed_probe_slots_at(Instant::now()))
-            .transpose()
-            .err();
+        if accepted {
+            self.targets[index]
+                .schedule
+                .as_mut()
+                .unwrap()
+                .commit(commit);
+            if let Poll::Ready(Ok(events)) = &mut result {
+                for event in events {
+                    if let ClientEvent::EchoSent {
+                        scheduled_at: intended,
+                        sent_at,
+                        timer_error,
+                        ..
+                    } = event
+                    {
+                        *intended = Some(scheduled_at);
+                        *timer_error = Some(instant_abs_diff(sent_at.mono, scheduled_at));
+                    }
+                }
+            }
+        }
+        let schedule_error = if accepted {
+            self.targets[index]
+                .schedule
+                .as_mut()
+                .unwrap()
+                .skip_missed_slots_at(Instant::now())
+                .err()
+        } else {
+            None
+        };
         self.targets[index].record_packets_sent(after);
         match result {
             Poll::Pending => {
@@ -1754,7 +1847,7 @@ impl ManagedClientTask {
                     let TargetState::Active { client } =
                         mem::replace(&mut self.targets[index].state, TargetState::Terminal)
                     else {
-                        unreachable!("probe sender remained active while publishing send events");
+                        unreachable!("sender remained active")
                     };
                     self.begin_open_session_failure(
                         index,
@@ -1769,6 +1862,7 @@ impl ManagedClientTask {
                     SendResult::Ready { accepted }
                 }
             }
+
             Poll::Ready(Err(error)) => {
                 self.targets[index].send_waiting = false;
                 self.begin_open_session_failure(
@@ -2032,7 +2126,12 @@ impl ManagedClientTask {
                     if target.desired && target.retirement.is_none() && !target.send_waiting {
                         send_deadline = send_deadline
                             .into_iter()
-                            .chain(client.next_send_deadline())
+                            .chain(
+                                target
+                                    .schedule
+                                    .as_ref()
+                                    .and_then(ProbeSchedule::next_send_deadline),
+                            )
                             .min();
                     }
                 }
@@ -2349,6 +2448,7 @@ fn build_task(
             }
         })?;
         runtimes.push(TargetRuntime {
+            schedule: None,
             instance: TargetInstance {
                 id: target.id.clone(),
                 generation,

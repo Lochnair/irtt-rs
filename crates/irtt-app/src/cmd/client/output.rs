@@ -207,7 +207,7 @@ enum OutputRow {
         client_send_wall: SystemTime,
         bytes: usize,
         send_call: Duration,
-        timer_error: Duration,
+        timer_error: Option<Duration>,
     },
     EchoReply(ReplyRow),
     Loss {
@@ -950,7 +950,7 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
         },
         Column::TimerErrorUs => match row {
             OutputRow::EchoSent { timer_error, .. } => {
-                Some(CellValue::Unsigned(duration_us(*timer_error)))
+                timer_error.map(|error| CellValue::Unsigned(duration_us(error)))
             }
             _ => None,
         },

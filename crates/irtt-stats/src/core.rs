@@ -100,12 +100,14 @@ impl CoreStats {
         }
     }
 
-    fn apply_sent(&mut self, bytes: usize, send_call_ns: i128, timer_error_ns: i128) {
+    fn apply_sent(&mut self, bytes: usize, send_call_ns: i128, timer_error_ns: Option<i128>) {
         self.events.sent_events += 1;
         self.packets.packets_sent += 1;
         self.packets.bytes_sent = self.packets.bytes_sent.saturating_add(bytes as u64);
         self.send_call.push_ns(send_call_ns);
-        self.timer_error.push_ns(timer_error_ns);
+        if let Some(error) = timer_error_ns {
+            self.timer_error.push_ns(error);
+        }
     }
 
     fn apply_unique_reply(&mut self, is_late: bool, sample: ReplySample) -> EventStatsUpdate {

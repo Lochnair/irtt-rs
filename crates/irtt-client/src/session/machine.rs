@@ -315,7 +315,7 @@ impl SessionMachine {
         self.config.probe_timeout
     }
 
-    pub(crate) fn prepare_probe(&self) -> Result<Option<PreparedProbe>, ClientError> {
+    pub(crate) fn prepare_probe(&self) -> Result<PreparedProbe, ClientError> {
         let session = self.open_session()?;
         let bytes = encode_request(
             RequestToEncode::Echo {
@@ -326,10 +326,10 @@ impl SessionMachine {
             },
             self.config.hmac_key.as_deref(),
         )?;
-        Ok(Some(PreparedProbe {
+        Ok(PreparedProbe {
             bytes: bytes.into_boxed_slice(),
             seq: session.next_wire_seq,
-        }))
+        })
     }
 
     pub(crate) fn preflight_probe_commit(
@@ -550,14 +550,21 @@ impl SessionMachine {
         }
     }
 
-    pub(crate) fn pending_is_empty(&self) -> bool {
+    pub(crate) fn negotiated_params(&self) -> Option<&NegotiatedParams> {
         match &self.state {
-            MachineState::Open(session) => session.pending.len() == 0,
-            MachineState::NoTestCompleted | MachineState::Closed { .. } => true,
-            MachineState::Connected => false,
+            MachineState::Open(session) => Some(&session.negotiated),
+            _ => None,
         }
     }
 
+    pub(crate) fn pending_is_empty(&self) -> bool {
+        match &self.state {
+            MachineState::Open(session) => session.pending.len() == 0,
+            _ => true,
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn is_terminal(&self) -> bool {
         matches!(
             self.state,
@@ -575,14 +582,6 @@ impl SessionMachine {
         )
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_timed_out_metadata(&self) -> bool {
-        matches!(
-            &self.state,
-            MachineState::Open(session) if session.timed_out.len() > 0
-        )
-    }
-
     #[cfg(any(feature = "tokio", test))]
     pub(crate) fn packets_sent(&self) -> u64 {
         match &self.state {
@@ -592,7 +591,6 @@ impl SessionMachine {
         }
     }
 
-    #[cfg(feature = "tokio")]
     pub(crate) fn next_probe_timeout_deadline(&self) -> Option<Instant> {
         match &self.state {
             MachineState::Open(session) => session.pending.next_timeout_deadline(),
@@ -617,6 +615,7 @@ impl SessionMachine {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn is_open(&self) -> bool {
         matches!(self.state, MachineState::Open(_))
     }
@@ -1179,43 +1178,6 @@ fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientE
 }
 
 #[cfg(test)]
-impl SessionMachine {
-    pub(crate) fn seed_wrapped_probe_history_for_test(&mut self, now: ClientTimestamp) {
-        let session = self
-            .open_session_mut()
-            .expect("wrapped probe history requires an open session");
-        session.next_wire_seq = 0;
-        session.timed_out.insert(PendingProbe {
-            wire_seq: 0,
-            sent_at: now,
-            timeout_at: now.mono,
-            tx_not_before_wall: now.wall,
-            kernel_tx_timestamp: None,
-        });
-        session.completed.insert(0);
-    }
-}
-
-#[cfg(all(test, feature = "tokio"))]
-impl SessionMachine {
-    pub(crate) fn remove_pending_for_test(&mut self, wire_seq: u32) -> Option<PendingProbe> {
-        self.open_session_mut()
-            .expect("test pending probes require an open session")
-            .pending
-            .remove(wire_seq)
-    }
-
-    pub(crate) fn replace_pending_for_test(&mut self, probe: PendingProbe) {
-        let session = self
-            .open_session_mut()
-            .expect("test pending probes require an open session");
-        session.pending.remove(probe.wire_seq);
-        session.pending.preflight_insert(probe.wire_seq).unwrap();
-        session.pending.commit_insert(probe);
-    }
-}
-
-#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -1744,7 +1706,7 @@ mod tests {
     #[test]
     fn uncommitted_probe_preparation_changes_no_authoritative_state() {
         let mut machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         assert_eq!(prepared.seq, 0);
 
         // Repeating preflight, and finalizing a commit that is never applied,
@@ -1768,8 +1730,8 @@ mod tests {
     #[test]
     fn stale_prepared_probe_is_rejected_without_changing_state() {
         let mut machine = open_machine(4, Duration::from_secs(1));
-        let stale = machine.prepare_probe().unwrap().unwrap();
-        let accepted = machine.prepare_probe().unwrap().unwrap();
+        let stale = machine.prepare_probe().unwrap();
+        let accepted = machine.prepare_probe().unwrap();
         let sent_at = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&accepted).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
@@ -1794,7 +1756,7 @@ mod tests {
     #[test]
     fn repeated_would_block_style_preflight_commits_once() {
         let mut machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         let sent_at = timestamp(Instant::now());
 
         for _ in 0..3 {
@@ -1815,7 +1777,7 @@ mod tests {
     #[test]
     fn probe_commit_does_not_require_presentation_timing() {
         let mut machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         let send_anchor = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine
@@ -1840,7 +1802,7 @@ mod tests {
     fn commit_uses_reserved_capacity_and_prevalidated_counter() {
         let mut machine = open_machine(2, Duration::from_secs(1));
         active_mut(&mut machine).packets_sent = u64::MAX - 1;
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let reserved_capacity = active(&machine).pending.capacity();
         assert_eq!(preflight.next_packets_sent, u64::MAX);
@@ -1860,13 +1822,13 @@ mod tests {
     #[test]
     fn pending_capacity_exhaustion_is_detected_before_commit() {
         let mut machine = open_machine(1, Duration::from_secs(1));
-        let first = machine.prepare_probe().unwrap().unwrap();
+        let first = machine.prepare_probe().unwrap();
         let sent_at = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&first).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         machine.commit_probe_sent(commit, sent_at, first.bytes.len());
 
-        let second = machine.prepare_probe().unwrap().unwrap();
+        let second = machine.prepare_probe().unwrap();
         assert!(matches!(
             machine.preflight_probe_commit(&second),
             Err(ClientError::PendingLimitExceeded { limit: 1 })
@@ -1877,14 +1839,14 @@ mod tests {
     #[test]
     fn pending_sequence_collision_is_detected_before_commit() {
         let mut machine = open_machine(2, Duration::from_secs(1));
-        let first = machine.prepare_probe().unwrap().unwrap();
+        let first = machine.prepare_probe().unwrap();
         let sent_at = timestamp(Instant::now());
         let preflight = machine.preflight_probe_commit(&first).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         machine.commit_probe_sent(commit, sent_at, first.bytes.len());
         active_mut(&mut machine).next_wire_seq = 0;
 
-        let reused = machine.prepare_probe().unwrap().unwrap();
+        let reused = machine.prepare_probe().unwrap();
         assert!(matches!(
             machine.preflight_probe_commit(&reused),
             Err(ClientError::PendingSequenceCollision { seq: 0 })
@@ -1896,7 +1858,7 @@ mod tests {
     fn counter_overflow_is_detected_before_commit() {
         let mut machine = open_machine(2, Duration::from_secs(1));
         active_mut(&mut machine).packets_sent = u64::MAX;
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
 
         assert!(matches!(
             machine.preflight_probe_commit(&prepared),
@@ -1910,7 +1872,7 @@ mod tests {
     #[test]
     fn timeout_overflow_is_detected_before_commit() {
         let mut machine = open_machine(2, Duration::MAX);
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
 
         assert!(matches!(
@@ -1954,7 +1916,7 @@ mod tests {
     fn wrapping_sequence_from_max_to_zero_remains_valid() {
         let mut machine = open_machine(2, Duration::from_secs(1));
         active_mut(&mut machine).next_wire_seq = u32::MAX;
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine
             .finalize_probe_commit(preflight, timestamp(Instant::now()))
@@ -1962,7 +1924,7 @@ mod tests {
         machine.commit_probe_sent(commit, timestamp(Instant::now()), prepared.bytes.len());
 
         assert_eq!(active(&machine).next_wire_seq, 0);
-        assert_eq!(machine.prepare_probe().unwrap().unwrap().seq, 0);
+        assert_eq!(machine.prepare_probe().unwrap().seq, 0);
     }
 
     #[test]
@@ -1982,7 +1944,7 @@ mod tests {
         session.timed_out.insert(obsolete);
         session.completed.insert(0);
 
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine
             .finalize_probe_commit(preflight, timestamp(now))
@@ -2395,7 +2357,7 @@ mod tests {
     }
 
     fn send_probe(machine: &mut SessionMachine, sent_at: ClientTimestamp) -> u32 {
-        let prepared = machine.prepare_probe().unwrap().unwrap();
+        let prepared = machine.prepare_probe().unwrap();
         let preflight = machine.preflight_probe_commit(&prepared).unwrap();
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         machine
@@ -3520,9 +3482,7 @@ mod tests {
             machine: &mut SessionMachine,
             now: ClientTimestamp,
         ) -> Result<ProbeSent, ClientError> {
-            let prepared = machine
-                .prepare_probe()?
-                .expect("prepare_probe always returns Some when Ok");
+            let prepared = machine.prepare_probe()?;
             let preflight = machine.preflight_probe_commit(&prepared)?;
             let commit = machine.finalize_probe_commit(preflight, now)?;
             let bytes = prepared.bytes.len();
@@ -3630,10 +3590,7 @@ mod tests {
                             result
                         );
                     } else {
-                        let prepared_a = machine
-                            .prepare_probe()
-                            .unwrap()
-                            .expect("open session prepares probes");
+                        let prepared_a = machine.prepare_probe().unwrap();
                         prop_assert_eq!(prepared_a.seq, model.next_wire_seq);
 
                         let sent = do_send(machine, *now).expect(
@@ -3665,7 +3622,7 @@ mod tests {
                     let result = machine.prepare_probe();
                     match model.state {
                         ModelState::Open => {
-                            let prepared = result.unwrap().expect("open session prepares probes");
+                            let prepared = result.unwrap();
                             prop_assert_eq!(prepared.seq, model.next_wire_seq);
                             prop_assert!(!prepared.bytes.is_empty());
                         }

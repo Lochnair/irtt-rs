@@ -20,9 +20,7 @@ fn kernel_rx_timestamp_unavailable_skip(test_name: &str) {
 }
 
 mod burst_recv;
-mod interrupted_receive;
 mod packet_length;
-mod probe_schedule;
 mod reply_classification;
 mod reply_decode;
 mod reply_metadata;

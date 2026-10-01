@@ -92,8 +92,9 @@ pub enum ClientEvent {
         seq: u32,
         /// Resolved remote socket address.
         remote: SocketAddr,
-        /// Monotonic deadline at which the probe was scheduled to be sent.
-        scheduled_at: Instant,
+        /// Intended send deadline, supplied by the managed runner.
+        /// Low-level adapters leave this absent.
+        scheduled_at: Option<Instant>,
         /// Paired client wall/monotonic timestamp captured immediately after
         /// the successful UDP send completed. This is the RTT and userspace
         /// upstream one-way-delay fallback endpoint. The operational probe
@@ -106,8 +107,8 @@ pub enum ClientEvent {
         /// scheduler commit work.
         send_call: Duration,
         /// Absolute difference between the scheduled send time and the
-        /// post-send `sent_at` timestamp above.
-        timer_error: Duration,
+        /// post-send `sent_at` timestamp above; absent for low-level sends.
+        timer_error: Option<Duration>,
     },
 
     /// First in-window reply for a pending echo request.

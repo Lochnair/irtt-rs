@@ -13,7 +13,7 @@ pub(crate) enum StatsEvent {
         at: Instant,
         bytes: usize,
         send_call_ns: i128,
-        timer_error_ns: i128,
+        timer_error_ns: Option<i128>,
     },
     UniqueReply {
         at: Instant,
@@ -48,7 +48,7 @@ pub(crate) fn normalize_event(event: &ClientEvent) -> Option<StatsEvent> {
             at: sent_at.mono,
             bytes: *bytes,
             send_call_ns: duration_ns_i128(*send_call),
-            timer_error_ns: duration_ns_i128(*timer_error),
+            timer_error_ns: timer_error.map(duration_ns_i128),
         }),
         ClientEvent::EchoReply {
             seq,

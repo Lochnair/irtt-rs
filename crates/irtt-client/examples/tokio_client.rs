@@ -18,7 +18,7 @@
 
 use std::time::{Duration, Instant};
 
-use irtt_client::{AsyncClient, ClientConfig, ClientEvent};
+use irtt_client::{AsyncClient, ClientConfig, ClientEvent, OpenOutcome};
 
 /// Upper bound on how long the receive wait can go without also calling
 /// `poll_timeouts()`. `AsyncClient` does not expose the earliest pending
@@ -58,24 +58,43 @@ async fn run() {
         }
     };
 
-    match client.open().await {
-        Ok(outcome) => println!("session opened: {outcome:?}"),
+    let negotiated = match client.open().await {
+        Ok(OpenOutcome::Started {
+            event, negotiated, ..
+        }) => {
+            println!("session opened: {event:?}");
+            negotiated
+        }
+        Ok(OpenOutcome::NoTestCompleted { event, .. }) => {
+            println!("{event:?}");
+            return;
+        }
         Err(err) => {
             eprintln!("open failed (is a server running at 127.0.0.1:2112?): {err}");
             return;
         }
-    }
+    };
 
-    while !client.is_run_complete() {
+    // This loop owns cadence and duration. The transport sends whenever called.
+    let interval = Duration::from_nanos(negotiated.params.interval_ns as u64);
+    let start = Instant::now();
+    let end = start + Duration::from_nanos(negotiated.params.duration_ns as u64);
+    let deadline = end + client.probe_timeout();
+    let mut next_send = start;
+    while Instant::now() < deadline && !client.is_peer_closed() {
+        if Instant::now() >= end && !client.has_pending_probes() {
+            break;
+        }
         // Bound the receive wait by the next send/timeout deadline, rather
         // than awaiting recv() unconditionally: a lost or rate-limited reply
         // must not stall pacing or timeout classification indefinitely.
-        let wake_at = client
-            .next_send_deadline()
+        let wake_at = (next_send < end)
+            .then_some(next_send)
             .into_iter()
+            .chain(client.next_probe_timeout_deadline())
             .chain(std::iter::once(Instant::now() + TIMEOUT_POLL_INTERVAL))
             .min()
-            .expect("the fixed poll-interval deadline is always present");
+            .unwrap();
 
         let recv_result = tokio::select! {
             events = client.recv() => Some(events),
@@ -91,16 +110,14 @@ async fn run() {
             }
         }
 
-        if client
-            .next_send_deadline()
-            .is_some_and(|send_at| Instant::now() >= send_at)
-        {
-            // A failed send retains its prepared probe without advancing the
-            // schedule, so a persistent error (e.g. the interface going
-            // down) would otherwise make this loop retry forever instead of
-            // reporting it.
+        if Instant::now() < end && Instant::now() >= next_send {
             match client.send_probe().await {
-                Ok(events) => events.iter().for_each(print_event),
+                Ok(events) => {
+                    events.iter().for_each(print_event);
+                    while next_send <= Instant::now() {
+                        next_send += interval;
+                    }
+                }
                 Err(err) => {
                     eprintln!("send failed: {err}");
                     break;
@@ -116,6 +133,9 @@ async fn run() {
         }
     }
 
+    if client.is_peer_closed() {
+        return;
+    }
     match client.close().await {
         Ok(events) => events.iter().for_each(print_event),
         Err(err) => eprintln!("close failed: {err}"),

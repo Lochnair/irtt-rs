@@ -146,11 +146,11 @@ mod tests {
         ClientEvent::EchoSent {
             seq,
             remote: "127.0.0.1:2112".parse().unwrap(),
-            scheduled_at: sent_at.mono,
+            scheduled_at: Some(sent_at.mono),
             sent_at,
             bytes: 32,
             send_call: Duration::from_micros(10 + u64::from(seq)),
-            timer_error: Duration::from_micros(2 + u64::from(seq)),
+            timer_error: Some(Duration::from_micros(2 + u64::from(seq))),
         }
     }
 

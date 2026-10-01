@@ -7,20 +7,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-#[cfg(test)]
-use std::{
-    cell::{Cell, RefCell},
-    collections::VecDeque,
-};
-
 use tokio::time;
 
 use crate::{
-    client::{
-        echo_sent_event,
-        schedule::{instant_abs_diff, ProbeSchedule},
-        validate_datagram_length,
-    },
+    client::{echo_sent_event, validate_datagram_length},
     config::ClientConfig,
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
@@ -54,13 +44,9 @@ const OPEN_POLL_WORK_BUDGET: usize = 64;
 /// this crate already bounds open-attempt work keeps that impossible.
 const RECV_POLL_WORK_BUDGET: usize = 64;
 
-#[cfg(test)]
-use crate::client::ProbeSendTimestamps;
-
 #[derive(Debug)]
 struct PreparedAsyncOpen {
     machine: PreparedOpenAcceptance,
-    schedule: Option<ProbeSchedule>,
     recv_buffer_len: Option<usize>,
     negotiated_traffic_class: Option<u8>,
 }
@@ -156,11 +142,6 @@ impl AsyncOpenState {
         self.stopped_after_current_attempt
     }
 
-    #[cfg(test)]
-    pub(crate) fn has_retained_cleanup(&self) -> bool {
-        self.cleanup.is_some()
-    }
-
     fn deadline(&self) -> Instant {
         self.deadline
             .expect("an open attempt has an active deadline")
@@ -170,70 +151,6 @@ impl AsyncOpenState {
         self.deadline_timer
             .as_mut()
             .expect("an open attempt has an active deadline timer")
-    }
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-enum InjectedSend {
-    WouldBlock,
-    Error,
-    ReportedLength(usize),
-}
-
-#[cfg(test)]
-#[derive(Debug, Default)]
-struct AsyncClientTestHooks {
-    sends: RefCell<VecDeque<InjectedSend>>,
-    send_attempts: Cell<usize>,
-    receive_would_block: Cell<usize>,
-    /// Number of subsequent receive attempts (`poll_open` or `poll_recv`)
-    /// that should report `io::ErrorKind::Interrupted` instead of performing
-    /// a real nonblocking receive, deterministically exercising interrupted-
-    /// syscall retry behavior.
-    inject_recv_interrupted: Cell<usize>,
-    fail_open_dscp: Cell<bool>,
-    fail_cleanup_send: Cell<bool>,
-    fail_peer_close_dscp: Cell<bool>,
-    fail_dscp_restore: Cell<bool>,
-    pause_open_cleanup_before_send: Cell<bool>,
-    pause_open_before_writable: Cell<bool>,
-    pause_open_before_readable: Cell<bool>,
-    pause_probe_before_writable: Cell<bool>,
-    pause_close_before_writable: Cell<bool>,
-    pause_close_after_would_block: Cell<bool>,
-    probe_timestamps: RefCell<VecDeque<ProbeSendTimestamps>>,
-    close_sent_at: Cell<Option<ClientTimestamp>>,
-}
-
-#[cfg(test)]
-impl AsyncClientTestHooks {
-    fn try_send(&self, socket: &tokio::net::UdpSocket, packet: &[u8]) -> io::Result<usize> {
-        self.send_attempts.set(self.send_attempts.get() + 1);
-        if let Some(injected) = self.sends.borrow_mut().pop_front() {
-            return match injected {
-                InjectedSend::WouldBlock => Err(io::Error::from(io::ErrorKind::WouldBlock)),
-                InjectedSend::Error => Err(io::Error::other("injected send failure")),
-                InjectedSend::ReportedLength(bytes) => Ok(bytes),
-            };
-        }
-        socket.try_send(packet)
-    }
-
-    fn take_probe_timestamps(&self) -> Option<ProbeSendTimestamps> {
-        self.probe_timestamps.borrow_mut().pop_front()
-    }
-
-    /// Consumes one pending injected interruption, if any, reporting whether
-    /// the caller should report `io::ErrorKind::Interrupted` instead of
-    /// attempting a real receive.
-    fn take_injected_interrupted(&self) -> bool {
-        let remaining = self.inject_recv_interrupted.get();
-        if remaining == 0 {
-            return false;
-        }
-        self.inject_recv_interrupted.set(remaining - 1);
-        true
     }
 }
 
@@ -271,7 +188,6 @@ impl AsyncClientTestHooks {
 pub struct AsyncClient {
     socket: tokio::net::UdpSocket,
     machine: SessionMachine,
-    schedule: Option<ProbeSchedule>,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
     applied_traffic_class: Option<u8>,
@@ -280,8 +196,6 @@ pub struct AsyncClient {
     /// See `Client::tx_timestamping_enabled` in `client.rs` for the
     /// invariant this tracks; it is the same adapter-owned capability flag.
     tx_timestamping_enabled: bool,
-    #[cfg(test)]
-    test_hooks: AsyncClientTestHooks,
 }
 
 impl AsyncClient {
@@ -302,15 +216,12 @@ impl AsyncClient {
         Ok(Self {
             socket,
             machine,
-            schedule: None,
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
             applied_traffic_class: None,
             prepared_open: Some(prepared_open),
             prepared_probe: None,
             tx_timestamping_enabled: false,
-            #[cfg(test)]
-            test_hooks: AsyncClientTestHooks::default(),
         })
     }
 
@@ -322,16 +233,16 @@ impl AsyncClient {
     /// ignored without resending the request.
     ///
     /// Dropping this future before trusted acceptance leaves the local machine
-    /// connected with no committed schedule or negotiated adapter state. If it
-    /// is dropped during best-effort post-token cleanup, cleanup may remain
-    /// incomplete because this low-level client never detaches cleanup work.
+    /// connected with no negotiated adapter state. If it is dropped during
+    /// best-effort post-token cleanup, cleanup may remain incomplete because
+    /// this low-level client never detaches cleanup work.
     pub async fn open(&mut self) -> Result<OpenOutcome, ClientError> {
         let mut state = AsyncOpenState::new();
         poll_fn(|cx| self.poll_open(&mut state, cx)).await
     }
 
-    /// Send one caller-paced probe with transactional protocol and schedule
-    /// commits.
+    /// Send one echo probe now, committing protocol state only after acceptance.
+    /// The caller owns pacing and run duration.
     ///
     /// A prepared packet is retained across readiness false positives,
     /// cancellation, and socket errors so a later call retries the same logical
@@ -412,10 +323,6 @@ impl AsyncClient {
             }
 
             if !state.request_submitted {
-                #[cfg(test)]
-                if self.test_hooks.pause_open_before_writable.replace(false) {
-                    return Poll::Pending;
-                }
                 match poll_writable_until(&self.socket, state.deadline_timer(), cx) {
                     Poll::Pending => return Poll::Pending,
                     Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -430,9 +337,6 @@ impl AsyncClient {
                     .prepared_open
                     .as_ref()
                     .expect("connected clients retain their prepared open request");
-                #[cfg(test)]
-                let send_result = self.test_hooks.try_send(&self.socket, &request.bytes);
-                #[cfg(not(test))]
                 let send_result = self.socket.try_send(&request.bytes);
                 match send_result {
                     Ok(bytes) => {
@@ -446,10 +350,6 @@ impl AsyncClient {
                 }
             }
 
-            #[cfg(test)]
-            if self.test_hooks.pause_open_before_readable.replace(false) {
-                return Poll::Pending;
-            }
             match poll_readable_until(&self.socket, state.deadline_timer(), cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
@@ -463,10 +363,6 @@ impl AsyncClient {
                 Poll::Ready(Ok(true)) => {}
             }
 
-            #[cfg(test)]
-            if self.test_hooks.take_injected_interrupted() {
-                continue;
-            }
             let datagram = match try_recv_tokio_datagram(&self.socket, &mut state.buffer) {
                 Ok(datagram) => datagram,
                 // WouldBlock is a readiness false positive; Interrupted
@@ -514,7 +410,7 @@ impl AsyncClient {
                     continue;
                 }
             };
-            let prepared = match self.prepare_async_open(machine, datagram.received_at) {
+            let prepared = match self.prepare_async_open(machine) {
                 Ok(prepared) => prepared,
                 Err(failure) => {
                     state.cleanup = Some(AsyncOpenCleanup::Adapter(failure));
@@ -539,19 +435,11 @@ impl AsyncClient {
         }
         if self.prepared_probe.is_none() {
             match self.machine.prepare_probe() {
-                Ok(prepared) => self.prepared_probe = prepared,
+                Ok(prepared) => self.prepared_probe = Some(prepared),
                 Err(error) => return Poll::Ready(Err(error)),
             }
         }
-        if self.prepared_probe.is_none() {
-            return Poll::Ready(Ok(Vec::new()));
-        }
-
         loop {
-            #[cfg(test)]
-            if self.test_hooks.pause_probe_before_writable.replace(false) {
-                return Poll::Pending;
-            }
             match self.socket.poll_send_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
@@ -560,23 +448,6 @@ impl AsyncClient {
                 }
             }
 
-            #[cfg(test)]
-            let test_timestamps = self.test_hooks.take_probe_timestamps();
-            #[cfg(not(test))]
-            let permission_at = Instant::now();
-            #[cfg(test)]
-            let permission_at = test_timestamps
-                .map(|timestamps| timestamps.permission_at)
-                .unwrap_or_else(Instant::now);
-
-            let schedule = self
-                .schedule
-                .as_mut()
-                .expect("open sessions always have a probe schedule");
-            if !schedule.permit_probe_at(permission_at) {
-                self.prepared_probe = None;
-                return Poll::Ready(Ok(Vec::new()));
-            }
             let prepared = self
                 .prepared_probe
                 .as_ref()
@@ -585,11 +456,6 @@ impl AsyncClient {
                 Ok(preflight) => preflight,
                 Err(error) => return Poll::Ready(Err(error)),
             };
-            let schedule_commit =
-                match schedule.preflight_caller_commit(machine_preflight.next_packets_sent) {
-                    Ok(commit) => commit,
-                    Err(error) => return Poll::Ready(Err(error)),
-                };
             let mut events = Vec::new();
             if let Err(source) = events.try_reserve(1) {
                 return Poll::Ready(Err(ClientError::AllocationFailed {
@@ -597,20 +463,14 @@ impl AsyncClient {
                     source,
                 }));
             }
-
             let expected_bytes = prepared.bytes.len();
-            let scheduled_at = schedule_commit.scheduled_at;
+
             // Private pre-send anchor: finalizes all fallible commit work
             // (timeout deadline arithmetic, kernel TX lower bound) before
             // the send attempt. A WouldBlock retry samples a fresh one on
             // the next loop iteration; only the successful attempt's anchor
             // is retained (via `machine_commit`/`commit_probe_sent` below).
-            #[cfg(not(test))]
             let send_anchor = ClientTimestamp::now();
-            #[cfg(test)]
-            let send_anchor = test_timestamps
-                .map(|timestamps| timestamps.send_anchor)
-                .unwrap_or_else(ClientTimestamp::now);
             let machine_commit = match self
                 .machine
                 .finalize_probe_commit(machine_preflight, send_anchor)
@@ -618,20 +478,11 @@ impl AsyncClient {
                 Ok(commit) => commit,
                 Err(error) => return Poll::Ready(Err(error)),
             };
-            #[cfg(not(test))]
             let send_call_start = Instant::now();
-            #[cfg(test)]
-            let send_call_start = test_timestamps
-                .map(|timestamps| timestamps.send_call_start)
-                .unwrap_or_else(Instant::now);
-            #[cfg(test)]
-            let send_result = self.test_hooks.try_send(&self.socket, &prepared.bytes);
-            #[cfg(not(test))]
             let send_result = self.socket.try_send(&prepared.bytes);
             let bytes = match send_result {
                 Ok(bytes) => bytes,
-                // No sent_at measurement, no machine commit, no schedule
-                // commit: the transaction is fully discarded and retried
+                // No measurement or machine commit: retry the transaction
                 // with a fresh send_anchor on the next loop iteration.
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.machine.invalidate_kernel_tx_correlation();
@@ -642,43 +493,25 @@ impl AsyncClient {
                     return Poll::Ready(Err(ClientError::Socket(error)));
                 }
             };
-
-            #[cfg(not(test))]
             let send_finished_at = Instant::now();
-            #[cfg(test)]
-            let send_finished_at = test_timestamps
-                .map(|timestamps| timestamps.send_finished_at)
-                .unwrap_or_else(Instant::now);
+
             // Public post-send measurement, captured only after the
-            // successful send above. The subsequent machine/schedule commit
+            // successful send above. The subsequent machine commit
             // is infallible.
-            #[cfg(not(test))]
             let sent_at = ClientTimestamp::now();
-            #[cfg(test)]
-            let sent_at = test_timestamps
-                .map(|timestamps| timestamps.sent_at)
-                .unwrap_or_else(ClientTimestamp::now);
             let sent = self
                 .machine
                 .commit_probe_sent(machine_commit, sent_at, bytes);
-            schedule.commit(schedule_commit);
             self.prepared_probe = None;
-
             let send_call = send_finished_at.saturating_duration_since(send_call_start);
-            let timer_error = instant_abs_diff(sent_at.mono, scheduled_at);
+
             if let Err(error) = validate_datagram_length(expected_bytes, bytes) {
                 return Poll::Ready(Err(error));
             }
             if let Err(error) = self.drain_tx_timestamps() {
                 return Poll::Ready(Err(error));
             }
-            events.push(echo_sent_event(
-                self.remote,
-                sent,
-                send_call,
-                scheduled_at,
-                timer_error,
-            ));
+            events.push(echo_sent_event(self.remote, sent, send_call));
             return Poll::Ready(Ok(events));
         }
     }
@@ -699,17 +532,7 @@ impl AsyncClient {
                     return Poll::Ready(Err(ClientError::Socket(error)));
                 }
             }
-            #[cfg(test)]
-            if self.test_hooks.receive_would_block.get() > 0 {
-                self.test_hooks
-                    .receive_would_block
-                    .set(self.test_hooks.receive_would_block.get() - 1);
-                continue;
-            }
-            #[cfg(test)]
-            if self.test_hooks.take_injected_interrupted() {
-                continue;
-            }
+
             let datagram = match try_recv_tokio_datagram(&self.socket, &mut self.recv_buffer) {
                 Ok(datagram) => datagram,
                 // See `RECV_POLL_WORK_BUDGET`: both a readiness false
@@ -743,7 +566,6 @@ impl AsyncClient {
                 Err(error) => return Poll::Ready(Err(error)),
             };
             if self.machine.is_peer_closed() {
-                self.schedule = None;
                 self.prepared_probe = None;
                 if self.clear_peer_close_dscp().is_ok() {
                     self.applied_traffic_class = None;
@@ -778,10 +600,6 @@ impl AsyncClient {
             let previous_traffic_class = self.applied_traffic_class;
             let expected_bytes = prepared.bytes.len();
 
-            #[cfg(test)]
-            if self.test_hooks.pause_close_before_writable.replace(false) {
-                return Poll::Pending;
-            }
             match self.socket.poll_send_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
@@ -792,16 +610,8 @@ impl AsyncClient {
             if let Err(error) = self.clear_close_dscp() {
                 return Poll::Ready(Err(error));
             }
-            let mut rollback = DscpRollback::armed(
-                &self.socket,
-                self.remote,
-                previous_traffic_class,
-                #[cfg(test)]
-                &self.test_hooks.fail_dscp_restore,
-            );
-            #[cfg(test)]
-            let send_result = self.test_hooks.try_send(&self.socket, prepared.bytes);
-            #[cfg(not(test))]
+            let mut rollback =
+                DscpRollback::armed(&self.socket, self.remote, previous_traffic_class);
             let send_result = self.socket.try_send(prepared.bytes);
             let bytes = match send_result {
                 Ok(bytes) => bytes,
@@ -809,28 +619,18 @@ impl AsyncClient {
                     if let Err(error) = rollback.restore() {
                         return Poll::Ready(Err(error));
                     }
-                    #[cfg(test)]
-                    if self.test_hooks.pause_close_after_would_block.replace(false) {
-                        return Poll::Pending;
-                    }
+
                     continue;
                 }
                 Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
             };
 
-            #[cfg(not(test))]
             let close_sent_at = ClientTimestamp::now();
-            #[cfg(test)]
-            let close_sent_at = self
-                .test_hooks
-                .close_sent_at
-                .take()
-                .unwrap_or_else(ClientTimestamp::now);
+
             let event = self
                 .machine
                 .commit_local_close(prepared.commit, close_sent_at);
             rollback.disarm();
-            self.schedule = None;
             self.prepared_probe = None;
             self.applied_traffic_class = None;
 
@@ -842,33 +642,19 @@ impl AsyncClient {
         }
     }
 
-    /// Return the next scheduled probe deadline.
-    pub fn next_send_deadline(&self) -> Option<Instant> {
-        if !self.machine.is_open() {
-            return None;
-        }
-        self.schedule.as_ref()?.next_send_deadline()
-    }
-
-    pub(crate) fn probe_interval(&self) -> Option<Duration> {
-        if !self.machine.is_open() {
-            return None;
-        }
-        self.schedule.as_ref().map(ProbeSchedule::interval)
-    }
-
     /// Return the configured local probe timeout.
     pub fn probe_timeout(&self) -> Duration {
         self.machine.probe_timeout()
     }
 
-    /// Return whether the current run has completed.
-    pub fn is_run_complete(&self) -> bool {
-        self.machine.is_terminal()
-            || self
-                .schedule
-                .as_ref()
-                .is_some_and(|schedule| schedule.is_finished() && self.machine.pending_is_empty())
+    /// Negotiated parameters of the currently open session.
+    pub fn negotiated_params(&self) -> Option<&crate::NegotiatedParams> {
+        self.machine.negotiated_params()
+    }
+
+    /// Whether any sent probes still await a reply or timeout.
+    pub fn has_pending_probes(&self) -> bool {
+        !self.machine.pending_is_empty()
     }
 
     /// Return whether an authenticated peer close ended the session.
@@ -884,7 +670,8 @@ impl AsyncClient {
         self.machine.packets_sent()
     }
 
-    pub(crate) fn next_probe_timeout_deadline(&self) -> Option<Instant> {
+    /// Earliest timeout deadline among probes still awaiting a reply.
+    pub fn next_probe_timeout_deadline(&self) -> Option<Instant> {
         self.machine.next_probe_timeout_deadline()
     }
 
@@ -896,63 +683,16 @@ impl AsyncClient {
         self.prepared_probe = None;
     }
 
-    #[cfg(test)]
-    pub(crate) fn retain_open_cleanup_once(&self) {
-        self.test_hooks.fail_open_dscp.set(true);
-        self.test_hooks.pause_open_cleanup_before_send.set(true);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn poll_recv_ready_for_test(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.socket.poll_recv_ready(cx)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn remove_pending_for_test(
-        &mut self,
-        wire_seq: u32,
-    ) -> Option<crate::probe::PendingProbe> {
-        self.machine.remove_pending_for_test(wire_seq)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replace_pending_for_test(&mut self, probe: crate::probe::PendingProbe) {
-        self.machine.replace_pending_for_test(probe);
-    }
-
-    pub(crate) fn skip_missed_probe_slots_at(&mut self, now: Instant) -> Result<(), ClientError> {
-        let Some(schedule) = self.schedule.as_mut() else {
-            return Ok(());
-        };
-        let Some(deadline) = schedule.next_send_deadline() else {
-            return Ok(());
-        };
-        if deadline > now {
-            return Ok(());
-        }
-        let commit = schedule.preflight_managed_commit(deadline, now)?;
-        schedule.commit(commit);
-        Ok(())
-    }
-
     fn prepare_async_open(
         &mut self,
         machine: PreparedOpenAcceptance,
-        opened_at: ClientTimestamp,
     ) -> Result<PreparedAsyncOpen, Box<PreparedAsyncOpenFailure>> {
         let Some(negotiated) = machine.normal_negotiated() else {
             return Ok(PreparedAsyncOpen {
                 machine,
-                schedule: None,
                 recv_buffer_len: None,
                 negotiated_traffic_class: None,
             });
-        };
-        let schedule = match ProbeSchedule::new(opened_at.mono, negotiated) {
-            Ok(schedule) => schedule,
-            Err(primary) => {
-                return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }));
-            }
         };
         let recv_buffer_len = match recv_buffer_size(self.machine.has_hmac(), Some(negotiated)) {
             Ok(size) => size,
@@ -981,17 +721,7 @@ impl AsyncClient {
                 machine,
             }));
         }
-        #[cfg(test)]
-        let dscp_result = if self.test_hooks.fail_open_dscp.replace(false) {
-            Err(ClientError::SocketOption {
-                operation: "set negotiated DSCP",
-                remote: self.remote,
-                source: io::Error::other("injected negotiated DSCP failure"),
-            })
-        } else {
-            apply_traffic_class_to_tokio_socket(&self.socket, self.remote, negotiated_traffic_class)
-        };
-        #[cfg(not(test))]
+
         let dscp_result = apply_traffic_class_to_tokio_socket(
             &self.socket,
             self.remote,
@@ -1004,7 +734,6 @@ impl AsyncClient {
 
         Ok(PreparedAsyncOpen {
             machine,
-            schedule: Some(schedule),
             recv_buffer_len: Some(recv_buffer_len),
             negotiated_traffic_class: Some(negotiated_traffic_class),
         })
@@ -1015,7 +744,7 @@ impl AsyncClient {
             self.recv_buffer.resize(recv_buffer_len, 0);
         }
         let outcome = self.machine.commit_open(prepared.machine);
-        self.schedule = prepared.schedule;
+
         self.applied_traffic_class = prepared.negotiated_traffic_class;
         self.prepared_open = None;
         self.tx_timestamping_enabled = try_enable_tx_timestamping(&self.socket);
@@ -1048,23 +777,6 @@ impl AsyncClient {
         else {
             return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
         };
-
-        #[cfg(test)]
-        if self
-            .test_hooks
-            .pause_open_cleanup_before_send
-            .replace(false)
-        {
-            return Poll::Pending;
-        }
-
-        #[cfg(test)]
-        if self.test_hooks.fail_cleanup_send.replace(false) {
-            return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()));
-        }
-        #[cfg(test)]
-        let send_result = self.test_hooks.try_send(&self.socket, packet);
-        #[cfg(not(test))]
         let send_result = self.socket.try_send(packet);
         match send_result {
             Ok(_) => return Poll::Ready(Err(state.cleanup.take().unwrap().into_primary())),
@@ -1087,14 +799,6 @@ impl AsyncClient {
     }
 
     fn clear_peer_close_dscp(&self) -> Result<(), ClientError> {
-        #[cfg(test)]
-        if self.test_hooks.fail_peer_close_dscp.replace(false) {
-            return Err(ClientError::SocketOption {
-                operation: "clear DSCP before close",
-                remote: self.remote,
-                source: io::Error::other("injected peer-close DSCP cleanup failure"),
-            });
-        }
         clear_dscp_on_tokio_socket(&self.socket, self.remote)
     }
 
@@ -1117,8 +821,6 @@ struct DscpRollback<'a> {
     remote: SocketAddr,
     previous_traffic_class: Option<u8>,
     armed: bool,
-    #[cfg(test)]
-    fail_restore: &'a Cell<bool>,
 }
 
 impl<'a> DscpRollback<'a> {
@@ -1126,15 +828,12 @@ impl<'a> DscpRollback<'a> {
         socket: &'a tokio::net::UdpSocket,
         remote: SocketAddr,
         previous_traffic_class: Option<u8>,
-        #[cfg(test)] fail_restore: &'a Cell<bool>,
     ) -> Self {
         Self {
             socket,
             remote,
             previous_traffic_class,
             armed: true,
-            #[cfg(test)]
-            fail_restore,
         }
     }
 
@@ -1142,14 +841,7 @@ impl<'a> DscpRollback<'a> {
         if !self.armed {
             return Ok(());
         }
-        #[cfg(test)]
-        if self.fail_restore.replace(false) {
-            return Err(ClientError::SocketOption {
-                operation: "restore negotiated DSCP",
-                remote: self.remote,
-                source: io::Error::other("injected DSCP restore failure"),
-            });
-        }
+
         match self.previous_traffic_class {
             Some(traffic_class) => {
                 apply_traffic_class_to_tokio_socket(self.socket, self.remote, traffic_class)?

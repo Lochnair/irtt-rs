@@ -58,11 +58,11 @@ fn synthetic_probe_stream(count: u32) -> Vec<ClientEvent> {
         events.push(ClientEvent::EchoSent {
             seq,
             remote,
-            scheduled_at: sent_at.mono,
+            scheduled_at: Some(sent_at.mono),
             sent_at,
             bytes: 64,
             send_call: Duration::from_micros(50),
-            timer_error: Duration::from_micros(20),
+            timer_error: Some(Duration::from_micros(20)),
         });
 
         if seq == count - 1 {

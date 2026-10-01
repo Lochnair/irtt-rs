@@ -85,12 +85,18 @@ pub struct ClientConfig {
     /// `None` requests continuous mode and is encoded on the wire as a zero
     /// duration. Use [`RunMode::NoTest`] when the caller wants negotiation only
     /// without sending probes.
+    ///
+    /// The managed driver stops sending after the negotiated duration.
+    /// Low-level adapters leave run duration to the caller.
     pub duration: Option<Duration>,
     /// Requested spacing between probe sends.
     ///
     /// The interval is encoded as nanoseconds in the open request and must be
     /// greater than zero. The server may return a different interval depending
     /// on the negotiated policy and server restrictions.
+    ///
+    /// The managed driver uses the negotiated interval for cadence.
+    /// Low-level adapters send whenever called.
     pub interval: Duration,
     /// Requested echo packet payload length, in bytes.
     ///
@@ -273,7 +279,8 @@ pub enum NegotiationPolicy {
 /// Mode requested during the IRTT open exchange.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunMode {
-    /// Open a session and send echo probes for the negotiated run duration.
+    /// Open a probe session. The managed driver runs for the negotiated duration;
+    /// low-level adapters leave sending and stopping to the caller.
     Normal,
     /// Complete negotiation without running the echo probe test.
     NoTest,
