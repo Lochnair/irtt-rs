@@ -96,6 +96,11 @@ Prefer production interfaces and component/integration tests at the lowest archi
 
 Do not move library behavior into application-binary tests merely to make it more end-to-end. For example, pacing and multi-target scheduling belong in `irtt-client` even though the CLI exposes them.
 
+Concurrency correctness is a production requirement, but deterministic coverage
+does not by itself justify a test-only synchronization hook. Prefer simplifying
+the concurrency machinery or observing receipts/status/events through the public
+control surface before introducing or restoring internal race gates.
+
 ### Every persistent test must earn its place
 
 Before adding or retaining a test, be able to state the durable behavior, compatibility guarantee, regression, or invariant it protects. Other agents and humans will review tests on that basis. Do not add persistent tests merely because code changed, a branch exists, coverage would increase, or the test was useful during implementation.

@@ -75,16 +75,48 @@ async fn exercise_client_server() {
             ..
         }] if *remote == server_addr
     ));
-    assert!(matches!(
-        client.recv().await.unwrap().as_slice(),
-        [ClientEvent::EchoReply {
-            seq: 0,
-            remote,
-            server_timing: Some(_),
-            received_stats: Some(_),
-            ..
-        }] if *remote == server_addr
-    ));
+    let events = client.recv().await.unwrap();
+    let [ClientEvent::EchoReply {
+        seq: 0,
+        remote,
+        sent_at,
+        received_at,
+        rtt,
+        server_timing: Some(timing),
+        one_way: Some(one_way),
+        received_stats: Some(_),
+        packet_meta,
+        ..
+    }] = events.as_slice()
+    else {
+        panic!("expected a measured reply, got {events:?}");
+    };
+    assert_eq!(*remote, server_addr);
+    assert_eq!(rtt.raw, received_at.mono.duration_since(sent_at.mono));
+    // Verify the measurement endpoint through public reply metadata and real
+    // OS timestamps. This also covers the userspace fallback on other targets.
+    let receive_wall = packet_meta
+        .kernel_rx_timestamp
+        .filter(|kernel| {
+            received_at
+                .wall
+                .duration_since(*kernel)
+                .is_ok_and(|lag| lag <= Duration::from_secs(1))
+        })
+        .unwrap_or(received_at.wall);
+    let receive_ns = i128::try_from(
+        receive_wall
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+    )
+    .unwrap();
+    assert_eq!(
+        one_way.server_to_client,
+        Some(irtt_client::SignedDuration::from_nanos(
+            receive_ns - i128::from(timing.send_wall_ns.unwrap())
+        ))
+    );
     assert!(matches!(
         client.close().await.unwrap().as_slice(),
         [ClientEvent::SessionClosed { remote, .. }] if *remote == server_addr

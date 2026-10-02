@@ -87,12 +87,18 @@ pub fn run_tui(
         ) {
             drop(handle.stop());
         }
+        let previous_dropped = dropped_events;
         let drain_state = drain_tui_events(
             &mut events,
             &mut state,
             &mut terminal_targets,
             &mut dropped_events,
         );
+        if dropped_events != previous_dropped {
+            // Data loss changes the meaning of displayed statistics, even while
+            // ordinary measurement refreshes are paused.
+            render_if_due(&mut terminal, &state, &mut next_render, true)?;
+        }
         match drain_state {
             ManagedDrainState::Empty => {
                 thread::sleep(managed_tui_wait_duration(&next_render, state.paused));
@@ -178,11 +184,16 @@ fn drain_tui_events(
     terminal_targets: &mut HashSet<TargetInstance>,
     dropped_events: &mut u64,
 ) -> ManagedDrainState {
-    drain_managed_events(events, dropped_events, |event| {
+    let previous_dropped = *dropped_events;
+    let drained = drain_managed_events(events, dropped_events, |event| {
         process_tui_event(event, state, terminal_targets);
         Ok::<(), std::convert::Infallible>(())
     })
-    .expect("processing TUI managed events is infallible")
+    .expect("processing TUI managed events is infallible");
+    if *dropped_events != previous_dropped {
+        state.mark_dropped_managed_events(*dropped_events);
+    }
+    drained
 }
 
 fn drain_final_tui_events(
@@ -300,4 +311,46 @@ fn managed_tui_wait_duration(next_render: &Instant, paused: bool) -> Duration {
         next_render.saturating_duration_since(Instant::now())
     };
     render_wait.min(TUI_WAIT_SLICE)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn subscription_lag_keeps_incomplete_statistics_visible_while_paused() {
+        for paused in [false, true] {
+            // The production subscription is a broadcast receiver. Overflow the
+            // real channel rather than synthesizing a lag result or UI state.
+            let (sender, mut events) = tokio::sync::broadcast::channel(1);
+            sender.send(ManagedEvent::Started).unwrap();
+            sender.send(ManagedEvent::Started).unwrap();
+            let mut state = TuiState::default();
+            if paused {
+                state.toggle_pause();
+            }
+            let mut dropped = 0;
+            let mut terminal_targets = HashSet::new();
+            drain_tui_events(&mut events, &mut state, &mut terminal_targets, &mut dropped);
+            assert_eq!(dropped, 1);
+            let mut terminal = Terminal::new(TestBackend::new(200, 40)).unwrap();
+            for _ in 0..2 {
+                // Empty drains must not clear the warning on later redraws.
+                drain_tui_events(&mut events, &mut state, &mut terminal_targets, &mut dropped);
+                terminal
+                    .draw(|frame| super::super::ui::draw_dashboard(frame, &state))
+                    .unwrap();
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content()
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                assert!(text.contains("incomplete:dropped=1"));
+                assert_eq!(text.contains("display paused"), paused);
+            }
+        }
+    }
 }

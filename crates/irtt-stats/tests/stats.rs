@@ -319,6 +319,19 @@ fn ipdv_wraparound_sequence_is_adjacent() {
     assert!(wrapped.contributed_sample);
     assert_one_ipdv_pair(&wrapped, u32::MAX, 0, Duration::from_millis(4));
 
+    // The client classifies duplicate datagrams before publishing events;
+    // their accounting must not emit an adjacent pair a second time.
+    for seq in [u32::MAX, 0] {
+        let duplicate = collector.process(&ClientEvent::DuplicateReply {
+            seq,
+            remote: "127.0.0.1:2112".parse().unwrap(),
+            received_at: ts(30),
+            bytes: 64,
+        });
+        assert!(!duplicate.contributed_sample);
+        assert_no_ipdv_pairs(&duplicate);
+    }
+
     let snapshot = collector.snapshot();
     assert_eq!(snapshot.ipdv.round_trip.count, 1);
     assert_eq!(snapshot.ipdv.round_trip.total_ns, 4_000_000);
@@ -353,19 +366,6 @@ fn late_reply_can_complete_ipdv_pair() {
 
     assert_eq!(snapshot.ipdv.round_trip.count, 1);
     assert_eq!(snapshot.ipdv.round_trip.total_ns, 10_000_000);
-}
-
-#[test]
-fn update_exposes_directional_ipdv_when_available() {
-    let mut collector = StatsCollector::new(StatsConfig::finite());
-    collector.process(&unadjusted_reply(0, 10));
-    let update = collector.process(&unadjusted_reply(1, 13));
-
-    assert!(update.contributed_sample);
-
-    let pair = assert_one_ipdv_pair(&update, 0, 1, Duration::from_millis(3));
-    assert!(pair.send_ipdv.is_some());
-    assert!(pair.receive_ipdv.is_some());
 }
 
 #[test]

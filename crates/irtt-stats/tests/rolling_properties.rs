@@ -1,44 +1,6 @@
-//! Property tests for the count-based and time-based rolling windows.
-//!
-//! [`RollingEvents`] (in `src/rolling.rs`) keeps two independent `VecDeque`s:
-//! one bounded by [`StatsConfig::rolling_count`] and one bounded by
-//! [`StatsConfig::rolling_time`]. They are pushed to together but evicted
-//! independently, and each exposes its own snapshot
-//! ([`StatsCollector::rolling_count`] / [`StatsCollector::rolling_time`]).
-//! Reading `rolling.rs` and the existing `rolling_count_eviction_recomputes_*`
-//! / `rolling_time_eviction_uses_event_timestamps` tests in `tests/stats.rs`
-//! confirms there is no single window bounded by *both* limits at once: the
-//! two bounds do not compose as AND or OR on shared storage, they are simply
-//! two separate parallel windows over the same input stream. This file proves
-//! that independence generatively: with both bounds configured
-//! simultaneously, each window must behave exactly as if the *other* bound
-//! did not exist.
-//!
-//! The reference model is a plain `Vec<(ClientEvent, at_ms)>` history that is
-//! re-filtered from scratch after every operation (once by count, once by
-//! time), then replayed through a fresh [`StatsCollector`] to obtain a
-//! [`Snapshot`]. Because [`StatsCollector::rolling_count`] /
-//! [`StatsCollector::rolling_time`] are themselves computed by replaying the
-//! retained events through a fresh `CoreStats` on every call (see
-//! `rolling.rs`'s `snapshot_window`), and because both the production window
-//! and this reference model process the *same* `ClientEvent` values in the
-//! *same* order through the *same* pure, deterministic normalization and
-//! aggregation code, the two snapshots are expected to be bit-for-bit equal,
-//! not merely close. `Snapshot` derives `PartialEq`, so the comparison below
-//! is exact `assert_eq!` with no floating-point tolerance: there is no
-//! independent numerical computation on the reference side to accumulate
-//! error against, both sides run the identical arithmetic in the identical
-//! order.
-//!
-//! The reference model's time-window recomputation (filter the whole history
-//! by `at_ms >= latest_at_ms - window_ms`) is only equivalent to the
-//! production incremental sliding-eviction (which pops from the front using
-//! the cutoff computed at each push) when event timestamps are pushed in
-//! non-decreasing order, exactly as `normalization.rs` documents ("Rolling-
-//! window eviction assumes events are pushed in non-decreasing `at()`
-//! order"). The operation generator below enforces that by construction: a
-//! shared clock only ever moves forward, and every generated event borrows
-//! its `at()` timestamp from the clock's current value.
+//! Independent count and time windows must match a filtered replay through
+//! StatsCollector, while cumulative accounting retains the complete history.
+//! Generated events have non-decreasing normalized window timestamps.
 
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -208,7 +170,7 @@ fn build_event(op: &Op, seq: u32, clock_ms: u64, base: Instant) -> ClientEvent {
         Op::Loss => ClientEvent::EchoLoss {
             seq,
             sent_at: ts_at(base, clock_ms),
-            timeout_at: ts_at(base, clock_ms).mono,
+            timeout_at: ts_at(base, clock_ms).mono - Duration::from_millis(10),
         },
         Op::Warning => ClientEvent::Warning {
             kind: irtt_client::WarningKind::UntrackedReply,
@@ -218,11 +180,7 @@ fn build_event(op: &Op, seq: u32, clock_ms: u64, base: Instant) -> ClientEvent {
     }
 }
 
-/// Replays `events` in order through a fresh collector using the rolling
-/// windows' own semantics (running statistics only, same late-reply policy),
-/// mirroring exactly what `rolling.rs`'s private `snapshot_window` does for
-/// the production windows. This is the "recompute from scratch" reference
-/// primitive both the count and time reference windows below are built on.
+/// Public reference: collect exactly the events retained by one window.
 fn replay(events: &[ClientEvent], late_replies: LateReplyMode) -> Snapshot {
     let mut collector = StatsCollector::new(StatsConfig {
         samples: SampleMode::RunningOnly,
@@ -275,6 +233,11 @@ proptest! {
         // scratch after every step.
         let mut history: Vec<(ClientEvent, u64)> = Vec::new();
 
+        // Force a loss whose clamped time evicts the initial send, while its
+        // raw pre-send deadline would retain it. Every generated case must
+        // therefore distinguish the two normalization choices.
+        let ops = [Op::Send, Op::Advance(u16::try_from(time_limit_ms + 5).unwrap()), Op::Loss, Op::Advance(10), Op::Warning]
+            .into_iter().chain(ops).collect::<Vec<_>>();
         for (idx, op) in ops.iter().enumerate() {
             if let Op::Advance(delta) = op {
                 clock_ms += u64::from(*delta);

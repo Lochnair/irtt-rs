@@ -11,7 +11,7 @@ use irtt_proto::{
 };
 
 use crate::{
-    clock::{saturating_ns, wall_ns_of, ClockSample, ClockSource, SystemClock},
+    clock::{saturating_ns, wall_ns_of, ClockSample, SystemClock},
     config::ServerConfig,
     error::ServerError,
     fill::{echo_payload_len, negotiate_server_fill},
@@ -27,8 +27,7 @@ use crate::{
 /// the bytes of one received datagram, and gets back the bytes to send to that
 /// endpoint, or nothing. Everything it does is a pure function of its state and
 /// that input, except for drawing session tokens and sampling the clock an echo
-/// reply's timestamps come from — both of which are private injected seams, so
-/// the whole engine stays deterministically testable.
+/// reply's timestamps come from — the clock is sampled directly and tokens have a private fault-injection seam.
 ///
 /// The Tokio runtime wraps it directly:
 ///
@@ -88,7 +87,7 @@ pub struct ServerCore {
     config: ServerConfig,
     sessions: HashMap<u64, Session>,
     tokens: Box<dyn TokenSource>,
-    clock: Box<dyn ClockSource>,
+    clock: SystemClock,
 }
 
 impl ServerCore {
@@ -99,24 +98,13 @@ impl ServerCore {
         Self::with_token_source(config, Box::new(OsTokenSource))
     }
 
-    /// A core with a chosen token source and the production clock, which is
-    /// what tests that care about session identity but not about timestamp
-    /// values want.
+    // Token fault injection covers random-source failures and allocation bounds.
     pub(crate) fn with_token_source(config: ServerConfig, tokens: Box<dyn TokenSource>) -> Self {
-        Self::with_sources(config, tokens, Box::new(SystemClock::new()))
-    }
-
-    /// A core with both nondeterministic sources chosen.
-    pub(crate) fn with_sources(
-        config: ServerConfig,
-        tokens: Box<dyn TokenSource>,
-        clock: Box<dyn ClockSource>,
-    ) -> Self {
         Self {
             config,
             sessions: HashMap::new(),
             tokens,
-            clock,
+            clock: SystemClock::new(),
         }
     }
 

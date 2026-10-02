@@ -333,9 +333,9 @@ effective parameters must be safe for the server to run.
 - The transition is pure and is committed only after the reply has encoded, so
   an internal encoding failure cannot leave a session claiming to have answered
   a request it never did.
-- Clock sampling is a private injected seam, like token generation, not a
-  runtime abstraction: the receive instant is taken as soon as a datagram is
-  classified as an echo and the send instant just before the reply is built, so
+- Clock sampling uses the system clock directly, not a runtime abstraction: the
+  receive instant is taken as soon as a datagram is classified as an echo and
+  the send instant just before the reply is built, so
   they bracket the server's own handling. The monotonic origin belongs to the
   clock source and is stable for its life.
 - A reply's receive instant is held back to its send instant where the wall
@@ -601,16 +601,22 @@ half-created session.
   maintain shadow encoders for well-formed wire data.
 - Hand-build packets only where the point is a payload a compliant encoder
   cannot produce — truncated varints, out-of-range enums, corrupted MACs.
-- Token generation and clock sampling are the only nondeterministic parts; tests
-  inject a scripted source for each, so identity, collisions, allocation failure
-  and timestamp values are all assertable. Keep both seams private, and keep
-  timestamp, rate and lifetime tests free of sleeps, tolerances and real
-  wall-clock assertions.
-- Two clock fakes, for two different questions. A scripted clock returns a fixed
-  list of samples and is for tests that assert individual timestamp *readings*; a
-  hand-moved clock stands still until the test moves it, and is for rate and
-  lifetime tests, which care when a datagram arrived and not how many times the
-  core read the clock on the way. Prefer the latter for anything about deadlines.
+- Prefer the public `ServerCore` packet interface and real runtime sockets for
+  durable behavior. Use production encoders and decoders, actual OS-generated
+  tokens, and observable replies/session capacity rather than private state.
+- Observe nonzero rate refill and lifetime deadlines with real time when an
+  oversleep cannot invalidate the assertion. Bound observation loops and report
+  useful failures. Do not restore fake clocks, random-source injection, race
+  gates, synthetic ancillary classifiers or private observability merely to
+  reproduce the deleted test structure. Focused fault injection remains allowed
+  under the root policy only when no reasonable production-interface alternative
+  can protect an important invariant.
+- Random fill's OS-source failure cannot be forced through the packet interface.
+  Its zero-fill fallback remains an explicitly unexercised error path; ordinary
+  random-fill wire tests must not claim to cover it or add an injection seam
+  merely for coverage. Existing token-allocation fault tests protect bounded
+  allocation and transactional failure, which cannot be driven reliably with
+  actual random draws.
 - Assert rate and lifetime behavior from replies: which datagrams came back, the
   count and window they reported, and `session_count`. The token bucket is a
   black-box inference about the reference server, not a protocol requirement, so

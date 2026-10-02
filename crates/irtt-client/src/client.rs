@@ -613,6 +613,3 @@ pub(crate) fn validate_datagram_length(expected: usize, actual: usize) -> Result
         Err(ClientError::DatagramLengthMismatch { expected, actual })
     }
 }
-
-#[cfg(test)]
-mod tests;

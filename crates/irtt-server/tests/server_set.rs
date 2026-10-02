@@ -465,3 +465,11 @@ where
         .await
         .expect("the test exceeded its bounded runtime");
 }
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_set_serving_nothing_is_refused() {
+    assert!(matches!(
+        ServerSet::bind([], ServerConfig::default()).await,
+        Err(ServerSetError::NoListeners)
+    ));
+}

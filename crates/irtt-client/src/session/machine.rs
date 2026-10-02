@@ -1137,1204 +1137,291 @@ fn config_duration_to_ns(field: &str, duration: Duration) -> Result<i64, ClientE
 #[cfg(test)]
 mod tests {
     use super::*;
+    use irtt_proto::{FLAG_OPEN, FLAG_REPLY};
 
-    fn open_machine(max_pending_probes: usize, probe_timeout: Duration) -> SessionMachine {
-        let config = ClientConfig {
-            max_pending_probes,
-            probe_timeout,
-            ..ClientConfig::default()
+    #[test]
+    fn timing_arithmetic_preserves_negative_samples() {
+        let mono = Instant::now();
+        let sent = ClientTimestamp {
+            mono,
+            wall: UNIX_EPOCH + Duration::from_nanos(100),
         };
-        let remote = "127.0.0.1:2112".parse().unwrap();
-        let mut machine = SessionMachine::new(config, remote).unwrap();
-        let prepared = machine
-            .prepare_open_acceptance(
-                normal_open_reply(&machine, 0x0102_0304_0506_0708),
-                timestamp(Instant::now()),
+        let received = ClientTimestamp {
+            mono: mono + Duration::from_nanos(10),
+            wall: UNIX_EPOCH + Duration::from_nanos(110),
+        };
+        // Processing longer than raw RTT must remain negative with either clock.
+        for timestamps in [
+            TimestampFields {
+                recv_mono: Some(100),
+                send_mono: Some(120),
+                ..TimestampFields::default()
+            },
+            TimestampFields {
+                recv_wall: Some(100),
+                send_wall: Some(120),
+                ..TimestampFields::default()
+            },
+        ] {
+            let rtt = compute_rtt(&sent, &received, &timestamps);
+            assert_eq!(rtt.raw, Duration::from_nanos(10));
+            assert_eq!(rtt.adjusted.unwrap().as_nanos(), -10);
+            assert_eq!(rtt.effective.as_nanos(), -10);
+        }
+        // A server clock behind or ahead can make either direction negative.
+        for (recv_wall, send_wall, upstream, downstream) in [(90, 95, -10, 15), (115, 120, 15, -10)]
+        {
+            let sample = compute_one_way(
+                &sent,
+                sent.wall,
+                &received,
+                None,
+                &ReceiveMeta::default(),
+                &TimestampFields {
+                    recv_wall: Some(recv_wall),
+                    send_wall: Some(send_wall),
+                    ..TimestampFields::default()
+                },
             )
             .unwrap();
-        machine.commit_open(prepared);
-        machine
-    }
-
-    fn active(machine: &SessionMachine) -> &ActiveSession {
-        match &machine.state {
-            MachineState::Open(session) => session,
-            _ => panic!("test machine must be open"),
+            assert_eq!(sample.client_to_server.unwrap().as_nanos(), upstream);
+            assert_eq!(sample.server_to_client.unwrap().as_nanos(), downstream);
         }
     }
 
-    fn active_mut(machine: &mut SessionMachine) -> &mut ActiveSession {
-        match &mut machine.state {
-            MachineState::Open(session) => session,
-            _ => panic!("test machine must be open"),
-        }
-    }
-
-    fn timestamp(mono: Instant) -> ClientTimestamp {
-        ClientTimestamp {
-            mono,
-            wall: SystemTime::now(),
-        }
-    }
-
-    fn normal_open_reply(machine: &SessionMachine, token: u64) -> OpenReply {
-        OpenReply {
-            flags: flags::FLAG_OPEN | flags::FLAG_REPLY,
-            token,
-            params: machine.requested.clone(),
-        }
-    }
-
-    #[test]
-    fn uncommitted_probe_preparation_changes_no_authoritative_state() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap();
-        assert_eq!(prepared.seq, 0);
-
-        // Repeating preflight, and finalizing a commit that is never applied,
-        // must both leave the session exactly as it was.
-        {
-            let _discarded_preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        }
-        {
-            let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-            let _discarded_commit = machine
-                .finalize_probe_commit(preflight, timestamp(Instant::now()))
-                .unwrap();
-        }
-
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 0);
-        assert_eq!(session.packets_sent, 0);
-        assert_eq!(session.pending.len(), 0);
-    }
-
-    #[test]
-    fn repeated_would_block_style_preflight_commits_once() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap();
-        let sent_at = timestamp(Instant::now());
-
-        for _ in 0..3 {
-            let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-            let _would_block_commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        }
-        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        let sent = machine.commit_probe_sent(commit, sent_at, prepared.bytes.len());
-
-        assert_eq!(sent.seq, 0);
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 1);
-        assert_eq!(session.packets_sent, 1);
-        assert_eq!(session.pending.len(), 1);
-    }
-
-    #[test]
-    fn pending_sequence_collision_is_detected_before_commit() {
-        let mut machine = open_machine(2, Duration::from_secs(1));
-        let first = machine.prepare_probe().unwrap();
-        let sent_at = timestamp(Instant::now());
-        let preflight = machine.preflight_probe_commit(&first).unwrap();
-        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine.commit_probe_sent(commit, sent_at, first.bytes.len());
-        active_mut(&mut machine).next_wire_seq = 0;
-
-        let reused = machine.prepare_probe().unwrap();
-        assert!(matches!(
-            machine.preflight_probe_commit(&reused),
-            Err(ClientError::PendingSequenceCollision { seq: 0 })
-        ));
-        assert_eq!(active(&machine).packets_sent, 1);
-    }
-
-    #[test]
-    fn counter_overflow_is_detected_before_commit() {
-        let mut machine = open_machine(2, Duration::from_secs(1));
-        active_mut(&mut machine).packets_sent = u64::MAX;
-        let prepared = machine.prepare_probe().unwrap();
-
-        assert!(matches!(
-            machine.preflight_probe_commit(&prepared),
-            Err(ClientError::CounterOverflow {
-                counter: "packets_sent"
-            })
-        ));
-        assert_eq!(active(&machine).pending.len(), 0);
-    }
-
-    #[test]
-    fn timeout_overflow_is_detected_before_commit() {
-        let mut machine = open_machine(2, Duration::MAX);
-        let prepared = machine.prepare_probe().unwrap();
-        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-
-        assert!(matches!(
-            machine.finalize_probe_commit(preflight, timestamp(Instant::now())),
-            Err(ClientError::DurationOverflow)
-        ));
-        assert_eq!(active(&machine).pending.len(), 0);
-    }
-
-    #[test]
-    fn wrapping_sequence_from_max_to_zero_remains_valid() {
-        let mut machine = open_machine(2, Duration::from_secs(1));
-        active_mut(&mut machine).next_wire_seq = u32::MAX;
-        let prepared = machine.prepare_probe().unwrap();
-        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let commit = machine
-            .finalize_probe_commit(preflight, timestamp(Instant::now()))
+    fn opened() -> SessionMachine {
+        let mut machine = SessionMachine::new(
+            ClientConfig {
+                max_pending_probes: 2,
+                clock: Clock::Wall,
+                stamp_at: irtt_proto::StampAt::Receive,
+                ..ClientConfig::default()
+            },
+            "127.0.0.1:2112".parse().unwrap(),
+        )
+        .unwrap();
+        let acceptance = machine
+            .prepare_open_acceptance(
+                OpenReply {
+                    flags: FLAG_OPEN | FLAG_REPLY,
+                    token: 1,
+                    params: machine.requested.clone(),
+                },
+                ClientTimestamp::now(),
+            )
             .unwrap();
-        machine.commit_probe_sent(commit, timestamp(Instant::now()), prepared.bytes.len());
-
-        assert_eq!(active(&machine).next_wire_seq, 0);
-        assert_eq!(machine.prepare_probe().unwrap().seq, 0);
+        machine.commit_open(acceptance);
+        machine
     }
 
-    #[test]
-    fn successful_wrapped_reuse_purges_obsolete_history_only_on_commit() {
-        let mut machine = open_machine(3, Duration::from_secs(1));
-        let now = Instant::now();
-        let obsolete_sent_at = timestamp(now - Duration::from_secs(1));
-        let obsolete = PendingProbe {
-            wire_seq: 0,
-            sent_at: obsolete_sent_at,
-            timeout_at: now,
-            tx_not_before_wall: obsolete_sent_at.wall,
-            kernel_tx_timestamp: None,
-        };
-        let session = active_mut(&mut machine);
-        session.next_wire_seq = 0;
-        session.timed_out.insert(obsolete);
-        session.completed.insert(0);
-
-        let prepared = machine.prepare_probe().unwrap();
-        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+    fn send(machine: &mut SessionMachine) -> ProbeSent {
+        let probe = machine.prepare_probe().unwrap();
+        let preflight = machine.preflight_probe_commit(&probe).unwrap();
         let commit = machine
-            .finalize_probe_commit(preflight, timestamp(now))
+            .finalize_probe_commit(preflight, ClientTimestamp::now())
             .unwrap();
-        assert!(active(&machine).timed_out.contains(0));
-        assert!(active(&machine).completed.contains(0));
-
-        machine.commit_probe_sent(commit, timestamp(now), prepared.bytes.len());
-        let session = active(&machine);
-        assert!(!session.timed_out.contains(0));
-        assert!(!session.completed.contains(0));
-        assert!(session.pending.contains(0));
-        assert_eq!(session.next_wire_seq, 1);
-        assert_eq!(session.packets_sent, 1);
+        machine.commit_probe_sent(commit, ClientTimestamp::now(), probe.bytes.len())
     }
 
-    // Downstream one-way delay endpoint selection.
-    //
-    // All values are anchored at a fixed wall-clock base so the expected
-    // delays are exact: the client sends at the base, the server receives 5 ms
-    // later and sends 10 ms later, userspace observes the reply at 30 ms
-    // (20 ms downstream) and the kernel observed it at 25 ms (15 ms
-    // downstream).
-    const OWD_BASE_WALL_NS: i64 = 10_000_000_000;
-    const OWD_SERVER_RECV_WALL_NS: i64 = OWD_BASE_WALL_NS + 5_000_000;
-    const OWD_SERVER_SEND_WALL_NS: i64 = OWD_BASE_WALL_NS + 10_000_000;
-
-    fn owd_wall(offset_ns: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_nanos(u64::try_from(OWD_BASE_WALL_NS).unwrap() + offset_ns)
+    fn reply(machine: &mut SessionMachine, seq: u32) -> ClientEvent {
+        let events = machine
+            .process_echo_reply(
+                EchoReply {
+                    flags: FLAG_REPLY,
+                    token: 1,
+                    sequence: seq,
+                    recv_count: None,
+                    recv_window: None,
+                    timestamps: TimestampFields {
+                        recv_wall: Some(1),
+                        ..TimestampFields::default()
+                    },
+                    payload: vec![],
+                },
+                32,
+                ClientTimestamp::now(),
+                ReceiveMeta::default(),
+            )
+            .unwrap();
+        events.into_iter().next().unwrap()
     }
 
-    fn owd_sent_at(mono: Instant) -> ClientTimestamp {
-        ClientTimestamp {
-            mono,
-            wall: owd_wall(0),
-        }
-    }
-
-    fn owd_received_at(mono: Instant) -> ClientTimestamp {
-        ClientTimestamp {
-            mono: mono + Duration::from_millis(40),
-            wall: owd_wall(30_000_000),
-        }
-    }
-
-    fn owd_timestamps() -> TimestampFields {
-        TimestampFields {
-            recv_wall: Some(OWD_SERVER_RECV_WALL_NS),
-            send_wall: Some(OWD_SERVER_SEND_WALL_NS),
-            ..Default::default()
-        }
-    }
-
-    fn owd_reply(timestamps: TimestampFields) -> EchoReply {
-        EchoReply {
-            flags: flags::FLAG_REPLY,
-            token: 0x0102_0304_0506_0708,
-            sequence: 0,
-            recv_count: None,
-            recv_window: None,
-            timestamps,
-            payload: Vec::new(),
-        }
-    }
-
-    fn kernel_rx_meta(offset_ns: u64) -> ReceiveMeta {
-        ReceiveMeta {
-            traffic_class: None,
-            kernel_rx_timestamp: Some(owd_wall(offset_ns)),
-        }
-    }
-
-    /// Machine with one outstanding probe for sequence 0. The pre-send
-    /// `tx_not_before_wall` bound defaults to `sent_at.wall`, i.e. this
-    /// helper does not exercise the pre-/post-send distinction; use
-    /// [`machine_with_pending_probe_anchored`] where that distinction
-    /// matters.
-    fn machine_with_pending_probe(sent_at: ClientTimestamp) -> SessionMachine {
-        machine_with_pending_probe_anchored(sent_at.wall, sent_at)
-    }
-
-    /// Machine with one outstanding probe for sequence 0, with an explicit
-    /// pre-send `tx_not_before_wall` bound independent of `sent_at.wall`.
-    fn machine_with_pending_probe_anchored(
-        tx_not_before_wall: SystemTime,
-        sent_at: ClientTimestamp,
-    ) -> SessionMachine {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let session = active_mut(&mut machine);
-        session.pending.preflight_insert(0).unwrap();
-        session.pending.commit_insert(PendingProbe {
-            wire_seq: 0,
-            sent_at,
-            timeout_at: sent_at.mono + Duration::from_secs(1),
-            tx_not_before_wall,
-            kernel_tx_timestamp: None,
-        });
-        session.next_wire_seq = 1;
-        machine
-    }
-
-    /// Machine whose probe for sequence 0 already timed out, so a reply for it
-    /// is a measurable late reply.
-    fn machine_with_timed_out_probe(sent_at: ClientTimestamp) -> SessionMachine {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let session = active_mut(&mut machine);
-        session.timed_out.insert(PendingProbe {
-            wire_seq: 0,
-            sent_at,
-            timeout_at: sent_at.mono + Duration::from_secs(1),
-            tx_not_before_wall: sent_at.wall,
-            kernel_tx_timestamp: None,
-        });
-        session.next_wire_seq = 1;
-        machine
-    }
-
-    fn reply_one_way(events: &[ClientEvent]) -> Option<OneWayDelaySample> {
-        match events {
-            [ClientEvent::EchoReply { one_way, .. } | ClientEvent::LateReply { one_way, .. }] => {
-                *one_way
+    // Advancing a real client through 2^32 submissions is unreasonable. Only
+    // move the send/receive sequence epoch; construct completion/timeout history through
+    // ordinary machine transitions and assert emitted behavior on reuse.
+    #[test]
+    fn sequence_wrap_reuses_completed_and_timed_out_ids_as_new_probes() {
+        for timed_out in [false, true] {
+            let mut machine = opened();
+            assert_eq!(send(&mut machine).seq, 0);
+            if timed_out {
+                let deadline = machine.next_probe_timeout_deadline().unwrap();
+                assert!(matches!(
+                    machine.poll_timeouts_at(deadline).unwrap()[0],
+                    ClientEvent::EchoLoss { seq: 0, .. }
+                ));
+            } else {
+                assert!(matches!(
+                    reply(&mut machine, 0),
+                    ClientEvent::EchoReply { seq: 0, .. }
+                ));
             }
-            other => panic!("expected a single measurable reply event, got {other:?}"),
-        }
-    }
-
-    fn reply_rtt(events: &[ClientEvent]) -> Option<RttSample> {
-        match events {
-            [ClientEvent::EchoReply { rtt, .. }] => Some(*rtt),
-            [ClientEvent::LateReply { rtt, .. }] => *rtt,
-            other => panic!("expected a single measurable reply event, got {other:?}"),
-        }
-    }
-
-    fn process_owd_reply(
-        machine: &mut SessionMachine,
-        timestamps: TimestampFields,
-        meta: ReceiveMeta,
-        received_at: ClientTimestamp,
-    ) -> Vec<ClientEvent> {
-        machine
-            .process_echo_reply(owd_reply(timestamps), 64, received_at, meta)
-            .unwrap()
-    }
-
-    #[test]
-    fn downstream_one_way_delay_prefers_valid_kernel_receive_time() {
-        let mono = Instant::now();
-        let mut machine = machine_with_pending_probe(owd_sent_at(mono));
-
-        let events = process_owd_reply(
-            &mut machine,
-            owd_timestamps(),
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-
-        let one_way = reply_one_way(&events).unwrap();
-        assert_eq!(
-            one_way.server_to_client,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-        assert_eq!(
-            one_way.client_to_server,
-            Some(SignedDuration::from_nanos(5_000_000))
-        );
-    }
-
-    #[test]
-    fn downstream_one_way_delay_uses_userspace_receive_time_without_kernel_metadata() {
-        let mono = Instant::now();
-        let mut machine = machine_with_pending_probe(owd_sent_at(mono));
-
-        let events = process_owd_reply(
-            &mut machine,
-            owd_timestamps(),
-            ReceiveMeta::default(),
-            owd_received_at(mono),
-        );
-
-        let one_way = reply_one_way(&events).unwrap();
-        assert_eq!(
-            one_way.server_to_client,
-            Some(SignedDuration::from_nanos(20_000_000))
-        );
-        assert_eq!(
-            one_way.client_to_server,
-            Some(SignedDuration::from_nanos(5_000_000))
-        );
-    }
-
-    #[test]
-    fn downstream_one_way_delay_falls_back_for_implausible_kernel_receive_time() {
-        let mono = Instant::now();
-        // Later than the userspace sample that observed the datagram.
-        let mut future = machine_with_pending_probe(owd_sent_at(mono));
-        let future_events = process_owd_reply(
-            &mut future,
-            owd_timestamps(),
-            kernel_rx_meta(35_000_000),
-            owd_received_at(mono),
-        );
-
-        // Lagging the userspace sample by far more than MAX_KERNEL_RX_LAG.
-        let mut stale = machine_with_pending_probe(owd_sent_at(mono));
-        let stale_meta = ReceiveMeta {
-            traffic_class: None,
-            kernel_rx_timestamp: Some(UNIX_EPOCH),
-        };
-        let stale_events = process_owd_reply(
-            &mut stale,
-            owd_timestamps(),
-            stale_meta,
-            owd_received_at(mono),
-        );
-
-        for events in [&future_events, &stale_events] {
-            assert_eq!(
-                reply_one_way(events).unwrap().server_to_client,
-                Some(SignedDuration::from_nanos(20_000_000))
+            let session = machine.open_session_mut().unwrap();
+            session.next_wire_seq = u32::MAX;
+            session.highest_received_seq = Some(u32::MAX - 1);
+            assert_eq!(send(&mut machine).seq, u32::MAX);
+            assert!(matches!(
+                reply(&mut machine, u32::MAX),
+                ClientEvent::EchoReply { seq: u32::MAX, .. }
+            ));
+            assert_eq!(send(&mut machine).seq, 0);
+            assert!(matches!(
+                reply(&mut machine, 0),
+                ClientEvent::EchoReply { seq: 0, .. }
+            ));
+            assert!(matches!(
+                reply(&mut machine, 0),
+                ClientEvent::DuplicateReply { seq: 0, .. }
+            ));
+            assert_eq!(send(&mut machine).seq, 1);
+            assert!(matches!(
+                reply(&mut machine, 1),
+                ClientEvent::EchoReply { seq: 1, .. }
+            ));
+            assert!(
+                matches!(
+                    reply(&mut machine, 0),
+                    ClientEvent::DuplicateReply { seq: 0, .. }
+                ),
+                "reused sequence must receive a fresh completion retention lifetime"
+            );
+            assert_eq!(send(&mut machine).seq, 2);
+            assert!(matches!(
+                reply(&mut machine, 2),
+                ClientEvent::EchoReply { seq: 2, .. }
+            ));
+            assert!(
+                matches!(
+                    reply(&mut machine, 0),
+                    ClientEvent::LateReply {
+                        sent_at: None,
+                        rtt: None,
+                        ..
+                    }
+                ),
+                "evicted reused sequence must not resurrect a previous epoch's timeout"
             );
         }
     }
 
+    // Kernel completion order relative to timeout cannot be forced reliably
+    // through a real socket. Drive both transitions through production methods
+    // and observe the selected endpoint on the emitted measurable LateReply.
     #[test]
-    fn measurable_late_reply_uses_the_same_receive_wall_selection() {
-        let mono = Instant::now();
-        let mut kernel = machine_with_timed_out_probe(owd_sent_at(mono));
-        let kernel_events = process_owd_reply(
-            &mut kernel,
-            owd_timestamps(),
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-
-        let mut userspace = machine_with_timed_out_probe(owd_sent_at(mono));
-        let userspace_events = process_owd_reply(
-            &mut userspace,
-            owd_timestamps(),
-            ReceiveMeta::default(),
-            owd_received_at(mono),
-        );
-
-        assert!(matches!(
-            kernel_events.as_slice(),
-            [ClientEvent::LateReply { .. }]
-        ));
-        assert_eq!(
-            reply_one_way(&kernel_events).unwrap().server_to_client,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-        assert_eq!(
-            reply_one_way(&userspace_events).unwrap().server_to_client,
-            Some(SignedDuration::from_nanos(20_000_000))
-        );
-    }
-
-    #[test]
-    fn untracked_late_reply_reports_no_one_way_delay_with_kernel_metadata() {
-        let mono = Instant::now();
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        active_mut(&mut machine).highest_received_seq = Some(5);
-
-        let events = process_owd_reply(
-            &mut machine,
-            owd_timestamps(),
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-
-        match events.as_slice() {
-            [ClientEvent::LateReply {
-                sent_at,
-                rtt,
-                one_way,
-                ..
-            }] => {
-                assert!(sent_at.is_none());
-                assert!(rtt.is_none());
-                assert!(one_way.is_none());
+    fn late_replies_use_tx_timestamps_attached_before_or_after_timeout() {
+        for attach_before_timeout in [true, false] {
+            let mut machine = opened();
+            let anchor = ClientTimestamp {
+                mono: Instant::now(),
+                wall: UNIX_EPOCH + Duration::from_secs(10),
+            };
+            let sent_at = ClientTimestamp {
+                mono: anchor.mono + Duration::from_millis(1),
+                wall: anchor.wall + Duration::from_millis(1),
+            };
+            let kernel_tx = anchor.wall + Duration::from_micros(500);
+            let probe = machine.prepare_probe().unwrap();
+            let preflight = machine.preflight_probe_commit(&probe).unwrap();
+            let commit = machine.finalize_probe_commit(preflight, anchor).unwrap();
+            let sent = machine.commit_probe_sent(commit, sent_at, probe.bytes.len());
+            if attach_before_timeout {
+                machine.record_kernel_tx_timestamp(sent.seq, kernel_tx);
             }
-            other => panic!("expected an untracked LateReply, got {other:?}"),
+            let deadline = machine.next_probe_timeout_deadline().unwrap();
+            assert!(matches!(
+                machine.poll_timeouts_at(deadline).unwrap()[0],
+                ClientEvent::EchoLoss { seq: 0, .. }
+            ));
+            if !attach_before_timeout {
+                machine.record_kernel_tx_timestamp(sent.seq, kernel_tx);
+            }
+            let events = machine
+                .process_echo_reply(
+                    EchoReply {
+                        flags: FLAG_REPLY,
+                        token: 1,
+                        sequence: sent.seq,
+                        recv_count: None,
+                        recv_window: None,
+                        timestamps: TimestampFields {
+                            recv_wall: Some(12_000_000_000),
+                            ..TimestampFields::default()
+                        },
+                        payload: vec![],
+                    },
+                    probe.bytes.len(),
+                    ClientTimestamp {
+                        mono: deadline + Duration::from_millis(1),
+                        wall: anchor.wall + Duration::from_secs(10),
+                    },
+                    ReceiveMeta::default(),
+                )
+                .unwrap();
+            let ClientEvent::LateReply {
+                sent_at: Some(reported_send),
+                server_timing: Some(timing),
+                one_way: Some(one_way),
+                ..
+            } = &events[0]
+            else {
+                panic!("expected measurable LateReply: {events:?}");
+            };
+            assert_eq!(*reported_send, sent_at);
+            let selected = i128::from(timing.receive_wall_ns.unwrap())
+                - one_way.client_to_server.unwrap().as_nanos();
+            assert_eq!(
+                selected, 10_000_500_000,
+                "kernel TX endpoint must survive timeout"
+            );
         }
     }
 
+    // A recoverable send failure that consumes an OPT_ID, followed by a
+    // plausible wrong-ID completion, cannot be induced reliably with public
+    // sockets. Exercise that failure boundary directly, without a socket hook
+    // or inspecting the stored correlation flag/metadata.
     #[test]
-    fn kernel_receive_time_changes_no_measurement_other_than_downstream_delay() {
-        let mono = Instant::now();
-        let timestamps = TimestampFields {
-            recv_mono: Some(1_000_000),
-            send_mono: Some(3_000_000),
-            ..owd_timestamps()
-        };
-
-        let mut kernel = machine_with_pending_probe(owd_sent_at(mono));
-        let kernel_events = process_owd_reply(
-            &mut kernel,
-            timestamps.clone(),
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-
-        let mut userspace = machine_with_pending_probe(owd_sent_at(mono));
-        let userspace_events = process_owd_reply(
-            &mut userspace,
-            timestamps,
-            ReceiveMeta::default(),
-            owd_received_at(mono),
-        );
-
-        // RTT stays a purely monotonic userspace measurement.
-        assert_eq!(
-            reply_rtt(&kernel_events),
-            reply_rtt(&userspace_events),
-            "kernel receive metadata must not affect RTT"
-        );
-        assert_eq!(
-            reply_rtt(&kernel_events).unwrap().raw,
-            Duration::from_millis(40)
-        );
-
-        // Upstream delay uses the client send wall time only.
-        assert_eq!(
-            reply_one_way(&kernel_events).unwrap().client_to_server,
-            reply_one_way(&userspace_events).unwrap().client_to_server
-        );
-        assert_ne!(
-            reply_one_way(&kernel_events).unwrap().server_to_client,
-            reply_one_way(&userspace_events).unwrap().server_to_client
-        );
-    }
-
-    #[test]
-    fn kernel_receive_time_applies_against_a_server_midpoint_timestamp() {
-        let mono = Instant::now();
-        let midpoint = TimestampFields {
-            midpoint_wall: Some(OWD_SERVER_SEND_WALL_NS),
-            ..Default::default()
-        };
-        let mut machine = machine_with_pending_probe(owd_sent_at(mono));
-
-        let events = process_owd_reply(
-            &mut machine,
-            midpoint,
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-
-        let one_way = reply_one_way(&events).unwrap();
-        assert_eq!(
-            one_way.server_to_client,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-        assert_eq!(
-            one_way.client_to_server,
-            Some(SignedDuration::from_nanos(10_000_000))
-        );
-    }
-
-    #[test]
-    fn kernel_receive_time_does_not_create_missing_cross_instant_directions() {
-        let mono = Instant::now();
-        let receive_only = TimestampFields {
-            recv_wall: Some(OWD_SERVER_RECV_WALL_NS),
-            ..Default::default()
-        };
-        let send_only = TimestampFields {
-            send_wall: Some(OWD_SERVER_SEND_WALL_NS),
-            ..Default::default()
-        };
-
-        let mut receive_machine = machine_with_pending_probe(owd_sent_at(mono));
-        let receive_events = process_owd_reply(
-            &mut receive_machine,
-            receive_only,
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-        let receive_sample = reply_one_way(&receive_events).unwrap();
-        assert_eq!(
-            receive_sample.client_to_server,
-            Some(SignedDuration::from_nanos(5_000_000))
-        );
-        assert_eq!(receive_sample.server_to_client, None);
-
-        let mut send_machine = machine_with_pending_probe(owd_sent_at(mono));
-        let send_events = process_owd_reply(
-            &mut send_machine,
-            send_only,
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-        let send_sample = reply_one_way(&send_events).unwrap();
-        assert_eq!(send_sample.client_to_server, None);
-        assert_eq!(
-            send_sample.server_to_client,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-    }
-
-    // Kernel TX timestamp correlation (`record_kernel_tx_timestamp`).
-    //
-    // These probe `SessionMachine`'s private association state directly.
-    // The kernel TX timestamp is dormant metadata in this change: none of
-    // these tests assert anything about RTT/OWD/IPDV output, only about
-    // where `PendingProbe::kernel_tx_timestamp` ends up.
-
-    fn tx_ts(offset_secs: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_secs(offset_secs)
-    }
-
-    fn send_probe(machine: &mut SessionMachine, sent_at: ClientTimestamp) -> u32 {
-        let prepared = machine.prepare_probe().unwrap();
-        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine
-            .commit_probe_sent(commit, sent_at, prepared.bytes.len())
-            .seq
-    }
-
-    #[test]
-    fn kernel_tx_timestamp_attaches_to_pending_probe() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq = send_probe(&mut machine, timestamp(now));
-
-        machine.record_kernel_tx_timestamp(seq, tx_ts(1));
-
-        assert_eq!(
-            active_mut(&mut machine)
-                .pending
-                .get_mut(seq)
-                .unwrap()
-                .kernel_tx_timestamp,
-            Some(tx_ts(1))
-        );
-    }
-
-    #[test]
-    fn kernel_tx_timestamp_for_unknown_id_does_nothing() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq = send_probe(&mut machine, timestamp(now));
-
-        // No probe was ever sent for sequence 41; recording against it must
-        // not panic, allocate a phantom entry, or affect the real probe.
-        machine.record_kernel_tx_timestamp(41, tx_ts(9));
-
-        assert!(active_mut(&mut machine)
-            .pending
-            .get_mut(seq)
-            .unwrap()
-            .kernel_tx_timestamp
-            .is_none());
-        assert_eq!(active(&machine).pending.len(), 1);
-    }
-
-    #[test]
-    fn kernel_tx_timestamps_associate_correctly_when_observed_out_of_order() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq10 = send_probe(&mut machine, timestamp(now));
-        let seq11 = send_probe(&mut machine, timestamp(now));
-        let seq12 = send_probe(&mut machine, timestamp(now));
-        assert_eq!((seq10, seq11, seq12), (0, 1, 2));
-
-        // Linux does not guarantee MSG_ERRQUEUE dequeue order matches send
-        // order; observe them out of order (12, 10, 11).
-        machine.record_kernel_tx_timestamp(seq12, tx_ts(12));
-        machine.record_kernel_tx_timestamp(seq10, tx_ts(10));
-        machine.record_kernel_tx_timestamp(seq11, tx_ts(11));
-
-        let session = active_mut(&mut machine);
-        assert_eq!(
-            session.pending.get_mut(seq10).unwrap().kernel_tx_timestamp,
-            Some(tx_ts(10))
-        );
-        assert_eq!(
-            session.pending.get_mut(seq11).unwrap().kernel_tx_timestamp,
-            Some(tx_ts(11))
-        );
-        assert_eq!(
-            session.pending.get_mut(seq12).unwrap().kernel_tx_timestamp,
-            Some(tx_ts(12))
-        );
-    }
-
-    #[test]
-    fn first_valid_kernel_tx_timestamp_wins_over_a_later_duplicate() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq = send_probe(&mut machine, timestamp(now));
-
-        machine.record_kernel_tx_timestamp(seq, tx_ts(1));
-        machine.record_kernel_tx_timestamp(seq, tx_ts(2));
-
-        assert_eq!(
-            active_mut(&mut machine)
-                .pending
-                .get_mut(seq)
-                .unwrap()
-                .kernel_tx_timestamp,
-            Some(tx_ts(1))
-        );
-    }
-
-    #[test]
-    fn probe_timeout_preserves_an_existing_kernel_tx_timestamp() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq = send_probe(&mut machine, timestamp(now));
-        machine.record_kernel_tx_timestamp(seq, tx_ts(1));
-
-        let events = machine
-            .poll_timeouts_at(now + Duration::from_secs(2))
-            .unwrap();
-        assert!(matches!(events.as_slice(), [ClientEvent::EchoLoss { .. }]));
-
-        let session = active_mut(&mut machine);
-        assert!(!session.pending.contains(seq));
-        assert_eq!(
-            session.timed_out.get_mut(seq).unwrap().kernel_tx_timestamp,
-            Some(tx_ts(1))
-        );
-    }
-
-    #[test]
-    fn kernel_tx_timestamp_arriving_after_timeout_attaches_to_timed_out_probe() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq = send_probe(&mut machine, timestamp(now));
-
-        machine
-            .poll_timeouts_at(now + Duration::from_secs(2))
-            .unwrap();
-        assert!(active(&machine).timed_out.contains(seq));
-
-        machine.record_kernel_tx_timestamp(seq, tx_ts(3));
-
-        assert_eq!(
-            active_mut(&mut machine)
-                .timed_out
-                .get_mut(seq)
-                .unwrap()
-                .kernel_tx_timestamp,
-            Some(tx_ts(3))
-        );
-    }
-
-    #[test]
-    fn measurable_late_reply_retains_the_kernel_tx_timestamp() {
-        let now = Instant::now();
-        let mut machine = machine_with_timed_out_probe(owd_sent_at(now));
-        machine.record_kernel_tx_timestamp(0, tx_ts(4));
-        assert_eq!(
-            active_mut(&mut machine)
-                .timed_out
-                .get_mut(0)
-                .unwrap()
-                .kernel_tx_timestamp,
-            Some(tx_ts(4))
-        );
-
-        // The reply is measurable (a late reply with a retained sent_at);
-        // OWD/RTT still come from sent_at only, per NO_OWD_CHANGE, but the
-        // dormant kernel timestamp must have already been retained above
-        // and this call must not disturb that.
-        let events = process_owd_reply(
-            &mut machine,
-            owd_timestamps(),
-            kernel_rx_meta(25_000_000),
-            owd_received_at(now),
-        );
-        assert!(matches!(events.as_slice(), [ClientEvent::LateReply { .. }]));
-    }
-
-    #[test]
-    fn completed_probe_ignores_a_later_kernel_tx_timestamp() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq = send_probe(&mut machine, timestamp(now));
-        let reply = EchoReply {
-            flags: 0,
-            token: active(&machine).token,
-            sequence: seq,
-            recv_count: None,
-            recv_window: None,
-            timestamps: TimestampFields::default(),
-            payload: Vec::new(),
-        };
-        machine
-            .process_echo_reply(
-                reply,
-                64,
-                ClientTimestamp {
-                    mono: now,
-                    wall: SystemTime::now(),
-                },
-                ReceiveMeta::default(),
-            )
-            .unwrap();
-        assert!(active(&machine).completed.contains(seq));
-        assert!(!active(&machine).pending.contains(seq));
-
-        // Must not resurrect the probe into either map.
-        machine.record_kernel_tx_timestamp(seq, tx_ts(5));
-
-        let session = active_mut(&mut machine);
-        assert!(session.pending.get_mut(seq).is_none());
-        assert!(session.timed_out.get_mut(seq).is_none());
-    }
-
-    #[test]
-    fn evicted_timed_out_probe_ignores_a_later_kernel_tx_timestamp() {
-        let mut machine = open_machine(1, Duration::from_secs(1));
-        let now = Instant::now();
-        let first = send_probe(&mut machine, timestamp(now));
-        machine
-            .poll_timeouts_at(now + Duration::from_secs(2))
-            .unwrap();
-        assert!(active(&machine).timed_out.contains(first));
-
-        // capacity 1: sending and timing out a second probe evicts the first
-        // from the bounded TimedOutMap.
-        let second = send_probe(&mut machine, timestamp(now + Duration::from_secs(2)));
-        machine
-            .poll_timeouts_at(now + Duration::from_secs(4))
-            .unwrap();
-        assert!(active(&machine).timed_out.contains(second));
-        assert!(!active(&machine).timed_out.contains(first));
-
-        // Recording against the evicted ID must not panic or resurrect it.
-        machine.record_kernel_tx_timestamp(first, tx_ts(6));
-        assert!(active_mut(&mut machine).timed_out.get_mut(first).is_none());
-    }
-
-    #[test]
-    fn kernel_tx_timestamp_ids_wrap_like_wire_seq() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        active_mut(&mut machine).next_wire_seq = u32::MAX;
-        let now = Instant::now();
-        let last = send_probe(&mut machine, timestamp(now));
-        let wrapped = send_probe(&mut machine, timestamp(now));
-        assert_eq!(last, u32::MAX);
-        assert_eq!(wrapped, 0);
-
-        machine.record_kernel_tx_timestamp(u32::MAX, tx_ts(1));
-        machine.record_kernel_tx_timestamp(0, tx_ts(2));
-
-        let session = active_mut(&mut machine);
-        assert_eq!(
-            session
-                .pending
-                .get_mut(u32::MAX)
-                .unwrap()
-                .kernel_tx_timestamp,
-            Some(tx_ts(1))
-        );
-        assert_eq!(
-            session.pending.get_mut(0).unwrap().kernel_tx_timestamp,
-            Some(tx_ts(2))
-        );
-    }
-
-    #[test]
-    fn kernel_tx_timestamp_changes_only_upstream_one_way_delay() {
-        let mono = Instant::now();
-        let mut without = machine_with_pending_probe(owd_sent_at(mono));
-        let mut with = machine_with_pending_probe(owd_sent_at(mono));
-        // Plausible: strictly between sent_at and received_at on the
-        // client's own wall clock.
-        with.record_kernel_tx_timestamp(0, owd_wall(2_000_000));
-
-        let without_events = process_owd_reply(
-            &mut without,
-            owd_timestamps(),
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-        let with_events = process_owd_reply(
-            &mut with,
-            owd_timestamps(),
-            kernel_rx_meta(25_000_000),
-            owd_received_at(mono),
-        );
-
-        let without_reply = match without_events.as_slice() {
-            [ClientEvent::EchoReply { rtt, one_way, .. }] => (*rtt, *one_way),
-            other => panic!("expected one EchoReply, got {other:?}"),
-        };
-        let with_reply = match with_events.as_slice() {
-            [ClientEvent::EchoReply { rtt, one_way, .. }] => (*rtt, *one_way),
-            other => panic!("expected one EchoReply, got {other:?}"),
-        };
-
-        // RTT is a purely monotonic userspace measurement.
-        assert_eq!(without_reply.0, with_reply.0, "RTT must be unaffected");
-        // Downstream delay is governed solely by the kernel RX selection.
-        assert_eq!(
-            without_reply.1.unwrap().server_to_client,
-            with_reply.1.unwrap().server_to_client,
-            "downstream delay must be unaffected"
-        );
-        // Upstream delay is the one thing the kernel TX timestamp changes.
-        assert_ne!(
-            without_reply.1.unwrap().client_to_server,
-            with_reply.1.unwrap().client_to_server
-        );
-        assert_eq!(
-            with_reply.1.unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(3_000_000))
-        );
-    }
-
-    // Upstream one-way delay: preferred client send wall selection.
-    //
-    // `preferred_send_wall` is exercised directly first (pure plausibility
-    // logic), then through `compute_one_way`/`process_echo_reply` to pin the
-    // end-to-end measurement behavior described in the client crate's
-    // `AGENTS.md`.
-
-    fn send_wall_ms(offset_ms: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_millis(offset_ms)
-    }
-
-    #[test]
-    fn preferred_send_wall_accepts_kernel_timestamp_equal_to_lower_bound() {
-        let anchor = send_wall_ms(1_000);
-        let received_at = send_wall_ms(1_040);
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, Some(anchor), received_at),
-            anchor
-        );
-    }
-
-    #[test]
-    fn preferred_send_wall_accepts_kernel_timestamp_equal_to_received_at() {
-        let anchor = send_wall_ms(1_000);
-        let received_at = send_wall_ms(1_040);
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, Some(received_at), received_at),
-            received_at
-        );
-    }
-
-    fn upstream_probe(sent_wall: SystemTime, mono: Instant) -> SessionMachine {
-        machine_with_pending_probe(ClientTimestamp {
-            mono,
-            wall: sent_wall,
-        })
-    }
-
-    fn upstream_reply(
-        machine: &mut SessionMachine,
-        server_recv_wall_ms: u64,
-        received_wall: SystemTime,
-        mono: Instant,
-    ) -> Vec<ClientEvent> {
-        let timestamps = TimestampFields {
-            recv_wall: Some(
-                i64::try_from(Duration::from_millis(server_recv_wall_ms).as_nanos()).unwrap(),
-            ),
-            ..Default::default()
-        };
-        let received_at = ClientTimestamp {
-            mono: mono + Duration::from_millis(40),
-            wall: received_wall,
-        };
-        process_owd_reply(machine, timestamps, ReceiveMeta::default(), received_at)
-    }
-
-    #[test]
-    fn upstream_one_way_delay_prefers_plausible_kernel_tx_time() {
-        let mono = Instant::now();
-        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-    }
-
-    #[test]
-    fn invalidated_kernel_tx_correlation_uses_userspace_send_time() {
-        let mono = Instant::now();
-        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
-
-        // A failed send can consume a kernel ID without advancing wire_seq.
-        // A later timestamp whose ID happens to match a pending wire sequence
-        // must not be associated after that gap.
-        machine.invalidate_kernel_tx_correlation();
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(20_000_000))
-        );
-    }
-
-    #[test]
-    fn upstream_one_way_delay_falls_back_without_kernel_tx() {
-        let mono = Instant::now();
-        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(20_000_000))
-        );
-    }
-
-    #[test]
-    fn upstream_one_way_delay_falls_back_for_kernel_tx_earlier_than_sent_at() {
-        let mono = Instant::now();
-        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(999));
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(20_000_000))
-        );
-    }
-
-    #[test]
-    fn upstream_one_way_delay_falls_back_for_kernel_tx_later_than_received_at() {
-        let mono = Instant::now();
-        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_041));
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(20_000_000))
-        );
-    }
-
-    #[test]
-    fn upstream_one_way_delay_measurable_late_reply_uses_the_retained_kernel_tx_time() {
-        let mono = Instant::now();
-        let mut machine = machine_with_timed_out_probe(ClientTimestamp {
-            mono,
-            wall: send_wall_ms(1_000),
-        });
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        assert!(matches!(events.as_slice(), [ClientEvent::LateReply { .. }]));
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-    }
-
-    #[test]
-    fn upstream_one_way_delay_untracked_late_reply_stays_unmeasurable() {
-        let mono = Instant::now();
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        active_mut(&mut machine).highest_received_seq = Some(5);
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        match events.as_slice() {
-            [ClientEvent::LateReply { one_way, .. }] => assert!(one_way.is_none()),
-            other => panic!("expected an untracked LateReply, got {other:?}"),
+    fn failed_submission_disables_later_tx_endpoints_for_the_session() {
+        let mut machine = opened();
+        for attempt in 0..3 {
+            if attempt == 1 {
+                machine.invalidate_kernel_tx_correlation();
+            }
+            let prepared = machine.prepare_probe().unwrap();
+            let preflight = machine.preflight_probe_commit(&prepared).unwrap();
+            let pre_send = ClientTimestamp::now();
+            let commit = machine.finalize_probe_commit(preflight, pre_send).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+            let sent =
+                machine.commit_probe_sent(commit, ClientTimestamp::now(), prepared.bytes.len());
+            machine.record_kernel_tx_timestamp(sent.seq, pre_send.wall);
+            let event = reply(&mut machine, sent.seq);
+            let ClientEvent::EchoReply {
+                one_way: Some(one_way),
+                ..
+            } = event
+            else {
+                panic!("expected measured reply")
+            };
+            let expected_wall = if attempt == 0 {
+                pre_send.wall
+            } else {
+                sent.sent_at.wall
+            };
+            let wall_ns =
+                i128::try_from(expected_wall.duration_since(UNIX_EPOCH).unwrap().as_nanos())
+                    .unwrap();
+            assert_eq!(one_way.client_to_server.unwrap().as_nanos(), 1 - wall_ns);
         }
-    }
-
-    #[test]
-    fn upstream_one_way_delay_applies_against_a_server_midpoint_timestamp() {
-        let mono = Instant::now();
-        let mut machine = upstream_probe(send_wall_ms(100), mono);
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(105));
-
-        let timestamps = TimestampFields {
-            midpoint_wall: Some(120_000_000),
-            ..Default::default()
-        };
-        let received_at = ClientTimestamp {
-            mono: mono + Duration::from_millis(40),
-            wall: send_wall_ms(140),
-        };
-        let events = process_owd_reply(
-            &mut machine,
-            timestamps,
-            ReceiveMeta::default(),
-            received_at,
-        );
-
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-    }
-
-    #[test]
-    fn upstream_one_way_delay_remains_unavailable_for_send_only_server_timestamps() {
-        let mono = Instant::now();
-        let mut machine = upstream_probe(send_wall_ms(1_000), mono);
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
-
-        let timestamps = TimestampFields {
-            send_wall: Some(1_010_000_000),
-            ..Default::default()
-        };
-        let received_at = ClientTimestamp {
-            mono: mono + Duration::from_millis(40),
-            wall: send_wall_ms(1_040),
-        };
-        let events = process_owd_reply(
-            &mut machine,
-            timestamps,
-            ReceiveMeta::default(),
-            received_at,
-        );
-
-        assert_eq!(reply_one_way(&events).unwrap().client_to_server, None);
-    }
-
-    // F-04: post-send `sent_at` measurement timing.
-    //
-    // `sent_at` moved from immediately before timeout finalization/socket
-    // send to immediately after a successful send. These tests pin the
-    // resulting end-to-end behavior: raw RTT and the userspace upstream OWD
-    // fallback both shrink because they no longer include the send-call
-    // interval, while kernel TX plausibility keeps a separate pre-send
-    // lower bound so a legitimate `TX_SOFTWARE` timestamp generated during
-    // the send path is not rejected merely for preceding the post-send
-    // sample.
-
-    #[test]
-    fn raw_rtt_uses_post_send_sent_at_not_pre_send_anchor() {
-        let base = Instant::now();
-        // A pre-send anchor at base+100ms is deliberately not used here:
-        // raw RTT must be measured from the post-send `sent_at` at
-        // base+110ms, giving 50ms, not the 60ms a pre-send anchor would
-        // have produced.
-        let sent_at = ClientTimestamp {
-            mono: base + Duration::from_millis(110),
-            wall: SystemTime::now(),
-        };
-        let received_at = ClientTimestamp {
-            mono: base + Duration::from_millis(160),
-            wall: SystemTime::now(),
-        };
-
-        let rtt = compute_rtt(&sent_at, &received_at, &TimestampFields::default());
-
-        assert_eq!(rtt.raw, Duration::from_millis(50));
-        assert_eq!(rtt.effective, SignedDuration::from_duration(rtt.raw));
-    }
-
-    #[test]
-    fn userspace_upstream_owd_fallback_uses_post_send_sent_at() {
-        let mono = Instant::now();
-        let mut machine = machine_with_pending_probe_anchored(
-            send_wall_ms(1_000), // pre-send anchor
-            ClientTimestamp {
-                mono,
-                wall: send_wall_ms(1_008), // post-send sent_at
-            },
-        );
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        // Old behavior would have used the pre-send 1000ms sample, giving
-        // 20ms. The new fallback uses the post-send 1008ms sample.
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(12_000_000))
-        );
-    }
-
-    #[test]
-    fn kernel_tx_accepted_even_though_earlier_than_post_send_sent_at() {
-        let mono = Instant::now();
-        let mut machine = machine_with_pending_probe_anchored(
-            send_wall_ms(1_000), // pre-send anchor / tx_not_before_wall
-            ClientTimestamp {
-                mono,
-                wall: send_wall_ms(1_008), // post-send sent_at
-            },
-        );
-        // The kernel TX timestamp is after the pre-send anchor and before
-        // the reply, but before the post-send `sent_at` sample. It must
-        // remain accepted: rejecting it here would be the regression this
-        // test guards against.
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(1_005));
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(15_000_000))
-        );
-    }
-
-    #[test]
-    fn kernel_tx_below_pre_send_anchor_falls_back_to_post_send_not_pre_send() {
-        let mono = Instant::now();
-        let mut machine = machine_with_pending_probe_anchored(
-            send_wall_ms(1_000), // pre-send anchor / tx_not_before_wall
-            ClientTimestamp {
-                mono,
-                wall: send_wall_ms(1_008), // post-send sent_at
-            },
-        );
-        // Earlier than even the pre-send anchor: implausible, rejected.
-        machine.record_kernel_tx_timestamp(0, send_wall_ms(999));
-
-        let events = upstream_reply(&mut machine, 1_020, send_wall_ms(1_040), mono);
-
-        // Fallback is the post-send 1008ms sample (12ms), not the pre-send
-        // 1000ms anchor (which would have given 20ms).
-        assert_eq!(
-            reply_one_way(&events).unwrap().client_to_server,
-            Some(SignedDuration::from_nanos(12_000_000))
-        );
     }
 }

@@ -94,7 +94,7 @@ impl FillMode {
             // region as unspecified residual buffer content, which returned
             // other traffic's bytes, and a compatible server must not.
             Self::None => Vec::new(),
-            Self::Random => random_payload(len, getrandom::fill),
+            Self::Random => random_payload(len),
             Self::Pattern(pattern) => pattern.iter().copied().cycle().take(len).collect(),
         }
     }
@@ -132,25 +132,17 @@ fn hex_digit(digit: u8) -> Option<u8> {
     }
 }
 
-/// `len` random bytes drawn with `draw`, or `len` zeroes if the draw failed.
+/// `len` random bytes from the operating system, or zeroes if the draw failed.
 ///
-/// `draw` is a parameter rather than a direct call so the failure path is
-/// assertable without a production hook: the caller passes the operating
-/// system's random source and one unit test passes a scripted one. An empty
-/// region asks the source for nothing at all.
-///
-/// **A failed draw zero-fills and is not an error.** Payload bytes carry no
-/// protocol meaning, so a random source having a bad afternoon must not cost a
-/// session its reply, let alone take the server down: the reply is still
-/// structurally valid and interoperable. The buffer is rewritten rather than
-/// trusted, because a failed draw leaves its contents unspecified.
+/// Failure is not fatal: payload variation has no protocol meaning, so a
+/// random-source failure must not terminate a listener or drop a session.
 ///
 /// The bytes exist to vary the payload, and nothing here is a security claim.
 /// `getrandom` is used because the crate already depends on it; session tokens,
 /// which *are* security state, keep their own separate source.
-fn random_payload<E>(len: usize, draw: impl FnOnce(&mut [u8]) -> Result<(), E>) -> Vec<u8> {
+fn random_payload(len: usize) -> Vec<u8> {
     let mut payload = vec![0; len];
-    if len > 0 && draw(&mut payload).is_err() {
+    if len > 0 && getrandom::fill(&mut payload).is_err() {
         payload.fill(0);
     }
     payload
@@ -222,22 +214,4 @@ pub(crate) fn negotiate_server_fill(params: &mut Params) -> FillMode {
 pub(crate) fn echo_payload_len(hmac: bool, params: &Params) -> usize {
     let header_len = PacketLayout::echo(hmac, params).header_len();
     echo_packet_len(hmac, params).map_or(0, |len| len.saturating_sub(header_len))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn a_failed_random_draw_yields_zeroes() {
-        // The real source cannot be made to fail without a production hook, and
-        // the fallback itself is the policy under test: a failed draw must
-        // produce a full-length payload of zeroes rather than an error or the
-        // buffer's unspecified contents.
-        let scribble = |buffer: &mut [u8]| {
-            buffer.fill(0xab);
-            Err(())
-        };
-        assert_eq!(random_payload(6, scribble), vec![0; 6]);
-    }
 }

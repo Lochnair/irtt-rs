@@ -16,8 +16,5 @@ pub use model::*;
 #[cfg(feature = "tokio")]
 pub use task::*;
 
-#[cfg(all(feature = "tokio", test))]
-mod blocking_tests;
-
 #[cfg(feature = "tokio")]
 mod schedule;

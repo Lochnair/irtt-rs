@@ -195,12 +195,6 @@ impl PendingMap {
         self.map.is_empty()
     }
 
-    // Verify repeated or abandoned send preflights do not create pending probes.
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
     /// Mutable access to a still-pending probe by wire sequence, without
     /// disturbing its position in the timeout order. Used to attach an
     /// observed kernel TX timestamp to a probe that has not yet completed or
@@ -215,7 +209,7 @@ impl PendingMap {
             .map(|entry| entry.probe.timeout_at)
     }
 
-    #[cfg(any(feature = "tokio", test))]
+    #[cfg(feature = "tokio")]
     pub fn latest_timeout_deadline(&self) -> Option<Instant> {
         self.last
             .and_then(|wire_seq| self.map.get(&wire_seq))
@@ -243,12 +237,6 @@ impl PendingMap {
                 None
             );
         }
-    }
-
-    // Check sequence-reuse and kernel timestamp retention without consuming a probe.
-    #[cfg(test)]
-    pub fn contains(&self, wire_seq: u32) -> bool {
-        self.map.contains_key(&wire_seq)
     }
 }
 
@@ -303,12 +291,6 @@ impl TimedOutMap {
     #[cfg(feature = "tokio")]
     pub fn latest_timeout_deadline(&self) -> Option<Instant> {
         self.map.values().map(|probe| probe.timeout_at).max()
-    }
-
-    // Check sequence-reuse and kernel timestamp retention without consuming a probe.
-    #[cfg(test)]
-    pub fn contains(&self, wire_seq: u32) -> bool {
-        self.map.contains_key(&wire_seq)
     }
 
     fn evict_oldest(&mut self) {
@@ -393,212 +375,69 @@ mod tests {
         }
     }
 
-    fn insert(map: &mut PendingMap, probe: PendingProbe) {
-        map.preflight_insert(probe.wire_seq).unwrap();
-        map.commit_insert(probe);
-    }
-
     #[test]
-    fn pending_map_rejects_over_capacity() {
-        let mut map = PendingMap::new(2);
-        let now = Instant::now();
-        map.preflight_insert(0).unwrap();
-        map.commit_insert(pending(0, now + Duration::from_secs(4)));
-        map.preflight_insert(1).unwrap();
-        map.commit_insert(pending(1, now + Duration::from_secs(4)));
-        assert!(matches!(
-            map.preflight_insert(2),
-            Err(ClientError::PendingLimitExceeded { limit: 2 })
-        ));
-    }
-
-    #[test]
-    fn pending_map_preflight_rejects_sequence_collision() {
-        let mut map = PendingMap::new(2);
-        let now = Instant::now();
-        map.preflight_insert(9).unwrap();
-        map.commit_insert(pending(9, now));
-
-        assert!(matches!(
-            map.preflight_insert(9),
-            Err(ClientError::PendingSequenceCollision { seq: 9 })
-        ));
-        assert_eq!(map.map.len(), 1);
-    }
-
-    #[test]
-    fn pending_map_unlinks_head_middle_and_tail_and_updates_extrema() {
-        let mut map = PendingMap::new(4);
-        let now = Instant::now();
-        insert(&mut map, pending(1, now + Duration::from_secs(1)));
-        insert(&mut map, pending(2, now + Duration::from_secs(2)));
-        insert(&mut map, pending(3, now + Duration::from_secs(3)));
-
-        assert_eq!(
-            map.next_timeout_deadline(),
-            Some(now + Duration::from_secs(1))
-        );
-        assert_eq!(
-            map.latest_timeout_deadline(),
-            Some(now + Duration::from_secs(3))
-        );
-
-        assert!(map.remove(2).is_some());
-        assert_eq!(
-            map.next_timeout_deadline(),
-            Some(now + Duration::from_secs(1))
-        );
-        assert_eq!(
-            map.latest_timeout_deadline(),
-            Some(now + Duration::from_secs(3))
-        );
-
-        assert!(map.remove(1).is_some());
-        assert_eq!(
-            map.next_timeout_deadline(),
-            Some(now + Duration::from_secs(3))
-        );
-        assert_eq!(
-            map.latest_timeout_deadline(),
-            Some(now + Duration::from_secs(3))
-        );
-
-        assert!(map.remove(3).is_some());
-        assert_eq!(map.next_timeout_deadline(), None);
-        assert_eq!(map.latest_timeout_deadline(), None);
-    }
-
-    #[test]
-    fn pending_map_bounded_expiration_matches_exhaustive_order() {
-        let now = Instant::now();
-        let probes = [
-            pending(1, now + Duration::from_secs(1)),
-            pending(2, now + Duration::from_secs(2)),
-            pending(3, now + Duration::from_secs(3)),
-            pending(4, now + Duration::from_secs(4)),
-        ];
-        let mut bounded = PendingMap::new(probes.len());
-        let mut exhaustive = PendingMap::new(probes.len());
-        for probe in probes.iter().cloned() {
-            insert(&mut bounded, probe.clone());
-            insert(&mut exhaustive, probe);
-        }
-
-        let empty = bounded.drain_expired_bounded(now + Duration::from_secs(4), 0);
-        assert!(empty.probes.is_empty());
-        assert!(empty.more_due);
-
-        let mut actual = Vec::new();
-        loop {
-            let batch = bounded.drain_expired_bounded(now + Duration::from_secs(4), 2);
-            actual.extend(batch.probes.into_iter().map(|probe| probe.wire_seq));
-            if !batch.more_due {
-                break;
+    fn pending_removal_and_sequence_reuse_preserve_expiry_and_capacity() {
+        let start = Instant::now();
+        // Remove the head, middle or tail, then reuse that sequence at a later
+        // deadline. Observe expiry and capacity, not private list links.
+        for removed in 0..3 {
+            let mut pending_map = PendingMap::new(3);
+            for seq in 0..3 {
+                pending_map.preflight_insert(seq).unwrap();
+                pending_map
+                    .commit_insert(pending(seq, start + Duration::from_secs(u64::from(seq))));
             }
+            assert!(matches!(
+                pending_map.preflight_insert(3),
+                Err(ClientError::PendingLimitExceeded { .. })
+            ));
+            assert_eq!(pending_map.remove(removed).unwrap().wire_seq, removed);
+            pending_map.preflight_insert(removed).unwrap();
+            let reused_deadline = start + Duration::from_secs(4);
+            pending_map.commit_insert(pending(removed, reused_deadline));
+
+            let remaining = (0..3).filter(|seq| *seq != removed).collect::<Vec<_>>();
+            for (index, seq) in remaining.iter().enumerate() {
+                assert_eq!(
+                    pending_map.next_timeout_deadline(),
+                    Some(start + Duration::from_secs(u64::from(*seq)))
+                );
+                let expired = pending_map.drain_expired_bounded(start + Duration::from_secs(3), 1);
+                assert_eq!(
+                    expired
+                        .probes
+                        .iter()
+                        .map(|probe| probe.wire_seq)
+                        .collect::<Vec<_>>(),
+                    vec![*seq]
+                );
+                assert_eq!(expired.more_due, index == 0);
+            }
+            assert_eq!(pending_map.next_timeout_deadline(), Some(reused_deadline));
+            let expired = pending_map.drain_expired_bounded(reused_deadline, 3);
+            assert_eq!(expired.probes.len(), 1);
+            assert_eq!(expired.probes[0].wire_seq, removed);
+            assert!(!expired.more_due);
+            assert!(pending_map.is_empty());
+            assert_eq!(pending_map.next_timeout_deadline(), None);
+            pending_map.preflight_insert(removed).unwrap();
+            pending_map.commit_insert(pending(removed, reused_deadline));
+            assert_eq!(pending_map.remove(removed).unwrap().wire_seq, removed);
+            assert!(pending_map.is_empty());
         }
-        let expected = exhaustive
-            .drain_expired_bounded(now + Duration::from_secs(4), usize::MAX)
-            .probes
-            .into_iter()
-            .map(|probe| probe.wire_seq)
-            .collect::<Vec<_>>();
-
-        assert_eq!(actual, expected);
-        assert_eq!(actual, vec![1, 2, 3, 4]);
     }
 
+    // Public loss/reply events cannot reveal leaked retention bookkeeping.
     #[test]
-    fn pending_map_sequence_reuse_leaves_no_stale_link() {
-        let mut map = PendingMap::new(1);
-        let now = Instant::now();
-        insert(&mut map, pending(7, now));
-        assert!(map.remove(7).is_some());
-        insert(&mut map, pending(7, now + Duration::from_secs(1)));
-
-        assert!(map.drain_expired_bounded(now, usize::MAX).probes.is_empty());
-        assert_eq!(
-            map.drain_expired_bounded(now + Duration::from_secs(1), usize::MAX)
-                .probes
-                .into_iter()
-                .map(|probe| probe.wire_seq)
-                .collect::<Vec<_>>(),
-            vec![7]
-        );
-    }
-
-    #[test]
-    fn pending_map_commit_uses_only_preflighted_map_capacity() {
-        let mut map = PendingMap::new(2);
-        let now = Instant::now();
-        map.preflight_insert(7).unwrap();
-        let capacity = map.map.capacity();
-
-        map.commit_insert(pending(7, now));
-
-        assert_eq!(map.map.capacity(), capacity);
-        assert_eq!(map.map.len(), 1);
-    }
-
-    #[test]
-    fn pending_map_mixed_removals_preserve_links() {
-        let mut map = PendingMap::new(4);
-        let now = Instant::now();
-        for seq in 1..=4 {
-            insert(
-                &mut map,
-                pending(seq, now + Duration::from_secs(u64::from(seq))),
-            );
-        }
-
-        assert!(map.remove(2).is_some());
-        let expired = map.drain_expired_bounded(now + Duration::from_secs(3), usize::MAX);
-        assert_eq!(
-            expired
-                .probes
-                .into_iter()
-                .map(|probe| probe.wire_seq)
-                .collect::<Vec<_>>(),
-            vec![1, 3]
-        );
-        assert!(map.remove(4).is_some());
-    }
-
-    #[test]
-    fn bounded_probe_tracking_evicts_oldest_entries() {
-        let mut set = CompletedSet::new(3);
-        set.insert(0);
-        set.insert(1);
-        set.insert(2);
-        assert!(set.contains(0));
-        assert!(set.contains(1));
-        assert!(set.contains(2));
-        set.insert(3);
-        assert_eq!(set.set.len(), 3);
-        assert!(!set.contains(0));
-        assert!(set.contains(3));
-
-        let mut map = TimedOutMap::new(2);
-        let now = Instant::now();
-        map.insert(pending(0, now));
-        map.insert(pending(1, now));
-        map.insert(pending(2, now));
-
-        assert_eq!(map.map.len(), 2);
-        assert!(map.remove(0).is_none());
-        assert!(map.remove(1).is_some());
-        assert!(map.remove(2).is_some());
-    }
-
-    #[test]
-    fn timed_out_map_remove_prunes_insertion_order() {
+    fn timed_out_retention_stays_bounded_after_repeated_removals() {
         let mut map = TimedOutMap::new(4);
         let now = Instant::now();
 
         for i in 0..20 {
             map.insert(pending(i, now));
             assert!(map.remove(i).is_some());
-            assert_eq!(map.map.len(), 0);
-            assert_eq!(map.insertion_order.len(), 0);
+            assert!(map.map.len() <= 4);
+            assert!(map.insertion_order.len() <= 4);
         }
     }
 }

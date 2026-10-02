@@ -9,8 +9,7 @@
 //! admission, authentication policy, open negotiation, the session table, echo
 //! receive state, rate and lifetime policy, resource decisions and reply
 //! construction. It performs no I/O; the clock its timestamps and deadlines
-//! come from is a private injected seam, not a runtime abstraction, so the
-//! engine stays testable. Each reply it produces is an [`OutboundDatagram`]:
+//! come from is sampled by the core. Each reply is an [`OutboundDatagram`]:
 //! the packet and the raw traffic class it must be sent with. [`Server`] owns
 //! one Tokio UDP listener and one core, and provides sequential receive, reply,
 //! scheduled expiry maintenance and caller-controlled shutdown. [`ServerSet`]

@@ -886,6 +886,3 @@ fn poll_readable_until(
         },
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -177,74 +177,6 @@ pub struct ManagedClientHandle {
     max_live_target_generations: usize,
     status: watch::Receiver<Arc<ManagedStatus>>,
     events: broadcast::WeakSender<ManagedEvent>,
-    #[cfg(test)]
-    update_submission_hook: Option<Arc<UpdateSubmissionTestHook>>,
-}
-
-// Pauses between admission and enqueue to exercise stop/seal linearization.
-#[cfg(test)]
-#[derive(Default)]
-struct UpdateSubmissionTestHook {
-    state: std::sync::Mutex<UpdateSubmissionTestState>,
-    arrived: std::sync::Condvar,
-    released: std::sync::Condvar,
-}
-
-#[cfg(test)]
-#[derive(Default)]
-struct UpdateSubmissionTestState {
-    armed: bool,
-    arrived: bool,
-    released: bool,
-}
-
-#[cfg(test)]
-impl UpdateSubmissionTestHook {
-    fn arm(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .armed = true;
-    }
-
-    fn pause_after_admission(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if !state.armed {
-            return;
-        }
-        state.arrived = true;
-        self.arrived.notify_all();
-        while !state.released {
-            state = self
-                .released
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-        }
-    }
-
-    fn wait_until_arrived(&self) {
-        let state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let (state, timeout) = self
-            .arrived
-            .wait_timeout_while(state, Duration::from_secs(2), |state| !state.arrived)
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(state.arrived && !timeout.timed_out());
-    }
-
-    fn release(&self) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.released = true;
-        self.released.notify_all();
-    }
 }
 
 impl fmt::Debug for ManagedClientHandle {
@@ -304,11 +236,6 @@ impl ManagedClientHandle {
                 configured: targets.len(),
                 limit: self.max_live_target_generations,
             });
-        }
-
-        #[cfg(test)]
-        if let Some(hook) = &self.update_submission_hook {
-            hook.pause_after_admission();
         }
 
         // Observing `Open` only permits attempting submission. A successful
@@ -403,9 +330,6 @@ impl Future for ManagedStopReceipt {
 type ConnectFuture =
     Pin<Box<dyn Future<Output = Result<AsyncClient, ClientError>> + Send + 'static>>;
 type WakeFuture = Pin<Box<dyn Future<Output = Option<watch::Receiver<()>>> + Send + 'static>>;
-// Snapshots at publication verify status is visible before the corresponding event.
-#[cfg(test)]
-type EventObservations = Arc<std::sync::Mutex<Vec<(ManagedEvent, Arc<ManagedStatus>)>>>;
 
 fn arm_wake(mut receiver: watch::Receiver<()>) -> WakeFuture {
     Box::pin(async move {
@@ -688,6 +612,8 @@ enum OpenSessionFailureCleanup {
 /// The sole authoritative zero-or-many target driver.
 #[must_use = "ManagedClientTask must be awaited or deliberately dropped"]
 pub struct ManagedClientTask {
+    #[cfg(test)]
+    timeout_inspections: std::cell::RefCell<Vec<usize>>,
     state: DriverState,
     lifecycle: ManagedLifecycle,
     config: ManagedClientConfig,
@@ -710,20 +636,6 @@ pub struct ManagedClientTask {
     final_outcome: Option<Arc<ManagedOutcome>>,
     next_generation: u64,
     applied_command_sequence: u64,
-    #[cfg(test)]
-    event_observations: Option<EventObservations>,
-    #[cfg(test)]
-    drain_test_hook: DrainTestHook,
-    // Counts work that cannot be observed through lossy presentation events.
-    #[cfg(test)]
-    timeout_inspections: usize,
-}
-
-// Holds queued replies past the drain deadline to exercise the final receive budget.
-#[cfg(test)]
-#[derive(Default)]
-struct DrainTestHook {
-    defer_work_until_deadline: bool,
 }
 
 impl ManagedClientTask {
@@ -734,13 +646,6 @@ impl ManagedClientTask {
     }
 
     fn publish_event(&self, event: ManagedEvent) {
-        #[cfg(test)]
-        if let Some(observations) = &self.event_observations {
-            observations
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .push((event.clone(), Arc::clone(&self.resources().status.borrow())));
-        }
         if let Some(events) = &self.resources().events {
             let _ = events.send(event);
         }
@@ -1376,22 +1281,6 @@ impl ManagedClientTask {
                 mut cleanup_failure,
                 mut post_deadline_receives_remaining,
             } => {
-                #[cfg(test)]
-                let defer_work = self.drain_test_hook.defer_work_until_deadline && now < deadline;
-                #[cfg(not(test))]
-                let defer_work = false;
-                if defer_work {
-                    self.targets[index].state = TargetState::Draining {
-                        client,
-                        drain_started_at,
-                        deadline,
-                        primary_end,
-                        cleanup_failure,
-                        post_deadline_receives_remaining,
-                    };
-                    return false;
-                }
-
                 if client
                     .next_probe_timeout_deadline()
                     .is_some_and(|timeout| timeout <= now)
@@ -1899,10 +1788,6 @@ impl ManagedClientTask {
             }
             let index = self.timeout_cursor;
             self.timeout_cursor = (self.timeout_cursor + 1) % target_len;
-            #[cfg(test)]
-            {
-                self.timeout_inspections += 1;
-            }
             if self.target_has_due_timeout(index, now) {
                 let generation = self.targets[index].instance.generation;
                 let step = self.poll_target_timeout(index, now);
@@ -1950,6 +1835,8 @@ impl ManagedClientTask {
     }
 
     fn target_has_due_timeout(&self, index: usize, now: Instant) -> bool {
+        #[cfg(test)]
+        self.timeout_inspections.borrow_mut().push(index);
         match &self.targets[index].state {
             TargetState::Active { client } => {
                 self.state != DriverState::Stopping
@@ -1958,20 +1845,9 @@ impl ManagedClientTask {
                         .next_probe_timeout_deadline()
                         .is_some_and(|deadline| deadline <= now)
             }
-            TargetState::Draining {
-                client,
-                deadline: _deadline,
-                ..
-            } => {
-                #[cfg(test)]
-                let defer_work = self.drain_test_hook.defer_work_until_deadline && now < *_deadline;
-                #[cfg(not(test))]
-                let defer_work = false;
-                !defer_work
-                    && client
-                        .next_probe_timeout_deadline()
-                        .is_some_and(|timeout| timeout <= now)
-            }
+            TargetState::Draining { client, .. } => client
+                .next_probe_timeout_deadline()
+                .is_some_and(|timeout| timeout <= now),
             _ => false,
         }
     }
@@ -2076,17 +1952,9 @@ impl ManagedClientTask {
                 TargetState::Draining {
                     client, deadline, ..
                 } => {
-                    #[cfg(test)]
-                    let defer_work = self.drain_test_hook.defer_work_until_deadline;
-                    #[cfg(not(test))]
-                    let defer_work = false;
                     non_send_deadline = non_send_deadline
                         .into_iter()
-                        .chain(
-                            (!defer_work)
-                                .then(|| client.next_probe_timeout_deadline())
-                                .flatten(),
-                        )
+                        .chain(client.next_probe_timeout_deadline())
                         .chain(Some(*deadline))
                         .min();
                 }
@@ -2454,6 +2322,8 @@ fn build_task(
         stop: Arc::clone(&stop),
     };
     let task = ManagedClientTask {
+        #[cfg(test)]
+        timeout_inspections: std::cell::RefCell::new(Vec::new()),
         state: DriverState::NotStarted,
         lifecycle: ManagedLifecycle::NotStarted,
         config,
@@ -2476,12 +2346,6 @@ fn build_task(
         final_outcome: None,
         next_generation,
         applied_command_sequence: 0,
-        #[cfg(test)]
-        event_observations: None,
-        #[cfg(test)]
-        drain_test_hook: DrainTestHook::default(),
-        #[cfg(test)]
-        timeout_inspections: 0,
     };
     let handle = ManagedClientHandle {
         stop,
@@ -2489,8 +2353,6 @@ fn build_task(
         max_live_target_generations,
         status: status_receiver,
         events: weak_events,
-        #[cfg(test)]
-        update_submission_hook: None,
     };
     Ok((task, handle))
 }
@@ -2533,5 +2395,39 @@ fn close_timeout_failure() -> ManagedTargetFailure {
 }
 
 #[cfg(test)]
-#[path = "tests.rs"]
-mod tests;
+mod tests {
+    use super::*;
+
+    // Poll latency through public events cannot distinguish an O(n) discovery
+    // scan from a bounded scan reliably. This tiny inspection trace measures
+    // work directly, including empty targets, and checks eventual coverage
+    // without asserting a cursor value or a particular visitation order.
+    #[test]
+    fn timeout_discovery_has_bounded_work_and_eventually_visits_every_target() {
+        let count = TIMEOUT_WORK_BUDGET * 2 + 1;
+        let targets = (0..count)
+            .map(|i| ManagedTargetConfig::new(i.to_string(), "127.0.0.1:2112"))
+            .collect();
+        let (mut task, _handle) = ManagedClient::task(
+            ManagedClientConfig {
+                max_live_target_generations: count,
+                ..ManagedClientConfig::default()
+            },
+            targets,
+        )
+        .unwrap();
+        let mut visited = HashSet::new();
+        for _ in 0..count.div_ceil(TIMEOUT_WORK_BUDGET) {
+            task.timeout_inspections.borrow_mut().clear();
+            task.poll_timeout_pass(Instant::now());
+            let inspected = task.timeout_inspections.borrow();
+            assert!(inspected.len() <= TIMEOUT_WORK_BUDGET);
+            visited.extend(inspected.iter().copied());
+        }
+        assert_eq!(
+            visited.len(),
+            count,
+            "timeout discovery must reach all targets"
+        );
+    }
+}

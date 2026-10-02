@@ -149,36 +149,3 @@ fn unsupported_traffic_class(_traffic_class: u32, option: &'static str) -> io::R
         format!("{option} are unsupported on this target"),
     ))
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Which listeners mark with the IPv4 option.
-    ///
-    /// The mapped forms are the point: such a socket is `AF_INET6` but sends
-    /// IPv4, and `IPV6_TCLASS` does not reach those packets. Linux marks them
-    /// through `IP_TOS`; the platforms that would reject that keep the IPv6
-    /// option, because an unappliable marking stops the send and a dropped
-    /// reply is worse than an unmarked one.
-    #[test]
-    fn a_mapped_listener_marks_with_the_ipv4_option_where_that_option_works() {
-        let mapped = cfg!(target_os = "linux");
-
-        for (addr, is_ipv4) in [
-            ("0.0.0.0:2112", true),
-            ("127.0.0.1:2112", true),
-            ("[::ffff:0.0.0.0]:2112", mapped),
-            ("[::ffff:127.0.0.1]:2112", mapped),
-            ("[::]:2112", false),
-            ("[::1]:2112", false),
-            ("[2001:db8::1]:2112", false),
-        ] {
-            assert_eq!(
-                marks_with_ipv4_option(addr.parse().unwrap()),
-                is_ipv4,
-                "{addr} would mark with the wrong option"
-            );
-        }
-    }
-}

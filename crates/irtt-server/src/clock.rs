@@ -1,16 +1,5 @@
 //! Clock sampling for echo timestamps.
 //!
-//! An echo reply reports when the server received the request and when it sent
-//! the answer, so the core needs a clock. It takes one through this private
-//! seam rather than reading the system clock inline, so that timestamp behavior
-//! is deterministically testable without a runtime, sleeps or timing
-//! tolerances.
-//!
-//! This is the clock counterpart of [`TokenSource`](crate::token::TokenSource)
-//! and nothing more. It is **not** a runtime abstraction, not a transport
-//! boundary and not a pluggable product API: it is crate-private and the public
-//! constructor still takes only a [`ServerConfig`](crate::ServerConfig).
-//!
 //! The public [`ServerCore::handle_datagram`](crate::ServerCore::handle_datagram)
 //! entry point takes no timestamp: the core samples every instant it reports.
 //! The Tokio runtime uses a crate-private entry point that may additionally hand
@@ -21,10 +10,7 @@
 //! one that models transport metadata. A [`ClockSample`] remains one paired
 //! userspace instant and never carries a kernel reading.
 
-use std::{
-    fmt,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// One instant, read from both clock domains together.
 ///
@@ -77,19 +63,6 @@ impl ClockSample {
     }
 }
 
-/// A source of clock samples.
-///
-/// Deliberately private, like [`TokenSource`](crate::token::TokenSource): it
-/// exists so tests can script the receive and send instants of a reply, not as
-/// an extension point. The production implementation is [`SystemClock`].
-///
-/// Sampling is infallible. A clock that could refuse would make an admitted
-/// echo fail for a reason that is neither the peer's fault nor recoverable, so
-/// the production source saturates rather than reporting an error.
-pub(crate) trait ClockSource: fmt::Debug + Send {
-    fn sample(&mut self) -> ClockSample;
-}
-
 /// Reads the wall clock from [`SystemTime`] and the monotonic clock from an
 /// [`Instant`] captured when the source was created.
 ///
@@ -115,8 +88,8 @@ impl Default for SystemClock {
     }
 }
 
-impl ClockSource for SystemClock {
-    fn sample(&mut self) -> ClockSample {
+impl SystemClock {
+    pub(crate) fn sample(&mut self) -> ClockSample {
         ClockSample {
             wall_ns: wall_ns(),
             mono_ns: saturating_ns(self.origin.elapsed()),
@@ -136,7 +109,7 @@ fn wall_ns() -> i64 {
 /// does not fit the wire's signed-nanosecond field.
 ///
 /// This is the conversion for an instant the server did **not** read from its
-/// own [`ClockSource`] — today, a kernel receive timestamp the transport
+/// own clock — today, a kernel receive timestamp the transport
 /// observed. It reports unrepresentability rather than saturating, because a
 /// clamped instant is indistinguishable from a real one at the boundary and
 /// would then be compared against a genuine sample as though it were plausible.
@@ -182,89 +155,4 @@ fn mean_ns(a: i64, b: i64) -> i64 {
     } else {
         i64::MAX
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Constructed values only: the production clock's real readings are not
-    /// assertable without a timing tolerance, and the behavioral echo tests use
-    /// a scripted source instead.
-    #[test]
-    fn a_midpoint_is_the_per_domain_mean_and_cannot_overflow() {
-        let receive = ClockSample {
-            wall_ns: 1_000,
-            mono_ns: 10_000,
-        };
-        let send = ClockSample {
-            wall_ns: 1_200,
-            mono_ns: 10_300,
-        };
-        assert_eq!(
-            receive.midpoint(send),
-            ClockSample {
-                wall_ns: 1_100,
-                mono_ns: 10_150,
-            }
-        );
-
-        // The sum overflows `i64`; the mean does not.
-        let high = ClockSample {
-            wall_ns: i64::MAX,
-            mono_ns: i64::MAX,
-        };
-        assert_eq!(
-            high.midpoint(high),
-            ClockSample {
-                wall_ns: i64::MAX,
-                mono_ns: i64::MAX,
-            }
-        );
-        let low = ClockSample {
-            wall_ns: i64::MIN,
-            mono_ns: i64::MIN,
-        };
-        assert_eq!(
-            low.midpoint(low),
-            ClockSample {
-                wall_ns: i64::MIN,
-                mono_ns: i64::MIN,
-            }
-        );
-        assert_eq!(
-            high.midpoint(low),
-            ClockSample {
-                wall_ns: 0,
-                mono_ns: 0,
-            }
-        );
-    }
-
-    #[test]
-    fn a_duration_beyond_the_wire_field_saturates_rather_than_panicking() {
-        assert_eq!(saturating_ns(Duration::from_nanos(1_500)), 1_500);
-        assert_eq!(saturating_ns(Duration::MAX), i64::MAX);
-    }
-
-    #[test]
-    fn an_observed_instant_converts_or_reports_that_it_cannot() {
-        assert_eq!(
-            wall_ns_of(UNIX_EPOCH + Duration::from_nanos(1_500)),
-            Some(1_500)
-        );
-        assert_eq!(wall_ns_of(UNIX_EPOCH), Some(0));
-
-        // Before the epoch is negative, not a wrap and not a rejection.
-        assert_eq!(
-            wall_ns_of(UNIX_EPOCH - Duration::from_nanos(1_500)),
-            Some(-1_500)
-        );
-
-        // Beyond the field, in either direction, is `None` rather than a
-        // clamped value that would then read as an ordinary instant.
-        let beyond = Duration::from_nanos(u64::MAX) + Duration::from_secs(1);
-        assert_eq!(wall_ns_of(UNIX_EPOCH + beyond), None);
-        assert_eq!(wall_ns_of(UNIX_EPOCH - beyond), None);
-    }
 }

@@ -393,14 +393,6 @@ mod tests {
     use super::*;
     use crate::{token::TokenSource, ServerCore, ServerError};
 
-    #[tokio::test(flavor = "current_thread")]
-    async fn a_set_serving_nothing_is_refused() {
-        assert!(matches!(
-            ServerSet::bind([], ServerConfig::default()).await,
-            Err(ServerSetError::NoListeners)
-        ));
-    }
-
     /// A token source that draws one value successfully and then fails every
     /// later draw.
     ///

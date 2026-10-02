@@ -93,6 +93,29 @@ risks clearing readiness state that the normal Echo receive path depends on.
 There is no background task or second `AsyncFd` around the Tokio-owned
 socket.
 
+### Testing kernel timestamp behavior
+
+The requirements above describe production behavior, not a required unit-test
+architecture.
+
+Prefer Linux tests that exercise the real socket and kernel timestamp path
+through production APIs. A test intended to prove TX timestamp support must
+actually require and observe a kernel TX timestamp when running on a supported
+Linux environment; accepting the userspace fallback does not prove that path.
+
+Likewise, prefer observable socket/client behavior for genuine error-queue
+errors and bounded draining where it can reasonably be induced.
+
+Do not restore synthetic `ControlMessageOwned` permutations, classifier-unit
+suites, raw ancillary fixtures, test-only socket hooks, or other internal seams
+solely to cover every `MSG_ERRQUEUE` branch. `nix` owns ancillary-message
+decoding and ABI safety; `irtt-client` tests should primarily prove its own
+observable interpretation and behavior through the real path.
+
+If some invariant cannot reasonably be induced through a production interface,
+a small focused internal test may be retained, but the burden is on that test to
+justify why integration coverage is insufficient.
+
 ## Retained state
 
 `PendingProbe` carries an optional `kernel_tx_timestamp: Option<SystemTime>`
