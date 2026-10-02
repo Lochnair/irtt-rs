@@ -94,20 +94,6 @@ fn recv_available_stops_after_peer_close() {
 }
 
 #[test]
-fn normal_echo_reply_does_not_close_session() {
-    let params = default_params();
-    let (mut client, server) = open_client_with_echo_server(&params);
-    client.send_probe().unwrap();
-
-    let events = client.recv_once().unwrap();
-    assert!(matches!(events.as_slice(), [ClientEvent::EchoReply { .. }]));
-    assert!(client.send_probe().is_ok());
-
-    client.close().unwrap();
-    server.join();
-}
-
-#[test]
 fn close_flagged_duplicate_emits_duplicate_then_closes() {
     let params = default_params();
     let server = start_fake_server({

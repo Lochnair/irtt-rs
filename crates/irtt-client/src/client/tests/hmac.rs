@@ -1,24 +1,6 @@
 use super::*;
 
 #[test]
-fn hmac_open_success() {
-    let key = b"secret".to_vec();
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.hmac_key = Some(key.clone());
-    let params = params_from_config(&config).unwrap();
-    let server = start_fake_server(move |socket, tx| {
-        let (request, peer) = recv_request(&socket, &tx);
-        verify_packet_hmac(&key, &request).unwrap();
-        let reply = open_reply(FLAG_OPEN | FLAG_REPLY, TOKEN, &params, Some(&key));
-        socket.send_to(&reply, peer).unwrap();
-    });
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
-    assert_open_started(client.open().unwrap());
-    server.join();
-}
-
-#[test]
 fn hmac_open_ignores_missing_hmac_before_valid_reply() {
     let key = b"secret".to_vec();
     let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));

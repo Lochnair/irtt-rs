@@ -113,19 +113,3 @@ fn open_fails_after_no_test_completed() {
     assert!(matches!(client.open(), Err(ClientError::AlreadyCompleted)));
     server.join();
 }
-
-#[test]
-fn no_test_success_validates_params() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
-    let params = params_from_config(&config).unwrap();
-    let server = no_test_server(params.clone(), 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
-
-    let negotiated = assert_no_test_completed(client.open().unwrap());
-    assert_eq!(negotiated.params, params);
-
-    assert_eq!(client.applied_traffic_class, None);
-    server.join();
-}

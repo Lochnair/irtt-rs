@@ -1,5 +1,3 @@
-use crate::socket_options::socket_ttl;
-
 use super::*;
 
 #[test]
@@ -27,13 +25,13 @@ fn connect_applies_configured_ipv4_ttl_before_open_and_close_preserves_it() {
     config.socket_config.ttl = Some(64);
     let mut client = Client::connect(config).unwrap();
 
-    assert_eq!(socket_ttl(&client.socket, client.remote).unwrap(), 64);
+    assert_eq!(socket2::SockRef::from(&client.socket).ttl_v4().unwrap(), 64);
 
     client.open().unwrap();
     server.join();
 
     client.close().unwrap();
-    assert_eq!(socket_ttl(&client.socket, client.remote).unwrap(), 64);
+    assert_eq!(socket2::SockRef::from(&client.socket).ttl_v4().unwrap(), 64);
 }
 
 #[test]

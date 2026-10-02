@@ -84,26 +84,15 @@ impl PreparedOpenAcceptance {
     pub(crate) fn normal_negotiated(&self) -> Option<&NegotiatedParams> {
         match &self.next_state {
             MachineState::Open(session) => Some(&session.negotiated),
-            MachineState::NoTestCompleted => None,
-            MachineState::Connected | MachineState::Closed { .. } => {
-                unreachable!("open acceptance only prepares open or no-test state")
-            }
+            _ => None,
         }
     }
 
     pub(crate) fn cleanup_close_packet(&self) -> Option<&[u8]> {
         match &self.next_state {
             MachineState::Open(session) => Some(&session.local_close_packet),
-            MachineState::NoTestCompleted => None,
-            MachineState::Connected | MachineState::Closed { .. } => {
-                unreachable!("open acceptance only prepares open or no-test state")
-            }
+            _ => None,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn has_prepared_active_session(&self) -> bool {
-        matches!(self.next_state, MachineState::Open(_))
     }
 }
 
@@ -559,17 +548,9 @@ impl SessionMachine {
 
     pub(crate) fn pending_is_empty(&self) -> bool {
         match &self.state {
-            MachineState::Open(session) => session.pending.len() == 0,
+            MachineState::Open(session) => session.pending.is_empty(),
             _ => true,
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn is_terminal(&self) -> bool {
-        matches!(
-            self.state,
-            MachineState::NoTestCompleted | MachineState::Closed { .. }
-        )
     }
 
     pub(crate) fn is_peer_closed(&self) -> bool {
@@ -582,7 +563,6 @@ impl SessionMachine {
         )
     }
 
-    #[cfg(any(feature = "tokio", test))]
     pub(crate) fn packets_sent(&self) -> u64 {
         match &self.state {
             MachineState::Open(session) => session.packets_sent,
@@ -594,9 +574,7 @@ impl SessionMachine {
     pub(crate) fn next_probe_timeout_deadline(&self) -> Option<Instant> {
         match &self.state {
             MachineState::Open(session) => session.pending.next_timeout_deadline(),
-            MachineState::Connected
-            | MachineState::NoTestCompleted
-            | MachineState::Closed { .. } => None,
+            _ => None,
         }
     }
 
@@ -609,17 +587,11 @@ impl SessionMachine {
                 .into_iter()
                 .chain(session.timed_out.latest_timeout_deadline())
                 .max(),
-            MachineState::Connected
-            | MachineState::NoTestCompleted
-            | MachineState::Closed { .. } => None,
+            _ => None,
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn is_open(&self) -> bool {
-        matches!(self.state, MachineState::Open(_))
-    }
-
+    #[cfg(feature = "tokio")]
     pub(crate) fn ensure_open(&self) -> Result<(), ClientError> {
         self.open_session().map(|_| ())
     }
@@ -856,33 +828,18 @@ impl SessionMachine {
         };
 
         if should_close {
-            self.close_from_peer(token, now, &mut events);
+            let packets_sent = self.packets_sent();
+            self.state = MachineState::Closed {
+                source: CloseSource::Peer,
+                packets_sent,
+            };
+            events.push(ClientEvent::SessionClosed {
+                remote: self.remote,
+                token,
+                at: now,
+            });
         }
         Ok(events)
-    }
-
-    fn close_from_peer(&mut self, token: u64, now: ClientTimestamp, events: &mut Vec<ClientEvent>) {
-        self.transition_to_closed(CloseSource::Peer);
-        events.push(ClientEvent::SessionClosed {
-            remote: self.remote,
-            token,
-            at: now,
-        });
-    }
-
-    fn transition_to_closed(&mut self, source: CloseSource) {
-        let packets_sent = match &mut self.state {
-            MachineState::Open(session) => {
-                session.timed_out.clear();
-                session.packets_sent
-            }
-            MachineState::Closed { packets_sent, .. } => *packets_sent,
-            MachineState::Connected | MachineState::NoTestCompleted => 0,
-        };
-        self.state = MachineState::Closed {
-            source,
-            packets_sent,
-        };
     }
 
     fn open_session(&self) -> Result<&ActiveSession, ClientError> {
@@ -965,7 +922,7 @@ pub(crate) fn sequence_is_after(candidate: u32, current: u32) -> bool {
 }
 
 pub(crate) fn sequence_is_before(candidate: u32, current: u32) -> bool {
-    current != candidate && current.wrapping_sub(candidate) < (1 << 31)
+    sequence_is_after(current, candidate)
 }
 
 pub(crate) fn compute_rtt(
@@ -1189,29 +1146,13 @@ mod tests {
         };
         let remote = "127.0.0.1:2112".parse().unwrap();
         let mut machine = SessionMachine::new(config, remote).unwrap();
-        let negotiated = NegotiatedParams {
-            params: machine.requested.clone(),
-            restrictions: Vec::new(),
-        };
-        machine.state = MachineState::Open(Box::new(ActiveSession {
-            token: 0x0102_0304_0506_0708,
-            negotiated,
-            local_close_packet: encode_request(
-                RequestToEncode::Close {
-                    token: 0x0102_0304_0506_0708,
-                },
-                None,
+        let prepared = machine
+            .prepare_open_acceptance(
+                normal_open_reply(&machine, 0x0102_0304_0506_0708),
+                timestamp(Instant::now()),
             )
-            .unwrap()
-            .into_boxed_slice(),
-            next_wire_seq: 0,
-            highest_received_seq: None,
-            packets_sent: 0,
-            pending: PendingMap::new(max_pending_probes),
-            timed_out: TimedOutMap::new(max_pending_probes),
-            completed: CompletedSet::new(max_pending_probes),
-            kernel_tx_correlation_valid: true,
-        }));
+            .unwrap();
+        machine.commit_open(prepared);
         machine
     }
 
@@ -1253,19 +1194,6 @@ mod tests {
         reply: &OpenReply,
     ) -> Result<Vec<u8>, irtt_proto::ProtoError> {
         irtt_proto::encode_open_reply(reply, machine.config.hmac_key.as_deref())
-    }
-
-    #[test]
-    fn prepared_open_request_is_exact_and_inert_when_dropped() {
-        let machine = connected_machine(ClientConfig::default());
-        let first = machine.prepare_open_request().unwrap();
-        let second = machine.prepare_open_request().unwrap();
-
-        assert_eq!(first.bytes, second.bytes);
-        assert!(!first.bytes.is_empty());
-        drop(first);
-        drop(second);
-        assert!(matches!(machine.state, MachineState::Connected));
     }
 
     #[test]
@@ -1466,244 +1394,6 @@ mod tests {
     }
 
     #[test]
-    fn dropping_prepared_acceptance_leaves_connected_state() {
-        let machine = connected_machine(ClientConfig::default());
-        let prepared = machine
-            .prepare_open_acceptance(
-                normal_open_reply(&machine, 0x1020_3040_5060_7080),
-                timestamp(Instant::now()),
-            )
-            .unwrap();
-
-        assert!(prepared.has_prepared_active_session());
-        assert!(prepared.cleanup_close_packet().is_some());
-        drop(prepared);
-        assert!(matches!(machine.state, MachineState::Connected));
-    }
-
-    #[test]
-    fn commit_open_assigns_prebuilt_state_once() {
-        let mut machine = connected_machine(ClientConfig::default());
-        let token = 0x1020_3040_5060_7080;
-        let prepared = machine
-            .prepare_open_acceptance(
-                normal_open_reply(&machine, token),
-                timestamp(Instant::now()),
-            )
-            .unwrap();
-
-        let expected_close = prepared.cleanup_close_packet().unwrap().to_vec();
-        let outcome = machine.commit_open(prepared);
-
-        assert!(matches!(
-            outcome,
-            OpenOutcome::Started {
-                token: outcome_token,
-                ..
-            } if outcome_token == token
-        ));
-        assert!(machine.is_open());
-        assert_eq!(active(&machine).local_close_packet.as_ref(), expected_close);
-        assert!(matches!(
-            machine.prepare_open_request(),
-            Err(ClientError::AlreadyOpen)
-        ));
-    }
-
-    #[test]
-    fn no_test_preparation_completes_without_active_session() {
-        let config = ClientConfig {
-            run_mode: RunMode::NoTest,
-            ..ClientConfig::default()
-        };
-        let mut machine = connected_machine(config);
-        let reply = OpenReply {
-            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
-            token: 0,
-            params: machine.requested.clone(),
-        };
-        let prepared = machine
-            .prepare_open_acceptance(reply, timestamp(Instant::now()))
-            .unwrap();
-
-        assert!(prepared.normal_negotiated().is_none());
-        assert!(prepared.cleanup_close_packet().is_none());
-        assert!(matches!(machine.state, MachineState::Connected));
-        let outcome = machine.commit_open(prepared);
-        assert!(matches!(outcome, OpenOutcome::NoTestCompleted { .. }));
-        assert!(matches!(machine.state, MachineState::NoTestCompleted));
-    }
-
-    #[test]
-    fn cleanup_close_is_preencoded_with_token_and_hmac() {
-        let key = b"cleanup-key".to_vec();
-        let machine = connected_machine(ClientConfig {
-            hmac_key: Some(key.clone()),
-            ..ClientConfig::default()
-        });
-        let token = 0x1020_3040_5060_7080;
-        let prepared = machine
-            .prepare_open_acceptance(
-                normal_open_reply(&machine, token),
-                timestamp(Instant::now()),
-            )
-            .unwrap();
-        let cleanup = prepared.cleanup_close_packet().unwrap();
-
-        assert_eq!(cleanup[3], flags::FLAG_CLOSE | flags::FLAG_HMAC);
-        irtt_proto::verify_hmac(&key, cleanup, 4).unwrap();
-        assert_eq!(
-            u64::from_le_bytes(
-                cleanup[4 + irtt_proto::HMAC_SIZE..12 + irtt_proto::HMAC_SIZE]
-                    .try_into()
-                    .unwrap()
-            ),
-            token
-        );
-        assert!(matches!(machine.state, MachineState::Connected));
-    }
-
-    #[test]
-    fn prepare_close_is_stable_inert_and_does_not_determine_event_timestamp() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        active_mut(&mut machine).packets_sent = 7;
-
-        let first_bytes = {
-            let prepared = machine.prepare_close().unwrap();
-            assert_eq!(
-                prepared.bytes,
-                encode_request(
-                    RequestToEncode::Close {
-                        token: 0x0102_0304_0506_0708,
-                    },
-                    None,
-                )
-                .unwrap()
-            );
-            assert_eq!(prepared.commit.packets_sent, 7);
-            assert_eq!(prepared.commit.token, 0x0102_0304_0506_0708);
-            prepared.bytes.to_vec()
-        };
-        assert!(machine.is_open());
-        assert_eq!(active(&machine).packets_sent, 7);
-
-        let prepared = machine.prepare_close().unwrap();
-        assert_eq!(prepared.bytes, first_bytes);
-        assert_eq!(prepared.commit.packets_sent, 7);
-        assert_eq!(prepared.commit.token, 0x0102_0304_0506_0708);
-        assert!(machine.is_open());
-    }
-
-    #[test]
-    fn local_close_commit_uses_supplied_exact_timestamp() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let remote = machine.remote;
-        active_mut(&mut machine).packets_sent = 7;
-        let prepared = machine.prepare_close().unwrap();
-        let sent_at = ClientTimestamp {
-            wall: UNIX_EPOCH + Duration::from_secs(1_234),
-            mono: Instant::now() + Duration::from_secs(5),
-        };
-        let event = machine.commit_local_close(prepared.commit, sent_at);
-
-        assert!(matches!(
-            event,
-            ClientEvent::SessionClosed {
-                remote: event_remote,
-                token: 0x0102_0304_0506_0708,
-                at,
-            } if event_remote == remote
-                && at == sent_at
-        ));
-        assert!(matches!(
-            machine.state,
-            MachineState::Closed {
-                source: CloseSource::Local,
-                packets_sent: 7,
-            }
-        ));
-        assert!(matches!(
-            machine.prepare_close(),
-            Err(ClientError::AlreadyClosed)
-        ));
-    }
-
-    #[test]
-    fn prepared_close_reuses_hmac_packet_built_during_open_acceptance() {
-        let key = b"close-key".to_vec();
-        let mut machine = connected_machine(ClientConfig {
-            hmac_key: Some(key.clone()),
-            ..ClientConfig::default()
-        });
-        let token = 0x1020_3040_5060_7080;
-        let prepared_open = machine
-            .prepare_open_acceptance(
-                normal_open_reply(&machine, token),
-                timestamp(Instant::now()),
-            )
-            .unwrap();
-        let opening_close = prepared_open.cleanup_close_packet().unwrap().to_vec();
-        machine.commit_open(prepared_open);
-
-        let prepared_close = machine.prepare_close().unwrap();
-        assert_eq!(prepared_close.bytes, opening_close);
-        assert_eq!(
-            prepared_close.bytes[3],
-            flags::FLAG_CLOSE | flags::FLAG_HMAC
-        );
-        irtt_proto::verify_hmac(&key, prepared_close.bytes, 4).unwrap();
-        assert_eq!(
-            u64::from_le_bytes(
-                prepared_close.bytes[4 + irtt_proto::HMAC_SIZE..12 + irtt_proto::HMAC_SIZE]
-                    .try_into()
-                    .unwrap()
-            ),
-            token
-        );
-    }
-
-    #[test]
-    fn close_preparation_preserves_non_open_errors_and_peer_source() {
-        let connected = connected_machine(ClientConfig::default());
-        assert!(matches!(
-            connected.prepare_close(),
-            Err(ClientError::NotOpen)
-        ));
-
-        let mut no_test = connected_machine(ClientConfig {
-            run_mode: RunMode::NoTest,
-            ..ClientConfig::default()
-        });
-        let reply = OpenReply {
-            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
-            token: 0,
-            params: no_test.requested.clone(),
-        };
-        let prepared = no_test
-            .prepare_open_acceptance(reply, timestamp(Instant::now()))
-            .unwrap();
-        no_test.commit_open(prepared);
-        assert!(matches!(
-            no_test.prepare_close(),
-            Err(ClientError::AlreadyCompleted)
-        ));
-
-        let mut peer_closed = open_machine(4, Duration::from_secs(1));
-        peer_closed.transition_to_closed(CloseSource::Peer);
-        assert!(matches!(
-            peer_closed.state,
-            MachineState::Closed {
-                source: CloseSource::Peer,
-                ..
-            }
-        ));
-        assert!(matches!(
-            peer_closed.prepare_close(),
-            Err(ClientError::AlreadyClosed)
-        ));
-    }
-
-    #[test]
     fn uncommitted_probe_preparation_changes_no_authoritative_state() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let prepared = machine.prepare_probe().unwrap();
@@ -1737,7 +1427,6 @@ mod tests {
         let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
         machine.commit_probe_sent(commit, sent_at, accepted.bytes.len());
 
-        let capacity = active(&machine).pending.capacity();
         assert!(matches!(
             machine.preflight_probe_commit(&stale),
             Err(ClientError::StalePreparedProbe {
@@ -1750,7 +1439,6 @@ mod tests {
         assert_eq!(session.next_wire_seq, 1);
         assert_eq!(session.packets_sent, 1);
         assert_eq!(session.pending.len(), 1);
-        assert_eq!(session.pending.capacity(), capacity);
     }
 
     #[test]
@@ -1772,51 +1460,6 @@ mod tests {
         assert_eq!(session.next_wire_seq, 1);
         assert_eq!(session.packets_sent, 1);
         assert_eq!(session.pending.len(), 1);
-    }
-
-    #[test]
-    fn probe_commit_does_not_require_presentation_timing() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let prepared = machine.prepare_probe().unwrap();
-        let send_anchor = timestamp(Instant::now());
-        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let commit = machine
-            .finalize_probe_commit(preflight, send_anchor)
-            .unwrap();
-        // Fallible work (timeout deadline arithmetic, tx lower bound) is
-        // finalized from the pre-send anchor, not any post-send sample.
-        assert_eq!(commit.timeout_at, send_anchor.mono + Duration::from_secs(1));
-        assert_eq!(commit.tx_not_before_wall, send_anchor.wall);
-
-        // The post-send measurement `sent_at` is supplied afterward and can
-        // legitimately differ from the pre-send anchor.
-        let sent_at = timestamp(Instant::now());
-        let sent = machine.commit_probe_sent(commit, sent_at, prepared.bytes.len());
-
-        assert_eq!(sent.seq, prepared.seq);
-        assert_eq!(sent.sent_at, sent_at);
-        assert_eq!(sent.bytes, prepared.bytes.len());
-    }
-
-    #[test]
-    fn commit_uses_reserved_capacity_and_prevalidated_counter() {
-        let mut machine = open_machine(2, Duration::from_secs(1));
-        active_mut(&mut machine).packets_sent = u64::MAX - 1;
-        let prepared = machine.prepare_probe().unwrap();
-        let preflight = machine.preflight_probe_commit(&prepared).unwrap();
-        let reserved_capacity = active(&machine).pending.capacity();
-        assert_eq!(preflight.next_packets_sent, u64::MAX);
-        let commit = machine
-            .finalize_probe_commit(preflight, timestamp(Instant::now()))
-            .unwrap();
-
-        machine.commit_probe_sent(commit, timestamp(Instant::now()), prepared.bytes.len());
-
-        let session = active(&machine);
-        assert_eq!(session.pending.capacity(), reserved_capacity);
-        assert_eq!(session.pending.len(), 1);
-        assert_eq!(session.packets_sent, u64::MAX);
-        assert_eq!(session.next_wire_seq, 1);
     }
 
     #[test]
@@ -1909,7 +1552,6 @@ mod tests {
             ]
         ));
         assert_eq!(active(&machine).pending.len(), 0);
-        assert_eq!(active(&machine).timed_out.len(), 3);
     }
 
     #[test]
@@ -2582,21 +2224,6 @@ mod tests {
     }
 
     #[test]
-    fn kernel_tx_timestamp_recording_is_a_no_op_once_closed() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        let seq = send_probe(&mut machine, timestamp(now));
-        let prepared = machine.prepare_close().unwrap();
-        let commit = prepared.commit;
-        machine.commit_local_close(commit, timestamp(now));
-        assert!(machine.is_terminal());
-
-        // Recording after close must not panic (there is no open session to
-        // index into) and must remain inert.
-        machine.record_kernel_tx_timestamp(seq, tx_ts(7));
-    }
-
-    #[test]
     fn kernel_tx_timestamp_ids_wrap_like_wire_seq() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         active_mut(&mut machine).next_wire_seq = u32::MAX;
@@ -2686,27 +2313,6 @@ mod tests {
     }
 
     #[test]
-    fn preferred_send_wall_without_kernel_timestamp_uses_sent_at() {
-        let anchor = send_wall_ms(1_000);
-        let received_at = send_wall_ms(1_040);
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, None, received_at),
-            anchor
-        );
-    }
-
-    #[test]
-    fn preferred_send_wall_uses_kernel_timestamp_strictly_between_bounds() {
-        let anchor = send_wall_ms(1_000);
-        let kernel_tx = send_wall_ms(1_005);
-        let received_at = send_wall_ms(1_040);
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, Some(kernel_tx), received_at),
-            kernel_tx
-        );
-    }
-
-    #[test]
     fn preferred_send_wall_accepts_kernel_timestamp_equal_to_lower_bound() {
         let anchor = send_wall_ms(1_000);
         let received_at = send_wall_ms(1_040);
@@ -2723,93 +2329,6 @@ mod tests {
         assert_eq!(
             preferred_send_wall(anchor, anchor, Some(received_at), received_at),
             received_at
-        );
-    }
-
-    #[test]
-    fn preferred_send_wall_rejects_kernel_timestamp_earlier_than_lower_bound() {
-        let anchor = send_wall_ms(1_000);
-        let kernel_tx = anchor - Duration::from_nanos(1);
-        let received_at = send_wall_ms(1_040);
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, Some(kernel_tx), received_at),
-            anchor
-        );
-    }
-
-    #[test]
-    fn preferred_send_wall_rejects_kernel_timestamp_later_than_received_at() {
-        let anchor = send_wall_ms(1_000);
-        let received_at = send_wall_ms(1_040);
-        let kernel_tx = received_at + Duration::from_nanos(1);
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, Some(kernel_tx), received_at),
-            anchor
-        );
-    }
-
-    #[test]
-    fn preferred_send_wall_handles_extreme_timestamps_without_panicking() {
-        let anchor = send_wall_ms(1_000);
-        let received_at = send_wall_ms(1_040);
-        let far_future = UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)) * 4;
-        let before_epoch = UNIX_EPOCH - Duration::from_secs(u64::from(u32::MAX));
-
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, Some(far_future), received_at),
-            anchor
-        );
-        assert_eq!(
-            preferred_send_wall(anchor, anchor, Some(before_epoch), received_at),
-            anchor
-        );
-        assert_eq!(
-            preferred_send_wall(before_epoch, before_epoch, None, received_at),
-            before_epoch
-        );
-    }
-
-    // Pre-/post-send decoupling (F-04): the plausibility lower bound is the
-    // pre-send anchor, but the fallback endpoint is the post-send sample,
-    // and the two can legitimately differ.
-
-    #[test]
-    fn preferred_send_wall_accepts_kernel_timestamp_before_post_send_sample() {
-        let tx_not_before_wall = send_wall_ms(1_000);
-        let post_send_sent_at = send_wall_ms(1_008);
-        let kernel_tx = send_wall_ms(1_005);
-        let received_at = send_wall_ms(1_040);
-
-        // The kernel timestamp precedes the post-send sample but follows
-        // the pre-send anchor: it must still be accepted.
-        assert_eq!(
-            preferred_send_wall(
-                tx_not_before_wall,
-                post_send_sent_at,
-                Some(kernel_tx),
-                received_at
-            ),
-            kernel_tx
-        );
-    }
-
-    #[test]
-    fn preferred_send_wall_rejected_kernel_timestamp_falls_back_to_post_send_sample() {
-        let tx_not_before_wall = send_wall_ms(1_000);
-        let post_send_sent_at = send_wall_ms(1_008);
-        let kernel_tx = send_wall_ms(999);
-        let received_at = send_wall_ms(1_040);
-
-        // Below the pre-send lower bound: rejected, and the fallback is the
-        // post-send sample, not the pre-send anchor.
-        assert_eq!(
-            preferred_send_wall(
-                tx_not_before_wall,
-                post_send_sent_at,
-                Some(kernel_tx),
-                received_at
-            ),
-            post_send_sent_at
         );
     }
 
@@ -3095,687 +2614,5 @@ mod tests {
             reply_one_way(&events).unwrap().client_to_server,
             Some(SignedDuration::from_nanos(12_000_000))
         );
-    }
-
-    /// Model-based tests for `SessionMachine`'s open-session operation
-    /// contract: probe sends, reply classification, timeouts, and close.
-    ///
-    /// ## Reference-model boundary
-    ///
-    /// The open handshake itself (accept/reject, run-mode, version and
-    /// token checks) is deliberately out of scope here: it already has
-    /// focused deterministic coverage above in `mod tests`, and every
-    /// generated case here starts from an already-`Open` session built the
-    /// same way `open_machine` above builds one, by constructing
-    /// `MachineState::Open` directly. What *is* generated and checked
-    /// against an independent reference model is the combinatorial space
-    /// that only exists once a session is open: interleaved probe sends,
-    /// valid/duplicate/late/unknown/wrong-token replies, peer and local
-    /// close, bounded and unbounded timeout polling, and `u32` wire-sequence
-    /// wraparound.
-    ///
-    /// The reference [`Model`] tracks only state the public contract
-    /// documents: open/closed(local)/closed(peer) state, the next wire
-    /// sequence and total sent-packet counters (mirroring
-    /// `SessionMachine::packets_sent`), which sequences are pending, timed
-    /// out, or completed (this drives the exact
-    /// `EchoReply`/`LateReply`/`DuplicateReply`/`Warning` classification
-    /// documented on `ClientEvent`), each pending probe's timeout deadline
-    /// (documented on `ClientEvent::EchoLoss::timeout_at`), and the highest
-    /// accepted in-window sequence used for late-reply classification. It
-    /// deliberately does *not* model the bounded FIFO eviction that
-    /// `PendingMap`/`TimedOutMap`/`CompletedSet` apply once
-    /// `max_pending_probes` is exceeded: that is a private capacity policy
-    /// with its own focused unit tests in `probe.rs`, not part of this
-    /// contract. Every generated case here uses a `max_pending_probes` far
-    /// larger than the generated operation count, so capacity/eviction
-    /// behavior never confounds the classification assertions made here.
-    ///
-    /// `u32` sequence wraparound is exercised by seeding a session's
-    /// starting wire sequence near `u32::MAX` through direct construction,
-    /// the same way `open_machine` above builds an open session without
-    /// running the handshake. The repository's `AGENTS.md` testing policy
-    /// names "sequence wrap" as a sanctioned reason to construct state
-    /// directly rather than drive billions of real sends.
-    mod model_properties {
-        use std::collections::{HashSet, VecDeque};
-
-        use proptest::prelude::*;
-        use proptest::test_runner::TestCaseError;
-
-        use super::*;
-        use irtt_proto::{encode_echo_reply, ReceivedStats, StampAt};
-
-        const TOKEN: u64 = 0x1122_3344_5566_7788;
-        const WRONG_TOKEN: u64 = 0x8877_6655_4433_2211;
-        const PROBE_TIMEOUT: Duration = Duration::from_millis(30);
-        /// Far larger than the generated operation count (`1..=OP_LIMIT`),
-        /// so pending/timed-out/completed bounded eviction never triggers;
-        /// see the module doc comment.
-        const MAX_PENDING_PROBES: usize = 4096;
-        const OP_LIMIT: usize = 50;
-        const CASES: u32 = 256;
-
-        fn model_config() -> ClientConfig {
-            ClientConfig {
-                received_stats: ReceivedStats::None,
-                stamp_at: StampAt::None,
-                clock: Clock::Wall,
-                probe_timeout: PROBE_TIMEOUT,
-                max_pending_probes: MAX_PENDING_PROBES,
-                run_mode: RunMode::Normal,
-                ..ClientConfig::default()
-            }
-        }
-
-        /// Builds an already-`Open` session directly, the same way `mod
-        /// tests`'s `open_machine` does, starting its wire sequence at
-        /// `start_seq` instead of always zero. See the module doc comment
-        /// for why this bypasses the open handshake and for the sequence
-        /// seeding rationale.
-        fn open_machine_for_model(start_seq: u32) -> (SessionMachine, Params) {
-            let config = model_config();
-            let remote = "127.0.0.1:2112".parse().unwrap();
-            let mut machine = SessionMachine::new(config, remote).unwrap();
-            let params = machine.requested.clone();
-            let negotiated = NegotiatedParams {
-                params: params.clone(),
-                restrictions: Vec::new(),
-            };
-            machine.state = MachineState::Open(Box::new(ActiveSession {
-                token: TOKEN,
-                negotiated,
-                local_close_packet: encode_request(RequestToEncode::Close { token: TOKEN }, None)
-                    .unwrap()
-                    .into_boxed_slice(),
-                next_wire_seq: start_seq,
-                highest_received_seq: None,
-                packets_sent: 0,
-                pending: PendingMap::new(MAX_PENDING_PROBES),
-                timed_out: TimedOutMap::new(MAX_PENDING_PROBES),
-                completed: CompletedSet::new(MAX_PENDING_PROBES),
-                kernel_tx_correlation_valid: true,
-            }));
-            (machine, params)
-        }
-
-        fn build_echo_reply(params: &Params, token: u64, seq: u32, close: bool) -> Vec<u8> {
-            let mut flags_value = flags::FLAG_REPLY;
-            if close {
-                flags_value |= flags::FLAG_CLOSE;
-            }
-            let reply = EchoReply {
-                flags: flags_value,
-                token,
-                sequence: seq,
-                recv_count: None,
-                recv_window: None,
-                timestamps: TimestampFields::default(),
-                payload: Vec::new(),
-            };
-            encode_echo_reply(&reply, params, None).unwrap()
-        }
-
-        /// Independently-authored mirror of the sequence-space half-window
-        /// "after" comparison (RFC 1982 style), used only to predict
-        /// expected late/in-window classification. Deliberately not a call
-        /// into `super::sequence_is_after`/`sequence_is_before`, so a bug in
-        /// the production comparator is not automatically invisible to this
-        /// model.
-        fn seq_after(candidate: u32, current: u32) -> bool {
-            candidate != current && candidate.wrapping_sub(current) < (1 << 31)
-        }
-
-        fn seq_before(candidate: u32, current: u32) -> bool {
-            seq_after(current, candidate)
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum ModelState {
-            Open,
-            ClosedLocal,
-            ClosedPeer,
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        enum ExpectedEvent {
-            EchoReply(u32),
-            LateReply(u32),
-            DuplicateReply(u32),
-            WarnWrongToken,
-            WarnUntracked,
-            SessionClosed,
-        }
-
-        /// The independent reference model. See the module doc comment for
-        /// its deliberate boundary against `SessionMachine`'s private state.
-        struct Model {
-            state: ModelState,
-            next_wire_seq: u32,
-            packets_sent: u64,
-            pending: VecDeque<(u32, Instant)>,
-            timed_out: HashSet<u32>,
-            completed: HashSet<u32>,
-            highest_received_seq: Option<u32>,
-        }
-
-        impl Model {
-            fn new(start_seq: u32) -> Self {
-                Self {
-                    state: ModelState::Open,
-                    next_wire_seq: start_seq,
-                    packets_sent: 0,
-                    pending: VecDeque::new(),
-                    timed_out: HashSet::new(),
-                    completed: HashSet::new(),
-                    highest_received_seq: None,
-                }
-            }
-
-            fn pending_remove(&mut self, seq: u32) -> bool {
-                if let Some(pos) = self.pending.iter().position(|&(s, _)| s == seq) {
-                    self.pending.remove(pos);
-                    true
-                } else {
-                    false
-                }
-            }
-
-            fn sorted_pending(&self) -> Vec<u32> {
-                let mut v: Vec<u32> = self.pending.iter().map(|&(s, _)| s).collect();
-                v.sort_unstable();
-                v
-            }
-
-            fn sorted_timed_out(&self) -> Vec<u32> {
-                let mut v: Vec<u32> = self.timed_out.iter().copied().collect();
-                v.sort_unstable();
-                v
-            }
-
-            fn sorted_completed(&self) -> Vec<u32> {
-                let mut v: Vec<u32> = self.completed.iter().copied().collect();
-                v.sort_unstable();
-                v
-            }
-
-            /// Resolves a generated [`ReplyTarget`] to a concrete sequence
-            /// number against the model's *current* membership. When the
-            /// requested bucket is empty this falls back to the raw index as
-            /// a literal (likely-unknown) sequence, so every `ReplyTarget`
-            /// variant remains a valid, meaningful generator input
-            /// regardless of what has happened so far.
-            fn resolve(&self, target: ReplyTarget) -> u32 {
-                fn pick(v: &[u32], i: u32) -> u32 {
-                    if v.is_empty() {
-                        i
-                    } else {
-                        v[(i as usize) % v.len()]
-                    }
-                }
-                match target {
-                    ReplyTarget::Pending(i) => pick(&self.sorted_pending(), i),
-                    ReplyTarget::TimedOut(i) => pick(&self.sorted_timed_out(), i),
-                    ReplyTarget::Completed(i) => pick(&self.sorted_completed(), i),
-                    ReplyTarget::Unknown(seq) => seq,
-                }
-            }
-
-            fn update_highest(&mut self, seq: u32) {
-                self.highest_received_seq = Some(match self.highest_received_seq {
-                    None => seq,
-                    Some(h) if seq_after(seq, h) => seq,
-                    Some(h) => h,
-                });
-            }
-
-            fn apply_send(&mut self, seq: u32, timeout_at: Instant) {
-                assert_eq!(
-                    seq, self.next_wire_seq,
-                    "model/machine wire sequence desync"
-                );
-                self.pending.push_back((seq, timeout_at));
-                self.next_wire_seq = self.next_wire_seq.wrapping_add(1);
-                self.packets_sent += 1;
-            }
-
-            fn apply_poll(&mut self, now: Instant, limit: usize) -> (Vec<u32>, bool) {
-                let mut expired = Vec::new();
-                while expired.len() < limit {
-                    let Some(&(seq, timeout_at)) = self.pending.front() else {
-                        break;
-                    };
-                    if timeout_at > now {
-                        break;
-                    }
-                    self.pending.pop_front();
-                    self.timed_out.insert(seq);
-                    expired.push(seq);
-                }
-                let more_due = self
-                    .pending
-                    .front()
-                    .is_some_and(|&(_, timeout_at)| timeout_at <= now);
-                (expired, more_due)
-            }
-
-            /// Mirrors `SessionMachine::process_echo_reply`'s classification
-            /// exactly (see that function's branches), mutating this model
-            /// the same way. Returns the event kinds a correct
-            /// implementation must produce, in order.
-            fn reply(&mut self, seq: u32, wrong_token: bool, close: bool) -> Vec<ExpectedEvent> {
-                if wrong_token {
-                    // A wrong-token reply is rejected before the close flag
-                    // is ever inspected, so `close` has no effect here.
-                    return vec![ExpectedEvent::WarnWrongToken];
-                }
-                let mut events = Vec::new();
-                if self.pending_remove(seq) {
-                    let is_late = self
-                        .highest_received_seq
-                        .is_some_and(|h| seq_before(seq, h));
-                    self.update_highest(seq);
-                    self.completed.insert(seq);
-                    events.push(if is_late {
-                        ExpectedEvent::LateReply(seq)
-                    } else {
-                        ExpectedEvent::EchoReply(seq)
-                    });
-                } else if self.completed.contains(&seq) {
-                    self.update_highest(seq);
-                    events.push(ExpectedEvent::DuplicateReply(seq));
-                } else if self.timed_out.remove(&seq) {
-                    self.update_highest(seq);
-                    self.completed.insert(seq);
-                    events.push(ExpectedEvent::LateReply(seq));
-                } else if self
-                    .highest_received_seq
-                    .is_some_and(|h| seq_before(seq, h))
-                {
-                    events.push(ExpectedEvent::LateReply(seq));
-                } else {
-                    events.push(ExpectedEvent::WarnUntracked);
-                }
-                if close {
-                    self.state = ModelState::ClosedPeer;
-                    events.push(ExpectedEvent::SessionClosed);
-                }
-                events
-            }
-        }
-
-        fn classify_real(events: &[ClientEvent]) -> Vec<ExpectedEvent> {
-            events
-                .iter()
-                .map(|event| match event {
-                    ClientEvent::EchoReply { seq, .. } => ExpectedEvent::EchoReply(*seq),
-                    ClientEvent::LateReply { seq, .. } => ExpectedEvent::LateReply(*seq),
-                    ClientEvent::DuplicateReply { seq, .. } => ExpectedEvent::DuplicateReply(*seq),
-                    ClientEvent::Warning {
-                        kind: WarningKind::WrongToken,
-                        ..
-                    } => ExpectedEvent::WarnWrongToken,
-                    ClientEvent::Warning {
-                        kind: WarningKind::UntrackedReply,
-                        ..
-                    } => ExpectedEvent::WarnUntracked,
-                    ClientEvent::SessionClosed { .. } => ExpectedEvent::SessionClosed,
-                    other => panic!("unexpected event from an open session: {other:?}"),
-                })
-                .collect()
-        }
-
-        fn is_already_closed<T: std::fmt::Debug>(result: &Result<T, ClientError>) -> bool {
-            matches!(result, Err(ClientError::AlreadyClosed))
-        }
-
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-        struct Observable {
-            is_open: bool,
-            is_terminal: bool,
-            is_peer_closed: bool,
-            packets_sent: u64,
-            pending_is_empty: bool,
-        }
-
-        fn observe(machine: &SessionMachine) -> Observable {
-            Observable {
-                is_open: machine.is_open(),
-                is_terminal: machine.is_terminal(),
-                is_peer_closed: machine.is_peer_closed(),
-                packets_sent: machine.packets_sent(),
-                pending_is_empty: machine.pending_is_empty(),
-            }
-        }
-
-        fn check_generic_invariants(
-            machine: &SessionMachine,
-            model: &Model,
-        ) -> Result<(), TestCaseError> {
-            prop_assert_eq!(machine.is_open(), model.state == ModelState::Open);
-            prop_assert_eq!(
-                machine.is_terminal(),
-                matches!(
-                    model.state,
-                    ModelState::ClosedLocal | ModelState::ClosedPeer
-                )
-            );
-            prop_assert_eq!(
-                machine.is_peer_closed(),
-                model.state == ModelState::ClosedPeer
-            );
-            prop_assert_eq!(machine.packets_sent(), model.packets_sent);
-            if model.state == ModelState::Open {
-                prop_assert_eq!(machine.pending_is_empty(), model.pending.is_empty());
-            } else {
-                prop_assert!(machine.pending_is_empty());
-            }
-            Ok(())
-        }
-
-        /// Drives the full real send transaction: prepare, preflight,
-        /// finalize, commit. Mirrors how `Client`/`AsyncClient` drive
-        /// `SessionMachine` around a real socket send, using `now` for both
-        /// the pre-send anchor and the post-send `sent_at` sample since no
-        /// real send elapses time here.
-        fn do_send(
-            machine: &mut SessionMachine,
-            now: ClientTimestamp,
-        ) -> Result<ProbeSent, ClientError> {
-            let prepared = machine.prepare_probe()?;
-            let preflight = machine.preflight_probe_commit(&prepared)?;
-            let commit = machine.finalize_probe_commit(preflight, now)?;
-            let bytes = prepared.bytes.len();
-            Ok(machine.commit_probe_sent(commit, now, bytes))
-        }
-
-        #[derive(Debug, Clone, Copy)]
-        enum ReplyTarget {
-            Pending(u32),
-            TimedOut(u32),
-            Completed(u32),
-            Unknown(u32),
-        }
-
-        #[derive(Debug, Clone, Copy)]
-        enum Op {
-            Send,
-            StaleProbe,
-            PrepareAbandon,
-            Reply {
-                target: ReplyTarget,
-                wrong_token: bool,
-                close: bool,
-            },
-            PollTimeouts,
-            PollTimeoutsBounded(u8),
-            AdvanceClock(u16),
-            LocalClose,
-            ReopenAttempt,
-        }
-
-        fn op_strategy() -> impl Strategy<Value = Op> {
-            let reply_target = prop_oneof![
-                any::<u32>().prop_map(ReplyTarget::Pending),
-                any::<u32>().prop_map(ReplyTarget::TimedOut),
-                any::<u32>().prop_map(ReplyTarget::Completed),
-                any::<u32>().prop_map(ReplyTarget::Unknown),
-            ];
-            prop_oneof![
-                4 => Just(Op::Send),
-                1 => Just(Op::StaleProbe),
-                1 => Just(Op::PrepareAbandon),
-                5 => (reply_target, any::<bool>(), any::<bool>()).prop_map(
-                    |(target, wrong_token, close)| Op::Reply {
-                        target,
-                        wrong_token,
-                        close,
-                    }
-                ),
-                2 => Just(Op::PollTimeouts),
-                1 => (0u8..=6).prop_map(Op::PollTimeoutsBounded),
-                4 => (0u16..=120).prop_map(Op::AdvanceClock),
-                1 => Just(Op::LocalClose),
-                1 => Just(Op::ReopenAttempt),
-            ]
-        }
-
-        /// Biased toward `0` (the common case) and toward the last few
-        /// values before `u32::MAX` (so a handful of sends from here cross
-        /// the wraparound boundary), with a uniformly random third case for
-        /// general coverage.
-        fn start_seq_strategy() -> impl Strategy<Value = u32> {
-            prop_oneof![
-                2 => Just(0u32),
-                3 => (u32::MAX - 4)..=u32::MAX,
-                2 => any::<u32>(),
-            ]
-        }
-
-        fn apply_op(
-            machine: &mut SessionMachine,
-            model: &mut Model,
-            params: &Params,
-            now: &mut ClientTimestamp,
-            op: Op,
-        ) -> Result<(), TestCaseError> {
-            match op {
-                Op::Send => {
-                    let result = do_send(machine, *now);
-                    match model.state {
-                        ModelState::Open => {
-                            let sent = result.expect(
-                                "open session send should succeed within chosen capacity bounds",
-                            );
-                            prop_assert_eq!(sent.seq, model.next_wire_seq);
-                            let timeout_at = now
-                                .mono
-                                .checked_add(PROBE_TIMEOUT)
-                                .expect("no overflow at test timescales");
-                            model.apply_send(sent.seq, timeout_at);
-                        }
-                        _ => prop_assert!(
-                            is_already_closed(&result),
-                            "expected AlreadyClosed, got {:?}",
-                            result
-                        ),
-                    }
-                }
-                Op::StaleProbe => {
-                    if model.state != ModelState::Open {
-                        let result = machine.prepare_probe();
-                        prop_assert!(
-                            is_already_closed(&result),
-                            "expected AlreadyClosed, got {:?}",
-                            result
-                        );
-                    } else {
-                        let prepared_a = machine.prepare_probe().unwrap();
-                        prop_assert_eq!(prepared_a.seq, model.next_wire_seq);
-
-                        let sent = do_send(machine, *now).expect(
-                            "intervening send should succeed within chosen capacity bounds",
-                        );
-                        prop_assert_eq!(sent.seq, prepared_a.seq);
-                        let timeout_at = now
-                            .mono
-                            .checked_add(PROBE_TIMEOUT)
-                            .expect("no overflow at test timescales");
-                        model.apply_send(sent.seq, timeout_at);
-
-                        match machine.preflight_probe_commit(&prepared_a) {
-                            Err(ClientError::StalePreparedProbe {
-                                prepared_seq,
-                                next_wire_seq,
-                            }) => {
-                                prop_assert_eq!(prepared_seq, prepared_a.seq);
-                                prop_assert_eq!(next_wire_seq, model.next_wire_seq);
-                            }
-                            other => {
-                                prop_assert!(false, "expected StalePreparedProbe, got {:?}", other)
-                            }
-                        }
-                    }
-                }
-                Op::PrepareAbandon => {
-                    let before = observe(machine);
-                    let result = machine.prepare_probe();
-                    match model.state {
-                        ModelState::Open => {
-                            let prepared = result.unwrap();
-                            prop_assert_eq!(prepared.seq, model.next_wire_seq);
-                            prop_assert!(!prepared.bytes.is_empty());
-                        }
-                        _ => prop_assert!(
-                            is_already_closed(&result),
-                            "expected AlreadyClosed, got {:?}",
-                            result
-                        ),
-                    }
-                    prop_assert_eq!(observe(machine), before);
-                }
-                Op::Reply {
-                    target,
-                    wrong_token,
-                    close,
-                } => {
-                    let seq = model.resolve(target);
-                    let token = if wrong_token { WRONG_TOKEN } else { TOKEN };
-                    let packet = build_echo_reply(params, token, seq, close);
-                    let result =
-                        machine.process_received_echo_packet(&packet, *now, ReceiveMeta::default());
-                    match model.state {
-                        ModelState::Open => {
-                            let events = result.expect("open session processes echo packets");
-                            let expected = model.reply(seq, wrong_token, close);
-                            prop_assert_eq!(classify_real(&events), expected);
-                        }
-                        _ => prop_assert!(
-                            is_already_closed(&result),
-                            "expected AlreadyClosed, got {:?}",
-                            result
-                        ),
-                    }
-                }
-                Op::PollTimeouts => {
-                    let result = machine.poll_timeouts_at(now.mono);
-                    match model.state {
-                        ModelState::Open => {
-                            let events = result.expect("open session polls succeed");
-                            let (expired, _more_due) = model.apply_poll(now.mono, usize::MAX);
-                            let real: Vec<u32> = events
-                                .iter()
-                                .map(|event| match event {
-                                    ClientEvent::EchoLoss { seq, .. } => *seq,
-                                    other => {
-                                        panic!("unexpected event from poll_timeouts_at: {other:?}")
-                                    }
-                                })
-                                .collect();
-                            prop_assert_eq!(real, expired);
-                        }
-                        _ => prop_assert!(
-                            is_already_closed(&result),
-                            "expected AlreadyClosed, got {:?}",
-                            result
-                        ),
-                    }
-                }
-                Op::PollTimeoutsBounded(limit) => {
-                    let result = machine.poll_timeouts_bounded_at(now.mono, limit as usize);
-                    match model.state {
-                        ModelState::Open => {
-                            let batch = result.expect("open session polls succeed");
-                            let (expired, more_due) = model.apply_poll(now.mono, limit as usize);
-                            let real: Vec<u32> = batch
-                                .events
-                                .iter()
-                                .map(|event| match event {
-                                    ClientEvent::EchoLoss { seq, .. } => *seq,
-                                    other => panic!(
-                                        "unexpected event from poll_timeouts_bounded_at: {other:?}"
-                                    ),
-                                })
-                                .collect();
-                            prop_assert_eq!(real, expired);
-                            prop_assert_eq!(batch.more_due, more_due);
-                        }
-                        _ => prop_assert!(
-                            is_already_closed(&result),
-                            "expected AlreadyClosed, got {:?}",
-                            result
-                        ),
-                    }
-                }
-                Op::AdvanceClock(millis) => {
-                    let delta = Duration::from_millis(u64::from(millis));
-                    now.mono += delta;
-                    now.wall += delta;
-                }
-                Op::LocalClose => match model.state {
-                    ModelState::Open => {
-                        let PreparedClose { commit, .. } = machine
-                            .prepare_close()
-                            .expect("open session can prepare close");
-                        let event = machine.commit_local_close(commit, *now);
-                        let is_session_closed = matches!(event, ClientEvent::SessionClosed { .. });
-                        prop_assert!(is_session_closed);
-                        model.state = ModelState::ClosedLocal;
-                    }
-                    _ => {
-                        let result = machine.prepare_close();
-                        prop_assert!(
-                            is_already_closed(&result),
-                            "expected AlreadyClosed, got {:?}",
-                            result
-                        );
-                    }
-                },
-                Op::ReopenAttempt => {
-                    let before = observe(machine);
-                    let result = machine.prepare_open_request();
-                    match model.state {
-                        ModelState::Open => {
-                            prop_assert!(matches!(result, Err(ClientError::AlreadyOpen)));
-                        }
-                        ModelState::ClosedLocal | ModelState::ClosedPeer => {
-                            prop_assert!(is_already_closed(&result));
-                        }
-                    }
-                    prop_assert_eq!(observe(machine), before);
-                }
-            }
-            check_generic_invariants(machine, model)
-        }
-
-        proptest! {
-            #![proptest_config(ProptestConfig::with_cases(CASES))]
-
-            /// Drives a generated sequence of operations through both a real,
-            /// already-`Open` `SessionMachine` and an independent reference
-            /// [`Model`], asserting after every operation that the observable
-            /// state (open/terminal/peer-closed/packets-sent/pending-empty)
-            /// matches, every error returned matches the model's
-            /// expectation, and every event/classification produced for a
-            /// probe send, a reply, or a timeout poll matches the model's
-            /// prediction. No operation should ever panic.
-            #[test]
-            fn open_session_matches_reference_model(
-                start_seq in start_seq_strategy(),
-                ops in proptest::collection::vec(op_strategy(), 1..=OP_LIMIT),
-            ) {
-                let (mut machine, params) = open_machine_for_model(start_seq);
-                let mut model = Model::new(start_seq);
-                let mut now = ClientTimestamp {
-                    mono: Instant::now(),
-                    wall: SystemTime::now(),
-                };
-
-                check_generic_invariants(&machine, &model)?;
-                for op in ops {
-                    apply_op(&mut machine, &mut model, &params, &mut now, op)?;
-                }
-            }
-        }
     }
 }

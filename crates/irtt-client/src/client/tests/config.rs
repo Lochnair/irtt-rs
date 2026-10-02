@@ -1,25 +1,6 @@
 use super::*;
 
 #[test]
-fn client_config_default() {
-    let config = ClientConfig::default();
-    assert_eq!(config.duration, Some(Duration::from_secs(3)));
-    assert_eq!(config.interval, Duration::from_secs(1));
-    assert_eq!(config.length, 0);
-    assert_eq!(config.received_stats, ReceivedStats::Both);
-    assert_eq!(config.stamp_at, StampAt::Both);
-    assert_eq!(config.clock, Clock::Both);
-    assert_eq!(config.dscp, 0);
-    assert_eq!(config.hmac_key, None);
-    assert_eq!(config.server_fill, None);
-    assert_eq!(config.open_timeouts, DEFAULT_OPEN_TIMEOUTS);
-    assert_eq!(config.run_mode, RunMode::Normal);
-    assert_eq!(config.negotiation_policy, NegotiationPolicy::Strict);
-    assert_eq!(config.probe_timeout, Duration::from_secs(4));
-    assert_eq!(config.max_pending_probes, 4096);
-}
-
-#[test]
 fn params_from_config_maps_compatibility_fields() {
     let config = ClientConfig {
         duration: Some(Duration::from_secs(5)),

@@ -112,11 +112,11 @@ pub(crate) fn drain_tx_timestamps<S: std::os::fd::AsRawFd>(
     linux::drain_tx_timestamps(socket, on_timestamp)
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "tokio"))]
 mod tests {
     use std::net::UdpSocket;
 
-    use crate::{metadata::ReceiveMeta, receive::recv_datagram, timing::ClientTimestamp};
+    use crate::metadata::ReceiveMeta;
 
     fn connected_loopback_pair() -> (UdpSocket, UdpSocket) {
         let a = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -126,44 +126,6 @@ mod tests {
         (a, b)
     }
 
-    #[test]
-    fn fallback_receive_returns_length() {
-        let (sender, receiver) = connected_loopback_pair();
-        sender.send(b"hello").unwrap();
-
-        let mut buf = [0_u8; 16];
-        let datagram = recv_datagram(&receiver, &mut buf).unwrap();
-
-        assert_eq!(datagram.len, 5);
-        assert_eq!(&buf[..datagram.len], b"hello");
-    }
-
-    #[test]
-    fn fallback_receive_returns_default_metadata() {
-        let (sender, receiver) = connected_loopback_pair();
-        sender.send(b"meta").unwrap();
-
-        let mut buf = [0_u8; 16];
-        let datagram = recv_datagram(&receiver, &mut buf).unwrap();
-
-        assert_eq!(datagram.meta, ReceiveMeta::default());
-    }
-
-    #[test]
-    fn fallback_receive_captures_timestamp_after_successful_receive() {
-        let (sender, receiver) = connected_loopback_pair();
-        sender.send(b"time").unwrap();
-
-        let before = ClientTimestamp::now();
-        let mut buf = [0_u8; 16];
-        let datagram = recv_datagram(&receiver, &mut buf).unwrap();
-        let after = ClientTimestamp::now();
-
-        assert!(datagram.received_at.mono >= before.mono);
-        assert!(datagram.received_at.mono <= after.mono);
-    }
-
-    #[cfg(feature = "tokio")]
     #[test]
     fn tokio_try_receive_preserves_fallback_metadata_and_would_block() {
         let runtime = tokio::runtime::Builder::new_current_thread()

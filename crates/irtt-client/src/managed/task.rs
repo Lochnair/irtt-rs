@@ -181,6 +181,7 @@ pub struct ManagedClientHandle {
     update_submission_hook: Option<Arc<UpdateSubmissionTestHook>>,
 }
 
+// Pauses between admission and enqueue to exercise stop/seal linearization.
 #[cfg(test)]
 #[derive(Default)]
 struct UpdateSubmissionTestHook {
@@ -402,10 +403,9 @@ impl Future for ManagedStopReceipt {
 type ConnectFuture =
     Pin<Box<dyn Future<Output = Result<AsyncClient, ClientError>> + Send + 'static>>;
 type WakeFuture = Pin<Box<dyn Future<Output = Option<watch::Receiver<()>>> + Send + 'static>>;
+// Snapshots at publication verify status is visible before the corresponding event.
 #[cfg(test)]
 type EventObservations = Arc<std::sync::Mutex<Vec<(ManagedEvent, Arc<ManagedStatus>)>>>;
-#[cfg(test)]
-type StaggerObservations = Arc<std::sync::Mutex<Vec<(usize, Duration)>>>;
 
 fn arm_wake(mut receiver: watch::Receiver<()>) -> WakeFuture {
     Box::pin(async move {
@@ -525,17 +525,7 @@ impl TargetRuntime {
     /// The client owns `packets_sent`; this runtime only mirrors it so a
     /// terminal outcome can report it after the client is gone.
     fn sync_packets_sent(&mut self, client: &AsyncClient) {
-        self.record_packets_sent(client.packets_sent());
-    }
-
-    /// Adopt an already-read authoritative sent count.
-    fn record_packets_sent(&mut self, packets_sent: u64) {
-        self.counters.packets_sent = packets_sent;
-    }
-
-    /// Account for one client event against this target's durable counters.
-    fn observe(&mut self, event: &ClientEvent) {
-        self.counters.observe(event);
+        self.counters.packets_sent = client.packets_sent();
     }
 
     /// Build this target's durable outcome.
@@ -723,21 +713,17 @@ pub struct ManagedClientTask {
     #[cfg(test)]
     event_observations: Option<EventObservations>,
     #[cfg(test)]
-    stagger_observations: Option<StaggerObservations>,
-    #[cfg(test)]
     drain_test_hook: DrainTestHook,
+    // Counts work that cannot be observed through lossy presentation events.
     #[cfg(test)]
     timeout_inspections: usize,
-    #[cfg(test)]
-    deadline_inspections: usize,
 }
 
+// Holds queued replies past the drain deadline to exercise the final receive budget.
 #[cfg(test)]
 #[derive(Default)]
 struct DrainTestHook {
     defer_work_until_deadline: bool,
-    fail_receive: bool,
-    fail_close: bool,
 }
 
 impl ManagedClientTask {
@@ -837,7 +823,7 @@ impl ManagedClientTask {
 
     fn publish_client_events(&mut self, index: usize, events: Vec<ClientEvent>) {
         for event in events {
-            self.targets[index].observe(&event);
+            self.targets[index].counters.observe(&event);
             self.publish_event(ManagedEvent::Client {
                 target: self.targets[index].instance.clone(),
                 event,
@@ -1421,10 +1407,6 @@ impl ManagedClientTask {
                     return true;
                 }
 
-                #[cfg(test)]
-                let injected_receive_failure = self.take_drain_receive_failure();
-                #[cfg(not(test))]
-                let injected_receive_failure = None;
                 let mut retained_state_changed = false;
                 let received = match client.poll_recv(cx) {
                     Poll::Pending => false,
@@ -1441,13 +1423,7 @@ impl ManagedClientTask {
                         return self.begin_close(index, client, primary_end, cleanup_failure, now);
                     }
                 };
-                if let Some(error) = injected_receive_failure {
-                    self.targets[index].sync_packets_sent(&client);
-                    cleanup_failure.get_or_insert_with(|| {
-                        classify_client_error(ManagedTargetFailurePhase::Receiving, &error)
-                    });
-                    return self.begin_close(index, client, primary_end, cleanup_failure, now);
-                }
+
                 if client.is_peer_closed() {
                     self.targets[index].sync_packets_sent(&client);
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, cleanup_failure);
@@ -1525,17 +1501,7 @@ impl ManagedClientTask {
                 Poll::Ready(Ok(events)) => {
                     self.targets[index].sync_packets_sent(&client);
                     self.publish_client_events(index, events);
-                    #[cfg(test)]
-                    let injected_close_failure = self.take_drain_close_failure().map(|error| {
-                        classify_client_error(ManagedTargetFailurePhase::Closing, &error)
-                    });
-                    #[cfg(not(test))]
-                    let injected_close_failure = None;
-                    self.finish_target(
-                        index,
-                        primary_end,
-                        cleanup_failure.or(injected_close_failure),
-                    );
+                    self.finish_target(index, primary_end, cleanup_failure);
                     false
                 }
                 Poll::Ready(Err(error)) => {
@@ -1616,26 +1582,6 @@ impl ManagedClientTask {
         true
     }
 
-    #[cfg(test)]
-    fn take_drain_receive_failure(&mut self) -> Option<ClientError> {
-        if !mem::take(&mut self.drain_test_hook.fail_receive) {
-            return None;
-        }
-        Some(ClientError::Socket(std::io::Error::other(
-            "injected drain receive failure",
-        )))
-    }
-
-    #[cfg(test)]
-    fn take_drain_close_failure(&mut self) -> Option<ClientError> {
-        if !mem::take(&mut self.drain_test_hook.fail_close) {
-            return None;
-        }
-        Some(ClientError::Socket(std::io::Error::other(
-            "injected drain close failure",
-        )))
-    }
-
     fn active_count(&self) -> usize {
         self.targets
             .iter()
@@ -1643,7 +1589,7 @@ impl ManagedClientTask {
             .count()
     }
 
-    fn active_stagger_spacing(&self) -> Option<(usize, Duration)> {
+    fn active_stagger_spacing(&self) -> Option<Duration> {
         let mut active = 0;
         let mut minimum: Option<Duration> = None;
         for target in &self.targets {
@@ -1661,7 +1607,7 @@ impl ManagedClientTask {
                 .interval();
             minimum = minimum.into_iter().chain(Some(interval)).min();
         }
-        minimum.map(|interval| (active, stagger_spacing(interval, active)))
+        minimum.map(|interval| stagger_spacing(interval, active))
     }
 
     fn stagger_target_added(&mut self, now: Instant) {
@@ -1672,7 +1618,7 @@ impl ManagedClientTask {
         let candidate = self
             .last_stagger_send
             .zip(self.active_stagger_spacing())
-            .and_then(|(last, (_, spacing))| last.checked_add(spacing))
+            .and_then(|(last, spacing)| last.checked_add(spacing))
             .filter(|gate| *gate > now);
         self.send_gate = candidate.map(|candidate| existing.min(candidate));
     }
@@ -1708,21 +1654,17 @@ impl ManagedClientTask {
     fn record_stagger_acceptance(
         &mut self,
         result: SendResult,
-        stagger_spacing: Option<(usize, Duration)>,
+        stagger_spacing: Option<Duration>,
         accepted_at: Instant,
     ) {
         if !result.accepted() {
             return;
         }
-        let Some((_active, spacing)) = stagger_spacing else {
+        let Some(spacing) = stagger_spacing else {
             return;
         };
         self.last_stagger_send = Some(accepted_at);
         self.send_gate = self.next_stagger_gate(spacing, accepted_at);
-        #[cfg(test)]
-        if let Some(observations) = &self.stagger_observations {
-            observations.lock().unwrap().push((_active, spacing));
-        }
     }
 
     fn poll_one_send(
@@ -1730,7 +1672,7 @@ impl ManagedClientTask {
         index: usize,
         cx: &mut Context<'_>,
         now: Instant,
-        stagger_spacing: Option<(usize, Duration)>,
+        stagger_spacing: Option<Duration>,
     ) -> SendResult {
         if !self.targets[index].desired || self.targets[index].retirement.is_some() {
             self.targets[index].send_waiting = false;
@@ -1832,7 +1774,7 @@ impl ManagedClientTask {
         } else {
             None
         };
-        self.targets[index].record_packets_sent(after);
+        self.targets[index].counters.packets_sent = after;
         match result {
             Poll::Pending => {
                 self.targets[index].send_waiting = true;
@@ -2109,11 +2051,7 @@ impl ManagedClientTask {
             .all(|target| matches!(target.state, TargetState::Terminal))
     }
 
-    fn next_deadline(&mut self) -> Option<Instant> {
-        #[cfg(test)]
-        {
-            self.deadline_inspections += self.targets.len();
-        }
+    fn next_deadline(&self) -> Option<Instant> {
         let mut non_send_deadline = None;
         let mut send_deadline = None;
         for target in &self.targets {
@@ -2541,13 +2479,9 @@ fn build_task(
         #[cfg(test)]
         event_observations: None,
         #[cfg(test)]
-        stagger_observations: None,
-        #[cfg(test)]
         drain_test_hook: DrainTestHook::default(),
         #[cfg(test)]
         timeout_inspections: 0,
-        #[cfg(test)]
-        deadline_inspections: 0,
     };
     let handle = ManagedClientHandle {
         stop,

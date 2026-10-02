@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{NegotiationPolicy, DEFAULT_OPEN_TIMEOUTS};
+use crate::config::NegotiationPolicy;
 use crate::{
     session::machine::{
         compute_one_way, compute_rtt, params_from_config, sequence_is_after, sequence_is_before,

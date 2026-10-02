@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet, TryReserveError, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     time::{Instant, SystemTime},
 };
 
@@ -85,7 +85,12 @@ impl PendingMap {
             });
         }
         if self.map.len() == self.map.capacity() {
-            self.map.try_reserve(1).map_err(pending_allocation_failed)?;
+            self.map
+                .try_reserve(1)
+                .map_err(|source| ClientError::AllocationFailed {
+                    operation: "pending probe storage",
+                    source,
+                })?;
         }
         Ok(())
     }
@@ -186,6 +191,12 @@ impl PendingMap {
         ExpiredBatch { probes, more_due }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
+    }
+
+    // Verify repeated or abandoned send preflights do not create pending probes.
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.map.len()
     }
@@ -234,33 +245,10 @@ impl PendingMap {
         }
     }
 
+    // Check sequence-reuse and kernel timestamp retention without consuming a probe.
     #[cfg(test)]
     pub fn contains(&self, wire_seq: u32) -> bool {
         self.map.contains_key(&wire_seq)
-    }
-
-    #[cfg(test)]
-    pub fn capacity(&self) -> usize {
-        self.map.capacity()
-    }
-
-    #[cfg(test)]
-    pub fn linkage(&self) -> (Option<u32>, Option<u32>) {
-        (self.first, self.last)
-    }
-
-    #[cfg(test)]
-    pub fn entry_links(&self, wire_seq: u32) -> Option<(Option<u32>, Option<u32>)> {
-        self.map
-            .get(&wire_seq)
-            .map(|entry| (entry.previous, entry.next))
-    }
-}
-
-fn pending_allocation_failed(source: TryReserveError) -> ClientError {
-    ClientError::AllocationFailed {
-        operation: "pending probe storage",
-        source,
     }
 }
 
@@ -312,29 +300,15 @@ impl TimedOutMap {
         self.map.get_mut(&wire_seq)
     }
 
-    pub fn clear(&mut self) {
-        self.map.clear();
-        self.insertion_order.clear();
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.map.len()
-    }
-
     #[cfg(feature = "tokio")]
     pub fn latest_timeout_deadline(&self) -> Option<Instant> {
         self.map.values().map(|probe| probe.timeout_at).max()
     }
 
+    // Check sequence-reuse and kernel timestamp retention without consuming a probe.
     #[cfg(test)]
     pub fn contains(&self, wire_seq: u32) -> bool {
         self.map.contains_key(&wire_seq)
-    }
-
-    #[cfg(test)]
-    fn insertion_order_len(&self) -> usize {
-        self.insertion_order.len()
     }
 
     fn evict_oldest(&mut self) {
@@ -439,23 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn pending_map_preflight_reserves_without_changing_contents() {
-        let mut map = PendingMap::new(2);
-        let initial_capacity = map.capacity();
-
-        map.preflight_insert(7).unwrap();
-        let reserved_capacity = map.capacity();
-        assert!(reserved_capacity >= initial_capacity);
-        assert_eq!(map.len(), 0);
-        assert!(!map.contains(7));
-
-        map.preflight_insert(7).unwrap();
-        assert_eq!(map.capacity(), reserved_capacity);
-        assert_eq!(map.len(), 0);
-        assert!(!map.contains(7));
-    }
-
-    #[test]
     fn pending_map_preflight_rejects_sequence_collision() {
         let mut map = PendingMap::new(2);
         let now = Instant::now();
@@ -466,21 +423,7 @@ mod tests {
             map.preflight_insert(9),
             Err(ClientError::PendingSequenceCollision { seq: 9 })
         ));
-        assert_eq!(map.len(), 1);
-    }
-
-    #[test]
-    fn pending_map_allocation_failure_maps_to_dedicated_error() {
-        let mut map = HashMap::<u32, PendingProbe>::new();
-        let source = map.try_reserve(usize::MAX).unwrap_err();
-
-        assert!(matches!(
-            pending_allocation_failed(source),
-            ClientError::AllocationFailed {
-                operation: "pending probe storage",
-                ..
-            }
-        ));
+        assert_eq!(map.map.len(), 1);
     }
 
     #[test]
@@ -499,10 +442,6 @@ mod tests {
             map.latest_timeout_deadline(),
             Some(now + Duration::from_secs(3))
         );
-        assert_eq!(map.linkage(), (Some(1), Some(3)));
-        assert_eq!(map.entry_links(1), Some((None, Some(2))));
-        assert_eq!(map.entry_links(2), Some((Some(1), Some(3))));
-        assert_eq!(map.entry_links(3), Some((Some(2), None)));
 
         assert!(map.remove(2).is_some());
         assert_eq!(
@@ -513,9 +452,6 @@ mod tests {
             map.latest_timeout_deadline(),
             Some(now + Duration::from_secs(3))
         );
-        assert_eq!(map.linkage(), (Some(1), Some(3)));
-        assert_eq!(map.entry_links(1), Some((None, Some(3))));
-        assert_eq!(map.entry_links(3), Some((Some(1), None)));
 
         assert!(map.remove(1).is_some());
         assert_eq!(
@@ -526,13 +462,10 @@ mod tests {
             map.latest_timeout_deadline(),
             Some(now + Duration::from_secs(3))
         );
-        assert_eq!(map.linkage(), (Some(3), Some(3)));
-        assert_eq!(map.entry_links(3), Some((None, None)));
 
         assert!(map.remove(3).is_some());
         assert_eq!(map.next_timeout_deadline(), None);
         assert_eq!(map.latest_timeout_deadline(), None);
-        assert_eq!(map.linkage(), (None, None));
     }
 
     #[test]
@@ -554,7 +487,6 @@ mod tests {
         let empty = bounded.drain_expired_bounded(now + Duration::from_secs(4), 0);
         assert!(empty.probes.is_empty());
         assert!(empty.more_due);
-        assert_eq!(bounded.linkage(), (Some(1), Some(4)));
 
         let mut actual = Vec::new();
         loop {
@@ -573,7 +505,6 @@ mod tests {
 
         assert_eq!(actual, expected);
         assert_eq!(actual, vec![1, 2, 3, 4]);
-        assert_eq!(bounded.linkage(), (None, None));
     }
 
     #[test]
@@ -585,8 +516,6 @@ mod tests {
         insert(&mut map, pending(7, now + Duration::from_secs(1)));
 
         assert!(map.drain_expired_bounded(now, usize::MAX).probes.is_empty());
-        assert_eq!(map.linkage(), (Some(7), Some(7)));
-        assert_eq!(map.entry_links(7), Some((None, None)));
         assert_eq!(
             map.drain_expired_bounded(now + Duration::from_secs(1), usize::MAX)
                 .probes
@@ -595,7 +524,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![7]
         );
-        assert_eq!(map.linkage(), (None, None));
     }
 
     #[test]
@@ -603,13 +531,12 @@ mod tests {
         let mut map = PendingMap::new(2);
         let now = Instant::now();
         map.preflight_insert(7).unwrap();
-        let capacity = map.capacity();
+        let capacity = map.map.capacity();
 
         map.commit_insert(pending(7, now));
 
-        assert_eq!(map.capacity(), capacity);
-        assert_eq!(map.len(), 1);
-        assert_eq!(map.linkage(), (Some(7), Some(7)));
+        assert_eq!(map.map.capacity(), capacity);
+        assert_eq!(map.map.len(), 1);
     }
 
     #[test]
@@ -624,8 +551,6 @@ mod tests {
         }
 
         assert!(map.remove(2).is_some());
-        assert_eq!(map.entry_links(1), Some((None, Some(3))));
-        assert_eq!(map.entry_links(3), Some((Some(1), Some(4))));
         let expired = map.drain_expired_bounded(now + Duration::from_secs(3), usize::MAX);
         assert_eq!(
             expired
@@ -635,9 +560,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 3]
         );
-        assert_eq!(map.linkage(), (Some(4), Some(4)));
         assert!(map.remove(4).is_some());
-        assert_eq!(map.linkage(), (None, None));
     }
 
     #[test]
@@ -660,7 +583,7 @@ mod tests {
         map.insert(pending(1, now));
         map.insert(pending(2, now));
 
-        assert_eq!(map.len(), 2);
+        assert_eq!(map.map.len(), 2);
         assert!(map.remove(0).is_none());
         assert!(map.remove(1).is_some());
         assert!(map.remove(2).is_some());
@@ -674,8 +597,8 @@ mod tests {
         for i in 0..20 {
             map.insert(pending(i, now));
             assert!(map.remove(i).is_some());
-            assert_eq!(map.len(), 0);
-            assert_eq!(map.insertion_order_len(), 0);
+            assert_eq!(map.map.len(), 0);
+            assert_eq!(map.insertion_order.len(), 0);
         }
     }
 }

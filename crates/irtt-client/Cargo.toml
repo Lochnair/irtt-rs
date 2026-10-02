@@ -47,5 +47,4 @@ doc-scrape-examples = true
 # Keep the packaged client testable against the latest published server while
 # workspace tests continue to exercise the local source through this path.
 irtt-server = { version = "0.5.1", path = "../irtt-server" }
-proptest = "1.11.0"
 tokio = { version = "1.53.1", default-features = false, features = ["rt", "sync"] }

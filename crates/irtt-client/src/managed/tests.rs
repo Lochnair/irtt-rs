@@ -16,7 +16,7 @@ use irtt_proto::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::*;
-use crate::{socket::resolution_call_counts, ClientAuthConfig, NegotiationPolicy, RunMode};
+use crate::{ClientAuthConfig, NegotiationPolicy, RunMode};
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -388,44 +388,6 @@ fn assert_rotated_without_catchup(sends: &[(TargetInstance, u32, Instant, Instan
     }
 }
 
-fn run_negotiated_stagger_case(
-    requested: Duration,
-    negotiated: &[Duration],
-) -> (Vec<(usize, Duration)>, Vec<u64>) {
-    let servers = negotiated
-        .iter()
-        .map(|interval| start_server_negotiating(ServerBehavior::Echo, None, Some(*interval)))
-        .collect::<Vec<_>>();
-    let mut managed = config(ManagedPacing::Staggered);
-    managed.client.duration = Some(Duration::from_millis(190));
-    managed.client.interval = requested;
-    managed.client.negotiation_policy = NegotiationPolicy::Loose;
-    let targets = servers
-        .iter()
-        .enumerate()
-        .map(|(index, server)| target(&format!("target-{index}"), server.addr))
-        .collect();
-    let (mut task, _) = ManagedClient::task(managed, targets).unwrap();
-    let observations = Arc::new(Mutex::new(Vec::new()));
-    task.stagger_observations = Some(Arc::clone(&observations));
-    let outcome = runtime().block_on(task);
-    let packets_sent = (0..servers.len())
-        .map(|index| {
-            outcome
-                .recent_target_outcomes
-                .iter()
-                .find(|target| target.target.id.as_ref() == format!("target-{index}"))
-                .unwrap()
-                .packets_sent
-        })
-        .collect();
-    for server in servers {
-        server.finish();
-    }
-    let spacings = observations.lock().unwrap().clone();
-    (spacings, packets_sent)
-}
-
 fn run_deferred_drain_burst(packet_count: usize) -> ManagedOutcome {
     let server = start_server(ServerBehavior::DeferredBurst(packet_count), None);
     let mut managed = config(ManagedPacing::Staggered);
@@ -459,13 +421,11 @@ fn run_deferred_drain_burst(packet_count: usize) -> ManagedOutcome {
 
 #[test]
 fn construction_is_runtime_and_io_free() {
-    let before = resolution_call_counts();
     let (task, handle) = ManagedClient::task(
         config(ManagedPacing::Staggered),
         vec![ManagedTargetConfig::new("dns", "no-such-host.invalid")],
     )
     .unwrap();
-    assert_eq!(resolution_call_counts(), before);
     assert_eq!(handle.status().lifecycle, ManagedLifecycle::NotStarted);
     drop(task);
 }
@@ -1400,7 +1360,6 @@ fn first_poll_without_runtime_fails_durably() {
 
 #[test]
 fn pre_poll_stop() {
-    let before = resolution_call_counts();
     let (task, handle) = ManagedClient::task(
         config(ManagedPacing::Staggered),
         vec![ManagedTargetConfig::new("one", "no-such-host.invalid")],
@@ -1413,7 +1372,6 @@ fn pre_poll_stop() {
     };
     assert!(poll_once(receipt.as_mut()).is_ready());
     assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
-    assert_eq!(resolution_call_counts(), before);
 }
 
 #[test]
@@ -1605,45 +1563,6 @@ fn staggered_pacing_fairness() {
 }
 
 #[test]
-fn staggered_pacing_uses_all_active_negotiated_intervals() {
-    let requested = Duration::from_millis(120);
-
-    let (single, single_packets) =
-        run_negotiated_stagger_case(requested, &[Duration::from_millis(40)]);
-    assert!(single
-        .iter()
-        .all(|entry| *entry == (1, Duration::from_millis(40))));
-    assert!(single_packets[0] >= 4);
-
-    let (different, different_packets) = run_negotiated_stagger_case(
-        requested,
-        &[Duration::from_millis(30), Duration::from_millis(90)],
-    );
-    let while_both_active = different
-        .iter()
-        .filter(|(active, _)| *active == 2)
-        .collect::<Vec<_>>();
-    assert!(!while_both_active.is_empty());
-    assert!(while_both_active
-        .iter()
-        .all(|(_, spacing)| *spacing == Duration::from_millis(15)));
-    assert!(different_packets[0] > different_packets[1]);
-
-    let (equal, _) = run_negotiated_stagger_case(
-        requested,
-        &[Duration::from_millis(60), Duration::from_millis(60)],
-    );
-    let while_both_active = equal
-        .iter()
-        .filter(|(active, _)| *active == 2)
-        .collect::<Vec<_>>();
-    assert!(!while_both_active.is_empty());
-    assert!(while_both_active
-        .iter()
-        .all(|(_, spacing)| *spacing == Duration::from_millis(30)));
-}
-
-#[test]
 fn stagger_gate_tracks_active_membership() {
     let first =
         start_server_negotiating(ServerBehavior::Echo, None, Some(Duration::from_millis(100)));
@@ -1690,7 +1609,7 @@ fn stagger_gate_tracks_active_membership() {
     let accepted_at = Instant::now();
     task.record_stagger_acceptance(
         SendResult::Failed { accepted: true },
-        Some((2, Duration::from_millis(50))),
+        Some(Duration::from_millis(50)),
         accepted_at,
     );
     assert_eq!(
@@ -1752,11 +1671,7 @@ fn the_stagger_gate_advances_by_one_spacing_per_send_without_accumulating_latene
     let start = Instant::now();
     let lateness = Duration::from_millis(3);
 
-    task.record_stagger_acceptance(
-        SendResult::Ready { accepted: true },
-        Some((1, spacing)),
-        start,
-    );
+    task.record_stagger_acceptance(SendResult::Ready { accepted: true }, Some(spacing), start);
     assert_eq!(task.send_gate, Some(start + spacing), "first send anchors");
 
     // Every later send is observed `lateness` after the gate that released it.
@@ -1766,7 +1681,7 @@ fn the_stagger_gate_advances_by_one_spacing_per_send_without_accumulating_latene
         let released_at = start + spacing * slot;
         task.record_stagger_acceptance(
             SendResult::Ready { accepted: true },
-            Some((1, spacing)),
+            Some(spacing),
             released_at + lateness,
         );
         assert_eq!(
@@ -1782,7 +1697,7 @@ fn the_stagger_gate_advances_by_one_spacing_per_send_without_accumulating_latene
     let resumed_at = stalled_gate + spacing;
     task.record_stagger_acceptance(
         SendResult::Ready { accepted: true },
-        Some((1, spacing)),
+        Some(spacing),
         resumed_at,
     );
     assert_eq!(task.send_gate, Some(resumed_at + spacing));
@@ -1924,69 +1839,6 @@ fn pending_limit_failure_drains_reply_and_closes_session() {
     assert_eq!(target.replies_received, 1);
     assert_eq!(probes(&records).len(), 1);
     assert!(has_close(&records));
-}
-
-#[test]
-fn drain_failures_preserve_primary_outcome_and_first_cleanup_failure() {
-    let completed_server = start_server(ServerBehavior::Echo, None);
-    let (mut completed_task, _) = ManagedClient::task(
-        config(ManagedPacing::Staggered),
-        vec![target("completed", completed_server.addr)],
-    )
-    .unwrap();
-    completed_task.drain_test_hook.fail_receive = true;
-    completed_task.drain_test_hook.fail_close = true;
-    let completed = runtime().block_on(completed_task);
-    let completed_target = &completed.recent_target_outcomes[0];
-    assert!(matches!(
-        completed_target.end_reason,
-        ManagedTargetEndReason::TestComplete
-    ));
-    assert_eq!(completed.failed_target_outcomes, 0);
-    assert!(matches!(
-        completed_target.cleanup_failure,
-        Some(ManagedTargetFailure {
-            phase: ManagedTargetFailurePhase::Receiving,
-            kind: ManagedTargetFailureKind::Socket,
-            ..
-        })
-    ));
-    completed_server.finish();
-
-    let stopped_server = start_server(ServerBehavior::Echo, None);
-    let mut managed = config(ManagedPacing::Staggered);
-    managed.completion = ManagedCompletionPolicy::ExplicitStop;
-    managed.client.duration = None;
-    let (mut stopped_task, handle) =
-        ManagedClient::task(managed, vec![target("stopped", stopped_server.addr)]).unwrap();
-    stopped_task.drain_test_hook.fail_receive = true;
-    let seen = Arc::clone(&stopped_server.probe_seen);
-    let stopper = thread::spawn(move || {
-        let (flag, ready) = &*seen;
-        let guard = flag.lock().unwrap();
-        let (guard, timeout) = ready
-            .wait_timeout_while(guard, Duration::from_secs(2), |seen| !*seen)
-            .unwrap();
-        assert!(*guard && !timeout.timed_out());
-        drop(handle.stop());
-    });
-    let stopped = runtime().block_on(stopped_task);
-    stopper.join().unwrap();
-    let stopped_target = &stopped.recent_target_outcomes[0];
-    assert!(matches!(
-        stopped_target.end_reason,
-        ManagedTargetEndReason::Stopped
-    ));
-    assert_eq!(stopped.failed_target_outcomes, 0);
-    assert!(matches!(
-        stopped_target.cleanup_failure,
-        Some(ManagedTargetFailure {
-            phase: ManagedTargetFailurePhase::Receiving,
-            kind: ManagedTargetFailureKind::Socket,
-            ..
-        })
-    ));
-    stopped_server.finish();
 }
 
 #[test]

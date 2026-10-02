@@ -103,10 +103,7 @@ pub(crate) fn classify(cmsgs: impl Iterator<Item = ControlMessageOwned>) -> Erro
 
     for cmsg in cmsgs {
         match cmsg {
-            ControlMessageOwned::Ipv4RecvErr(err, _) => {
-                extended_error = Some((err.ee_errno, err.ee_origin, err.ee_info, err.ee_data));
-            }
-            ControlMessageOwned::Ipv6RecvErr(err, _) => {
+            ControlMessageOwned::Ipv4RecvErr(err, _) | ControlMessageOwned::Ipv6RecvErr(err, _) => {
                 extended_error = Some((err.ee_errno, err.ee_origin, err.ee_info, err.ee_data));
             }
             ControlMessageOwned::ScmTimestampsns(observed) => {
@@ -145,12 +142,6 @@ pub(crate) fn classify(cmsgs: impl Iterator<Item = ControlMessageOwned>) -> Erro
 #[repr(align(8))]
 struct ErrorQueueControlBuffer([u8; ERROR_QUEUE_CONTROL_LEN]);
 
-impl ErrorQueueControlBuffer {
-    fn new() -> Self {
-        Self([0; ERROR_QUEUE_CONTROL_LEN])
-    }
-}
-
 /// Nonblocking drain of a single record from `fd`'s `MSG_ERRQUEUE`.
 ///
 /// Returns `Ok(None)` when the queue is empty (`EAGAIN`/`EWOULDBLOCK`) — the
@@ -171,7 +162,7 @@ impl ErrorQueueControlBuffer {
 pub(crate) fn try_recv_error_queue_record(fd: RawFd) -> io::Result<Option<ErrorQueueRecord>> {
     let mut payload: [u8; 0] = [];
     let mut iov = [IoSliceMut::new(&mut payload)];
-    let mut control = ErrorQueueControlBuffer::new();
+    let mut control = ErrorQueueControlBuffer([0; ERROR_QUEUE_CONTROL_LEN]);
 
     match recvmsg::<()>(
         fd,

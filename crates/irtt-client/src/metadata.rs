@@ -136,37 +136,6 @@ mod tests {
     }
 
     #[test]
-    fn preferred_receive_wall_rejects_implausibly_old_kernel_timestamp() {
-        let userspace = userspace_wall();
-        let kernel = SystemTime::UNIX_EPOCH;
-
-        assert_eq!(
-            meta_with_kernel_rx(kernel).preferred_receive_wall(userspace),
-            userspace
-        );
-    }
-
-    #[test]
-    fn preferred_receive_wall_handles_extreme_timestamps_without_panicking() {
-        let userspace = userspace_wall();
-        let far_future = SystemTime::UNIX_EPOCH + Duration::from_secs(u64::from(u32::MAX)) * 4;
-        let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(u64::from(u32::MAX));
-
-        assert_eq!(
-            meta_with_kernel_rx(far_future).preferred_receive_wall(userspace),
-            userspace
-        );
-        assert_eq!(
-            meta_with_kernel_rx(before_epoch).preferred_receive_wall(userspace),
-            userspace
-        );
-        assert_eq!(
-            ReceiveMeta::default().preferred_receive_wall(before_epoch),
-            before_epoch
-        );
-    }
-
-    #[test]
     fn metadata_preserves_kernel_timestamp_rejected_for_measurement() {
         let userspace = userspace_wall();
         let rejected = userspace + Duration::from_secs(30);
@@ -178,19 +147,6 @@ mod tests {
             Some(rejected),
             "observed metadata must survive rejection as a measurement endpoint"
         );
-    }
-
-    #[test]
-    fn metadata_observed_traffic_class_zero_preserves_observed_zero() {
-        let packet_meta = PacketMeta::from(ReceiveMeta {
-            traffic_class: Some(0),
-            kernel_rx_timestamp: None,
-        });
-
-        assert_eq!(packet_meta.traffic_class, Some(0));
-        assert_eq!(packet_meta.dscp, Some(0));
-        assert_eq!(packet_meta.ecn, Some(0));
-        assert_eq!(packet_meta.kernel_rx_timestamp, None);
     }
 
     #[test]

@@ -21,8 +21,8 @@
 //! session so later IDs cannot be misattributed. It performs a small bounded,
 //! nonblocking read of
 //! `MSG_ERRQUEUE` so the adapter can opportunistically collect timestamps
-//! without ever waiting for one. The observed kernel TX wall time is retained
-//! as metadata only; it is not consumed by any measurement in this change.
+//! without ever waiting for one. A plausible kernel TX wall time is used only
+//! for upstream one-way delay; RTT retains the userspace send instant.
 
 use std::{
     io::{self, IoSliceMut},
@@ -161,12 +161,12 @@ fn recv_datagram_fd(
     buf: &mut [u8],
     flags: MsgFlags,
 ) -> Result<ReceivedDatagram, io::Error> {
-    let mut control = ControlBuffer::new();
+    let mut control = ControlBuffer([0; CONTROL_LEN]);
     let mut iov = [IoSliceMut::new(buf)];
 
     // The socket is connected, so the source address is not needed; `()` skips
     // copying it out.
-    let msg = recvmsg::<()>(socket_fd, &mut iov, Some(control.as_mut_slice()), flags)?;
+    let msg = recvmsg::<()>(socket_fd, &mut iov, Some(&mut control.0), flags)?;
     let received_at = ClientTimestamp::now();
 
     Ok(ReceivedDatagram {
@@ -215,16 +215,6 @@ fn system_time_from_timespec(timespec: TimeSpec) -> Option<SystemTime> {
 /// `cmsghdr` alignment, which 8-byte alignment covers on supported targets.
 #[repr(align(8))]
 struct ControlBuffer([u8; CONTROL_LEN]);
-
-impl ControlBuffer {
-    fn new() -> Self {
-        Self([0; CONTROL_LEN])
-    }
-
-    fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.0
-    }
-}
 
 #[cfg(test)]
 mod tests {

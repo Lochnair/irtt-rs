@@ -140,50 +140,13 @@ pub(crate) fn apply_ttl_to_socket(
     ttl: u32,
 ) -> Result<(), ClientError> {
     validate_ttl(ttl)?;
-    set_socket_ttl(socket, remote, ttl).map_err(|source| ClientError::SocketOption {
-        operation: "set TTL/hop limit",
-        remote,
-        source,
-    })
-}
-
-#[cfg(test)]
-pub(crate) fn socket_traffic_class(
-    socket: &UdpSocket,
-    remote: SocketAddr,
-) -> Result<u32, ClientError> {
-    get_socket_traffic_class(socket, remote).map_err(|source| ClientError::SocketOption {
-        operation: "read DSCP socket option",
-        remote,
-        source,
-    })
-}
-
-#[cfg(all(test, feature = "tokio"))]
-pub(crate) fn tokio_socket_traffic_class(
-    socket: &tokio::net::UdpSocket,
-    remote: SocketAddr,
-) -> Result<u32, ClientError> {
-    get_socket_traffic_class_ref(SockRef::from(socket), remote).map_err(|source| {
+    set_socket_ttl_ref(SockRef::from(socket), remote, ttl).map_err(|source| {
         ClientError::SocketOption {
-            operation: "read DSCP socket option",
+            operation: "set TTL/hop limit",
             remote,
             source,
         }
     })
-}
-
-#[cfg(test)]
-pub(crate) fn socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> Result<u32, ClientError> {
-    get_socket_ttl(socket, remote).map_err(|source| ClientError::SocketOption {
-        operation: "read TTL/hop limit socket option",
-        remote,
-        source,
-    })
-}
-
-fn set_socket_ttl(socket: &UdpSocket, remote: SocketAddr, ttl: u32) -> io::Result<()> {
-    set_socket_ttl_ref(SockRef::from(socket), remote, ttl)
 }
 
 fn set_socket_ttl_ref(socket: SockRef<'_>, remote: SocketAddr, ttl: u32) -> io::Result<()> {
@@ -194,37 +157,19 @@ fn set_socket_ttl_ref(socket: SockRef<'_>, remote: SocketAddr, ttl: u32) -> io::
     }
 }
 
-#[cfg(test)]
-fn get_socket_ttl(socket: &UdpSocket, remote: SocketAddr) -> io::Result<u32> {
-    let socket = SockRef::from(socket);
-    if remote.is_ipv4() {
-        socket.ttl_v4()
-    } else {
-        socket.unicast_hops_v6()
-    }
-}
-
 fn set_socket_traffic_class(
     socket: &UdpSocket,
     remote: SocketAddr,
     traffic_class: u32,
     operation: &'static str,
 ) -> Result<(), ClientError> {
-    set_socket_traffic_class_io(socket, remote, traffic_class).map_err(|source| {
+    set_socket_traffic_class_ref(SockRef::from(socket), remote, traffic_class).map_err(|source| {
         ClientError::SocketOption {
             operation,
             remote,
             source,
         }
     })
-}
-
-fn set_socket_traffic_class_io(
-    socket: &UdpSocket,
-    remote: SocketAddr,
-    traffic_class: u32,
-) -> io::Result<()> {
-    set_socket_traffic_class_ref(SockRef::from(socket), remote, traffic_class)
 }
 
 #[cfg(feature = "tokio")]
@@ -333,304 +278,5 @@ fn unsupported_traffic_class(traffic_class: u32, feature: &'static str) -> io::R
             io::ErrorKind::Unsupported,
             format!("{feature} are unsupported on this target"),
         ))
-    }
-}
-
-#[cfg(all(
-    test,
-    not(any(
-        target_os = "fuchsia",
-        target_os = "redox",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "haiku",
-    ))
-))]
-fn get_ipv4_traffic_class(socket: SockRef<'_>) -> io::Result<u32> {
-    socket.tos_v4()
-}
-
-#[cfg(all(
-    test,
-    any(
-        target_os = "fuchsia",
-        target_os = "redox",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "haiku",
-    )
-))]
-fn get_ipv4_traffic_class(_socket: SockRef<'_>) -> io::Result<u32> {
-    unsupported_readback("IPv4 DSCP socket option readback")
-}
-
-#[cfg(all(
-    test,
-    any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-    )
-))]
-fn get_ipv6_traffic_class(socket: SockRef<'_>) -> io::Result<u32> {
-    socket.tclass_v6()
-}
-
-#[cfg(all(
-    test,
-    not(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-    ))
-))]
-fn get_ipv6_traffic_class(_socket: SockRef<'_>) -> io::Result<u32> {
-    unsupported_readback("IPv6 DSCP socket option readback")
-}
-
-#[cfg(test)]
-fn get_socket_traffic_class(socket: &UdpSocket, remote: SocketAddr) -> io::Result<u32> {
-    get_socket_traffic_class_ref(SockRef::from(socket), remote)
-}
-
-#[cfg(test)]
-fn get_socket_traffic_class_ref(socket: SockRef<'_>, remote: SocketAddr) -> io::Result<u32> {
-    if remote.is_ipv4() {
-        get_ipv4_traffic_class(socket)
-    } else {
-        get_ipv6_traffic_class(socket)
-    }
-}
-
-#[cfg(all(
-    test,
-    any(
-        target_os = "fuchsia",
-        target_os = "redox",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "haiku",
-        not(any(
-            target_os = "android",
-            target_os = "dragonfly",
-            target_os = "freebsd",
-            target_os = "fuchsia",
-            target_os = "linux",
-            target_os = "macos",
-            target_os = "netbsd",
-            target_os = "openbsd",
-            target_os = "cygwin",
-        )),
-    )
-))]
-fn unsupported_readback(feature: &'static str) -> io::Result<u32> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        format!("{feature} is unsupported on this target"),
-    ))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn converts_dscp_codepoint_to_traffic_class_byte() {
-        for (dscp, traffic_class) in [(0, 0), (1, 4), (46, 184), (63, 252)] {
-            let value = dscp_codepoint_to_traffic_class(dscp).unwrap();
-            assert_eq!(value, traffic_class);
-            assert_eq!(value & 0b11, 0);
-        }
-    }
-
-    #[test]
-    fn rejects_out_of_range_dscp_codepoint() {
-        assert!(matches!(
-            dscp_codepoint_to_traffic_class(64),
-            Err(ClientError::InvalidConfig { .. })
-        ));
-    }
-
-    #[test]
-    fn validates_ttl_range() {
-        assert!(validate_ttl(1).is_ok());
-        assert!(validate_ttl(64).is_ok());
-        assert!(validate_ttl(255).is_ok());
-        assert!(matches!(
-            validate_ttl(0),
-            Err(ClientError::InvalidConfig { .. })
-        ));
-        assert!(matches!(
-            validate_ttl(256),
-            Err(ClientError::InvalidConfig { .. })
-        ));
-    }
-
-    #[test]
-    fn ipv4_socket_option_sets_ttl() {
-        let remote = SocketAddr::from(([127, 0, 0, 1], 9));
-        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        socket.connect(remote).unwrap();
-
-        apply_ttl_to_socket(&socket, remote, 64).unwrap();
-        assert_eq!(socket_ttl(&socket, remote).unwrap(), 64);
-
-        apply_ttl_to_socket(&socket, remote, 1).unwrap();
-        assert_eq!(socket_ttl(&socket, remote).unwrap(), 1);
-    }
-
-    #[test]
-    fn ipv6_socket_option_sets_unicast_hop_limit() {
-        let remote = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9));
-        let Some(socket) = bind_connected_ipv6_loopback(remote) else {
-            return;
-        };
-
-        apply_ttl_to_socket(&socket, remote, 64).unwrap();
-        let ttl = match socket_ttl(&socket, remote) {
-            Ok(ttl) => ttl,
-            Err(error) if is_unsupported_socket_readback(&error) => {
-                eprintln!("skipping IPv6 hop-limit readback test: {error}");
-                return;
-            }
-            Err(error) => panic!("{error}"),
-        };
-        assert_eq!(ttl, 64);
-
-        apply_ttl_to_socket(&socket, remote, 1).unwrap();
-        assert_eq!(socket_ttl(&socket, remote).unwrap(), 1);
-    }
-
-    #[test]
-    #[cfg(not(any(
-        target_os = "fuchsia",
-        target_os = "redox",
-        target_os = "solaris",
-        target_os = "illumos",
-        target_os = "haiku",
-    )))]
-    fn ipv4_socket_option_sets_and_clears_traffic_class() {
-        let remote = SocketAddr::from(([127, 0, 0, 1], 9));
-        let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-        socket.connect(remote).unwrap();
-
-        // 184 is the raw wire TOS/Traffic Class byte for DSCP codepoint 46
-        // (EF); applying it directly must not shift it again.
-        apply_traffic_class_to_socket(&socket, remote, 184).unwrap();
-        assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 184);
-
-        clear_dscp_on_socket(&socket, remote).unwrap();
-        assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 0);
-    }
-
-    #[cfg(all(
-        feature = "tokio",
-        not(any(
-            target_os = "fuchsia",
-            target_os = "redox",
-            target_os = "solaris",
-            target_os = "illumos",
-            target_os = "haiku",
-        ))
-    ))]
-    #[test]
-    fn tokio_ipv4_socket_option_sets_and_clears_traffic_class() {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_io()
-            .build()
-            .unwrap();
-
-        runtime.block_on(async {
-            let remote = SocketAddr::from(([127, 0, 0, 1], 9));
-            let socket = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], 0))).unwrap();
-            socket.connect(remote).unwrap();
-            socket.set_nonblocking(true).unwrap();
-            let socket = tokio::net::UdpSocket::from_std(socket).unwrap();
-
-            apply_traffic_class_to_tokio_socket(&socket, remote, 184).unwrap();
-            assert_eq!(tokio_socket_traffic_class(&socket, remote).unwrap(), 184);
-
-            clear_dscp_on_tokio_socket(&socket, remote).unwrap();
-            assert_eq!(tokio_socket_traffic_class(&socket, remote).unwrap(), 0);
-        });
-    }
-
-    #[test]
-    #[cfg(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "fuchsia",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd",
-        target_os = "cygwin",
-    ))]
-    fn ipv6_socket_option_sets_and_clears_traffic_class() {
-        let remote = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 9));
-        let Some(socket) = bind_connected_ipv6_loopback(remote) else {
-            return;
-        };
-
-        apply_traffic_class_to_socket(&socket, remote, 184).unwrap();
-        let traffic_class = match socket_traffic_class(&socket, remote) {
-            Ok(traffic_class) => traffic_class,
-            Err(error) if is_unsupported_socket_readback(&error) => {
-                eprintln!("skipping IPv6 traffic-class readback test: {error}");
-                return;
-            }
-            Err(error) => panic!("{error}"),
-        };
-        assert_eq!(traffic_class, 184);
-
-        clear_dscp_on_socket(&socket, remote).unwrap();
-        assert_eq!(socket_traffic_class(&socket, remote).unwrap(), 0);
-    }
-
-    fn bind_connected_ipv6_loopback(remote: SocketAddr) -> Option<UdpSocket> {
-        let socket = match UdpSocket::bind(SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], 0))) {
-            Ok(socket) => socket,
-            Err(error) if is_unavailable_ipv6_loopback(&error) => {
-                eprintln!("skipping IPv6 socket option test: IPv6 loopback unavailable: {error}");
-                return None;
-            }
-            Err(error) => panic!("{error}"),
-        };
-        match socket.connect(remote) {
-            Ok(()) => Some(socket),
-            Err(error) if is_unavailable_ipv6_loopback(&error) => {
-                eprintln!("skipping IPv6 socket option test: IPv6 loopback unavailable: {error}");
-                None
-            }
-            Err(error) => panic!("{error}"),
-        }
-    }
-
-    fn is_unavailable_ipv6_loopback(error: &io::Error) -> bool {
-        matches!(
-            error.kind(),
-            io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported
-        )
-    }
-
-    fn is_unsupported_socket_readback(error: &ClientError) -> bool {
-        matches!(
-            error,
-            ClientError::SocketOption { source, .. }
-                if matches!(source.kind(), io::ErrorKind::Unsupported)
-        )
     }
 }

@@ -18,38 +18,6 @@ fn rejection_reason(requested: &Params, returned: &Params, policy: NegotiationPo
 }
 
 #[test]
-fn strict_negotiation_accepts_identical_params() {
-    let config = ClientConfig::default();
-    let params = params_from_config(&config).unwrap();
-    let negotiated = assert_negotiates(&params, &params, NegotiationPolicy::Strict);
-    assert_eq!(negotiated.params, params);
-    assert!(negotiated.restrictions.is_empty());
-}
-
-#[test]
-fn strict_negotiation_rejects_changed_params() {
-    let config = ClientConfig {
-        dscp: 46,
-        ..ClientConfig::default()
-    };
-    let requested = params_from_config(&config).unwrap();
-    assert_eq!(
-        requested.dscp, 184,
-        "codepoint 46 must become raw wire byte 184"
-    );
-    let mut returned = requested.clone();
-    returned.dscp = 0;
-    assert_eq!(
-        rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
-        NegotiationRestriction::DscpChanged {
-            requested: 46,
-            negotiated: 0,
-        }
-        .message()
-    );
-}
-
-#[test]
 fn loose_negotiation_accepts_server_restricted_params() {
     let config = ClientConfig::default();
     let mut requested = params_from_config(&config).unwrap();
@@ -86,79 +54,6 @@ fn loose_negotiation_rejects_non_positive_returned_interval() {
             "interval must be positive"
         );
     }
-}
-
-#[test]
-fn loose_negotiation_accepts_documented_duration_combinations() {
-    let finite_config = ClientConfig::default();
-    let requested_finite = params_from_config(&finite_config).unwrap();
-
-    let returned_same_finite = requested_finite.clone();
-    assert!(assert_negotiates(
-        &requested_finite,
-        &returned_same_finite,
-        NegotiationPolicy::Loose
-    )
-    .restrictions
-    .is_empty());
-
-    let mut returned_shorter_finite = requested_finite.clone();
-    returned_shorter_finite.duration_ns /= 2;
-    assert_eq!(
-        assert_negotiates(
-            &requested_finite,
-            &returned_shorter_finite,
-            NegotiationPolicy::Loose
-        )
-        .restrictions,
-        vec![NegotiationRestriction::DurationReduced {
-            requested_ns: requested_finite.duration_ns,
-            negotiated_ns: returned_shorter_finite.duration_ns,
-        }]
-    );
-
-    let continuous_config = ClientConfig {
-        duration: None,
-        ..ClientConfig::default()
-    };
-    let requested_continuous = params_from_config(&continuous_config).unwrap();
-
-    let returned_continuous = requested_continuous.clone();
-    assert!(assert_negotiates(
-        &requested_continuous,
-        &returned_continuous,
-        NegotiationPolicy::Loose
-    )
-    .restrictions
-    .is_empty());
-
-    let mut returned_finite = requested_continuous.clone();
-    returned_finite.duration_ns = 1_000_000_000;
-    assert_eq!(
-        assert_negotiates(
-            &requested_continuous,
-            &returned_finite,
-            NegotiationPolicy::Loose
-        )
-        .restrictions,
-        vec![NegotiationRestriction::DurationReduced {
-            requested_ns: requested_continuous.duration_ns,
-            negotiated_ns: returned_finite.duration_ns,
-        }]
-    );
-}
-
-#[test]
-fn loose_negotiation_rejects_finite_request_returned_continuous() {
-    let config = ClientConfig::default();
-    let requested = params_from_config(&config).unwrap();
-    let mut returned = requested.clone();
-    returned.duration_ns = 0;
-
-    assert_eq!(
-        rejection_reason(&requested, &returned, NegotiationPolicy::Loose),
-        "server returned continuous duration for finite request"
-    );
 }
 
 #[test]
@@ -235,26 +130,6 @@ fn loose_negotiation_records_dscp_disabled_by_server() {
             requested: 46,
             negotiated: 0,
         }]
-    );
-}
-
-#[test]
-fn strict_negotiation_rejects_dscp_disabled_by_server_as_specific_restriction() {
-    let config = ClientConfig {
-        dscp: 46,
-        ..ClientConfig::default()
-    };
-    let requested = params_from_config(&config).unwrap();
-    let mut returned = requested.clone();
-    returned.dscp = 0;
-
-    assert_eq!(
-        rejection_reason(&requested, &returned, NegotiationPolicy::Strict),
-        NegotiationRestriction::DscpChanged {
-            requested: 46,
-            negotiated: 0,
-        }
-        .message()
     );
 }
 

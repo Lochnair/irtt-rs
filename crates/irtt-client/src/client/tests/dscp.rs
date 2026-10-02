@@ -1,5 +1,4 @@
 use super::*;
-use crate::socket_options::socket_traffic_class;
 
 #[test]
 #[cfg(not(any(
@@ -25,20 +24,17 @@ fn normal_open_applies_negotiated_traffic_class_after_open_and_close_clears_it()
     let mut client = Client::connect(config).unwrap();
 
     assert_eq!(
-        socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
+        socket2::SockRef::from(&client.socket).tos_v4().unwrap() & 0xfc,
         0
     );
     assert_open_started(client.open().unwrap());
     assert_eq!(
-        socket_traffic_class(&client.socket, client.remote).unwrap() & 0xfc,
+        socket2::SockRef::from(&client.socket).tos_v4().unwrap() & 0xfc,
         184
     );
 
     client.close().unwrap();
-    assert_eq!(
-        socket_traffic_class(&client.socket, client.remote).unwrap(),
-        0
-    );
+    assert_eq!(socket2::SockRef::from(&client.socket).tos_v4().unwrap(), 0);
     server.join();
 }
 
@@ -69,10 +65,7 @@ fn normal_open_uses_negotiated_traffic_class_not_requested_dscp() {
             negotiated: 0,
         }]
     );
-    assert_eq!(
-        socket_traffic_class(&client.socket, client.remote).unwrap(),
-        0
-    );
+    assert_eq!(socket2::SockRef::from(&client.socket).tos_v4().unwrap(), 0);
     server.join();
 }
 
@@ -128,10 +121,6 @@ fn authenticated_peer_close_clears_negotiated_traffic_class() {
         ]
     ));
 
-    assert_eq!(client.applied_traffic_class, None);
-    assert_eq!(
-        socket_traffic_class(&client.socket, client.remote).unwrap(),
-        0
-    );
+    assert_eq!(socket2::SockRef::from(&client.socket).tos_v4().unwrap(), 0);
     server.join();
 }

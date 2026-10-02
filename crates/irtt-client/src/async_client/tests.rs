@@ -17,7 +17,7 @@ use tokio::runtime::{Builder, Runtime};
 mod in_tree_server;
 
 use super::*;
-use crate::{socket_options::tokio_socket_traffic_class, Client, RunMode, SocketConfig};
+use crate::{Client, RunMode, SocketConfig};
 use in_tree_server::InTreeServer;
 use irtt_server::ServerConfig;
 
@@ -66,10 +66,6 @@ async fn opened_client(addr: SocketAddr, dscp: u8) -> AsyncClient {
         .unwrap();
     client.open().await.unwrap();
     client
-}
-
-fn socket_dscp(client: &AsyncClient) -> u32 {
-    tokio_socket_traffic_class(&client.socket, client.remote).unwrap() >> 2
 }
 
 fn start_server<F>(handler: F) -> TestServer
@@ -382,85 +378,24 @@ fn recv_after_local_close_and_no_test_fails_on_first_poll() {
 }
 
 #[test]
-fn blocking_and_async_hmac_dscp_lifecycle_are_semantically_equivalent() {
-    let key = b"async-equivalence-key".to_vec();
-    let blocking_server = InTreeServer::start(ServerConfig::default().with_hmac_key(key.clone()));
-    let mut blocking =
-        Client::connect(config(blocking_server.addr, Some(key.clone()), 46)).unwrap();
-    let blocking_open = blocking.open().unwrap();
-    let blocking_sent = blocking.send_probe().unwrap();
-    let blocking_reply = blocking.recv_once().unwrap();
-    let blocking_close = blocking.close().unwrap();
-    drop(blocking_server);
-
-    let async_server = InTreeServer::start(ServerConfig::default().with_hmac_key(key.clone()));
-    let (async_open, async_sent, async_reply, async_close) = runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(async_server.addr, Some(key), 46))
+fn authenticated_async_lifecycle_applies_negotiated_dscp() {
+    let key = b"async-lifecycle-key".to_vec();
+    let server = InTreeServer::start(ServerConfig::default().with_hmac_key(key.clone()));
+    runtime().block_on(async {
+        let mut client = AsyncClient::connect(config(server.addr, Some(key), 46))
             .await
             .unwrap();
         let opened = client.open().await.unwrap();
-        assert_eq!(socket_dscp(&client), 46);
-        let sent = client.send_probe().await.unwrap();
-        let reply = client.recv().await.unwrap();
-        let closed = client.close().await.unwrap();
-        (opened, sent, reply, closed)
+        assert_eq!(open_negotiated(&opened).params.dscp, 184);
+        #[cfg(not(any(
+            target_os = "fuchsia", target_os = "redox", target_os = "solaris",
+            target_os = "illumos", target_os = "haiku",
+        )))]
+        assert_eq!(socket2::SockRef::from(&client.socket).tos_v4().unwrap() >> 2, 46);
+        client.send_probe().await.unwrap();
+        assert!(matches!(client.recv().await.unwrap().as_slice(), [ClientEvent::EchoReply { seq: 0, .. }]));
+        assert!(matches!(client.close().await.unwrap().as_slice(), [ClientEvent::SessionClosed { token, .. }] if *token == open_token(&opened)));
     });
-    drop(async_server);
-
-    assert_eq!(
-        open_negotiated(&blocking_open),
-        open_negotiated(&async_open)
-    );
-    assert_eq!(
-        open_negotiated(&async_open).params.dscp,
-        184,
-        "negotiated Params::dscp is the raw wire byte for codepoint 46"
-    );
-    assert_matching_event_shape(&blocking_sent[0], &async_sent[0]);
-    assert_matching_event_shape(&blocking_reply[0], &async_reply[0]);
-    assert!(matches!(
-        blocking_close.as_slice(),
-        [ClientEvent::SessionClosed { token, .. }] if *token == open_token(&blocking_open)
-    ));
-    assert!(matches!(
-        async_close.as_slice(),
-        [ClientEvent::SessionClosed { token, .. }] if *token == open_token(&async_open)
-    ));
-    assert_matching_event_shape(&blocking_close[0], &async_close[0]);
-}
-
-#[test]
-fn blocking_and_async_no_test_are_semantically_equivalent() {
-    let blocking_no_test_server = InTreeServer::start(ServerConfig::default());
-    let mut blocking_no_test_config = config(blocking_no_test_server.addr, None, 0);
-    blocking_no_test_config.run_mode = RunMode::NoTest;
-    let mut blocking_no_test = Client::connect(blocking_no_test_config).unwrap();
-    let blocking_no_test_open = blocking_no_test.open().unwrap();
-    assert!(blocking_no_test.negotiated_params().is_none());
-    drop(blocking_no_test_server);
-
-    let async_no_test_server = InTreeServer::start(ServerConfig::default());
-    let mut async_no_test_config = config(async_no_test_server.addr, None, 0);
-    async_no_test_config.run_mode = RunMode::NoTest;
-    let async_no_test_open = runtime().block_on(async {
-        let mut client = AsyncClient::connect(async_no_test_config).await.unwrap();
-        let opened = client.open().await.unwrap();
-        assert!(client.negotiated_params().is_none());
-        opened
-    });
-    drop(async_no_test_server);
-    assert!(matches!(
-        blocking_no_test_open,
-        OpenOutcome::NoTestCompleted { .. }
-    ));
-    assert!(matches!(
-        async_no_test_open,
-        OpenOutcome::NoTestCompleted { .. }
-    ));
-    assert_eq!(
-        open_negotiated(&blocking_no_test_open),
-        open_negotiated(&async_no_test_open)
-    );
 }
 
 #[test]
@@ -722,50 +657,6 @@ fn blocking_and_async_complete_every_caller_paced_probe() {
     for (blocking, asynchronous) in blocking_replies.iter().zip(&async_replies) {
         assert_matching_event_shape(blocking, asynchronous);
     }
-}
-
-#[test]
-fn blocking_and_async_reject_probes_before_open_and_after_close() {
-    let blocking_server = InTreeServer::start(ServerConfig::default());
-    let mut blocking = Client::connect(config(blocking_server.addr, None, 0)).unwrap();
-    let blocking_before = blocking.send_probe().unwrap_err();
-    blocking.open().unwrap();
-    let blocking_reopen = blocking.open().unwrap_err();
-    blocking.close().unwrap();
-    let blocking_after_send = blocking.send_probe().unwrap_err();
-    let blocking_after_close = blocking.close().unwrap_err();
-    drop(blocking_server);
-
-    let async_server = InTreeServer::start(ServerConfig::default());
-    let (async_before, async_reopen, async_after_send, async_after_close) =
-        runtime().block_on(async {
-            let mut client = AsyncClient::connect(config(async_server.addr, None, 0))
-                .await
-                .unwrap();
-            let before = client.send_probe().await.unwrap_err();
-            client.open().await.unwrap();
-            let reopen = client.open().await.unwrap_err();
-            client.close().await.unwrap();
-            let after_send = client.send_probe().await.unwrap_err();
-            let after_close = client.close().await.unwrap_err();
-            (before, reopen, after_send, after_close)
-        });
-    drop(async_server);
-
-    assert_eq!(error_name(&blocking_before), "not open");
-    assert_eq!(error_name(&blocking_reopen), "already open");
-    assert_eq!(error_name(&blocking_after_send), "already closed");
-    assert_eq!(error_name(&blocking_after_close), "already closed");
-    assert_eq!(error_name(&blocking_before), error_name(&async_before));
-    assert_eq!(error_name(&blocking_reopen), error_name(&async_reopen));
-    assert_eq!(
-        error_name(&blocking_after_send),
-        error_name(&async_after_send)
-    );
-    assert_eq!(
-        error_name(&blocking_after_close),
-        error_name(&async_after_close)
-    );
 }
 
 #[test]

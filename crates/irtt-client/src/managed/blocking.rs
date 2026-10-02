@@ -157,20 +157,12 @@ impl BlockingManagedClient {
     }
 
     fn join_worker(&mut self) -> Result<ManagedOutcome, BlockingManagedJoinError> {
-        join_worker(
-            self.worker
-                .take()
-                .expect("blocking managed worker is joined at most once"),
-        )
+        self.worker
+            .take()
+            .expect("blocking managed worker is joined at most once")
+            .join()
+            .map_err(|_| BlockingManagedJoinError::WorkerPanicked)
     }
-}
-
-pub(super) fn join_worker(
-    worker: JoinHandle<ManagedOutcome>,
-) -> Result<ManagedOutcome, BlockingManagedJoinError> {
-    worker
-        .join()
-        .map_err(|_| BlockingManagedJoinError::WorkerPanicked)
 }
 
 impl Drop for BlockingManagedClient {

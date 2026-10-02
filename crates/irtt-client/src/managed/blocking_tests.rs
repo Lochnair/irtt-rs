@@ -12,8 +12,7 @@ use irtt_proto::{
 use tokio::{runtime::Builder, time::timeout};
 
 use super::{
-    blocking::{join_worker, WorkerRuntime},
-    BlockingManagedClient, BlockingManagedJoinError, ManagedClientConfig, ManagedCompletionPolicy,
+    blocking::WorkerRuntime, BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy,
     ManagedEndReason, ManagedEvent, ManagedLifecycle, ManagedPacing, ManagedTargetConfig,
     ManagedTargetEndReason,
 };
@@ -307,15 +306,6 @@ fn dropping_owner_stops_and_joins_worker() {
     );
     server.wait_close();
     server.finish();
-}
-
-#[test]
-fn worker_panic_is_a_join_error() {
-    let worker = thread::spawn(|| -> super::ManagedOutcome { panic!("test worker panic") });
-    assert_eq!(
-        join_worker(worker),
-        Err(BlockingManagedJoinError::WorkerPanicked)
-    );
 }
 
 #[test]

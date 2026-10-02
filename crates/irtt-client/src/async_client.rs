@@ -85,7 +85,7 @@ impl AsyncOpenCleanup {
 /// Owned state for one asynchronous open transaction.
 ///
 /// This state deliberately contains no reference to [`AsyncClient`], allowing
-/// a future managed target to store the client and opening state side by side.
+/// a managed target to store the client and opening state side by side.
 #[derive(Debug)]
 pub(crate) struct AsyncOpenState {
     attempt: usize,
@@ -567,7 +567,7 @@ impl AsyncClient {
             };
             if self.machine.is_peer_closed() {
                 self.prepared_probe = None;
-                if self.clear_peer_close_dscp().is_ok() {
+                if clear_dscp_on_tokio_socket(&self.socket, self.remote).is_ok() {
                     self.applied_traffic_class = None;
                 }
             }
@@ -607,7 +607,7 @@ impl AsyncClient {
                     return Poll::Ready(Err(ClientError::Socket(error)));
                 }
             }
-            if let Err(error) = self.clear_close_dscp() {
+            if let Err(error) = clear_dscp_on_tokio_socket(&self.socket, self.remote) {
                 return Poll::Ready(Err(error));
             }
             let mut rollback =
@@ -796,14 +796,6 @@ impl AsyncClient {
                 Poll::Ready(Err(state.cleanup.take().unwrap().into_primary()))
             }
         }
-    }
-
-    fn clear_peer_close_dscp(&self) -> Result<(), ClientError> {
-        clear_dscp_on_tokio_socket(&self.socket, self.remote)
-    }
-
-    fn clear_close_dscp(&self) -> Result<(), ClientError> {
-        clear_dscp_on_tokio_socket(&self.socket, self.remote)
     }
 
     fn restore_dscp_best_effort(&self, previous_traffic_class: Option<u8>) {

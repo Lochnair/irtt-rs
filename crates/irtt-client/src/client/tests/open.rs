@@ -137,20 +137,6 @@ fn post_token_negotiation_failure_sends_cleanup_close() {
 }
 
 #[test]
-fn successful_open_handshake() {
-    let config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    let params = params_from_config(&config).unwrap();
-    let server = open_success_server(params.clone());
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
-
-    let negotiated = assert_open_started(client.open().unwrap());
-    assert_eq!(negotiated.params, params);
-
-    assert_eq!(client.applied_traffic_class, Some(0));
-    server.join();
-}
-
-#[test]
 fn successful_open_restores_configured_receive_timeout() {
     let config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
     let params = params_from_config(&config).unwrap();

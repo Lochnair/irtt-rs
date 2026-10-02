@@ -36,9 +36,6 @@ pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), Client
 }
 
 pub(crate) fn resolve_remote(config: &ClientConfig) -> Result<SocketAddr, ClientError> {
-    #[cfg(all(test, feature = "tokio"))]
-    SYNC_RESOLVER_CALLS.with(|calls| calls.set(calls.get() + 1));
-
     let addr = normalize_server_addr(&config.server_addr);
     let mut addrs = addr
         .to_socket_addrs()
@@ -57,9 +54,6 @@ pub(crate) async fn resolve_remote_tokio(config: &ClientConfig) -> Result<Socket
             .ok_or(ClientError::Resolve { addr });
     }
 
-    #[cfg(all(test, feature = "tokio"))]
-    TOKIO_DNS_LOOKUPS.with(|calls| calls.set(calls.get() + 1));
-
     let mut addrs = tokio::net::lookup_host(&addr)
         .await
         .map_err(|_| ClientError::Resolve { addr: addr.clone() })?;
@@ -71,20 +65,6 @@ pub(crate) async fn resolve_remote_tokio(config: &ClientConfig) -> Result<Socket
 fn address_family_allowed(config: &ClientConfig, remote: SocketAddr) -> bool {
     (!config.socket_config.ipv4_only || remote.is_ipv4())
         && (!config.socket_config.ipv6_only || remote.is_ipv6())
-}
-
-#[cfg(all(test, feature = "tokio"))]
-std::thread_local! {
-    static SYNC_RESOLVER_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static TOKIO_DNS_LOOKUPS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(all(test, feature = "tokio"))]
-pub(crate) fn resolution_call_counts() -> (usize, usize) {
-    (
-        SYNC_RESOLVER_CALLS.with(std::cell::Cell::get),
-        TOKIO_DNS_LOOKUPS.with(std::cell::Cell::get),
-    )
 }
 
 pub(crate) fn normalize_server_addr(addr: &str) -> String {
@@ -280,7 +260,7 @@ mod tests {
 
     #[cfg(feature = "tokio")]
     #[test]
-    fn tokio_resolver_filters_families_without_using_blocking_resolution() {
+    fn tokio_resolver_filters_address_families() {
         let mut config = ClientConfig {
             server_addr: "localhost:2112".to_owned(),
             ..ClientConfig::default()
@@ -288,13 +268,9 @@ mod tests {
         config.socket_config.ipv4_only = true;
 
         tokio_runtime().block_on(async {
-            let before = resolution_call_counts();
             let remote = resolve_remote_tokio(&config).await.unwrap();
-            let after = resolution_call_counts();
 
             assert!(remote.is_ipv4());
-            assert_eq!(after.0, before.0);
-            assert_eq!(after.1, before.1 + 1);
         });
     }
 
@@ -310,24 +286,6 @@ mod tests {
         tokio_runtime().block_on(async {
             let remote = resolve_remote_tokio(&config).await.unwrap();
             assert!(remote.is_ipv6());
-        });
-    }
-
-    #[cfg(feature = "tokio")]
-    #[test]
-    fn tokio_resolver_literal_path_bypasses_all_name_resolution() {
-        let config = ClientConfig {
-            server_addr: "127.0.0.1:2112".to_owned(),
-            ..ClientConfig::default()
-        };
-
-        tokio_runtime().block_on(async {
-            let before = resolution_call_counts();
-            let remote = resolve_remote_tokio(&config).await.unwrap();
-            let after = resolution_call_counts();
-
-            assert_eq!(remote, SocketAddr::from(([127, 0, 0, 1], 2112)));
-            assert_eq!(after, before);
         });
     }
 

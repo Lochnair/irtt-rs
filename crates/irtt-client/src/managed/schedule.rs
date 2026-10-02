@@ -70,7 +70,14 @@ impl ProbeSchedule {
     ) -> Result<ScheduleCommit, ClientError> {
         let (scheduled_at, next_send_at) =
             advance_cadence(scheduled_at, self.interval, permission_at)?;
-        Ok(self.finish_commit(scheduled_at, next_send_at))
+        Ok(ScheduleCommit {
+            scheduled_at,
+            next_send_at: if self.end_at.is_some_and(|end| next_send_at >= end) {
+                None
+            } else {
+                Some(next_send_at)
+            },
+        })
     }
 
     pub(crate) fn commit(&mut self, commit: ScheduleCommit) {
@@ -89,17 +96,6 @@ impl ProbeSchedule {
 
     pub(crate) fn is_finished(&self) -> bool {
         self.next_send_at.is_none()
-    }
-
-    fn finish_commit(&self, scheduled_at: Instant, next_send_at: Instant) -> ScheduleCommit {
-        ScheduleCommit {
-            scheduled_at,
-            next_send_at: if self.end_at.is_some_and(|end| next_send_at >= end) {
-                None
-            } else {
-                Some(next_send_at)
-            },
-        }
     }
 }
 
