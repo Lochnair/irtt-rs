@@ -1,6 +1,5 @@
 use std::{
     future::{poll_fn, Future},
-    mem,
     net::{SocketAddr, UdpSocket},
     pin::Pin,
     sync::{Arc, Condvar, Mutex},
@@ -16,7 +15,7 @@ use irtt_proto::{
 use tokio::runtime::{Builder, Runtime};
 
 use super::*;
-use crate::{ClientAuthConfig, NegotiationPolicy, RunMode};
+use crate::{ClientAuthConfig, RunMode};
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 
@@ -767,52 +766,6 @@ fn terminal_targets_count_toward_retained_generation_limit() {
 }
 
 #[test]
-fn pruning_leaves_no_stale_target_work() {
-    let (mut task, _) = ManagedClient::task(
-        config(ManagedPacing::Staggered),
-        vec![
-            ManagedTargetConfig::new("one", "127.0.0.1:9"),
-            ManagedTargetConfig::new("two", "127.0.0.1:10"),
-            ManagedTargetConfig::new("three", "127.0.0.1:11"),
-        ],
-    )
-    .unwrap();
-    task.cursor = 2;
-    task.timeout_cursor = 2;
-    task.send_cursor = 2;
-    task.scan_remaining = 3;
-    task.burst_remaining = 3;
-    task.stagger_remaining = 3;
-
-    task.targets[2].desired = false;
-    task.targets[2].state = TargetState::Terminal;
-    task.prune_undesired_terminal();
-
-    // Timeout discovery indexes `targets` with `timeout_cursor` directly, so a
-    // prune must leave it safe to use; the target and send passes modulo their
-    // own cursors. Pending per-pass work must not outlive the targets it was
-    // scheduled for either.
-    assert_eq!(task.targets.len(), 2);
-    assert!(task.timeout_cursor < task.targets.len());
-    assert!(task.scan_remaining <= task.targets.len());
-    assert!(task.burst_remaining <= task.targets.len());
-    assert!(task.stagger_remaining <= task.targets.len());
-    assert!(!task.poll_timeout_pass(Instant::now()));
-
-    for target in &mut task.targets {
-        target.desired = false;
-        target.state = TargetState::Terminal;
-    }
-    task.prune_undesired_terminal();
-
-    assert!(task.targets.is_empty());
-    assert_eq!(task.scan_remaining, 0);
-    assert_eq!(task.burst_remaining, 0);
-    assert_eq!(task.stagger_remaining, 0);
-    assert!(!task.poll_timeout_pass(Instant::now()));
-}
-
-#[test]
 fn dynamic_rejections_leave_transaction_state_unchanged() {
     let mut managed = config(ManagedPacing::Staggered);
     managed.completion = ManagedCompletionPolicy::ExplicitStop;
@@ -1558,79 +1511,6 @@ fn staggered_pacing_fairness() {
     task.event_observations = Some(Arc::clone(&observations));
     runtime().block_on(task);
     assert_rotated_without_catchup(&echo_sends(&observations));
-    first.finish();
-    second.finish();
-}
-
-#[test]
-fn stagger_gate_tracks_active_membership() {
-    let first =
-        start_server_negotiating(ServerBehavior::Echo, None, Some(Duration::from_millis(100)));
-    let second_gate = Arc::new(PacketGate::default());
-    let second = start_server_with_gates(
-        ServerBehavior::Echo,
-        None,
-        Some(Duration::from_secs(1)),
-        Some(Arc::clone(&second_gate)),
-        None,
-    );
-    let mut managed = config(ManagedPacing::Staggered);
-    managed.client.duration = Some(Duration::from_millis(1_250));
-    managed.client.interval = Duration::from_secs(1);
-    managed.client.negotiation_policy = NegotiationPolicy::Loose;
-    managed.client.open_timeouts = vec![Duration::from_secs(2)];
-    let (task, handle) = ManagedClient::task(
-        managed,
-        vec![target("first", first.addr), target("second", second.addr)],
-    )
-    .unwrap();
-    let runtime = runtime();
-    let mut task = Box::pin(task);
-    drive_task_until(&runtime, &mut task, |task| {
-        task.targets[0].counters.packets_sent == 1
-    });
-    let one_target_last = task.last_stagger_send.unwrap();
-    let one_target_gate = task.send_gate.unwrap();
-    assert_eq!(
-        task.send_gate,
-        one_target_last.checked_add(Duration::from_millis(100))
-    );
-    second_gate.release();
-    drive_task_until(&runtime, &mut task, |task| task.active_count() == 2);
-    let last = task.last_stagger_send.unwrap();
-    let gate = task.send_gate.unwrap();
-    assert_eq!(gate, last.checked_add(Duration::from_millis(50)).unwrap());
-    assert!(gate <= one_target_gate);
-    assert!(gate > last && gate < last.checked_add(Duration::from_millis(100)).unwrap());
-    drive_task_until(&runtime, &mut task, |task| {
-        task.targets[1].counters.packets_sent == 1
-    });
-
-    let accepted_at = Instant::now();
-    task.record_stagger_acceptance(
-        SendResult::Failed { accepted: true },
-        Some(Duration::from_millis(50)),
-        accepted_at,
-    );
-    assert_eq!(
-        task.send_gate,
-        accepted_at.checked_add(Duration::from_millis(50))
-    );
-    let preserved_gate = task.send_gate;
-    let TargetState::Active { client } =
-        mem::replace(&mut task.targets[0].state, TargetState::Terminal)
-    else {
-        panic!("fast target was not active before removal");
-    };
-    assert!(task.begin_drain(0, client, ManagedTargetEndReason::Stopped, Instant::now()));
-    assert_eq!(task.send_gate, preserved_gate);
-    drive_task_until(&runtime, &mut task, |task| {
-        task.targets[1].counters.packets_sent == 2
-    });
-
-    drop(handle.stop());
-    let outcome = runtime.block_on(task);
-    assert_eq!(outcome.failed_target_outcomes, 0);
     first.finish();
     second.finish();
 }

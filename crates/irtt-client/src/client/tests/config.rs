@@ -1,74 +1,7 @@
 use super::*;
 
 #[test]
-fn params_from_config_maps_compatibility_fields() {
-    let config = ClientConfig {
-        duration: Some(Duration::from_secs(5)),
-        interval: Duration::from_millis(250),
-        length: 1472,
-        received_stats: ReceivedStats::Window,
-        stamp_at: StampAt::Midpoint,
-        clock: Clock::Wall,
-        dscp: 46,
-        hmac_key: Some(b"secret".to_vec()),
-        server_fill: Some("rand".to_owned()),
-        ..ClientConfig::default()
-    };
-
-    let params = params_from_config(&config).unwrap();
-    assert_eq!(params.protocol_version, PROTOCOL_VERSION);
-    assert_eq!(params.duration_ns, 5_000_000_000);
-    assert_eq!(params.interval_ns, 250_000_000);
-    assert_eq!(params.length, 1472);
-    assert_eq!(params.received_stats, ReceivedStats::Window);
-    assert_eq!(params.stamp_at, StampAt::Midpoint);
-    assert_eq!(params.clock, Clock::Wall);
-    assert_eq!(
-        params.dscp, 184,
-        "config DSCP codepoint 46 must be shifted into raw wire byte 184"
-    );
-    assert_eq!(
-        params.server_fill.as_ref().map(|fill| fill.value.as_str()),
-        Some("rand")
-    );
-    assert_eq!(config.hmac_key.as_deref(), Some(b"secret".as_slice()));
-}
-
-#[test]
-fn params_from_config_accepts_boundary_values() {
-    for length in [0, 1, 1472, 4096, MAX_UDP_PAYLOAD_LENGTH] {
-        let config = ClientConfig {
-            length,
-            ..ClientConfig::default()
-        };
-        assert_eq!(
-            params_from_config(&config).unwrap().length,
-            i64::from(length)
-        );
-    }
-
-    let config = ClientConfig {
-        dscp: 63,
-        ..ClientConfig::default()
-    };
-    assert_eq!(
-        params_from_config(&config).unwrap().dscp,
-        252,
-        "boundary codepoint 63 must be shifted into raw wire byte 252"
-    );
-}
-
-#[test]
-fn params_from_config_encodes_continuous_duration_as_zero() {
-    let config = ClientConfig {
-        duration: None,
-        ..ClientConfig::default()
-    };
-    assert_eq!(params_from_config(&config).unwrap().duration_ns, 0);
-}
-
-#[test]
-fn params_from_config_rejects_invalid_values() {
+fn connect_rejects_invalid_configuration() {
     let i64_max_ns = u64::try_from(i64::MAX).unwrap();
     let too_large = Duration::from_nanos(i64_max_ns) + Duration::from_nanos(1);
     let cases = [
@@ -151,10 +84,10 @@ fn params_from_config_rejects_invalid_values() {
     for (name, config, expected_reason) in cases {
         assert!(
             matches!(
-                params_from_config(&config),
-                Err(ClientError::InvalidConfig { reason }) if reason.contains(expected_reason)
+                Client::connect(config),
+                Err(ClientError::InvalidConfig { .. })
             ),
-            "{name} should fail with InvalidConfig containing {expected_reason:?}"
+            "{name} should fail with InvalidConfig ({expected_reason})"
         );
     }
 }

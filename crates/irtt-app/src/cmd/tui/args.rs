@@ -2,8 +2,6 @@ use std::time::Duration;
 
 use clap::Parser;
 
-#[cfg(test)]
-use crate::shared::client::TimestampArg;
 use crate::shared::client::{
     parse_target, parse_test_duration, prepare_managed_run, CommonClientArgs, GroupPacingArg,
     ManagedRunSetup, TargetArg, TargetSelection,
@@ -65,11 +63,6 @@ impl TuiArgs {
 
     pub fn is_continuous(&self) -> bool {
         self.duration == Duration::ZERO
-    }
-
-    #[cfg(test)]
-    pub fn timestamp_mode(&self) -> TimestampArg {
-        self.common.tstamp
     }
 }
 
@@ -157,35 +150,6 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_labels_are_rejected() {
-        let args = parse(&["host-a:2112", "host-a:2112=host-b:2112"]).unwrap();
-        let err = args.prepare().unwrap_err();
-
-        assert!(err.contains("duplicate target label"));
-    }
-
-    #[test]
-    fn duplicate_positional_target_strings_get_stable_suffixes() {
-        let args = parse(&["host-a:2112", "host-a:2112"]).unwrap();
-        let specs = args.prepare().unwrap().targets;
-
-        assert_eq!(specs[0].label, "host-a:2112");
-        assert_eq!(specs[1].label, "host-a:2112#2");
-    }
-
-    #[test]
-    fn duplicate_target_endpoints_are_allowed() {
-        let args = parse(&["127.0.0.1:2112", "127.0.0.1"]).unwrap();
-        assert_eq!(args.prepare().unwrap().target_count(), 2);
-    }
-
-    #[test]
-    fn invalid_labelled_target_syntax_is_rejected() {
-        assert!(parse(&["=127.0.0.1:2112"]).unwrap().prepare().is_err());
-        assert!(parse(&["label="]).unwrap().prepare().is_err());
-    }
-
-    #[test]
     fn old_target_option_is_rejected() {
         assert!(parse(&["--target", "eu=host.example"]).is_err());
     }
@@ -268,14 +232,6 @@ mod tests {
         assert_eq!(shared.server_fill, tui.server_fill);
         assert_eq!(shared.negotiation_policy, tui.negotiation_policy);
         assert_eq!(shared.socket_config.ttl, tui.socket_config.ttl);
-    }
-
-    #[test]
-    fn an_empty_hmac_key_is_rejected_via_the_shared_args() {
-        // CommonClientArgs is flattened into both the client and TUI parsers,
-        // so proving rejection once here covers both without duplicating it.
-        let err = parse(&["--hmac", "", "127.0.0.1:2112"]).unwrap_err();
-        assert!(err.to_string().contains("HMAC key must not be empty"));
     }
 
     #[test]

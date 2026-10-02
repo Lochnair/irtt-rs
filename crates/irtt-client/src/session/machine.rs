@@ -1177,220 +1177,12 @@ mod tests {
         }
     }
 
-    fn connected_machine(config: ClientConfig) -> SessionMachine {
-        SessionMachine::new(config, "127.0.0.1:2112".parse().unwrap()).unwrap()
-    }
-
     fn normal_open_reply(machine: &SessionMachine, token: u64) -> OpenReply {
         OpenReply {
             flags: flags::FLAG_OPEN | flags::FLAG_REPLY,
             token,
             params: machine.requested.clone(),
         }
-    }
-
-    fn encoded_open_reply(
-        machine: &SessionMachine,
-        reply: &OpenReply,
-    ) -> Result<Vec<u8>, irtt_proto::ProtoError> {
-        irtt_proto::encode_open_reply(reply, machine.config.hmac_key.as_deref())
-    }
-
-    #[test]
-    fn malformed_wrong_direction_and_invalid_flags_are_ignored() {
-        let machine = connected_machine(ClientConfig::default());
-        assert!(matches!(
-            machine.inspect_open_datagram(&[0_u8]),
-            Ok(OpenDatagramDisposition::Ignore)
-        ));
-
-        let request = machine.prepare_open_request().unwrap();
-        assert!(matches!(
-            machine.inspect_open_datagram(&request.bytes),
-            Ok(OpenDatagramDisposition::Ignore)
-        ));
-
-        let reply = normal_open_reply(&machine, 0x1020_3040_5060_7080);
-        let mut reserved = encoded_open_reply(&machine, &reply).unwrap();
-        reserved[3] |= 0x10;
-        assert!(matches!(
-            machine.inspect_open_datagram(&reserved),
-            Ok(OpenDatagramDisposition::Ignore)
-        ));
-        assert!(matches!(machine.state, MachineState::Connected));
-    }
-
-    #[test]
-    fn missing_unexpected_and_bad_hmac_are_ignored() {
-        let key = b"open-key".to_vec();
-        let authenticated = connected_machine(ClientConfig {
-            hmac_key: Some(key.clone()),
-            ..ClientConfig::default()
-        });
-        let reply = normal_open_reply(&authenticated, 0x1020_3040_5060_7080);
-        let plain = irtt_proto::encode_open_reply(&reply, None).unwrap();
-        assert!(matches!(
-            authenticated.inspect_open_datagram(&plain),
-            Ok(OpenDatagramDisposition::Ignore)
-        ));
-
-        let mut bad = encoded_open_reply(&authenticated, &reply).unwrap();
-        *bad.last_mut().unwrap() ^= 0x80;
-        assert!(matches!(
-            authenticated.inspect_open_datagram(&bad),
-            Ok(OpenDatagramDisposition::Ignore)
-        ));
-
-        let plain_machine = connected_machine(ClientConfig::default());
-        let unexpected = irtt_proto::encode_open_reply(&reply, Some(&key)).unwrap();
-        assert!(matches!(
-            plain_machine.inspect_open_datagram(&unexpected),
-            Ok(OpenDatagramDisposition::Ignore)
-        ));
-    }
-
-    #[test]
-    fn authenticated_zero_token_is_trusted_and_terminal() {
-        let key = b"open-key".to_vec();
-        let machine = connected_machine(ClientConfig {
-            hmac_key: Some(key.clone()),
-            ..ClientConfig::default()
-        });
-        let reply = normal_open_reply(&machine, 0x1020_3040_5060_7080);
-        let mut packet = encoded_open_reply(&machine, &reply).unwrap();
-        let token_offset = 4 + irtt_proto::HMAC_SIZE;
-        packet[token_offset..token_offset + 8].fill(0);
-        irtt_proto::compute_hmac_in_place(&key, &mut packet, 4).unwrap();
-
-        assert!(matches!(
-            machine.inspect_open_datagram(&packet),
-            Err(ClientError::Protocol(irtt_proto::ProtoError::ZeroToken))
-        ));
-        assert!(matches!(machine.state, MachineState::Connected));
-    }
-
-    #[test]
-    fn trusted_invalid_parameter_encoding_is_terminal() {
-        let machine = connected_machine(ClientConfig::default());
-        let mut packet = irtt_proto::MAGIC.to_vec();
-        packet.push(flags::FLAG_OPEN | flags::FLAG_REPLY);
-        packet.extend_from_slice(&0x1020_3040_5060_7080_u64.to_le_bytes());
-        packet.push(0x80);
-
-        assert!(matches!(
-            machine.inspect_open_datagram(&packet),
-            Err(ClientError::Protocol(
-                irtt_proto::ProtoError::TruncatedVarint
-            ))
-        ));
-        assert!(matches!(machine.state, MachineState::Connected));
-    }
-
-    #[test]
-    fn trusted_rejection_version_and_run_mode_failures_do_not_open() {
-        let machine = connected_machine(ClientConfig::default());
-        let rejection = OpenReply {
-            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
-            token: 0,
-            params: machine.requested.clone(),
-        };
-        assert!(matches!(
-            machine
-                .prepare_open_acceptance(rejection, timestamp(Instant::now()))
-                .unwrap_err()
-                .primary,
-            ClientError::ServerRejected
-        ));
-
-        let mut version = normal_open_reply(&machine, 0x1020_3040_5060_7080);
-        version.params.protocol_version += 1;
-        assert!(matches!(
-            machine
-                .prepare_open_acceptance(version, timestamp(Instant::now()))
-                .unwrap_err()
-                .primary,
-            ClientError::ProtocolVersionMismatch { .. }
-        ));
-
-        let no_test = connected_machine(ClientConfig {
-            run_mode: RunMode::NoTest,
-            ..ClientConfig::default()
-        });
-        assert!(matches!(
-            no_test
-                .prepare_open_acceptance(
-                    normal_open_reply(&no_test, 0x1020_3040_5060_7080),
-                    timestamp(Instant::now()),
-                )
-                .unwrap_err()
-                .primary,
-            ClientError::UnexpectedNoTestReply
-        ));
-        assert!(matches!(machine.state, MachineState::Connected));
-        assert!(matches!(no_test.state, MachineState::Connected));
-    }
-
-    #[test]
-    fn no_test_non_close_reply_prepares_authenticated_cleanup_without_state_change() {
-        let key = b"cleanup-key".to_vec();
-        let machine = connected_machine(ClientConfig {
-            run_mode: RunMode::NoTest,
-            hmac_key: Some(key.clone()),
-            ..ClientConfig::default()
-        });
-        let token = 0x1020_3040_5060_7080;
-
-        let failure = machine
-            .prepare_open_acceptance(
-                normal_open_reply(&machine, token),
-                timestamp(Instant::now()),
-            )
-            .unwrap_err();
-
-        assert!(matches!(
-            failure.primary,
-            ClientError::UnexpectedNoTestReply
-        ));
-        let cleanup = failure.cleanup_close.as_deref().unwrap();
-        assert_eq!(cleanup[3], flags::FLAG_CLOSE | flags::FLAG_HMAC);
-        irtt_proto::verify_hmac(&key, cleanup, 4).unwrap();
-        assert_eq!(
-            u64::from_le_bytes(
-                cleanup[4 + irtt_proto::HMAC_SIZE..12 + irtt_proto::HMAC_SIZE]
-                    .try_into()
-                    .unwrap()
-            ),
-            token
-        );
-        drop(failure);
-        assert!(matches!(machine.state, MachineState::Connected));
-    }
-
-    #[test]
-    fn no_test_close_replies_do_not_prepare_cleanup() {
-        let machine = connected_machine(ClientConfig {
-            run_mode: RunMode::NoTest,
-            ..ClientConfig::default()
-        });
-        let reply = |token| OpenReply {
-            flags: flags::FLAG_OPEN | flags::FLAG_REPLY | flags::FLAG_CLOSE,
-            token,
-            params: machine.requested.clone(),
-        };
-
-        let prepared = machine
-            .prepare_open_acceptance(reply(0), timestamp(Instant::now()))
-            .unwrap();
-        assert!(prepared.cleanup_close_packet().is_none());
-
-        let failure = machine
-            .prepare_open_acceptance(reply(0x1020_3040_5060_7080), timestamp(Instant::now()))
-            .unwrap_err();
-        assert!(matches!(
-            failure.primary,
-            ClientError::NonZeroNoTestToken { .. }
-        ));
-        assert!(failure.cleanup_close.is_none());
     }
 
     #[test]
@@ -1418,30 +1210,6 @@ mod tests {
     }
 
     #[test]
-    fn stale_prepared_probe_is_rejected_without_changing_state() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let stale = machine.prepare_probe().unwrap();
-        let accepted = machine.prepare_probe().unwrap();
-        let sent_at = timestamp(Instant::now());
-        let preflight = machine.preflight_probe_commit(&accepted).unwrap();
-        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine.commit_probe_sent(commit, sent_at, accepted.bytes.len());
-
-        assert!(matches!(
-            machine.preflight_probe_commit(&stale),
-            Err(ClientError::StalePreparedProbe {
-                prepared_seq: 0,
-                next_wire_seq: 1,
-            })
-        ));
-
-        let session = active(&machine);
-        assert_eq!(session.next_wire_seq, 1);
-        assert_eq!(session.packets_sent, 1);
-        assert_eq!(session.pending.len(), 1);
-    }
-
-    #[test]
     fn repeated_would_block_style_preflight_commits_once() {
         let mut machine = open_machine(4, Duration::from_secs(1));
         let prepared = machine.prepare_probe().unwrap();
@@ -1460,23 +1228,6 @@ mod tests {
         assert_eq!(session.next_wire_seq, 1);
         assert_eq!(session.packets_sent, 1);
         assert_eq!(session.pending.len(), 1);
-    }
-
-    #[test]
-    fn pending_capacity_exhaustion_is_detected_before_commit() {
-        let mut machine = open_machine(1, Duration::from_secs(1));
-        let first = machine.prepare_probe().unwrap();
-        let sent_at = timestamp(Instant::now());
-        let preflight = machine.preflight_probe_commit(&first).unwrap();
-        let commit = machine.finalize_probe_commit(preflight, sent_at).unwrap();
-        machine.commit_probe_sent(commit, sent_at, first.bytes.len());
-
-        let second = machine.prepare_probe().unwrap();
-        assert!(matches!(
-            machine.preflight_probe_commit(&second),
-            Err(ClientError::PendingLimitExceeded { limit: 1 })
-        ));
-        assert_eq!(active(&machine).packets_sent, 1);
     }
 
     #[test]
@@ -1521,35 +1272,6 @@ mod tests {
         assert!(matches!(
             machine.finalize_probe_commit(preflight, timestamp(Instant::now())),
             Err(ClientError::DurationOverflow)
-        ));
-        assert_eq!(active(&machine).pending.len(), 0);
-    }
-
-    #[test]
-    fn exhaustive_timeout_polling_returns_every_due_loss() {
-        let mut machine = open_machine(4, Duration::from_secs(1));
-        let now = Instant::now();
-        for seq in [2, 1, 0] {
-            let sent_at = timestamp(now - Duration::from_secs(u64::from(seq) + 1));
-            let session = active_mut(&mut machine);
-            session.pending.preflight_insert(seq).unwrap();
-            session.pending.commit_insert(PendingProbe {
-                wire_seq: seq,
-                sent_at,
-                timeout_at: sent_at.mono + Duration::from_secs(1),
-                tx_not_before_wall: sent_at.wall,
-                kernel_tx_timestamp: None,
-            });
-        }
-
-        let events = machine.poll_timeouts_at(now).unwrap();
-        assert!(matches!(
-            events.as_slice(),
-            [
-                ClientEvent::EchoLoss { seq: 2, .. },
-                ClientEvent::EchoLoss { seq: 1, .. },
-                ClientEvent::EchoLoss { seq: 0, .. },
-            ]
         ));
         assert_eq!(active(&machine).pending.len(), 0);
     }

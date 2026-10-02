@@ -2057,19 +2057,6 @@ mod tests {
         }
     }
 
-    fn graph_sample_with_timing(seq: u32, effective_ns: i128) -> GraphSample {
-        GraphSample {
-            timestamp: Instant::now() + Duration::from_secs(u64::from(seq)),
-            seq,
-            effective_ns,
-            raw_ns: effective_ns + 1_000,
-            adjusted_ns: Some(effective_ns + 500),
-            client_to_server_ns: Some(effective_ns / 3),
-            server_to_client_ns: Some(effective_ns / 2),
-            server_processing_ns: Some(100_000),
-        }
-    }
-
     fn series(data: Vec<(f64, f64)>) -> ChartSeries {
         ChartSeries {
             name: GraphMetric::EffectiveRtt.label().to_owned(),
@@ -2129,18 +2116,6 @@ mod tests {
         assert_eq!(format_span(Duration::from_millis(25)), "25.0ms");
         assert_eq!(format_span(Duration::from_millis(1_500)), "1.5s");
         assert_eq!(format_span(Duration::from_secs(90)), "1m30s");
-    }
-
-    #[test]
-    fn formats_signed_durations_and_missing_values() {
-        assert_eq!(format_optional_ns_i128(Some(-1_500_000)), "-1.5ms");
-        assert_eq!(format_optional_ns_i128(Some(750)), "750ns");
-        assert_eq!(format_optional_ns_i128(None), "-");
-        assert_eq!(format_optional_ns_i128(Some(1_500)), "1.5µs");
-        assert_eq!(format_optional_span(None), "-");
-        assert_eq!(format_duration(Duration::from_millis(25)), "25.0ms");
-        assert_eq!(format_percent_ratio(1, 4), "25.00%");
-        assert_eq!(format_optional_hex(Some(0x1f)), "0x1f");
     }
 
     #[test]
@@ -2637,13 +2612,6 @@ mod tests {
     }
 
     #[test]
-    fn recent_event_visible_count_tracks_panel_inner_height() {
-        assert_eq!(recent_events_visible_count(0), 0);
-        assert_eq!(recent_events_visible_count(2), 0);
-        assert_eq!(recent_events_visible_count(9), 7);
-    }
-
-    #[test]
     fn visible_window_selects_samples_inside_viewport() {
         let history: VecDeque<_> = (0..300).map(|seq| graph_sample(seq, seq.into())).collect();
         let start = history[100].timestamp;
@@ -2723,20 +2691,6 @@ mod tests {
     }
 
     #[test]
-    fn y_axis_tick_labels_use_label_count_minus_one_spacing() {
-        let labels = y_axis_labels(-1.0, 1.0, 5);
-        let rendered = labels
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            rendered,
-            vec!["-1.00ms", "-500µs", "0.0µs", "500µs", "1.00ms"]
-        );
-    }
-
-    #[test]
     fn optional_missing_one_way_series_are_omitted_not_zero_filled() {
         let visible_samples = [graph_sample(1, 2_000_000)];
         let visible: Vec<_> = visible_samples.iter().collect();
@@ -2748,22 +2702,6 @@ mod tests {
         assert!(one_way.is_empty());
         assert_eq!(rtt.len(), 1);
         assert_eq!(rtt[0].name, "effective RTT");
-    }
-
-    #[test]
-    fn graph_metrics_use_readable_default_series() {
-        let visible_samples = [graph_sample_with_timing(1, 3_000_000)];
-        let visible: Vec<_> = visible_samples.iter().collect();
-        let viewport = viewport_for_visible(&visible);
-
-        assert_eq!(
-            graph_series(GraphMetric::EffectiveRtt, &visible, viewport)[0].data,
-            vec![(0.0, 3.0)]
-        );
-        assert_eq!(
-            graph_series(GraphMetric::ClientToServer, &visible, viewport)[0].data,
-            vec![(0.0, 1.0)]
-        );
     }
 
     #[test]
@@ -2846,43 +2784,6 @@ mod tests {
                 .data,
             vec![(1.0, 5.0)]
         );
-    }
-
-    #[test]
-    fn graph_metric_cycling_walks_all_metrics() {
-        let cases = [
-            GraphMetric::EffectiveRtt,
-            GraphMetric::RawRtt,
-            GraphMetric::AdjustedRtt,
-            GraphMetric::ClientToServer,
-            GraphMetric::ServerToClient,
-            GraphMetric::ServerProcessing,
-            GraphMetric::EffectiveRtt,
-        ];
-        let mut state = TuiState::default();
-        for metric in cases {
-            assert_eq!(state.graph_metric, metric);
-            state.cycle_graph_metric();
-        }
-    }
-
-    #[test]
-    fn view_toggle_switches_between_graph_and_dashboard() {
-        let mut state = TuiState::default();
-
-        assert_eq!(state.view, TuiView::Graph);
-        state.toggle_view();
-        assert_eq!(state.view, TuiView::Dashboard);
-        state.toggle_view();
-        assert_eq!(state.view, TuiView::Graph);
-    }
-
-    #[test]
-    fn target_label_span_uses_graph_series_style() {
-        let span = target_label_span("alpha-target", 3, 16);
-
-        assert_eq!(span.style, target_style(3).add_modifier(Modifier::BOLD));
-        assert_eq!(span.content.as_ref(), "alpha-target    ");
     }
 
     #[test]

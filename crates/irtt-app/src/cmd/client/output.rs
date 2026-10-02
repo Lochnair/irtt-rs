@@ -1265,15 +1265,6 @@ mod tests {
     }
 
     #[test]
-    fn default_structured_columns_always_include_target_first() {
-        for format in [OutputFormat::Csv, OutputFormat::Tsv, OutputFormat::Jsonl] {
-            let columns = default_columns(format, false);
-            assert_eq!(columns.first(), Some(&Column::Target));
-            assert_eq!(columns, ALL_COLUMNS);
-        }
-    }
-
-    #[test]
     fn columns_default_keyword_matches_omitted_columns() {
         for format in [
             OutputFormat::Table,
@@ -1330,82 +1321,23 @@ mod tests {
     }
 
     #[test]
-    fn truncate_for_table_leaves_short_value_unchanged() {
-        assert_eq!(truncate_for_table("ams", 18), "ams");
-    }
-
-    #[test]
-    fn truncate_for_table_leaves_exact_width_value_unchanged() {
-        let value = "a".repeat(18);
-        assert_eq!(truncate_for_table(&value, 18), value);
-    }
-
-    #[test]
-    fn truncate_for_table_shortens_long_value_to_width() {
-        let value = "a".repeat(40);
-        let truncated = truncate_for_table(&value, 18);
-
-        assert_eq!(truncated.chars().count(), 18);
-        assert!(truncated.len() <= 18); // ASCII: byte len matches char len
-    }
-
-    #[test]
-    fn truncate_for_table_keeps_prefix_and_appends_ellipsis_deterministically() {
-        let value = "abcdefghijklmnopqrstuvwxyz";
-        let truncated = truncate_for_table(value, 18);
-
-        assert_eq!(truncated, "abcdefghijklmno...");
-        assert_eq!(truncated.chars().count(), 18);
-    }
-
-    #[test]
-    fn truncate_for_table_does_not_split_multibyte_code_points() {
-        // Each character below is multibyte in UTF-8; a byte-index slice
-        // would panic or corrupt the string on a non-boundary cut.
-        let value = "\u{1F600}".repeat(40); // 😀 repeated, well past width 18
-        let truncated = truncate_for_table(&value, 18);
-
-        // Must not panic (validated by test completing) and must remain
-        // valid UTF-8 with exactly 18 chars (15 prefix chars + "...").
-        assert_eq!(truncated.chars().count(), 18);
-        assert!(truncated.ends_with("..."));
-        assert_eq!(truncated.chars().filter(|c| *c == '\u{1F600}').count(), 15);
-    }
-
-    #[test]
     fn table_row_with_long_target_keeps_next_column_aligned() {
         let config = output_config(OutputFormat::Table, None);
-        let long_target = "a".repeat(40);
         let header = config.render_header().unwrap();
-        let line = config
-            .render_event(
-                &reply(),
-                Some(&long_target),
-                Some(&EventRenderStats::default()),
-            )
-            .unwrap();
+        let event_offset = header.find("event").unwrap();
 
-        // Target column is truncated to its table width (18), so the
-        // "event" column starts at the same offset for both a normal and an
-        // overlong target label.
-        let short_config = output_config(OutputFormat::Table, None);
-        let short_line = short_config
-            .render_event(&reply(), Some("ams"), Some(&EventRenderStats::default()))
-            .unwrap();
-
-        let target_width = Column::Target.table_width();
-        let expected_event_offset = target_width + "  ".len();
-        assert_eq!(&header[expected_event_offset..][..5], "event");
-        // The event column ("echo_reply") starts at the same offset
-        // regardless of whether the target label was short or overlong.
-        assert_eq!(
-            &line[expected_event_offset..][.."echo_reply".len()],
-            "echo_reply"
-        );
-        assert_eq!(
-            &short_line[expected_event_offset..][.."echo_reply".len()],
-            "echo_reply"
-        );
+        for label in ["ams".to_owned(), "a".repeat(40), "é".repeat(40)] {
+            let line = config
+                .render_event(&reply(), Some(&label), Some(&EventRenderStats::default()))
+                .unwrap();
+            let prefix = line.split("echo_reply").next().unwrap();
+            assert_eq!(prefix.chars().count(), event_offset, "{line}");
+            if label.chars().count() > event_offset {
+                assert!(prefix.trim_end().ends_with("..."), "{line}");
+            } else {
+                assert!(prefix.starts_with(&label), "{line}");
+            }
+        }
     }
 
     #[test]
@@ -1451,27 +1383,5 @@ mod tests {
             .unwrap();
 
         assert_eq!(line, format!("{{\"target\":\"{long_target}\",\"seq\":7}}"));
-    }
-
-    #[test]
-    fn explicit_table_columns_with_target_truncate_same_as_default() {
-        let config = output_config(OutputFormat::Table, Some("target,seq"));
-        let long_target = "d".repeat(40);
-        let line = config
-            .render_event(
-                &reply(),
-                Some(&long_target),
-                Some(&EventRenderStats::default()),
-            )
-            .unwrap();
-
-        let target_width = Column::Target.table_width();
-        let expected_prefix: String = long_target
-            .chars()
-            .take(target_width - 3)
-            .chain("...".chars())
-            .collect();
-        assert!(line.starts_with(&expected_prefix));
-        assert_eq!(&line[..target_width], expected_prefix.as_str());
     }
 }

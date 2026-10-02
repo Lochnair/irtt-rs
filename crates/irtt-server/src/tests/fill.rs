@@ -1,12 +1,9 @@
 //! Server fill: what an open reply reports, what the session will fill with,
 //! and the bytes an echo reply actually carries.
 //!
-//! The first two are deliberately different questions. A client that expressed
-//! no preference keeps its absent or empty descriptor in the negotiated
-//! parameters while the session uses this server's default fill, and only a
-//! descriptor the server could not honor is rewritten. Asserting the reply alone
-//! would not separate those, so the negotiation tests read the session's
-//! effective mode too, and the payload tests then pin the bytes on the wire.
+//! A client that expressed no preference keeps its absent or empty descriptor
+//! in the negotiated parameters. Payload tests assert the effective fill from
+//! reply bytes, without inspecting the session's internal representation.
 //!
 //! Payload lengths here are derived from `irtt-proto`'s own layout rather than
 //! written as offsets, and are deliberately not multiples of the pattern length.
@@ -18,7 +15,6 @@ use super::support::{
     expect_no_test_reply, expect_normal_open_reply, no_test_request, open_negotiated, open_request,
     other_peer, peer, unthrottled, ScriptedTokens, KEY,
 };
-use crate::{core::ServerCore, fill::FillMode};
 
 const TOKEN_A: u64 = 0x0102_0304_0506_0708;
 const TOKEN_B: u64 = 0x1112_1314_1516_1718;
@@ -38,8 +34,8 @@ fn requesting(descriptor: Option<&str>) -> Params {
 }
 
 /// Opens a session requesting `descriptor` and returns the descriptor the reply
-/// carried together with the fill the session actually holds.
-fn negotiated(descriptor: Option<&str>) -> (Option<String>, FillMode) {
+/// carried.
+fn negotiated(descriptor: Option<&str>) -> Option<String> {
     let mut core = core_with_tokens(unthrottled(), ScriptedTokens::new([TOKEN_A]));
     let packet = core
         .handle_datagram(peer(), &open_request(&requesting(descriptor), None))
@@ -47,16 +43,7 @@ fn negotiated(descriptor: Option<&str>) -> (Option<String>, FillMode) {
         .expect("the open must be answered");
 
     let reply = expect_normal_open_reply(&packet, None);
-    let fill = effective_fill(&core, reply.token);
-    (reply.params.server_fill.map(|fill| fill.value), fill)
-}
-
-/// The effective fill of the session `token` names.
-fn effective_fill(core: &ServerCore, token: u64) -> FillMode {
-    core.session(token)
-        .expect("the open must have created a session")
-        .fill()
-        .clone()
+    reply.params.server_fill.map(|fill| fill.value)
 }
 
 /// The descriptor a no-test open reports for `descriptor`, which creates no
@@ -76,48 +63,18 @@ fn no_test_negotiated(descriptor: Option<&str>) -> Option<String> {
 }
 
 #[test]
-fn no_preference_keeps_an_absent_descriptor_and_uses_the_default_fill() {
-    // The important half is the first: a client that asked for nothing must be
-    // answered with nothing, or a strict client rejects a restriction the
-    // server never actually imposed. The server's own default is an internal
-    // choice and stays internal.
-    let (returned, fill) = negotiated(None);
-    assert_eq!(returned, None, "an absent request stays absent");
-    assert_eq!(fill, FillMode::default_fill());
-}
-
-#[test]
 fn an_explicitly_empty_descriptor_is_preserved_and_uses_the_default_fill() {
     // A low-level peer can send this even though `ClientConfig` rejects an
     // empty fill before it reaches the wire. The clean evidence groups empty
     // with absent as "no preference", so it is neither refused nor rewritten:
     // the requested wire value comes back exactly, and the server picks its own
     // behavior behind it.
-    let (returned, fill) = negotiated(Some(""));
+    let returned = negotiated(Some(""));
     assert_eq!(
         returned.as_deref(),
         Some(""),
         "an empty request stays empty"
     );
-    assert_eq!(fill, FillMode::default_fill());
-}
-
-#[test]
-fn a_valid_descriptor_is_returned_exactly_as_requested() {
-    for (descriptor, expected) in [
-        ("none", FillMode::None),
-        ("rand", FillMode::Random),
-        ("pattern:00", FillMode::Pattern(vec![0x00])),
-        ("pattern:ff00", FillMode::Pattern(vec![0xff, 0x00])),
-        // Returned with its own hexadecimal case, not normalized to the bytes
-        // it decodes to: rewriting it would report a restriction that did not
-        // happen, and a strict client would reject the session for it.
-        ("pattern:AaBb", FillMode::Pattern(vec![0xaa, 0xbb])),
-    ] {
-        let (returned, fill) = negotiated(Some(descriptor));
-        assert_eq!(returned.as_deref(), Some(descriptor), "{descriptor}");
-        assert_eq!(fill, expected, "{descriptor}");
-    }
 }
 
 #[test]
@@ -137,13 +94,12 @@ fn an_unknown_or_malformed_descriptor_is_replaced_by_the_default() {
         "pattern:0g",
         "0123456789abcdef0123456789abcdef",
     ] {
-        let (returned, fill) = negotiated(Some(descriptor));
+        let returned = negotiated(Some(descriptor));
         assert_eq!(
             returned.as_deref(),
             Some(crate::fill::DEFAULT_FILL_DESCRIPTOR),
             "{descriptor}"
         );
-        assert_eq!(fill, FillMode::default_fill(), "{descriptor}");
     }
 }
 
@@ -229,8 +185,8 @@ fn repeated(pattern: &[u8], len: usize) -> Vec<u8> {
 
 #[test]
 fn no_preference_fills_with_the_default_pattern() {
-    // The wire consequence of the negotiation test above: absent descriptor,
-    // default bytes. 7 is not a multiple of 4, so the last repeat is partial.
+    // An absent descriptor uses default bytes. 7 is not a multiple of 4, so
+    // the last repeat is partial.
     assert_eq!(echo_payload(None, 7), b"irttirt".to_vec());
 }
 

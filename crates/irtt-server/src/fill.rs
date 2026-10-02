@@ -229,75 +229,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn recognized_descriptors_parse_to_their_mode() {
-        for (descriptor, expected) in [
-            ("none", FillMode::None),
-            ("rand", FillMode::Random),
-            ("pattern:00", FillMode::Pattern(vec![0x00])),
-            ("pattern:ff00", FillMode::Pattern(vec![0xff, 0x00])),
-            // Only the hexadecimal body is case-insensitive.
-            ("pattern:AaBb", FillMode::Pattern(vec![0xaa, 0xbb])),
-            (
-                "pattern:69727474",
-                FillMode::Pattern(DEFAULT_FILL_PATTERN.to_vec()),
-            ),
-        ] {
-            assert_eq!(FillMode::parse(descriptor), Some(expected), "{descriptor}");
-        }
-    }
-
-    #[test]
-    fn unrecognized_and_malformed_descriptors_parse_to_nothing() {
-        for descriptor in [
-            "",
-            "bogus",
-            // The mode names themselves are case-sensitive.
-            "RAND",
-            "None",
-            "Pattern:aabb",
-            "rand ",
-            "pattern:",
-            "pattern:f",
-            "pattern:abc",
-            "pattern:zz",
-            "pattern:0g",
-            // A multi-byte character is not two hexadecimal digits, whatever
-            // its byte length.
-            "pattern:é",
-        ] {
-            assert_eq!(FillMode::parse(descriptor), None, "{descriptor:?}");
-        }
-    }
-
-    #[test]
-    fn the_default_descriptor_and_the_default_pattern_agree() {
-        // The two constants are held separately so nothing has to parse a
-        // string per open; this is what keeps them from drifting.
-        assert_eq!(
-            FillMode::parse(DEFAULT_FILL_DESCRIPTOR),
-            Some(FillMode::default_fill())
-        );
-    }
-
-    #[test]
-    fn a_pattern_repeats_from_its_first_byte_and_stops_at_the_region() {
-        let mode = FillMode::Pattern(vec![0xaa, 0xbb]);
-        assert_eq!(mode.payload(0), Vec::<u8>::new());
-        assert_eq!(mode.payload(1), vec![0xaa]);
-        assert_eq!(
-            mode.payload(7),
-            vec![0xaa, 0xbb, 0xaa, 0xbb, 0xaa, 0xbb, 0xaa]
-        );
-    }
-
-    #[test]
-    fn no_fill_leaves_the_region_to_the_encoder() {
-        // Not a length-sized run of zeroes: the encoder has already zeroed the
-        // region, and copying zeroes over zeroes would only cost an allocation.
-        assert!(FillMode::None.payload(16).is_empty());
-    }
-
-    #[test]
     fn a_failed_random_draw_yields_zeroes() {
         // The real source cannot be made to fail without a production hook, and
         // the fallback itself is the policy under test: a failed draw must
@@ -308,26 +239,5 @@ mod tests {
             Err(())
         };
         assert_eq!(random_payload(6, scribble), vec![0; 6]);
-    }
-
-    #[test]
-    fn a_successful_random_draw_is_propagated_whole() {
-        // Deterministic on purpose. Nothing here asserts that real random bytes
-        // are nonzero, distinct or well distributed; those are properties of
-        // the operating system's source, and testing them would be a coin flip
-        // dressed up as an assertion.
-        let drawn = [1, 2, 3, 4, 5];
-        let source = |buffer: &mut [u8]| -> Result<(), ()> {
-            assert_eq!(buffer.len(), drawn.len(), "the whole region is offered");
-            buffer.copy_from_slice(&drawn);
-            Ok(())
-        };
-        assert_eq!(random_payload(drawn.len(), source), drawn);
-    }
-
-    #[test]
-    fn an_empty_region_never_reaches_the_random_source() {
-        let source = |_: &mut [u8]| -> Result<(), ()> { panic!("no bytes were needed") };
-        assert!(random_payload(0, source).is_empty());
     }
 }

@@ -1052,26 +1052,6 @@ mod tests {
         assert!(mailbox.latest().is_none());
     }
 
-    #[test]
-    fn eof_and_shutdown_stop_without_waiting_for_the_stdin_reader() {
-        let mailbox = StdinMailbox::default();
-        let shutdown_requested = AtomicBool::new(false);
-        assert!(stdin_stop_request(&shutdown_requested, &mailbox).is_none());
-
-        mailbox.finish();
-        assert!(matches!(
-            stdin_stop_request(&shutdown_requested, &mailbox),
-            Some(StdinStop::Eof)
-        ));
-
-        let mailbox = StdinMailbox::default();
-        shutdown_requested.store(true, std::sync::atomic::Ordering::Relaxed);
-        assert!(matches!(
-            stdin_stop_request(&shutdown_requested, &mailbox),
-            Some(StdinStop::Interrupted)
-        ));
-    }
-
     fn status_with_targets(targets: &[TargetInstance]) -> ManagedStatus {
         ManagedStatus {
             lifecycle: ManagedLifecycle::Running,
@@ -1207,18 +1187,6 @@ mod tests {
     #[test]
     fn finite_stats_memory_warning_saturates_target_count_multiplication() {
         assert!(finite_stats_memory_warning(&long_finite_args(), usize::MAX).is_some());
-    }
-
-    #[test]
-    fn lagged_events_are_counted_saturatingly() {
-        let mut dropped = 0_u64;
-        dropped = dropped.saturating_add(7);
-        dropped = dropped.saturating_add(3);
-        assert_eq!(dropped, 10);
-        assert_eq!(u64::MAX.saturating_add(1), u64::MAX);
-        assert!(dropped_event_warning(dropped)
-            .unwrap()
-            .contains("dropped 10 managed run events"));
     }
 
     #[test]

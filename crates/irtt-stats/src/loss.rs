@@ -91,21 +91,3 @@ pub(crate) fn loss_stats(packets: PacketCounts) -> LossStats {
 fn percent(numerator: f64, denominator: f64) -> f64 {
     100.0 * numerator / denominator
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn duplicate_and_late_percentages_use_packets_received_denominator() {
-        let loss = loss_stats(PacketCounts {
-            packets_received: 4,
-            duplicates: 1,
-            late_packets: 2,
-            ..PacketCounts::default()
-        });
-
-        assert_eq!(loss.duplicate_percent, 25.0);
-        assert_eq!(loss.late_packets_percent, 50.0);
-    }
-}

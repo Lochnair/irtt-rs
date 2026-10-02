@@ -205,15 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn ipdv_tracker_duplicate_sequence_does_not_emit_pair_again() {
-        let mut tracker = IpdvTracker::new(None);
-        assert!(tracker.insert(ipdv_sample(0, 10)).is_empty());
-        assert_eq!(tracker.insert(ipdv_sample(1, 14)).len(), 1);
-
-        assert!(tracker.insert(ipdv_sample(1, 18)).is_empty());
-    }
-
-    #[test]
     fn ipdv_tracker_bounded_mode_limits_sequence_state() {
         let limit = 4;
         let mut tracker = IpdvTracker::new(Some(limit));

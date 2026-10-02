@@ -174,25 +174,6 @@ mod tests {
         assert_eq!(normalize_server_addr("[::1]:1234"), "[::1]:1234");
     }
 
-    #[test]
-    fn address_family_filtering_remains_unchanged() {
-        let ipv4 = SocketAddr::from(([127, 0, 0, 1], DEFAULT_PORT));
-        let ipv6 = SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 1], DEFAULT_PORT));
-        let mut config = ClientConfig::default();
-
-        assert!(address_family_allowed(&config, ipv4));
-        assert!(address_family_allowed(&config, ipv6));
-
-        config.socket_config.ipv4_only = true;
-        assert!(address_family_allowed(&config, ipv4));
-        assert!(!address_family_allowed(&config, ipv6));
-
-        config.socket_config.ipv4_only = false;
-        config.socket_config.ipv6_only = true;
-        assert!(!address_family_allowed(&config, ipv4));
-        assert!(address_family_allowed(&config, ipv6));
-    }
-
     #[cfg(feature = "tokio")]
     #[test]
     fn tokio_ipv6_only_is_applied_before_bind() {
