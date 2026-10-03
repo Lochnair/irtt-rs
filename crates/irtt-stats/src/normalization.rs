@@ -118,10 +118,9 @@ pub(crate) fn normalize_event(event: &ClientEvent) -> Option<StatsEvent> {
             // `timeout_at` is anchored to the pre-send probe timestamp (see
             // irtt-client's AGENTS.md), so it can precede this same probe's
             // own post-send `sent_at` when a probe_timeout is small relative
-            // to the send-call duration. Rolling-window eviction assumes
-            // events are pushed in non-decreasing `at()` order, so clamp to
-            // `sent_at` to preserve that invariant without changing the
-            // public `timeout_at` value on the event itself.
+            // to the send-call duration. Clamp to `sent_at` so the loss is
+            // not earlier than its own send. Delayed timeout discovery can
+            // still put it before other probes' events.
             at: (*timeout_at).max(sent_at.mono),
         }),
         ClientEvent::Warning { at, .. } => Some(StatsEvent::Warning { at: at.mono }),

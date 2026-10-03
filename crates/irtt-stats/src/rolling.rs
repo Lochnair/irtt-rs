@@ -1,4 +1,7 @@
-use std::{collections::VecDeque, time::Duration};
+use std::{
+    collections::VecDeque,
+    time::{Duration, Instant},
+};
 
 use measurement_stats::CountWindow;
 
@@ -11,6 +14,7 @@ pub(crate) struct RollingEvents {
     time_limit: Option<Duration>,
     count_events: Option<CountWindow<StatsEvent>>,
     time_events: Option<VecDeque<StatsEvent>>,
+    time_anchor: Option<Instant>,
     late_replies: LateReplyMode,
 }
 
@@ -20,6 +24,7 @@ impl RollingEvents {
             time_limit: config.rolling_time,
             count_events: config.rolling_count.map(CountWindow::new),
             time_events: config.rolling_time.map(|_| VecDeque::new()),
+            time_anchor: None,
             late_replies: config.late_replies,
         }
     }
@@ -30,12 +35,14 @@ impl RollingEvents {
         }
 
         if let (Some(duration), Some(window)) = (self.time_limit, self.time_events.as_mut()) {
-            let cutoff = event.at().checked_sub(duration);
+            let anchor = self.time_anchor.map_or(event.at(), |at| at.max(event.at()));
+            self.time_anchor = Some(anchor);
+            let cutoff = anchor.checked_sub(duration);
             window.push_back(event);
             if let Some(cutoff) = cutoff {
-                while window.front().is_some_and(|event| event.at() < cutoff) {
-                    window.pop_front();
-                }
+                // Delayed timeout discovery can backdate events behind newer
+                // ones. Filter the whole window, preserving replay order.
+                window.retain(|event| event.at() >= cutoff);
             }
         }
     }

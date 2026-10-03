@@ -513,6 +513,53 @@ fn rolling_time_eviction_uses_event_timestamps() {
 }
 
 #[test]
+fn rolling_time_expires_delayed_losses_without_moving_backwards() {
+    let base = Instant::now();
+    let at = |ms| ClientTimestamp {
+        mono: base + Duration::from_millis(ms),
+        wall: UNIX_EPOCH + Duration::from_millis(ms),
+    };
+    let mut collector = StatsCollector::new(StatsConfig {
+        rolling_count: Some(2),
+        rolling_time: Some(Duration::from_millis(3)),
+        ..StatsConfig::continuous()
+    });
+    collector.process(&sent(0, at(1)));
+    collector.process(&sent(1, at(2)));
+    collector.process(&sent(2, at(5)));
+    // Timeout polling discovers probe 0's deadline after the later send.
+    collector.process(&ClientEvent::EchoLoss {
+        seq: 0,
+        sent_at: at(1),
+        timeout_at: at(4).mono,
+    });
+    assert_eq!(collector.rolling_time().unwrap().events.loss_events, 1);
+
+    collector.process(&sent(3, at(8)));
+    let rolling = collector.rolling_time().unwrap();
+    // The cutoff is inclusive: the send at 5 remains, the loss at 4 expires.
+    assert_eq!(rolling.events.loss_events, 0);
+    assert_eq!(rolling.packets.packets_sent, 2);
+    assert_eq!(rolling.send_call.count, 2);
+
+    collector.process(&sent(4, at(9)));
+    let rolling = collector.rolling_time().unwrap();
+    assert_eq!(rolling.packets.packets_sent, 2);
+    // Another delayed timeout is already outside the window when discovered.
+    collector.process(&ClientEvent::EchoLoss {
+        seq: 1,
+        sent_at: at(2),
+        timeout_at: at(5).mono,
+    });
+    assert_eq!(collector.rolling_time().unwrap(), rolling);
+    // Time expiry does not change cumulative or arrival-count accounting.
+    assert_eq!(collector.snapshot().packets.packets_sent, 5);
+    assert_eq!(collector.snapshot().events.loss_events, 2);
+    assert_eq!(collector.rolling_count().unwrap().events.loss_events, 1);
+    assert_eq!(collector.rolling_count().unwrap().packets.packets_sent, 1);
+}
+
+#[test]
 fn empty_and_all_lost_edges_are_defined() {
     let empty = StatsCollector::new(StatsConfig::finite()).snapshot();
     assert_eq!(empty.loss.packet_loss_percent, 0.0);

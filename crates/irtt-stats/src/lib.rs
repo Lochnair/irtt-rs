@@ -58,7 +58,9 @@ pub struct StatsConfig {
     ///
     /// This window has no item cap, even in continuous mode. Its memory depends
     /// on event volume inside the interval. Expiry occurs on insertion, anchored
-    /// at the latest event timestamp, not when a snapshot is read.
+    /// at the maximum observed normalized event timestamp, not when a snapshot
+    /// is read. Events exactly at the cutoff are included. Backdated events
+    /// cannot move the anchor backwards or restore expired history.
     pub rolling_time: Option<Duration>,
     /// Whether matched late replies contribute measurements.
     pub late_replies: LateReplyMode,

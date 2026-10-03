@@ -1,6 +1,6 @@
 //! Independent count and time windows must match a filtered replay through
 //! StatsCollector, while cumulative accounting retains the complete history.
-//! Generated events have non-decreasing normalized window timestamps.
+//! Includes delayed timeout discovery with backdated window timestamps.
 
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -12,8 +12,8 @@ use irtt_stats::{LateReplyMode, SampleMode, Snapshot, StatsCollector, StatsConfi
 use proptest::prelude::*;
 
 /// One generated operation. `Advance` moves the shared monotonic clock
-/// forward without producing an event; every other variant produces exactly
-/// one normalized event at the clock's current value.
+/// forward without producing an event; other variants produce a normalized
+/// event, with delayed losses timestamped before the clock's current value.
 #[derive(Debug, Clone)]
 enum Op {
     /// Advance the shared clock by this many milliseconds.
@@ -30,6 +30,8 @@ enum Op {
     Duplicate,
     /// A probe timeout / loss.
     Loss,
+    /// A timeout discovered this many milliseconds after its deadline.
+    DelayedLoss { age_ms: u16 },
     /// A diagnostic warning event.
     Warning,
 }
@@ -43,6 +45,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         1 => Just(Op::LateReplyUnmatched),
         1 => Just(Op::Duplicate),
         2 => Just(Op::Loss),
+        2 => (0u16..100).prop_map(|age_ms| Op::DelayedLoss { age_ms }),
         1 => Just(Op::Warning),
     ]
 }
@@ -83,8 +86,8 @@ fn one_way(seq: u32) -> OneWayDelaySample {
 }
 
 /// Builds the `ClientEvent` for one non-`Advance` op. `clock_ms` is the
-/// shared clock's current value, used as the event's windowing timestamp
-/// (`at()`, see `normalization.rs`) for every variant.
+/// shared clock's current value; delayed losses use their earlier deadline
+/// as the event's windowing timestamp.
 fn build_event(op: &Op, seq: u32, clock_ms: u64, base: Instant) -> ClientEvent {
     match *op {
         Op::Advance(_) => unreachable!("Advance does not produce an event"),
@@ -172,6 +175,14 @@ fn build_event(op: &Op, seq: u32, clock_ms: u64, base: Instant) -> ClientEvent {
             sent_at: ts_at(base, clock_ms),
             timeout_at: ts_at(base, clock_ms).mono - Duration::from_millis(10),
         },
+        Op::DelayedLoss { age_ms } => {
+            let deadline_ms = clock_ms.saturating_sub(u64::from(age_ms));
+            ClientEvent::EchoLoss {
+                seq,
+                sent_at: ts_at(base, deadline_ms.saturating_sub(3)),
+                timeout_at: ts_at(base, deadline_ms).mono,
+            }
+        }
         Op::Warning => ClientEvent::Warning {
             kind: irtt_client::WarningKind::UntrackedReply,
             message: "generated".to_owned(),
@@ -245,7 +256,11 @@ proptest! {
                 let seq = u32::try_from(idx).unwrap();
                 let event = build_event(op, seq, clock_ms, base);
                 collector.process(&event);
-                history.push((event, clock_ms));
+                let at_ms = match op {
+                    Op::DelayedLoss { age_ms } => clock_ms.saturating_sub(u64::from(*age_ms)),
+                    _ => clock_ms,
+                };
+                history.push((event, at_ms));
             }
 
             // Cumulative snapshot: unaffected by rolling eviction, so it must
@@ -271,13 +286,10 @@ proptest! {
             );
 
             // Time window reference: every retained event whose timestamp is
-            // within `time_limit_ms` of the *latest processed event's*
-            // timestamp, ignoring the count bound entirely. This recompute-
-            // from-scratch filter is equivalent to the production window's
-            // incremental sliding-eviction only because `clock_ms` is
-            // non-decreasing across pushes (enforced by construction above:
-            // `Advance` never subtracts).
-            if let Some((_, latest_at_ms)) = history.last() {
+            // within `time_limit_ms` of the maximum observed event timestamp,
+            // ignoring the count bound entirely. Delayed losses cannot move
+            // this anchor backwards.
+            if let Some(latest_at_ms) = history.iter().map(|(_, at_ms)| at_ms).max() {
                 let cutoff = latest_at_ms.checked_sub(time_limit_ms);
                 let time_ref: Vec<ClientEvent> = history
                     .iter()
