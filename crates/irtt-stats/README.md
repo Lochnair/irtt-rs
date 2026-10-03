@@ -32,8 +32,10 @@ unbounded sessions. Rolling-window snapshots are always running-only and
 report no medians, whichever `StatsConfig` produced them.
 
 An enabled time-based rolling window has no event-count cap, including in
-continuous mode. It expires only on new events, anchored at their timestamps;
-reading a snapshot does not advance time. Use count-based rolling storage for a
+continuous mode. It expires only on new events, anchored at the maximum observed
+normalized timestamp, with events exactly at the cutoff retained. Retained events
+are replayed in arrival order; backdated events cannot move the window backwards.
+Reading a snapshot does not advance time. Use count-based rolling storage for a
 hard bound on retained events. The memory estimate excludes time-window storage.
 
 Exact snapshots sort a temporary copy of each metric's retained samples, adding
