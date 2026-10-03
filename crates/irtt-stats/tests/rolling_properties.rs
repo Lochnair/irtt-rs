@@ -221,12 +221,13 @@ fn collector_equality_ignores_expired_time_window_bookkeeping() {
     };
     let mut left = StatsCollector::new(config);
     let mut right = StatsCollector::new(config);
-    for at_ms in [1, 10] {
+    for at_ms in [1, 2, 4, 5, 6] {
         left.process(&build_event(&Op::Warning, 0, at_ms, base));
     }
-    for at_ms in [10, 1] {
+    for at_ms in [1, 4, 2, 5, 6] {
         right.process(&build_event(&Op::Warning, 0, at_ms, base));
     }
+    // Different expired histories leave the same live events in arrival order.
     assert_eq!(left.snapshot(), right.snapshot());
     assert_eq!(left.rolling_time(), right.rolling_time());
     assert_eq!(left, right);
@@ -288,7 +289,7 @@ proptest! {
     fn rolling_count_and_rolling_time_windows_are_independent(
         ops in prop::collection::vec(op_strategy(), 1..40),
         count_limit in 1usize..6,
-        time_limit_ms in 1u64..80,
+        time_limit_ms in 0u64..80,
         count_only in prop::bool::ANY,
     ) {
         let late_replies = if count_only {

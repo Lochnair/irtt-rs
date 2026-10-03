@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, VecDeque},
+    collections::{BTreeMap, BTreeSet},
     time::{Duration, Instant},
 };
 
@@ -9,22 +9,24 @@ use crate::{
     core::CoreStats, normalization::StatsEvent, LateReplyMode, SampleMode, Snapshot, StatsConfig,
 };
 
+type ArrivalKey = (Instant, usize);
+
 #[derive(Debug, Clone)]
 pub(crate) struct RollingEvents {
     time_limit: Option<Duration>,
     count_events: Option<CountWindow<StatsEvent>>,
-    time_events: Option<VecDeque<Option<StatsEvent>>>,
-    time_expiry: BTreeSet<(Instant, usize)>,
-    time_front: usize,
+    // Both indexes contain exactly the live events; expiry removes from both.
+    time_events: Option<BTreeMap<ArrivalKey, StatsEvent>>,
+    time_expiry: BTreeSet<(Instant, ArrivalKey)>,
     time_anchor: Option<Instant>,
     late_replies: LateReplyMode,
 }
 
 impl PartialEq for RollingEvents {
     fn eq(&self, other: &Self) -> bool {
-        // Expiry ordinals and tombstones are bookkeeping, not retained events.
+        // Arrival keys are bookkeeping, not retained events.
         let same_time_events = match (&self.time_events, &other.time_events) {
-            (Some(left), Some(right)) => left.iter().flatten().eq(right.iter().flatten()),
+            (Some(left), Some(right)) => left.values().eq(right.values()),
             (None, None) => true,
             _ => false,
         };
@@ -41,9 +43,8 @@ impl RollingEvents {
         Self {
             time_limit: config.rolling_time,
             count_events: config.rolling_count.map(CountWindow::new),
-            time_events: config.rolling_time.map(|_| VecDeque::new()),
+            time_events: config.rolling_time.map(|_| BTreeMap::new()),
             time_expiry: BTreeSet::new(),
-            time_front: 0,
             time_anchor: None,
             late_replies: config.late_replies,
         }
@@ -61,23 +62,19 @@ impl RollingEvents {
             if let Some(cutoff) = cutoff {
                 // Expiry uses timestamp order; replay keeps arrival order.
                 while self.time_expiry.first().is_some_and(|(at, _)| *at < cutoff) {
-                    let (_, ordinal) = self.time_expiry.pop_first().unwrap();
-                    window[ordinal.wrapping_sub(self.time_front)] = None;
-                }
-                while window.front().is_some_and(Option::is_none) {
-                    window.pop_front();
-                    self.time_front = self.time_front.wrapping_add(1);
+                    let (_, arrival) = self.time_expiry.pop_first().unwrap();
+                    window.remove(&arrival);
                 }
                 if event.at() < cutoff {
                     return;
                 }
             }
-            // Logical deque positions allow constant-time expiry lookup. The
-            // queue cannot hold enough slots for live ordinals to alias, so
-            // wrapping arithmetic also handles a long-running ordinal rollover.
-            let ordinal = self.time_front.wrapping_add(window.len());
-            self.time_expiry.insert((event.at(), ordinal));
-            window.push_back(Some(event));
+            // Within one anchor, no accepted event expires, so length orders
+            // arrivals. A newer anchor sorts after all earlier arrivals even
+            // when expiry reduces the length. No lifetime counter can wrap.
+            let arrival = (anchor, window.len());
+            self.time_expiry.insert((event.at(), arrival));
+            window.insert(arrival, event);
         }
     }
 
@@ -88,9 +85,9 @@ impl RollingEvents {
     }
 
     pub(crate) fn time_snapshot(&self) -> Option<Snapshot> {
-        self.time_events.as_ref().map(|events| {
-            snapshot_window(events.iter().filter_map(Option::as_ref), self.late_replies)
-        })
+        self.time_events
+            .as_ref()
+            .map(|events| snapshot_window(events.values(), self.late_replies))
     }
 }
 
@@ -111,36 +108,63 @@ fn snapshot_window<'a>(
 mod tests {
     use super::*;
 
-    // Storage reclamation and ordinal rollover cannot be observed in snapshots.
+    // Snapshots alone cannot reveal storage or traversal over expired events.
     #[test]
-    fn expired_storage_is_reclaimed_across_ordinal_rollover() {
+    fn expired_interior_batches_are_reclaimed_while_the_front_stays_live() {
         let base = Instant::now();
+        let warning = |seconds| StatsEvent::Warning {
+            at: base + Duration::from_secs(seconds),
+        };
         let mut rolling = RollingEvents::new(StatsConfig {
-            rolling_time: Some(Duration::from_millis(10)),
+            rolling_time: Some(Duration::from_secs(100)),
             ..StatsConfig::continuous()
         });
-        rolling.time_front = usize::MAX - 1;
-        for cycle in 1..=100 {
-            let anchor_ms = cycle * 10;
-            // Each cycle hides an older event behind a newer one, then expires
-            // it while that newer event is still live.
-            for at_ms in [anchor_ms, anchor_ms - 9, anchor_ms + 2] {
-                rolling.push(StatsEvent::Warning {
-                    at: base + Duration::from_millis(at_ms),
-                });
+        rolling.push(warning(100));
+        for second in 0..64 {
+            // A large batch sits exactly on the cutoff behind the live front.
+            for _ in 0..2_048 {
+                rolling.push(warning(second));
             }
-            // Both stores must stay tied to recent volume, not total arrivals.
-            assert!(rolling.time_events.as_ref().unwrap().len() <= 6);
-            assert!(rolling.time_expiry.len() <= 6);
             assert_eq!(
                 rolling.time_snapshot().unwrap().events.warning_events,
-                2 + u64::from(cycle > 1)
+                second + 1 + 2_048
+            );
+            rolling.push(warning(101 + second));
+            // This now-expired arrival must not allocate another retained slot.
+            rolling.push(warning(second));
+            let live = usize::try_from(second + 2).unwrap();
+            assert_eq!(rolling.time_events.as_ref().unwrap().len(), live);
+            assert_eq!(rolling.time_expiry.len(), live);
+            assert_eq!(
+                rolling.time_snapshot().unwrap().events.warning_events,
+                u64::try_from(live).unwrap()
             );
         }
-        rolling.push(StatsEvent::Warning {
-            at: base + Duration::from_millis(2_000),
-        });
+        rolling.push(warning(1_000));
         assert_eq!(rolling.time_events.as_ref().unwrap().len(), 1);
         assert_eq!(rolling.time_expiry.len(), 1);
+    }
+
+    #[test]
+    fn chronological_stream_retains_only_the_current_window() {
+        let base = Instant::now();
+        let window_ms = 16_384;
+        let mut rolling = RollingEvents::new(StatsConfig {
+            rolling_time: Some(Duration::from_millis(window_ms)),
+            ..StatsConfig::continuous()
+        });
+        // Fill a substantial uncapped window, then run through several expiries.
+        for at_ms in 0..4 * window_ms {
+            rolling.push(StatsEvent::Warning {
+                at: base + Duration::from_millis(at_ms),
+            });
+            let live = usize::try_from(at_ms.min(window_ms) + 1).unwrap();
+            assert_eq!(rolling.time_events.as_ref().unwrap().len(), live);
+            assert_eq!(rolling.time_expiry.len(), live);
+        }
+        assert_eq!(
+            rolling.time_snapshot().unwrap().events.warning_events,
+            window_ms + 1
+        );
     }
 }

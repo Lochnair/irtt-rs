@@ -60,7 +60,8 @@ pub struct StatsConfig {
     /// on event volume inside the interval. Expiry occurs on insertion, anchored
     /// at the maximum observed normalized event timestamp, not when a snapshot
     /// is read. Events exactly at the cutoff are included. Backdated events
-    /// cannot move the anchor backwards or restore expired history.
+    /// cannot move the anchor backwards or restore expired history. Retained
+    /// events are replayed in arrival order.
     pub rolling_time: Option<Duration>,
     /// Whether matched late replies contribute measurements.
     pub late_replies: LateReplyMode,
