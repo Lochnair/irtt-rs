@@ -1,6 +1,6 @@
 //! Independent count and time windows must match a filtered replay through
 //! StatsCollector, while cumulative accounting retains the complete history.
-//! Includes delayed timeout discovery with backdated window timestamps.
+//! Includes delayed timeout discovery and replies with backdated timestamps.
 
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
@@ -13,7 +13,7 @@ use proptest::prelude::*;
 
 /// One generated operation. `Advance` moves the shared monotonic clock
 /// forward without producing an event; other variants produce a normalized
-/// event, with delayed losses timestamped before the clock's current value.
+/// event, with delayed events timestamped before the clock's current value.
 #[derive(Debug, Clone)]
 enum Op {
     /// Advance the shared clock by this many milliseconds.
@@ -22,6 +22,8 @@ enum Op {
     Send,
     /// An on-time unique reply with the given client-observed RTT.
     Reply { raw_ms: u16 },
+    /// A reply processed after later events, but timestamped at receipt.
+    DelayedReply { raw_ms: u16, age_ms: u16 },
     /// A late reply matched to retained send state (measurable).
     LateReplyMatched { raw_ms: u16 },
     /// A late reply that could not be matched to retained state.
@@ -41,6 +43,7 @@ fn op_strategy() -> impl Strategy<Value = Op> {
         3 => (0u16..40).prop_map(Op::Advance),
         4 => Just(Op::Send),
         4 => (0u16..60).prop_map(|raw_ms| Op::Reply { raw_ms }),
+        2 => (0u16..60, 0u16..100).prop_map(|(raw_ms, age_ms)| Op::DelayedReply { raw_ms, age_ms }),
         2 => (0u16..60).prop_map(|raw_ms| Op::LateReplyMatched { raw_ms }),
         1 => Just(Op::LateReplyUnmatched),
         1 => Just(Op::Duplicate),
@@ -86,9 +89,13 @@ fn one_way(seq: u32) -> OneWayDelaySample {
 }
 
 /// Builds the `ClientEvent` for one non-`Advance` op. `clock_ms` is the
-/// shared clock's current value; delayed losses use their earlier deadline
-/// as the event's windowing timestamp.
+/// shared clock's current value; delayed events use their earlier deadline or
+/// receipt time as the event's windowing timestamp.
 fn build_event(op: &Op, seq: u32, clock_ms: u64, base: Instant) -> ClientEvent {
+    let clock_ms = match *op {
+        Op::DelayedReply { age_ms, .. } => clock_ms.saturating_sub(u64::from(age_ms)),
+        _ => clock_ms,
+    };
     match *op {
         Op::Advance(_) => unreachable!("Advance does not produce an event"),
         Op::Send => ClientEvent::EchoSent {
@@ -100,7 +107,7 @@ fn build_event(op: &Op, seq: u32, clock_ms: u64, base: Instant) -> ClientEvent {
             send_call: Duration::from_micros(10),
             timer_error: Some(Duration::from_micros(2)),
         },
-        Op::Reply { raw_ms } => {
+        Op::Reply { raw_ms } | Op::DelayedReply { raw_ms, .. } => {
             let sent_at = ts_at(base, clock_ms.saturating_sub(u64::from(raw_ms)));
             let received_at = ts_at(base, clock_ms);
             ClientEvent::EchoReply {
@@ -205,6 +212,65 @@ fn replay(events: &[ClientEvent], late_replies: LateReplyMode) -> Snapshot {
     collector.snapshot()
 }
 
+#[test]
+fn collector_equality_ignores_expired_time_window_bookkeeping() {
+    let base = Instant::now();
+    let config = StatsConfig {
+        rolling_time: Some(Duration::from_millis(3)),
+        ..StatsConfig::continuous()
+    };
+    let mut left = StatsCollector::new(config);
+    let mut right = StatsCollector::new(config);
+    for at_ms in [1, 10] {
+        left.process(&build_event(&Op::Warning, 0, at_ms, base));
+    }
+    for at_ms in [10, 1] {
+        right.process(&build_event(&Op::Warning, 0, at_ms, base));
+    }
+    assert_eq!(left.snapshot(), right.snapshot());
+    assert_eq!(left.rolling_time(), right.rolling_time());
+    assert_eq!(left, right);
+}
+
+#[test]
+fn time_expiry_preserves_arrival_order_for_server_receive_window() {
+    let base = Instant::now();
+    let mut collector = StatsCollector::new(StatsConfig {
+        rolling_time: Some(Duration::from_millis(3)),
+        ..StatsConfig::continuous()
+    });
+    for (seq, at_ms, window) in [(1, 5, 0x5), (0, 4, 0x4)] {
+        let mut event = build_event(&Op::Reply { raw_ms: 1 }, seq, at_ms, base);
+        let ClientEvent::EchoReply { received_stats, .. } = &mut event else {
+            unreachable!();
+        };
+        received_stats.as_mut().unwrap().window = Some(window);
+        collector.process(&event);
+    }
+    // The last arrival owns the observation even with an older receive time.
+    assert_eq!(
+        collector
+            .rolling_time()
+            .unwrap()
+            .packets
+            .server_received_window,
+        Some(0x4)
+    );
+    collector.process(&build_event(&Op::Warning, 2, 8, base));
+    let rolling = collector.rolling_time().unwrap();
+    assert_eq!(rolling.rtt.primary.count, 1);
+    assert_eq!(rolling.packets.server_received_window, Some(0x5));
+    // The hidden, expired observation remains in cumulative accounting.
+    assert_eq!(
+        collector.snapshot().packets.server_received_window,
+        Some(0x4)
+    );
+    collector.process(&build_event(&Op::Warning, 3, 9, base));
+    let rolling = collector.rolling_time().unwrap();
+    assert_eq!(rolling.rtt.primary.count, 0);
+    assert_eq!(rolling.packets.server_received_window, None);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig { cases: 128, .. ProptestConfig::default() })]
 
@@ -257,7 +323,7 @@ proptest! {
                 let event = build_event(op, seq, clock_ms, base);
                 collector.process(&event);
                 let at_ms = match op {
-                    Op::DelayedLoss { age_ms } => clock_ms.saturating_sub(u64::from(*age_ms)),
+                    Op::DelayedLoss { age_ms } | Op::DelayedReply { age_ms, .. } => clock_ms.saturating_sub(u64::from(*age_ms)),
                     _ => clock_ms,
                 };
                 history.push((event, at_ms));
