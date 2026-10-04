@@ -109,7 +109,9 @@ fn hmac_close_success_sends_authenticated_close_and_closes_session() {
     ));
     assert!(matches!(
         client.send_probe(),
-        Err(ClientError::AlreadyClosed)
+        Err(irtt_client::SendProbeError::NotCommitted(
+            ClientError::AlreadyClosed
+        ))
     ));
 
     let observations = server.observations(2);
@@ -175,7 +177,7 @@ fn bad_hmac_echo_reply_is_rejected_without_echo_reply_event() {
     assert_started(outcome, &params);
 
     let sent = client.send_probe().unwrap();
-    assert_eq!(sent.len(), 1);
+    assert_eq!(sent.seq, 0);
     let events = client.recv_once().unwrap();
     assert!(matches!(
         events.as_slice(),
@@ -292,7 +294,7 @@ fn backend_hmac_correct_key_succeeds() {
     assert!(matches!(outcome, OpenOutcome::Started(_)));
 
     let sent = client.send_probe().unwrap();
-    assert_eq!(sent.len(), 1);
+    assert_eq!(sent.seq, 0);
 
     let events = client.recv_once().unwrap();
     assert_eq!(events.len(), 1);

@@ -101,7 +101,9 @@ fn send_probe_fails_after_no_test_completed() {
     assert_no_test_completed(client.open().unwrap());
     assert!(matches!(
         client.send_probe(),
-        Err(ClientError::AlreadyCompleted)
+        Err(irtt_client::SendProbeError::NotCommitted(
+            ClientError::AlreadyCompleted
+        ))
     ));
     server.join();
 }

@@ -17,7 +17,7 @@ use tokio::runtime::{Builder, Runtime};
 mod support;
 
 use irtt_client::{AsyncClient, ClientConfig, ClientError, ClientEvent, OpenOutcome};
-use irtt_client::{Client, RunMode};
+use irtt_client::{Client, RunMode, SendProbeError};
 use irtt_server::ServerConfig;
 use std::{
     io,
@@ -274,6 +274,11 @@ fn recv_before_open_fails_on_first_poll_without_socket_readiness() {
             poll_recv_once(&mut client),
             Poll::Ready(Err(ClientError::NotOpen))
         ));
+        let mut send = Box::pin(client.send_probe());
+        assert!(matches!(
+            poll_once(send.as_mut()),
+            Poll::Ready(Err(SendProbeError::NotCommitted(ClientError::NotOpen)))
+        ));
     });
 }
 
@@ -376,6 +381,13 @@ fn recv_after_local_close_and_no_test_fails_on_first_poll() {
             poll_recv_once(&mut client),
             Poll::Ready(Err(ClientError::AlreadyClosed))
         ));
+        let mut send = Box::pin(client.send_probe());
+        assert!(matches!(
+            poll_once(send.as_mut()),
+            Poll::Ready(Err(SendProbeError::NotCommitted(
+                ClientError::AlreadyClosed
+            )))
+        ));
     });
     assert_eq!(close_server.finish().len(), 2);
 
@@ -390,6 +402,13 @@ fn recv_after_local_close_and_no_test_fails_on_first_poll() {
         assert!(matches!(
             poll_recv_once(&mut client),
             Poll::Ready(Err(ClientError::AlreadyCompleted))
+        ));
+        let mut send = Box::pin(client.send_probe());
+        assert!(matches!(
+            poll_once(send.as_mut()),
+            Poll::Ready(Err(SendProbeError::NotCommitted(
+                ClientError::AlreadyCompleted
+            )))
         ));
     });
     assert_eq!(no_test_server.finish().len(), 1);
@@ -556,7 +575,7 @@ fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
     assert!(!blocking.has_pending_probes());
     let blocking_second = blocking.open().unwrap();
     assert!(!blocking.has_pending_probes());
-    let blocking_sent = blocking.send_probe().unwrap();
+    let blocking_sent = [ClientEvent::from(blocking.send_probe().unwrap())];
     let blocking_reply = blocking.recv_once().unwrap();
     let blocking_close = blocking.close().unwrap();
     assert_eq!(blocking_server.finish().len(), 4);
@@ -572,7 +591,7 @@ fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
             assert!(!client.has_pending_probes());
             let second = client.open().await.unwrap();
             assert!(!client.has_pending_probes());
-            let sent = client.send_probe().await.unwrap();
+            let sent = [ClientEvent::from(client.send_probe().await.unwrap())];
             let reply = client.recv().await.unwrap();
             let closed = client.close().await.unwrap();
             (first, second, sent, reply, closed)
@@ -624,7 +643,7 @@ fn blocking_and_async_complete_every_caller_paced_probe() {
     let mut blocking_sent = Vec::new();
     let mut blocking_replies = Vec::new();
     for _ in 0..PROBES {
-        blocking_sent.extend(blocking.send_probe().unwrap());
+        blocking_sent.push(ClientEvent::from(blocking.send_probe().unwrap()));
         assert!(blocking.has_pending_probes());
         assert!(blocking.next_probe_timeout_deadline().is_some());
         blocking_replies.extend(blocking.recv_once().unwrap());
@@ -644,7 +663,7 @@ fn blocking_and_async_complete_every_caller_paced_probe() {
         let mut sent = Vec::new();
         let mut replies = Vec::new();
         for _ in 0..PROBES {
-            sent.extend(client.send_probe().await.unwrap());
+            sent.push(ClientEvent::from(client.send_probe().await.unwrap()));
             assert!(client.has_pending_probes());
             assert!(client.next_probe_timeout_deadline().is_some());
             replies.extend(client.recv().await.unwrap());

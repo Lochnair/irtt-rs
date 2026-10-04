@@ -72,14 +72,10 @@ async fn exercise_client_server() {
         OpenOutcome::NoTestCompleted(_) => panic!("normal client unexpectedly ran no-test"),
     }
 
-    assert!(matches!(
-        client.send_probe().await.unwrap().as_slice(),
-        [ClientEvent::EchoSent {
-            seq: 0,
-            remote,
-            ..
-        }] if *remote == server_addr
-    ));
+    let receipt = client.send_probe().await.unwrap();
+    assert_eq!(receipt.seq, 0);
+    assert_eq!(receipt.remote, server_addr);
+    assert!(client.has_pending_probes());
     let events = client.recv().await.unwrap();
     let [ClientEvent::EchoReply {
         seq: 0,
@@ -97,6 +93,7 @@ async fn exercise_client_server() {
         panic!("expected a measured reply, got {events:?}");
     };
     assert_eq!(*remote, server_addr);
+    assert_eq!(*sent_at, receipt.sent_at);
     assert_eq!(rtt.raw, received_at.mono.duration_since(sent_at.mono));
     // Verify the measurement endpoint through public reply metadata and real
     // OS timestamps. This also covers the userspace fallback on other targets.

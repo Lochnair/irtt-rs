@@ -10,7 +10,7 @@ use std::{
 use tokio::time;
 
 use crate::{
-    client::{echo_sent_event, validate_datagram_length},
+    client::validate_datagram_length,
     config::ClientConfig,
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
@@ -22,6 +22,7 @@ use crate::{
     socket::{connect_tokio_udp_socket, resolve_remote_tokio},
     socket_options::{apply_traffic_class_to_tokio_socket, clear_dscp_on_tokio_socket},
     timing::ClientTimestamp,
+    SendProbeError, SendReceipt,
 };
 
 /// Maximum amount of immediately available opening work performed by one poll.
@@ -253,8 +254,13 @@ impl AsyncClient {
     ///
     /// A prepared packet is retained across readiness false positives,
     /// cancellation, and socket errors so a later call retries the same logical
-    /// probe without advancing state before kernel acceptance.
-    pub async fn send_probe(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+    /// probe without advancing state before kernel acceptance. Cancellation or
+    /// `WouldBlock` before submission is uncommitted. After acceptance there is
+    /// no suspension before infallible commitment, and the prepared probe is
+    /// cleared even if post-send processing returns [`SendProbeError::AfterCommit`].
+    /// That failure retains the authoritative receipt; earlier failures return
+    /// [`SendProbeError::NotCommitted`].
+    pub async fn send_probe(&mut self) -> Result<SendReceipt, SendProbeError> {
         poll_fn(|cx| self.poll_send_probe(cx)).await
     }
 
@@ -436,14 +442,14 @@ impl AsyncClient {
     pub(crate) fn poll_send_probe(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<Result<Vec<ClientEvent>, ClientError>> {
+    ) -> Poll<Result<SendReceipt, SendProbeError>> {
         if let Err(error) = self.machine.ensure_open() {
-            return Poll::Ready(Err(error));
+            return Poll::Ready(Err(SendProbeError::NotCommitted(error)));
         }
         if self.prepared_probe.is_none() {
             match self.machine.prepare_probe() {
                 Ok(prepared) => self.prepared_probe = Some(prepared),
-                Err(error) => return Poll::Ready(Err(error)),
+                Err(error) => return Poll::Ready(Err(SendProbeError::NotCommitted(error))),
             }
         }
         loop {
@@ -451,7 +457,9 @@ impl AsyncClient {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(error)) => {
-                    return Poll::Ready(Err(ClientError::Socket(error)));
+                    return Poll::Ready(Err(SendProbeError::NotCommitted(ClientError::Socket(
+                        error,
+                    ))));
                 }
             }
 
@@ -461,15 +469,8 @@ impl AsyncClient {
                 .expect("prepared probe was retained across readiness");
             let machine_preflight = match self.machine.preflight_probe_commit(prepared) {
                 Ok(preflight) => preflight,
-                Err(error) => return Poll::Ready(Err(error)),
+                Err(error) => return Poll::Ready(Err(SendProbeError::NotCommitted(error))),
             };
-            let mut events = Vec::new();
-            if let Err(source) = events.try_reserve(1) {
-                return Poll::Ready(Err(ClientError::AllocationFailed {
-                    operation: "probe event result",
-                    source,
-                }));
-            }
             let expected_bytes = prepared.bytes.len();
 
             // Private pre-send anchor: finalizes all fallible commit work
@@ -483,7 +484,7 @@ impl AsyncClient {
                 .finalize_probe_commit(machine_preflight, send_anchor)
             {
                 Ok(commit) => commit,
-                Err(error) => return Poll::Ready(Err(error)),
+                Err(error) => return Poll::Ready(Err(SendProbeError::NotCommitted(error))),
             };
             let send_call_start = Instant::now();
             let send_result = self.socket.try_send(&prepared.bytes);
@@ -497,7 +498,9 @@ impl AsyncClient {
                 }
                 Err(error) => {
                     self.machine.invalidate_kernel_tx_correlation();
-                    return Poll::Ready(Err(ClientError::Socket(error)));
+                    return Poll::Ready(Err(SendProbeError::NotCommitted(ClientError::Socket(
+                        error,
+                    ))));
                 }
             };
             let send_finished_at = Instant::now();
@@ -512,14 +515,26 @@ impl AsyncClient {
             self.prepared_probe = None;
             let send_call = send_finished_at.saturating_duration_since(send_call_start);
 
-            if let Err(error) = validate_datagram_length(expected_bytes, bytes) {
-                return Poll::Ready(Err(error));
+            let receipt = SendReceipt {
+                seq: sent.seq,
+                remote: self.remote,
+                sent_at: sent.sent_at,
+                bytes: sent.bytes,
+                send_call,
+            };
+            if let Err(source) = validate_datagram_length(expected_bytes, bytes) {
+                return Poll::Ready(Err(SendProbeError::AfterCommit {
+                    receipt,
+                    source: Box::new(source),
+                }));
             }
-            if let Err(error) = self.drain_tx_timestamps() {
-                return Poll::Ready(Err(error));
+            if let Err(source) = self.drain_tx_timestamps() {
+                return Poll::Ready(Err(SendProbeError::AfterCommit {
+                    receipt,
+                    source: Box::new(source),
+                }));
             }
-            events.push(echo_sent_event(self.remote, sent, send_call));
-            return Poll::Ready(Ok(events));
+            return Poll::Ready(Ok(receipt));
         }
     }
 

@@ -243,8 +243,7 @@ where
         .unwrap();
     let negotiated = assert_started(client.open().unwrap());
 
-    let sent_events = client.send_probe().unwrap();
-    assert_eq!(sent_events.len(), 1);
+    let receipt = client.send_probe().unwrap();
 
     let reply_events = client.recv_once().unwrap();
     assert_eq!(reply_events.len(), 1);
@@ -254,7 +253,7 @@ where
 
     OneProbeRun {
         negotiated,
-        sent: sent_events.into_iter().next().unwrap(),
+        sent: receipt.into(),
         reply: reply_events.into_iter().next().unwrap(),
         observations,
     }

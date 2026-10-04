@@ -19,7 +19,11 @@
 //! `tokio` feature, `AsyncClient` provides the corresponding low-level Tokio
 //! adapter for a caller that owns a runtime and drives socket readiness
 //! itself. Both adapters send one probe whenever called; callers own cadence
-//! and run duration, using `negotiation()` after Open. [`managed`] owns
+//! and run duration, using `negotiation()` after Open. Sends return a
+//! [`SendReceipt`] after socket acceptance and session commitment;
+//! [`SendProbeError`] distinguishes uncommitted failures from post-commit
+//! failures carrying that receipt. Convert a receipt to [`ClientEvent`] for
+//! presentation or statistics. [`managed`] owns
 //! negotiated-interval scheduling, finite runs, and staggered/burst pacing:
 //! `ManagedClientTask` /
 //! `ManagedClientHandle` (`tokio` feature) run and control one or more
@@ -54,6 +58,7 @@ pub mod managed;
 mod metadata;
 mod probe;
 mod receive;
+mod send;
 mod session;
 mod socket;
 mod socket_options;
@@ -73,5 +78,6 @@ pub use event::{
     ClientEvent, NoTestCompleted, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample,
     RttSample, ServerTiming, SessionStarted, SignedDuration, WarningKind,
 };
+pub use send::{SendProbeError, SendReceipt};
 pub use session::{AcceptedSessionParameters, NegotiationChange, NegotiationResult};
 pub use timing::ClientTimestamp;

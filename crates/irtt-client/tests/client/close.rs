@@ -60,7 +60,9 @@ fn send_probe_fails_after_close() {
     client.close().unwrap();
     assert!(matches!(
         client.send_probe(),
-        Err(ClientError::AlreadyClosed)
+        Err(irtt_client::SendProbeError::NotCommitted(
+            ClientError::AlreadyClosed
+        ))
     ));
     server.join();
 }
@@ -206,9 +208,7 @@ fn close_flagged_retained_timeout_emits_late_then_closes() {
         .unwrap();
     assert_open_started(client.open().unwrap());
     let sent = client.send_probe().unwrap();
-    let ClientEvent::EchoSent { sent_at, .. } = &sent[0] else {
-        panic!("expected EchoSent");
-    };
+    let sent_at = sent.sent_at;
     assert!(matches!(
         client
             .poll_timeouts_at(sent_at.mono + client.probe_timeout())
@@ -426,10 +426,7 @@ fn wrong_token_close_flag_does_not_close_session() {
         }]
     ));
     assert!(!client.is_peer_closed());
-    assert!(matches!(
-        client.send_probe().unwrap().as_slice(),
-        [ClientEvent::EchoSent { seq: 1, .. }]
-    ));
+    assert_eq!(client.send_probe().unwrap().seq, 1);
     client.close().unwrap();
     server.join();
 }
@@ -498,7 +495,9 @@ fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
 
     assert!(matches!(
         client.send_probe(),
-        Err(ClientError::AlreadyClosed)
+        Err(irtt_client::SendProbeError::NotCommitted(
+            ClientError::AlreadyClosed
+        ))
     ));
 
     let first = server.rx.recv_timeout(Duration::from_millis(100)).unwrap();
