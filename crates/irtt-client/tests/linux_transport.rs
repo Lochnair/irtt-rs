@@ -9,7 +9,9 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use irtt_client::{Client, ClientConfig, ClientEvent, NegotiationPolicy, SocketConfig};
+use irtt_client::{
+    Client, ClientConfig, ClientEvent, NegotiationPolicy, OpenPolicy, SessionRequest, SocketConfig,
+};
 use irtt_proto::{decode_request, Clock, DecodedRequestKind, ReceivedStats, StampAt};
 use irtt_server::{ServerConfig, ServerCore};
 use nix::sys::socket::{recvmsg, ControlMessageOwned, MsgFlags};
@@ -81,21 +83,24 @@ fn peer(dscp_allowed: bool, probes: usize) -> (SocketAddr, thread::JoinHandle<Ve
     (addr, task)
 }
 
-fn config(addr: SocketAddr) -> ClientConfig {
+fn config() -> ClientConfig {
     ClientConfig {
-        server_addr: addr.to_string(),
-        dscp: 46,
-        negotiation_policy: NegotiationPolicy::Loose,
-        duration: None,
-        interval: Duration::from_millis(10),
-        clock: Clock::Both,
-        stamp_at: StampAt::Both,
-        received_stats: ReceivedStats::Both,
-        length: 128,
-        open_timeouts: vec![Duration::from_secs(1)],
-        socket_config: SocketConfig {
+        open: OpenPolicy {
+            negotiation: NegotiationPolicy::Loose,
+            timeouts: vec![Duration::from_secs(1)],
+        },
+        request: SessionRequest {
+            dscp: 46,
+            duration: None,
+            interval: Duration::from_millis(10),
+            clock: Clock::Both,
+            stamp_at: StampAt::Both,
+            received_stats: ReceivedStats::Both,
+            length: 128,
+            ..Default::default()
+        },
+        socket: SocketConfig {
             ttl: Some(TEST_TTL),
-            recv_timeout: Some(Duration::from_secs(1)),
             ..SocketConfig::default()
         },
         ..ClientConfig::default()
@@ -149,7 +154,10 @@ fn blocking_probes_use_kernel_tx_timing_and_negotiated_packet_marking() {
     for allowed in [true, false] {
         const PROBES: usize = 3;
         let (addr, peer) = peer(allowed, PROBES);
-        let mut client = Client::connect(config(addr)).unwrap();
+        let mut client = Client::connect(addr.to_string(), config()).unwrap();
+        client
+            .set_recv_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
         client.open().unwrap();
         assert_eq!(
             client.negotiated_params().unwrap().params.dscp,
@@ -189,7 +197,7 @@ fn async_probes_use_kernel_tx_timing_and_negotiated_packet_marking() {
         let (addr, peer) = peer(allowed, PROBES);
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(5), async {
-                let mut client = irtt_client::AsyncClient::connect(config(addr))
+                let mut client = irtt_client::AsyncClient::connect(addr.to_string(), config())
                     .await
                     .unwrap();
                 client.open().await.unwrap();
@@ -245,7 +253,10 @@ fn a_closed_udp_peer_surfaces_a_socket_error() {
         close_rx.recv_timeout(Duration::from_secs(3)).unwrap();
         drop(socket);
     });
-    let mut client = Client::connect(config(addr)).unwrap();
+    let mut client = Client::connect(addr.to_string(), config()).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_secs(1)))
+        .unwrap();
     client.open().unwrap();
     close_tx.send(()).unwrap();
     task.join().unwrap();

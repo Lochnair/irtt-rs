@@ -2,7 +2,7 @@ mod support;
 
 use std::{collections::HashMap, time::Duration};
 
-use irtt_client::{managed::*, ClientConfig, ClientEvent};
+use irtt_client::{managed::*, ClientConfig, ClientEvent, OpenPolicy, SessionRequest};
 use irtt_server::ServerConfig;
 use support::InTreeServer;
 use tokio::time::timeout;
@@ -18,10 +18,16 @@ async fn both_pacing_modes_serve_every_target_on_its_negotiated_grid() {
             for _ in 0..3 {
                 let config = ManagedClientConfig {
                     client: ClientConfig {
-                        duration: Some(Duration::from_millis(600)),
-                        interval: Duration::from_millis(100),
+                        open: OpenPolicy {
+                            timeouts: vec![Duration::from_millis(200)],
+                            ..Default::default()
+                        },
+                        request: SessionRequest {
+                            duration: Some(Duration::from_millis(600)),
+                            interval: Duration::from_millis(100),
+                            ..Default::default()
+                        },
                         probe_timeout: Duration::from_millis(100),
-                        open_timeouts: vec![Duration::from_millis(200)],
                         ..ClientConfig::default()
                     },
                     pacing,
@@ -111,10 +117,16 @@ async fn target_updates_preserve_identical_sessions_and_retire_removed_generatio
         let server = InTreeServer::start(ServerConfig::default());
         let config = ManagedClientConfig {
             client: ClientConfig {
-                duration: None,
-                interval: Duration::from_millis(20),
+                open: OpenPolicy {
+                    timeouts: vec![Duration::from_millis(200)],
+                    ..Default::default()
+                },
+                request: SessionRequest {
+                    duration: None,
+                    interval: Duration::from_millis(20),
+                    ..Default::default()
+                },
                 probe_timeout: Duration::from_millis(100),
-                open_timeouts: vec![Duration::from_millis(200)],
                 ..ClientConfig::default()
             },
             completion: ManagedCompletionPolicy::ExplicitStop,

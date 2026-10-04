@@ -13,7 +13,7 @@ use crate::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, ProbeSent,
         SessionMachine, MAX_OPEN_PACKET_SIZE,
     },
-    socket::{connect_udp_socket, resolve_remote, validate_open_timeouts},
+    socket::{connect_udp_socket, resolve_remote},
     socket_options::{apply_traffic_class_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
 };
@@ -50,7 +50,7 @@ struct PreparedClientOpenFailure {
 /// use irtt_client::{Client, ClientConfig};
 ///
 /// # fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut client = Client::connect(ClientConfig::default())?;
+/// let mut client = Client::connect("127.0.0.1:2112", ClientConfig::default())?;
 /// let outcome = client.open()?;
 /// println!("opened: {outcome:?}");
 /// let sent = client.send_probe()?;
@@ -70,6 +70,7 @@ pub struct Client {
     socket: UdpSocket,
     remote: SocketAddr,
     recv_buffer: Vec<u8>,
+    recv_timeout: Option<Duration>,
     applied_traffic_class: Option<u8>,
     /// Whether the socket's `SO_TIMESTAMPING` flags carry `TX_SOFTWARE` +
     /// `OPT_ID` + `OPT_TSONLY`. Always `false` off Linux, without the
@@ -81,32 +82,53 @@ pub struct Client {
 }
 
 impl Client {
-    /// Resolve the configured server and create a connected UDP socket.
+    /// Resolve the endpoint and create a connected UDP socket.
     ///
     /// This validates local configuration and prepares the open request, but it
     /// does not contact the server. Call [`open`](Self::open) to perform the
     /// IRTT open exchange.
-    pub fn connect(config: ClientConfig) -> Result<Self, ClientError> {
-        validate_open_timeouts(&config.open_timeouts)?;
-        let remote = resolve_remote(&config)?;
+    ///
+    /// The endpoint accepts a name or address; an omitted port defaults to 2112.
+    /// IPv6 literals may be bracketed or unbracketed with the default port.
+    /// The reusable config contains no endpoint identity.
+    pub fn connect(endpoint: impl AsRef<str>, config: ClientConfig) -> Result<Self, ClientError> {
+        config.open.validate()?;
+        let remote = resolve_remote(endpoint.as_ref(), config.address_family)?;
         let runtime = SessionMachine::new(config.clone(), remote)?;
-        let socket = connect_udp_socket(&config.socket_config, remote)?;
+        let socket = connect_udp_socket(&config.socket, remote, config.address_family)?;
 
         Ok(Self {
             runtime,
             socket,
             remote,
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
+            recv_timeout: None,
             applied_traffic_class: None,
             tx_timestamping_enabled: false,
         })
+    }
+
+    /// Set the blocking receive timeout used outside open attempts.
+    ///
+    /// `None` (the default) lets `recv_once()` block indefinitely. A nonzero
+    /// timeout bounds one logical receive, including retries after EINTR.
+    /// `recv_available()` retains its bounded drain behavior. Open attempts
+    /// use only [`OpenPolicy::timeouts`](crate::OpenPolicy::timeouts) and
+    /// restore this setting on success or failure.
+    ///
+    /// A zero duration is rejected by the socket; the previous setting is
+    /// retained when applying the new timeout fails.
+    pub fn set_recv_timeout(&mut self, timeout: Option<Duration>) -> Result<(), ClientError> {
+        self.socket.set_read_timeout(timeout)?;
+        self.recv_timeout = timeout;
+        Ok(())
     }
 
     /// Perform the IRTT open exchange.
     ///
     /// On success, returns the negotiated open outcome and transitions the
     /// client into either an open probe session or completed no-test state.
-    /// Open attempts use [`ClientConfig::open_timeouts`]. Malformed or
+    /// Open attempts use [`OpenPolicy::timeouts`](crate::OpenPolicy::timeouts). Malformed or
     /// unrelated datagrams are ignored until the current attempt's absolute
     /// deadline, so one attempt may consume several datagrams without
     /// retransmitting. Silence or ignored traffic eventually produces
@@ -121,9 +143,7 @@ impl Client {
     pub fn open(&mut self) -> Result<OpenOutcome, ClientError> {
         let result = self.open_transaction();
         if result.is_err() {
-            let _ = self
-                .socket
-                .set_read_timeout(self.runtime.config().socket_config.recv_timeout);
+            let _ = self.socket.set_read_timeout(self.recv_timeout);
         }
         result
     }
@@ -225,8 +245,7 @@ impl Client {
     /// Requires an open session; lifecycle errors are returned before socket I/O.
     pub fn recv_once(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
         self.runtime.ensure_open()?;
-        self.socket
-            .set_read_timeout(self.runtime.config().socket_config.recv_timeout)?;
+        self.socket.set_read_timeout(self.recv_timeout)?;
         self.recv_once_inner()
     }
 
@@ -267,7 +286,7 @@ impl Client {
     fn recv_datagram_retrying_interrupted(
         &mut self,
     ) -> Result<Option<ReceivedDatagram>, ClientError> {
-        let configured_timeout = self.runtime.config().socket_config.recv_timeout;
+        let configured_timeout = self.recv_timeout;
         let deadline = match configured_timeout {
             Some(timeout) => Some(
                 Instant::now()
@@ -322,8 +341,7 @@ impl Client {
     /// Requires an open session; lifecycle errors are returned before socket I/O.
     pub fn recv_available(&mut self, budget: RecvBudget) -> Result<Vec<ClientEvent>, ClientError> {
         self.runtime.ensure_open()?;
-        self.socket
-            .set_read_timeout(self.runtime.config().socket_config.recv_timeout)?;
+        self.socket.set_read_timeout(self.recv_timeout)?;
         let mut all_events = Vec::new();
         for _ in 0..budget.max_packets {
             let events = self.recv_once_inner()?;
@@ -383,10 +401,10 @@ impl Client {
     fn open_transaction(&mut self) -> Result<OpenOutcome, ClientError> {
         let request = self.runtime.prepare_open_request()?;
         let mut buf = [0_u8; MAX_OPEN_PACKET_SIZE];
-        let attempt_count = self.runtime.config().open_timeouts.len();
+        let attempt_count = self.runtime.config().open.timeouts.len();
 
         for attempt in 0..attempt_count {
-            let timeout = self.runtime.config().open_timeouts[attempt];
+            let timeout = self.runtime.config().open.timeouts[attempt];
             let deadline = Instant::now()
                 .checked_add(timeout)
                 .ok_or(ClientError::DurationOverflow)?;
@@ -470,7 +488,7 @@ impl Client {
                 recv_buffer_len: None,
                 negotiated_traffic_class: None,
                 previous_traffic_class: self.applied_traffic_class,
-                post_open_recv_timeout: self.runtime.config().socket_config.recv_timeout,
+                post_open_recv_timeout: self.recv_timeout,
             });
         };
         let recv_buffer_len = match recv_buffer_size(self.runtime.has_hmac(), Some(negotiated)) {
@@ -495,7 +513,7 @@ impl Client {
             recv_buffer_len: Some(recv_buffer_len),
             negotiated_traffic_class: Some(negotiated_traffic_class),
             previous_traffic_class: self.applied_traffic_class,
-            post_open_recv_timeout: self.runtime.config().socket_config.recv_timeout,
+            post_open_recv_timeout: self.recv_timeout,
         })
     }
 

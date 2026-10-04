@@ -2,8 +2,8 @@ use super::*;
 
 #[test]
 fn no_test_rejects_non_close_open_reply() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
+    let mut config = default_test_config();
+    config.request.run_mode = RunMode::NoTest;
     let params = default_params();
     let server = start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);
@@ -15,8 +15,7 @@ fn no_test_rejects_non_close_open_reply() {
             .unwrap();
         let _ = recv_request(&socket, &tx);
     });
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     assert!(matches!(
         client.open(),
         Err(ClientError::UnexpectedNoTestReply)
@@ -32,12 +31,11 @@ fn no_test_rejects_non_close_open_reply() {
 
 #[test]
 fn no_test_rejects_non_zero_token_with_close_reply() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
+    let mut config = default_test_config();
+    config.request.run_mode = RunMode::NoTest;
     let params = default_params();
     let server = no_test_server(params, TOKEN);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     assert!(matches!(
         client.open(),
         Err(ClientError::NonZeroNoTestToken { token: TOKEN })
@@ -47,13 +45,12 @@ fn no_test_rejects_non_zero_token_with_close_reply() {
 
 #[test]
 fn no_test_strict_negotiation_rejects_changed_params() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
+    let mut config = default_test_config();
+    config.request.run_mode = RunMode::NoTest;
     let mut params = default_params();
     params.dscp = 1;
     let server = no_test_server(params, 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     assert!(matches!(
         client.open(),
         Err(ClientError::NegotiationRejected { .. })
@@ -63,15 +60,14 @@ fn no_test_strict_negotiation_rejects_changed_params() {
 
 #[test]
 fn no_test_loose_negotiation_accepts_restricted_params() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
-    config.negotiation_policy = NegotiationPolicy::Loose;
+    let mut config = default_test_config();
+    config.request.run_mode = RunMode::NoTest;
+    config.open.negotiation = NegotiationPolicy::Loose;
     let requested = default_params();
     let mut params = requested.clone();
     params.duration_ns /= 2;
     let server = no_test_server(params.clone(), 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     let negotiated = assert_no_test_completed(client.open().unwrap());
     assert_eq!(negotiated.params, params);
     assert_eq!(
@@ -86,12 +82,11 @@ fn no_test_loose_negotiation_accepts_restricted_params() {
 
 #[test]
 fn send_probe_fails_after_no_test_completed() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
+    let mut config = default_test_config();
+    config.request.run_mode = RunMode::NoTest;
     let params = default_params();
     let server = no_test_server(params, 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     assert_no_test_completed(client.open().unwrap());
     assert!(matches!(
         client.send_probe(),
@@ -102,13 +97,15 @@ fn send_probe_fails_after_no_test_completed() {
 
 #[test]
 fn operations_fail_after_no_test_completed_without_datagrams() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.run_mode = RunMode::NoTest;
-    config.socket_config.recv_timeout = Some(Duration::from_millis(50));
+    let mut config = default_test_config();
+    config.request.run_mode = RunMode::NoTest;
+
     let params = default_params();
     let server = no_test_server(params, 0);
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     assert_no_test_completed(client.open().unwrap());
     assert!(matches!(client.open(), Err(ClientError::AlreadyCompleted)));
     let results = [

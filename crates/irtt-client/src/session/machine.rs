@@ -7,7 +7,8 @@ use irtt_proto::{
 
 use crate::{
     config::{
-        ClientConfig, RunMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_UDP_PAYLOAD_LENGTH,
+        ClientConfig, RunMode, SessionRequest, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES,
+        MAX_UDP_PAYLOAD_LENGTH,
     },
     error::ClientError,
     event::{
@@ -172,7 +173,7 @@ impl SessionMachine {
         remote: std::net::SocketAddr,
     ) -> Result<Self, ClientError> {
         Self::validate_config(&config)?;
-        let requested = params_from_config(&config)?;
+        let requested = params_from_request(&config.request)?;
 
         Ok(Self {
             config,
@@ -193,7 +194,7 @@ impl SessionMachine {
                 reason: "probe_timeout must be greater than zero".to_owned(),
             });
         }
-        params_from_config(config).map(|_| ())
+        params_from_request(&config.request).map(|_| ())
     }
 
     pub(crate) fn config(&self) -> &ClientConfig {
@@ -209,7 +210,7 @@ impl SessionMachine {
         let bytes = encode_request(
             RequestToEncode::Open {
                 params: &self.requested,
-                no_test: self.config.run_mode == RunMode::NoTest,
+                no_test: self.config.request.run_mode == RunMode::NoTest,
             },
             self.config.auth.hmac_key(),
         )?;
@@ -269,7 +270,7 @@ impl SessionMachine {
             ));
         }
 
-        match self.config.run_mode {
+        match self.config.request.run_mode {
             RunMode::Normal if reply_is_close => Err(OpenAcceptanceFailure::new(
                 ClientError::ServerRejected,
                 cleanup_close,
@@ -602,14 +603,11 @@ impl SessionMachine {
         cleanup_close: Option<Box<[u8]>>,
     ) -> Result<PreparedOpenAcceptance, OpenAcceptanceFailure> {
         let token = reply.token;
-        let negotiated = match negotiate_params(
-            &self.requested,
-            reply.params,
-            self.config.negotiation_policy,
-        ) {
-            Ok(negotiated) => negotiated,
-            Err(primary) => return Err(OpenAcceptanceFailure::new(primary, cleanup_close)),
-        };
+        let negotiated =
+            match negotiate_params(&self.requested, reply.params, self.config.open.negotiation) {
+                Ok(negotiated) => negotiated,
+                Err(primary) => return Err(OpenAcceptanceFailure::new(primary, cleanup_close)),
+            };
         let local_close_packet =
             cleanup_close.expect("normal non-zero-token replies prepare a cleanup close");
         let next_state = MachineState::Open(Box::new(ActiveSession {
@@ -649,12 +647,9 @@ impl SessionMachine {
         reply: OpenReply,
         now: ClientTimestamp,
     ) -> Result<PreparedOpenAcceptance, OpenAcceptanceFailure> {
-        let negotiated = negotiate_params(
-            &self.requested,
-            reply.params,
-            self.config.negotiation_policy,
-        )
-        .map_err(OpenAcceptanceFailure::without_cleanup)?;
+        let negotiated =
+            negotiate_params(&self.requested, reply.params, self.config.open.negotiation)
+                .map_err(OpenAcceptanceFailure::without_cleanup)?;
         let event = ClientEvent::NoTestCompleted {
             remote: self.remote,
             negotiated: negotiated.clone(),
@@ -888,21 +883,24 @@ pub(crate) fn recv_buffer_size(
     })
 }
 
-pub(crate) fn params_from_config(config: &ClientConfig) -> Result<Params, ClientError> {
-    validate_protocol_config(config)?;
+pub(crate) fn params_from_request(request: &SessionRequest) -> Result<Params, ClientError> {
+    validate_request(request)?;
     Ok(Params {
         protocol_version: PROTOCOL_VERSION,
-        duration_ns: match config.duration {
+        duration_ns: match request.duration {
             Some(duration) => config_duration_to_ns("duration", duration)?,
             None => 0,
         },
-        interval_ns: config_duration_to_ns("interval", config.interval)?,
-        length: i64::from(config.length),
-        received_stats: config.received_stats,
-        stamp_at: config.stamp_at,
-        clock: config.clock,
-        dscp: i64::from(dscp_codepoint_to_traffic_class(config.dscp)?),
-        server_fill: config.server_fill.clone().map(|value| ServerFill { value }),
+        interval_ns: config_duration_to_ns("interval", request.interval)?,
+        length: i64::from(request.length),
+        received_stats: request.received_stats,
+        stamp_at: request.stamp_at,
+        clock: request.clock,
+        dscp: i64::from(dscp_codepoint_to_traffic_class(request.dscp)?),
+        server_fill: request
+            .server_fill
+            .clone()
+            .map(|value| ServerFill { value }),
     })
 }
 
@@ -1083,34 +1081,34 @@ fn build_received_stats(reply: &EchoReply) -> Option<ReceivedStatsSample> {
     })
 }
 
-fn validate_protocol_config(config: &ClientConfig) -> Result<(), ClientError> {
-    if config.duration == Some(Duration::ZERO) {
+fn validate_request(request: &SessionRequest) -> Result<(), ClientError> {
+    if request.duration == Some(Duration::ZERO) {
         return Err(ClientError::InvalidConfig {
             reason: "duration must be greater than zero; use None for continuous mode".to_owned(),
         });
     }
-    if config.interval == Duration::ZERO {
+    if request.interval == Duration::ZERO {
         return Err(ClientError::InvalidConfig {
             reason: "interval must be greater than zero".to_owned(),
         });
     }
-    if config.clock == Clock::Unspecified {
+    if request.clock == Clock::Unspecified {
         return Err(ClientError::InvalidConfig {
             reason: "clock must be wall, monotonic, or both".to_owned(),
         });
     }
-    if config.dscp > MAX_DSCP_CODEPOINT {
+    if request.dscp > MAX_DSCP_CODEPOINT {
         return Err(ClientError::InvalidConfig {
             reason: format!("dscp must be <= {MAX_DSCP_CODEPOINT}"),
         });
     }
-    if config.length > MAX_UDP_PAYLOAD_LENGTH {
+    if request.length > MAX_UDP_PAYLOAD_LENGTH {
         return Err(ClientError::InvalidConfig {
             reason: format!("packet length must be <= {MAX_UDP_PAYLOAD_LENGTH}"),
         });
     }
 
-    if let Some(fill) = &config.server_fill {
+    if let Some(fill) = &request.server_fill {
         let len = fill.len();
         if len == 0 {
             return Err(ClientError::InvalidConfig {
@@ -1191,9 +1189,12 @@ mod tests {
     fn opened() -> SessionMachine {
         let mut machine = SessionMachine::new(
             ClientConfig {
+                request: crate::SessionRequest {
+                    clock: Clock::Wall,
+                    stamp_at: irtt_proto::StampAt::Receive,
+                    ..Default::default()
+                },
                 max_pending_probes: 2,
-                clock: Clock::Wall,
-                stamp_at: irtt_proto::StampAt::Receive,
                 ..ClientConfig::default()
             },
             "127.0.0.1:2112".parse().unwrap(),

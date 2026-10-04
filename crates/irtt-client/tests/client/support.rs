@@ -25,10 +25,12 @@ impl FakeServer {
     }
 }
 
-pub(super) fn default_test_config(addr: SocketAddr) -> ClientConfig {
+pub(super) fn default_test_config() -> ClientConfig {
     ClientConfig {
-        server_addr: addr.to_string(),
-        open_timeouts: vec![Duration::from_millis(200), Duration::from_millis(200)],
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(200), Duration::from_millis(200)],
+            ..Default::default()
+        },
         ..ClientConfig::default()
     }
 }
@@ -252,14 +254,11 @@ pub(super) fn assert_no_test_completed(outcome: OpenOutcome) -> NegotiatedParams
 
 pub(super) fn open_client_with_echo_server(params: &Params) -> (Client, FakeServer) {
     let server = echo_server(params.clone());
-    let config = ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     (client, server)
 }

@@ -20,7 +20,6 @@ use tokio::{
 use crate::{
     async_client::{AsyncClient, AsyncOpenState},
     session::machine::SessionMachine,
-    socket::validate_open_timeouts,
     socket_options::validate_ttl,
     ClientConfig, ClientError, ClientEvent, OpenOutcome,
 };
@@ -62,7 +61,10 @@ const MAX_BROADCAST_CHANNEL_CAPACITY: usize = usize::MAX >> 1;
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 /// let config = ManagedClientConfig {
 ///     client: ClientConfig {
-///         duration: Some(std::time::Duration::from_secs(10)),
+///         request: irtt_client::SessionRequest {
+///             duration: Some(std::time::Duration::from_secs(10)),
+///             ..irtt_client::SessionRequest::default()
+///         },
 ///         ..ClientConfig::default()
 ///     },
 ///     ..ManagedClientConfig::default()
@@ -944,7 +946,6 @@ impl ManagedClientTask {
                 return Err(ManagedCommandApplyError::DuplicateTargetId { id: target.id });
             }
             let mut client_config = self.config.client.clone();
-            client_config.server_addr.clone_from(&target.server_addr);
             client_config.auth = target.auth.resolve(&self.config.client.auth);
             validate_target_config(&client_config).map_err(|source| {
                 ManagedCommandApplyError::InvalidTarget {
@@ -1060,7 +1061,8 @@ impl ManagedClientTask {
     }
 
     fn start_connecting(&mut self, index: usize, config: ClientConfig) {
-        let future = Box::pin(AsyncClient::connect(config));
+        let endpoint = Arc::clone(&self.targets[index].server_addr);
+        let future = Box::pin(async move { AsyncClient::connect(endpoint, config).await });
         self.install_target_state(index, TargetState::Connecting { future });
     }
 
@@ -2248,7 +2250,6 @@ fn build_task(
             .checked_add(1)
             .ok_or(ManagedConfigError::GenerationExhausted)?;
         let mut client_config = config.client.clone();
-        client_config.server_addr.clone_from(&target.server_addr);
         client_config.auth = target.auth.resolve(&config.client.auth);
         validate_target_config(&client_config).map_err(|source| {
             ManagedConfigError::InvalidTarget {
@@ -2361,14 +2362,9 @@ fn build_task(
 }
 
 fn validate_target_config(config: &ClientConfig) -> Result<(), ClientError> {
-    validate_open_timeouts(&config.open_timeouts)?;
+    config.open.validate()?;
     SessionMachine::validate_config(config)?;
-    if config.socket_config.ipv4_only && config.socket_config.ipv6_only {
-        return Err(ClientError::InvalidConfig {
-            reason: "ipv4_only and ipv6_only cannot both be true".to_owned(),
-        });
-    }
-    if let Some(ttl) = config.socket_config.ttl {
+    if let Some(ttl) = config.socket.ttl {
         validate_ttl(ttl)?;
     }
     Ok(())
@@ -2429,12 +2425,9 @@ mod tests {
                     vec![ManagedTargetConfig::new("target", "127.0.0.1:9")],
                 )
                 .unwrap();
-                let client = AsyncClient::connect(ClientConfig {
-                    server_addr: "127.0.0.1:9".into(),
-                    ..ClientConfig::default()
-                })
-                .await
-                .unwrap();
+                let client = AsyncClient::connect("127.0.0.1:9", ClientConfig::default())
+                    .await
+                    .unwrap();
                 task.state = DriverState::Running;
                 task.install_target_state(0, TargetState::Active { client });
                 task.send_gate = Some(end + Duration::from_secs(1));

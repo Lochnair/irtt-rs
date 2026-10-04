@@ -10,7 +10,8 @@
 use std::time::Duration;
 
 use irtt_client::{
-    AsyncClient, ClientConfig, NegotiationPolicy, NegotiationRestriction, OpenOutcome, SocketConfig,
+    AsyncClient, ClientConfig, NegotiationPolicy, NegotiationRestriction, OpenOutcome, OpenPolicy,
+    SessionRequest,
 };
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 use irtt_server::{Server, ServerConfig, TimestampAllowance};
@@ -84,13 +85,19 @@ async fn exercise_dscp_restriction() {
     // The client's configuration is a DSCP codepoint; 46 (EF) is raw byte 184 on
     // the wire, and this test does not change either convention.
     let with_dscp = |policy| ClientConfig {
-        dscp: 46,
-        ..test_config(server_addr, policy)
+        request: SessionRequest {
+            dscp: 46,
+            ..test_config(policy).request
+        },
+        ..test_config(policy)
     };
 
-    let mut strict = AsyncClient::connect(with_dscp(NegotiationPolicy::Strict))
-        .await
-        .unwrap();
+    let mut strict = AsyncClient::connect(
+        server_addr.to_string(),
+        with_dscp(NegotiationPolicy::Strict),
+    )
+    .await
+    .unwrap();
     let rejected = strict
         .open()
         .await
@@ -100,9 +107,10 @@ async fn exercise_dscp_restriction() {
         "the restriction names DSCP: {rejected}"
     );
 
-    let mut loose = AsyncClient::connect(with_dscp(NegotiationPolicy::Loose))
-        .await
-        .unwrap();
+    let mut loose =
+        AsyncClient::connect(server_addr.to_string(), with_dscp(NegotiationPolicy::Loose))
+            .await
+            .unwrap();
     let negotiated = match loose.open().await.unwrap() {
         OpenOutcome::Started { negotiated, .. } => negotiated,
         OpenOutcome::NoTestCompleted { .. } => panic!("normal client unexpectedly ran no-test"),
@@ -138,10 +146,16 @@ async fn a_default_server_restricts_nothing_an_ordinary_client_asks_for() {
 async fn exercise_default_policy() {
     let (server_addr, shutdown_tx, server_task) = serve(ServerConfig::default()).await;
 
-    let mut client = AsyncClient::connect(ClientConfig {
-        dscp: 46,
-        ..test_config(server_addr, NegotiationPolicy::Strict)
-    })
+    let mut client = AsyncClient::connect(
+        server_addr.to_string(),
+        ClientConfig {
+            request: SessionRequest {
+                dscp: 46,
+                ..test_config(NegotiationPolicy::Strict).request
+            },
+            ..test_config(NegotiationPolicy::Strict)
+        },
+    )
     .await
     .unwrap();
     let negotiated = match client.open().await.unwrap() {
@@ -186,28 +200,29 @@ async fn serve(
 }
 
 /// A short deterministic client requesting both timestamps from both clocks.
-fn test_config(server_addr: std::net::SocketAddr, policy: NegotiationPolicy) -> ClientConfig {
+fn test_config(policy: NegotiationPolicy) -> ClientConfig {
     ClientConfig {
-        server_addr: server_addr.to_string(),
-        duration: Some(Duration::from_secs(1)),
-        interval: Duration::from_millis(100),
-        length: 64,
-        received_stats: ReceivedStats::Both,
-        stamp_at: StampAt::Both,
-        clock: Clock::Both,
-        negotiation_policy: policy,
-        open_timeouts: vec![Duration::from_millis(200)],
-        socket_config: SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..SocketConfig::default()
+        open: OpenPolicy {
+            negotiation: policy,
+            timeouts: vec![Duration::from_millis(200)],
         },
+        request: SessionRequest {
+            duration: Some(Duration::from_secs(1)),
+            interval: Duration::from_millis(100),
+            length: 64,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Default::default()
+        },
+
         probe_timeout: Duration::from_millis(200),
         ..ClientConfig::default()
     }
 }
 
 async fn client(server_addr: std::net::SocketAddr, policy: NegotiationPolicy) -> AsyncClient {
-    AsyncClient::connect(test_config(server_addr, policy))
+    AsyncClient::connect(server_addr.to_string(), test_config(policy))
         .await
         .unwrap()
 }

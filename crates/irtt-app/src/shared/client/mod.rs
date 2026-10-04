@@ -8,7 +8,7 @@ pub use args::{
     parse_dscp, parse_duration, parse_length, parse_server_fill, parse_test_duration, parse_ttl,
     ClockArg, CommonClientArgs, ReceivedStatsArg, TimestampArg,
 };
-pub use config::{expected_probe_count, DEFAULT_RECV_TIMEOUT};
+pub use config::expected_probe_count;
 pub use prepare::{
     prepare_managed_run, ManagedRunSetup, TargetSelection, MANAGED_EVENT_CAPACITY,
     STDIN_MAX_DESIRED_TARGETS, STDIN_MAX_LIVE_TARGET_GENERATIONS, STDIN_OUTCOME_HISTORY_LIMIT,

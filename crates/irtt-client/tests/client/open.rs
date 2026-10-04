@@ -3,10 +3,13 @@ use super::*;
 #[test]
 fn receive_before_open_returns_not_open_without_datagrams() {
     let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-    let mut config = default_test_config(peer.local_addr().unwrap());
+    let config = default_test_config();
     // Bound the old implementation's blocking receive without sending a packet.
-    config.socket_config.recv_timeout = Some(Duration::from_millis(50));
-    let mut client = Client::connect(config).unwrap();
+
+    let mut client = Client::connect(peer.local_addr().unwrap().to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
 
     let results = [
         client.recv_once(),
@@ -35,10 +38,13 @@ fn loose_open_rejects_nonpositive_returned_intervals() {
         returned.interval_ns = interval_ns;
         let server = open_success_server(returned);
         let config = ClientConfig {
-            negotiation_policy: NegotiationPolicy::Loose,
-            ..default_test_config(server.addr)
+            open: OpenPolicy {
+                negotiation: NegotiationPolicy::Loose,
+                ..default_test_config().open
+            },
+            ..default_test_config()
         };
-        let mut client = Client::connect(config).unwrap();
+        let mut client = Client::connect(server.addr.to_string(), config).unwrap();
         assert!(
             matches!(client.open(), Err(ClientError::NegotiationRejected { .. })),
             "returned interval {interval_ns} must be rejected"
@@ -51,7 +57,7 @@ fn loose_open_rejects_nonpositive_returned_intervals() {
 fn open_fails_when_already_open() {
     let params = default_params();
     let server = open_success_server(params);
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
     assert_open_started(client.open().unwrap());
     assert!(matches!(client.open(), Err(ClientError::AlreadyOpen)));
     server.join();
@@ -68,10 +74,13 @@ fn open_retries_after_first_timeout() {
         socket.send_to(&reply, peer).unwrap();
     });
     let config = ClientConfig {
-        open_timeouts: vec![Duration::from_millis(200), Duration::from_millis(500)],
-        ..default_test_config(server.addr)
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(200), Duration::from_millis(500)],
+            ..default_test_config().open
+        },
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     let outcome = client.open().unwrap();
     assert_open_started(outcome);
     assert_eq!(server.rx.iter().take(2).count(), 2);
@@ -80,12 +89,12 @@ fn open_retries_after_first_timeout() {
 
 #[test]
 fn protocol_version_mismatch_fails() {
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
-    config.negotiation_policy = NegotiationPolicy::Loose;
+    let mut config = default_test_config();
+    config.open.negotiation = NegotiationPolicy::Loose;
     let mut params = default_params();
     params.protocol_version = 2;
     let server = open_success_server(params);
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
     assert!(matches!(
         client.open(),
         Err(ClientError::ProtocolVersionMismatch { received: 2, .. })
@@ -102,7 +111,7 @@ fn server_rejection_fails_in_normal_mode() {
         let reply = open_reply(FLAG_OPEN | FLAG_REPLY | flags::FLAG_CLOSE, 0, &params, None);
         socket.send_to(&reply, peer).unwrap();
     });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
     assert!(matches!(client.open(), Err(ClientError::ServerRejected)));
     assert_eq!(server.rx.iter().take(1).count(), 1);
     server.join();
@@ -119,10 +128,13 @@ fn ignored_datagrams_do_not_restart_the_attempt_deadline() {
         let _ = recv_request(&socket, &tx);
     });
     let config = ClientConfig {
-        open_timeouts: vec![Duration::from_millis(250), Duration::from_millis(250)],
-        ..default_test_config(server.addr)
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(250), Duration::from_millis(250)],
+            ..default_test_config().open
+        },
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     let started = Instant::now();
 
     assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
@@ -139,10 +151,13 @@ fn ignored_datagrams_do_not_restart_the_attempt_deadline() {
 fn opening_deadline_overflow_occurs_before_send() {
     let server = timeout_server(Duration::from_millis(250));
     let config = ClientConfig {
-        open_timeouts: vec![Duration::MAX],
-        ..default_test_config(server.addr)
+        open: OpenPolicy {
+            timeouts: vec![Duration::MAX],
+            ..default_test_config().open
+        },
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
 
     assert!(matches!(client.open(), Err(ClientError::DurationOverflow)));
     assert!(server.rx.try_recv().is_err());
@@ -163,7 +178,7 @@ fn post_token_negotiation_failure_sends_cleanup_close() {
             .unwrap();
         let _ = recv_request(&socket, &tx);
     });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
 
     assert!(matches!(
         client.open(),
@@ -182,14 +197,16 @@ fn post_token_negotiation_failure_sends_cleanup_close() {
 fn open_timeout_after_all_timeouts() {
     let server = timeout_server(Duration::from_millis(700));
     let config = ClientConfig {
-        open_timeouts: vec![Duration::from_millis(200), Duration::from_millis(200)],
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(200), Duration::from_millis(200)],
+            ..default_test_config().open
         },
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
     assert_eq!(server.rx.iter().take(2).count(), 2);
     server.join();
@@ -221,7 +238,7 @@ fn multiple_untrusted_datagrams_before_valid_reply_use_one_attempt() {
             socket.send_to(&packet, peer).unwrap();
         }
     });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
 
     assert_open_started(client.open().unwrap());
     assert_eq!(server.rx.iter().take(1).count(), 1);
@@ -241,14 +258,16 @@ fn only_ignored_open_datagrams_eventually_time_out() {
         thread::sleep(Duration::from_millis(300));
     });
     let config = ClientConfig {
-        open_timeouts: vec![Duration::from_millis(200), Duration::from_millis(200)],
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(200), Duration::from_millis(200)],
+            ..default_test_config().open
         },
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
 
     assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
     assert_eq!(server.rx.iter().take(2).count(), 2);
@@ -268,7 +287,7 @@ fn trusted_zero_token_normal_reply_is_terminal() {
         reply[HMAC_OFFSET..HMAC_OFFSET + 8].copy_from_slice(&0_u64.to_le_bytes());
         socket.send_to(&reply, peer).unwrap();
     });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
 
     assert!(matches!(
         client.open(),

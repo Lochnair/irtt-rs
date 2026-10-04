@@ -4,7 +4,7 @@ use irtt_client::{Authentication, HmacKey};
 #[test]
 fn hmac_open_ignores_missing_hmac_before_valid_reply() {
     let key = b"secret".to_vec();
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+    let mut config = default_test_config();
     config.auth = Authentication::Hmac(HmacKey::new(key.clone()));
     let params = default_params();
     let server = start_fake_server(move |socket, tx| {
@@ -14,8 +14,7 @@ fn hmac_open_ignores_missing_hmac_before_valid_reply() {
         socket.send_to(&missing, peer).unwrap();
         socket.send_to(&valid, peer).unwrap();
     });
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     assert_open_started(client.open().unwrap());
     assert_eq!(server.rx.iter().take(1).count(), 1);
     assert!(server.rx.try_recv().is_err());
@@ -26,7 +25,7 @@ fn hmac_open_ignores_missing_hmac_before_valid_reply() {
 fn hmac_open_ignores_bad_hmac_before_valid_reply() {
     let key = b"secret".to_vec();
     let wrong_key = b"wrong".to_vec();
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+    let mut config = default_test_config();
     config.auth = Authentication::Hmac(HmacKey::new(key.clone()));
     let params = default_params();
     let server = start_fake_server(move |socket, tx| {
@@ -36,8 +35,7 @@ fn hmac_open_ignores_bad_hmac_before_valid_reply() {
         socket.send_to(&bad, peer).unwrap();
         socket.send_to(&valid, peer).unwrap();
     });
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     assert_open_started(client.open().unwrap());
     assert_eq!(server.rx.iter().take(1).count(), 1);
     assert!(server.rx.try_recv().is_err());
@@ -47,7 +45,7 @@ fn hmac_open_ignores_bad_hmac_before_valid_reply() {
 #[test]
 fn post_token_hmac_negotiation_failure_sends_authenticated_cleanup_close() {
     let key = b"secret".to_vec();
-    let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
+    let mut config = default_test_config();
     config.auth = Authentication::Hmac(HmacKey::new(key.clone()));
     let mut returned = default_params();
     returned.interval_ns += 1;
@@ -58,8 +56,7 @@ fn post_token_hmac_negotiation_failure_sends_authenticated_cleanup_close() {
         socket.send_to(&reply, peer).unwrap();
         let _ = recv_request(&socket, &tx);
     });
-    config.server_addr = server.addr.to_string();
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
 
     assert!(matches!(
         client.open(),

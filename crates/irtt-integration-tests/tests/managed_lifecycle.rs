@@ -1,4 +1,4 @@
-use irtt_client::{Authentication, HmacKey};
+use irtt_client::{Authentication, HmacKey, OpenPolicy, SessionRequest};
 use std::{
     future::Future,
     net::{SocketAddr, UdpSocket},
@@ -176,12 +176,18 @@ fn runtime() -> Runtime {
 fn config(pacing: ManagedPacing) -> ManagedClientConfig {
     ManagedClientConfig {
         client: ClientConfig {
-            duration: Some(Duration::from_millis(130)),
-            interval: Duration::from_millis(60),
+            open: OpenPolicy {
+                timeouts: vec![Duration::from_millis(200)],
+                ..Default::default()
+            },
+            request: SessionRequest {
+                duration: Some(Duration::from_millis(130)),
+                interval: Duration::from_millis(60),
+                received_stats: ReceivedStats::None,
+                stamp_at: StampAt::None,
+                ..Default::default()
+            },
             probe_timeout: Duration::from_millis(35),
-            open_timeouts: vec![Duration::from_millis(200)],
-            received_stats: ReceivedStats::None,
-            stamp_at: StampAt::None,
             ..ClientConfig::default()
         },
         pacing,
@@ -340,7 +346,7 @@ fn finite_immediate_replies_use_retained_drain_deadline() {
 fn no_test_target_completion() {
     let server = start_server(ServerBehavior::NoTest, None);
     let mut config = config(ManagedPacing::Staggered);
-    config.client.run_mode = RunMode::NoTest;
+    config.client.request.run_mode = RunMode::NoTest;
     let (task, _) = ManagedClient::task(config, vec![target("no-test", server.addr)]).unwrap();
     let outcome = runtime().block_on(task);
     let records = server.finish();
@@ -411,8 +417,8 @@ fn pending_limit_failure_drains_reply_and_closes_session() {
         Some(key.clone()),
     );
     let mut managed = config(ManagedPacing::Staggered);
-    managed.client.duration = Some(Duration::from_millis(250));
-    managed.client.interval = Duration::from_millis(20);
+    managed.client.request.duration = Some(Duration::from_millis(250));
+    managed.client.request.interval = Duration::from_millis(20);
     managed.client.probe_timeout = Duration::from_secs(2);
     managed.client.max_pending_probes = 1;
     managed.final_drain = Duration::from_millis(50);

@@ -1,12 +1,12 @@
 use std::{net::SocketAddr, time::Duration};
 
-use crate::Authentication;
+use crate::{Authentication, ClientError};
 
 /// Protocol compatibility bound for a requested `server_fill` value, in UTF-8
 /// bytes.
 ///
 /// This is the maximum encoded server-fill string accepted by this client and
-/// protocol decoder. [`ClientConfig::server_fill`] enforces the same bound
+/// protocol decoder. [`SessionRequest::server_fill`] enforces the same bound
 /// before opening a session.
 pub use irtt_proto::MAX_SERVER_FILL_BYTES;
 use irtt_proto::{Clock, ReceivedStats, StampAt};
@@ -28,7 +28,7 @@ pub const MAX_TTL: u32 = 255;
 /// Largest UDP payload length accepted by client configuration, in bytes.
 ///
 /// This is the maximum UDP payload size excluding IP and UDP headers. It caps
-/// [`ClientConfig::length`] before protocol packets are encoded or sent.
+/// [`SessionRequest::length`] before protocol packets are encoded or sent.
 pub const MAX_UDP_PAYLOAD_LENGTH: u32 = 65_507;
 pub(crate) const DEFAULT_DURATION: Duration = Duration::from_secs(3);
 pub(crate) const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
@@ -58,29 +58,82 @@ pub(crate) const DEFAULT_MAX_PENDING: usize = 4096;
 /// ```
 /// use std::time::Duration;
 ///
-/// use irtt_client::{ClientConfig, NegotiationPolicy};
+/// use irtt_client::{ClientConfig, NegotiationPolicy, OpenPolicy, SessionRequest};
 ///
 /// let config = ClientConfig {
-///     server_addr: "example.net:2112".into(),
-///     duration: Some(Duration::from_secs(10)),
-///     interval: Duration::from_millis(250),
-///     length: 1200,
-///     negotiation_policy: NegotiationPolicy::Loose,
+///     request: SessionRequest {
+///         duration: Some(Duration::from_secs(10)),
+///         interval: Duration::from_millis(250),
+///         length: 1200,
+///         ..SessionRequest::default()
+///     },
+///     open: OpenPolicy {
+///         negotiation: NegotiationPolicy::Loose,
+///         ..OpenPolicy::default()
+///     },
 ///     ..ClientConfig::default()
 /// };
 ///
-/// assert_eq!(config.duration, Some(Duration::from_secs(10)));
-/// assert_eq!(config.interval, Duration::from_millis(250));
-/// assert_eq!(config.length, 1200);
+/// assert_eq!(config.request.duration, Some(Duration::from_secs(10)));
+/// assert_eq!(config.request.interval, Duration::from_millis(250));
+/// assert_eq!(config.request.length, 1200);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientConfig {
-    /// Remote server name or address.
+    /// Remote address families allowed during resolution and socket creation.
+    pub address_family: AddressFamily,
+    /// Local UDP socket properties.
+    pub socket: SocketConfig,
+    /// Protocol and session values requested from the server.
+    pub request: SessionRequest,
+    /// Open retry timeouts and negotiation policy.
+    pub open: OpenPolicy,
+    /// Concrete authentication for open, echo, and close packets.
     ///
-    /// If no port is present, the default IRTT port 2112 is used. IPv6
-    /// literals may be supplied either bracketed or unbracketed when the
-    /// default port should be used.
-    pub server_addr: String,
+    /// HMAC peers must use the same key. An empty HMAC key remains authenticated.
+    pub auth: Authentication,
+    /// Time after sending a probe before the client reports it as lost.
+    ///
+    /// This timeout is local client behavior; it is not negotiated with the
+    /// server. It must be greater than zero.
+    pub probe_timeout: Duration,
+    /// Maximum number of probes tracked as pending/timed-out/completed.
+    ///
+    /// This bounds memory used for reply classification and must be greater
+    /// than zero. A very small value can reject sends when replies are still
+    /// outstanding.
+    pub max_pending_probes: usize,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            address_family: AddressFamily::default(),
+            socket: SocketConfig::default(),
+            request: SessionRequest::default(),
+            open: OpenPolicy::default(),
+            auth: Authentication::Unauthenticated,
+            probe_timeout: DEFAULT_PROBE_TIMEOUT,
+            max_pending_probes: DEFAULT_MAX_PENDING,
+        }
+    }
+}
+
+/// Allowed remote address families. IPv6-only selection also sets IPV6_V6ONLY.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AddressFamily {
+    /// Accept IPv4 and IPv6 addresses.
+    #[default]
+    Any,
+    /// Accept only IPv4 addresses.
+    Ipv4,
+    /// Accept only IPv6 addresses and use IPv6-only sockets.
+    Ipv6,
+}
+
+/// Requested IRTT protocol and session semantics, reusable across endpoints.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionRequest {
     /// Requested run duration.
     ///
     /// `Some(duration)` requests a finite test and must be greater than zero.
@@ -120,46 +173,20 @@ pub struct ClientConfig {
     /// This is the six-bit DSCP value, not the full traffic-class byte, and
     /// must be less than or equal to [`MAX_DSCP_CODEPOINT`].
     pub dscp: u8,
-    /// Concrete authentication for open, echo, and close packets.
-    ///
-    /// HMAC peers must use the same key. An empty HMAC key remains authenticated.
-    pub auth: Authentication,
     /// Optional server payload fill request.
     ///
     /// `None` leaves server fill behavior unspecified. `Some(value)` requests
     /// a non-empty server fill mode/value and must not exceed
     /// [`MAX_SERVER_FILL_BYTES`] bytes when UTF-8 encoded.
     pub server_fill: Option<String>,
-    /// Per-attempt receive timeouts used while opening the session.
-    ///
-    /// The client sends an open request for each entry until a valid open reply
-    /// is received. The list must not be empty, and each timeout must be at
-    /// least 200 ms.
-    pub open_timeouts: Vec<Duration>,
     /// Whether opening the session should start a probe test or perform a
     /// negotiation-only no-test exchange.
     pub run_mode: RunMode,
-    /// Policy for server changes to negotiable protocol parameters.
-    pub negotiation_policy: NegotiationPolicy,
-    /// Local UDP socket configuration.
-    pub socket_config: SocketConfig,
-    /// Time after sending a probe before the client reports it as lost.
-    ///
-    /// This timeout is local client behavior; it is not negotiated with the
-    /// server. It must be greater than zero.
-    pub probe_timeout: Duration,
-    /// Maximum number of probes tracked as pending/timed-out/completed.
-    ///
-    /// This bounds memory used for reply classification and must be greater
-    /// than zero. A very small value can reject sends when replies are still
-    /// outstanding.
-    pub max_pending_probes: usize,
 }
 
-impl Default for ClientConfig {
+impl Default for SessionRequest {
     fn default() -> Self {
         Self {
-            server_addr: format!("127.0.0.1:{DEFAULT_PORT}"),
             duration: Some(DEFAULT_DURATION),
             interval: DEFAULT_INTERVAL,
             length: 0,
@@ -167,23 +194,55 @@ impl Default for ClientConfig {
             stamp_at: StampAt::Both,
             clock: Clock::Both,
             dscp: 0,
-            auth: Authentication::Unauthenticated,
             server_fill: None,
-            open_timeouts: DEFAULT_OPEN_TIMEOUTS.to_vec(),
             run_mode: RunMode::Normal,
-            negotiation_policy: NegotiationPolicy::Strict,
-            socket_config: SocketConfig::default(),
-            probe_timeout: DEFAULT_PROBE_TIMEOUT,
-            max_pending_probes: DEFAULT_MAX_PENDING,
+        }
+    }
+}
+
+/// Opening behavior shared by blocking, async, and managed clients.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenPolicy {
+    /// Per-attempt receive timeouts used while opening the session.
+    ///
+    /// The client sends an open request for each entry until a valid open reply
+    /// is received. The list must not be empty, and each timeout must be at
+    /// least 200 ms.
+    pub timeouts: Vec<Duration>,
+    /// Policy for server changes to negotiable protocol parameters.
+    pub negotiation: NegotiationPolicy,
+}
+
+impl OpenPolicy {
+    pub(crate) fn validate(&self) -> Result<(), ClientError> {
+        if self.timeouts.is_empty() {
+            return Err(ClientError::NoOpenTimeouts);
+        }
+        for timeout in &self.timeouts {
+            if *timeout < MIN_OPEN_TIMEOUT {
+                return Err(ClientError::OpenTimeoutTooSmall {
+                    timeout: *timeout,
+                    minimum: MIN_OPEN_TIMEOUT,
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Default for OpenPolicy {
+    fn default() -> Self {
+        Self {
+            timeouts: DEFAULT_OPEN_TIMEOUTS.to_vec(),
+            negotiation: NegotiationPolicy::Strict,
         }
     }
 }
 
 /// Local UDP socket options used by [`ClientConfig`].
 ///
-/// These settings affect how the client binds, resolves, and receives from the
-/// socket. They do not change the IRTT protocol parameters negotiated with the
-/// server.
+/// These settings affect how the client binds and sends from the socket. They
+/// do not change the IRTT protocol parameters negotiated with the server.
 ///
 /// # Example
 ///
@@ -192,20 +251,20 @@ impl Default for ClientConfig {
 /// ```
 /// use std::net::{Ipv4Addr, SocketAddr};
 ///
-/// use irtt_client::{ClientConfig, SocketConfig};
+/// use irtt_client::{AddressFamily, ClientConfig, SocketConfig};
 ///
 /// let config = ClientConfig {
-///     socket_config: SocketConfig {
+///     address_family: AddressFamily::Ipv4,
+///     socket: SocketConfig {
 ///         bind_addr: Some(SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))),
 ///         ttl: Some(32),
-///         ipv4_only: true,
 ///         ..SocketConfig::default()
 ///     },
 ///     ..ClientConfig::default()
 /// };
 ///
-/// assert_eq!(config.socket_config.ttl, Some(32));
-/// assert!(config.socket_config.ipv4_only);
+/// assert_eq!(config.socket.ttl, Some(32));
+/// assert_eq!(config.address_family, AddressFamily::Ipv4);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SocketConfig {
@@ -229,17 +288,6 @@ pub struct SocketConfig {
     /// platform socket option range; [`MAX_TTL`] is the public configuration
     /// bound used by this crate.
     pub ttl: Option<u32>,
-    /// Restrict name resolution to IPv4 addresses.
-    pub ipv4_only: bool,
-    /// Restrict name resolution to IPv6 addresses and set IPV6_V6ONLY for IPv6
-    /// sockets.
-    pub ipv6_only: bool,
-    /// Socket read timeout used after the session is open.
-    ///
-    /// `None` leaves reads blocking for APIs that perform a single receive.
-    /// Managed sessions may replace `None` or long timeouts with a short
-    /// timeout so cooperative cancellation can be observed promptly.
-    pub recv_timeout: Option<Duration>,
 }
 
 /// How strictly to handle server-side negotiation restrictions.

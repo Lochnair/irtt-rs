@@ -22,14 +22,20 @@ use irtt_client::managed::{
     BlockingManagedClient, ManagedClientConfig, ManagedCompletionPolicy, ManagedEvent,
     ManagedTargetConfig,
 };
-use irtt_client::ClientConfig;
+use irtt_client::{ClientConfig, OpenPolicy, SessionRequest};
 
 fn main() {
     let config = ManagedClientConfig {
         client: ClientConfig {
-            duration: None,
-            interval: Duration::from_millis(200),
-            open_timeouts: vec![Duration::from_millis(300)],
+            open: OpenPolicy {
+                timeouts: vec![Duration::from_millis(300)],
+                ..Default::default()
+            },
+            request: SessionRequest {
+                duration: None,
+                interval: Duration::from_millis(200),
+                ..Default::default()
+            },
             ..Default::default()
         },
         completion: ManagedCompletionPolicy::ExplicitStop,

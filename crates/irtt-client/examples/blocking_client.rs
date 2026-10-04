@@ -12,38 +12,44 @@
 //! ```
 //!
 //! Without a reachable server this exits quickly with an open-timeout error
-//! instead of hanging, because the example shortens `open_timeouts` for a
+//! instead of hanging, because the example shortens `open.timeouts` for a
 //! fast demonstration; a real caller would normally keep the default retry
 //! schedule.
 
 use std::time::{Duration, Instant};
 
-use irtt_client::{Client, ClientConfig, ClientEvent, OpenOutcome};
+use irtt_client::{Client, ClientConfig, ClientEvent, OpenOutcome, OpenPolicy, SessionRequest};
 
 const RUN_DURATION: Duration = Duration::from_secs(2);
 
 fn main() {
     let config = ClientConfig {
-        server_addr: "127.0.0.1:2112".to_owned(),
-        duration: Some(RUN_DURATION),
-        interval: Duration::from_millis(200),
-        // A single short attempt keeps this example fast when no server is
-        // reachable; production callers should generally keep the default.
-        open_timeouts: vec![Duration::from_millis(300)],
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(100)),
+        open: OpenPolicy {
+            // A single short attempt keeps this example fast when no server is
+            // reachable; production callers should generally keep the default.
+            timeouts: vec![Duration::from_millis(300)],
+            ..Default::default()
+        },
+        request: SessionRequest {
+            duration: Some(RUN_DURATION),
+            interval: Duration::from_millis(200),
             ..Default::default()
         },
         ..Default::default()
     };
 
-    let mut client = match Client::connect(config) {
+    let mut client = match Client::connect("127.0.0.1:2112", config) {
         Ok(client) => client,
         Err(err) => {
             eprintln!("failed to prepare client socket: {err}");
             return;
         }
     };
+
+    if let Err(err) = client.set_recv_timeout(Some(Duration::from_millis(100))) {
+        eprintln!("failed to configure receive timeout: {err}");
+        return;
+    }
 
     let negotiated = match client.open() {
         Ok(OpenOutcome::Started {

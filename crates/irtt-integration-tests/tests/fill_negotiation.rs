@@ -1,6 +1,9 @@
+use std::time::Duration;
 mod support;
 
-use irtt_client::{Client, ClientConfig, ClientError, NegotiationPolicy};
+use irtt_client::{
+    Client, ClientConfig, ClientError, NegotiationPolicy, OpenPolicy, SessionRequest,
+};
 use irtt_proto::{Params, TimestampFields};
 
 use support::{
@@ -52,11 +55,14 @@ fn server_fill_none_short_and_max_map_into_open_params() {
 fn server_fill_empty_and_oversized_values_are_rejected_at_config_boundary() {
     for fill in ["", "0123456789abcdef0123456789abcdefx"] {
         let config = ClientConfig {
-            server_fill: Some(fill.to_owned()),
+            request: SessionRequest {
+                server_fill: Some(fill.to_owned()),
+                ..Default::default()
+            },
             ..ClientConfig::default()
         };
         assert!(matches!(
-            Client::connect(config),
+            Client::connect("127.0.0.1:2112", config),
             Err(ClientError::InvalidConfig { .. })
         ));
     }
@@ -69,7 +75,10 @@ fn server_fill_negotiated_params_reflect_accepted_value() {
     let mut params = default_params();
     params.server_fill = server_fill("rand");
     let server = InTreeServer::start(irtt_server::ServerConfig::default());
-    let mut client = Client::connect(config_for_params(server.addr, &params)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config_for_params(&params)).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
     let outcome = client.open().unwrap();
     let negotiated = match outcome {
         irtt_client::OpenOutcome::Started { negotiated, .. } => negotiated,
@@ -99,7 +108,11 @@ fn server_fill_strict_rejects_removed_changed_or_unexpected_fill() {
         returned.server_fill = returned_fill.and_then(server_fill);
 
         let server = start_open_server(returned, None);
-        let mut client = Client::connect(config_for_params(server.addr, &requested)).unwrap();
+        let mut client =
+            Client::connect(server.addr.to_string(), config_for_params(&requested)).unwrap();
+        client
+            .set_recv_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         assert!(matches!(
             client.open(),
             Err(ClientError::NegotiationRejected { .. })
@@ -117,10 +130,13 @@ fn server_fill_loose_allows_server_to_remove_fill() {
     returned.server_fill = None;
 
     let requested_for_config = requested.clone();
-    let run = run_one_probe_with_config(returned, TimestampFields::default(), None, |addr| {
+    let run = run_one_probe_with_config(returned, TimestampFields::default(), None, || {
         ClientConfig {
-            negotiation_policy: NegotiationPolicy::Loose,
-            ..config_for_params(addr, &requested_for_config)
+            open: OpenPolicy {
+                negotiation: NegotiationPolicy::Loose,
+                ..config_for_params(&requested_for_config).open
+            },
+            ..config_for_params(&requested_for_config)
         }
     });
 
