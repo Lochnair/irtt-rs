@@ -234,7 +234,7 @@ impl CoreStats {
         Snapshot {
             events: self.events,
             packets,
-            loss: loss_stats(packets),
+            loss: loss_stats(packets, packets.server_packets_received),
             send_call: self.send_call.snapshot(),
             timer_error: self.timer_error.snapshot(),
             rtt: self.rtt_stats(),

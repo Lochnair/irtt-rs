@@ -38,6 +38,26 @@ are replayed in arrival order; backdated events cannot move the window backwards
 Reading a snapshot does not advance time. Use count-based rolling storage for a
 hard bound on retained events. The memory estimate excludes time-window storage.
 
+Rolling directional loss uses the increase in the highest observed server
+receive count across the retained packet events in arrival order. Upstream loss
+is window sends minus that increase; downstream loss is the increase minus all
+window replies, including duplicates and untracked late replies, as in cumulative
+accounting. The baseline is the highest count observed before the first retained
+packet event, or zero if no earlier packet events existed. Each retained event
+keeps this prior position, so eviction cannot erase a known baseline. Reordered
+counts do not move the observation backwards; only matched unique replies supply
+counter observations, regardless of the late-reply timing policy.
+
+Both directional packet estimates are `None` if the baseline or endpoint is
+unknown, or if time filtering excludes a packet event between retained packet
+events. Their percentage fields use the existing unavailable value of `0.0`.
+Loss/warning events do not affect this interval. A boundary between a send and
+its reply can still produce signed estimates, and outstanding sends retain the
+existing provisional-loss interpretation. These are changes in observed
+accounting, not exact network transit loss for probes sent in a wall-clock period.
+Raw `server_packets_received`, ordinary packet counts, and cumulative loss retain
+their existing meanings.
+
 Exact snapshots sort a temporary copy of each metric's retained samples, adding
 O(n) scratch memory and O(n log n) computation for that metric. The retention
 estimate is not peak snapshot or allocator accounting.

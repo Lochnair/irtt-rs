@@ -9,7 +9,8 @@ use std::mem::size_of;
 
 use crate::core::CONTINUOUS_SEQUENCE_LIMIT;
 use crate::ipdv::IpdvSample;
-use crate::normalization::{ReplySample, StatsEvent};
+use crate::normalization::ReplySample;
+use crate::rolling::RollingEvent;
 use crate::{SampleMode, StatsConfig};
 
 /// Capacity headroom applied to the live element bytes.
@@ -94,8 +95,8 @@ fn rolling_count_bytes(config: &StatsConfig, probe_count: u64) -> u64 {
     retained.saturating_mul(rolling_bytes_per_event())
 }
 
-/// A retained event is the enum itself plus, for a unique reply, the boxed
-/// reply sample it owns.
+/// A retained event includes its directional baseline plus, for a unique reply,
+/// the boxed reply sample it owns.
 fn rolling_bytes_per_event() -> u64 {
-    (size_of::<StatsEvent>() + size_of::<ReplySample>()) as u64
+    (size_of::<RollingEvent>() + size_of::<ReplySample>()) as u64
 }

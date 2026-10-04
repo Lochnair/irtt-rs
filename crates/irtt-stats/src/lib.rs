@@ -599,8 +599,9 @@ pub struct PacketCounts {
     pub bytes_received: u64,
     /// Highest cumulative server-reported packets received, when available.
     ///
-    /// This is the only server-reported input to the directional loss estimates
-    /// in [`LossStats`].
+    /// Rolling snapshots also preserve this raw cumulative value from retained
+    /// replies. Their directional loss uses an interval-relative increase
+    /// instead; see [`LossStats`] for baseline and availability semantics.
     pub server_packets_received: Option<u64>,
     /// Raw server-reported receive window from the most recently processed
     /// reply that carried one, when available.
