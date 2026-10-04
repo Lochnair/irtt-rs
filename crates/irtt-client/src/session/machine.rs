@@ -1245,6 +1245,86 @@ mod tests {
         events.into_iter().next().unwrap()
     }
 
+    // The latest retained deadline is internal to managed draining. Exercise
+    // ordinary session transitions to check its classification/retention policy.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn retained_deadline_tracks_timeouts_late_replies_eviction_and_close() {
+        let mut machine = opened();
+        assert_eq!(send(&mut machine).seq, 0);
+        let first = machine.latest_probe_timeout_deadline().unwrap();
+        assert_eq!(send(&mut machine).seq, 1);
+        let second = machine.latest_probe_timeout_deadline().unwrap();
+        let batch = machine.poll_timeouts_bounded_at(second, 1).unwrap();
+        assert!(
+            matches!(batch.events[0], ClientEvent::EchoLoss { seq: 0, timeout_at, .. } if timeout_at == first)
+        );
+        assert!(batch.more_due);
+        assert_eq!(machine.latest_probe_timeout_deadline(), Some(second));
+        let batch = machine.poll_timeouts_bounded_at(second, 1).unwrap();
+        assert!(
+            matches!(batch.events[0], ClientEvent::EchoLoss { seq: 1, timeout_at, .. } if timeout_at == second)
+        );
+        assert!(!batch.more_due);
+        assert!(machine.pending_is_empty());
+        assert_eq!(machine.next_probe_timeout_deadline(), None);
+        assert_eq!(machine.latest_probe_timeout_deadline(), Some(second));
+        assert!(matches!(
+            reply(&mut machine, 1),
+            ClientEvent::LateReply {
+                sent_at: Some(_),
+                rtt: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(machine.latest_probe_timeout_deadline(), Some(first));
+        assert!(matches!(
+            reply(&mut machine, 1),
+            ClientEvent::DuplicateReply { .. }
+        ));
+
+        for seq in 2..4 {
+            assert_eq!(send(&mut machine).seq, seq);
+            let deadline = machine.latest_probe_timeout_deadline().unwrap();
+            machine.poll_timeouts_at(deadline).unwrap();
+            assert_eq!(machine.latest_probe_timeout_deadline(), Some(deadline));
+        }
+        // Capacity eviction removes seq 0's measurement, not late classification.
+        assert!(matches!(
+            reply(&mut machine, 0),
+            ClientEvent::LateReply {
+                sent_at: None,
+                rtt: None,
+                ..
+            }
+        ));
+        assert!(matches!(
+            reply(&mut machine, 3),
+            ClientEvent::LateReply {
+                sent_at: Some(_),
+                rtt: Some(_),
+                ..
+            }
+        ));
+        assert!(machine.latest_probe_timeout_deadline().is_some());
+        assert!(matches!(
+            reply(&mut machine, 2),
+            ClientEvent::LateReply {
+                sent_at: Some(_),
+                rtt: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(machine.latest_probe_timeout_deadline(), None);
+
+        assert_eq!(send(&mut machine).seq, 4);
+        let deadline = machine.next_probe_timeout_deadline().unwrap();
+        machine.poll_timeouts_at(deadline).unwrap();
+        let commit = machine.prepare_close().unwrap().commit;
+        machine.commit_local_close(commit, ClientTimestamp::now());
+        assert_eq!(machine.latest_probe_timeout_deadline(), None);
+    }
+
     // Advancing a real client through 2^32 submissions is unreasonable. Only
     // move the send/receive sequence epoch; construct completion/timeout history through
     // ordinary machine transitions and assert emitted behavior on reuse.
@@ -1278,6 +1358,8 @@ mod tests {
                 reply(&mut machine, 0),
                 ClientEvent::EchoReply { seq: 0, .. }
             ));
+            #[cfg(feature = "tokio")]
+            assert_eq!(machine.latest_probe_timeout_deadline(), None);
             assert!(matches!(
                 reply(&mut machine, 0),
                 ClientEvent::DuplicateReply { seq: 0, .. }

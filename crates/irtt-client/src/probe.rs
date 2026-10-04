@@ -242,63 +242,61 @@ impl PendingMap {
 
 #[derive(Debug)]
 pub(crate) struct TimedOutMap {
-    map: HashMap<u32, PendingProbe>,
-    insertion_order: VecDeque<u32>,
-    max_capacity: usize,
+    // Timeout transitions consume PendingMap's head in deadline order. Reuse
+    // its linked storage in a separate map: the head owns FIFO eviction and
+    // the tail owns the latest retained timeout, even after arbitrary replies.
+    probes: PendingMap,
+    #[cfg(all(test, feature = "tokio"))]
+    deadline_inspections: std::cell::Cell<usize>,
 }
 
 impl TimedOutMap {
     pub fn new(max_capacity: usize) -> Self {
         Self {
-            map: HashMap::new(),
-            insertion_order: VecDeque::new(),
-            max_capacity,
+            probes: PendingMap::new(max_capacity),
+            #[cfg(all(test, feature = "tokio"))]
+            deadline_inspections: std::cell::Cell::new(0),
         }
     }
 
     pub fn insert(&mut self, probe: PendingProbe) {
-        if self.max_capacity == 0 {
+        if self.probes.max_capacity == 0 {
             return;
         }
-        if let std::collections::hash_map::Entry::Occupied(mut entry) =
-            self.map.entry(probe.wire_seq)
-        {
-            entry.insert(probe);
-            return;
+        // A sequence cannot be both pending and retained: committing its next
+        // generation removes the old retention before adding the pending probe.
+        debug_assert!(!self.probes.map.contains_key(&probe.wire_seq));
+        if self.probes.map.len() == self.probes.max_capacity {
+            self.probes
+                .remove(self.probes.first.expect("full retention has a head"));
         }
-        while self.map.len() >= self.max_capacity {
-            self.evict_oldest();
-        }
-        self.insertion_order.push_back(probe.wire_seq);
-        self.map.insert(probe.wire_seq, probe);
+        // Unlike pending admission, retention always makes room by eviction.
+        // Allocation here remains infallible as it was for the previous map.
+        self.probes.commit_insert(probe);
     }
 
     pub fn remove(&mut self, wire_seq: u32) -> Option<PendingProbe> {
-        let removed = self.map.remove(&wire_seq);
-        if removed.is_some() {
-            self.insertion_order.retain(|seq| *seq != wire_seq);
-        }
-        removed
+        self.probes.remove(wire_seq)
     }
 
     /// Mutable access to a still-retained timed-out probe by wire sequence,
     /// without disturbing eviction order. Used to attach an observed kernel
     /// TX timestamp that arrives after the probe has already timed out.
     pub fn get_mut(&mut self, wire_seq: u32) -> Option<&mut PendingProbe> {
-        self.map.get_mut(&wire_seq)
+        self.probes.get_mut(wire_seq)
     }
 
     #[cfg(feature = "tokio")]
     pub fn latest_timeout_deadline(&self) -> Option<Instant> {
-        self.map.values().map(|probe| probe.timeout_at).max()
-    }
-
-    fn evict_oldest(&mut self) {
-        while let Some(oldest_key) = self.insertion_order.pop_front() {
-            if self.map.remove(&oldest_key).is_some() {
-                break;
-            }
-        }
+        self.probes
+            .last
+            .and_then(|wire_seq| self.probes.map.get(&wire_seq))
+            .map(|entry| {
+                #[cfg(test)]
+                self.deadline_inspections
+                    .set(self.deadline_inspections.get() + 1);
+                entry.probe.timeout_at
+            })
     }
 }
 
@@ -427,17 +425,89 @@ mod tests {
         }
     }
 
+    // Measure deadline inspection work directly: wall-clock thresholds cannot
+    // reliably distinguish a bounded lookup from a retention scan.
+    #[cfg(feature = "tokio")]
+    #[test]
+    fn timeout_retention_deadlines_have_bounded_lookup_work() {
+        const COUNT: u32 = 4096;
+        let start = Instant::now();
+        let deadline = |seq| start + Duration::from_micros(u64::from(seq / 2));
+        let mut pending_map = PendingMap::new(COUNT as usize);
+        let mut timed_out = TimedOutMap::new(COUNT as usize);
+        for seq in 0..COUNT {
+            pending_map.preflight_insert(seq).unwrap();
+            pending_map.commit_insert(pending(seq, deadline(seq)));
+        }
+        let last_deadline = deadline(COUNT - 1);
+        for seq in 0..COUNT {
+            let batch = pending_map.drain_expired_bounded(last_deadline, 1);
+            assert_eq!(batch.probes.len(), 1);
+            assert_eq!(batch.probes[0].wire_seq, seq);
+            assert_eq!(batch.more_due, seq + 1 < COUNT);
+            timed_out.insert(batch.probes.into_iter().next().unwrap());
+            assert_eq!(timed_out.latest_timeout_deadline(), Some(deadline(seq)));
+            assert_eq!(
+                pending_map
+                    .latest_timeout_deadline()
+                    .into_iter()
+                    .chain(timed_out.latest_timeout_deadline())
+                    .max(),
+                Some(last_deadline)
+            );
+        }
+        assert!(
+            timed_out.deadline_inspections.replace(0) <= 2 * COUNT as usize,
+            "draining must not scan growing timeout retention after each transition"
+        );
+        // A middle/head removal leaves the latest deadline intact. Removing
+        // the newest survivors must walk back through equal deadlines too.
+        assert!(timed_out.remove(COUNT / 2).is_some());
+        assert!(timed_out.remove(0).is_some());
+        for seq in (1..COUNT).rev().filter(|seq| *seq != COUNT / 2) {
+            assert_eq!(timed_out.latest_timeout_deadline(), Some(deadline(seq)));
+            assert!(timed_out.remove(seq).is_some());
+        }
+        assert_eq!(timed_out.latest_timeout_deadline(), None);
+        assert!(timed_out.deadline_inspections.get() <= COUNT as usize);
+    }
+
     // Public loss/reply events cannot reveal leaked retention bookkeeping.
     #[test]
-    fn timed_out_retention_stays_bounded_after_repeated_removals() {
+    fn timed_out_retention_preserves_fifo_eviction_and_stays_bounded() {
         let mut map = TimedOutMap::new(4);
         let now = Instant::now();
 
         for i in 0..20 {
             map.insert(pending(i, now));
             assert!(map.remove(i).is_some());
-            assert!(map.map.len() <= 4);
-            assert!(map.insertion_order.len() <= 4);
+            assert!(map.probes.map.len() <= 4);
+        }
+
+        // Equal deadlines across wire-sequence wrap must still evict by
+        // insertion order. Removal at any position frees capacity immediately.
+        let sequences = [u32::MAX - 1, u32::MAX, 0, 1];
+        for removed in sequences {
+            let mut map = TimedOutMap::new(4);
+            for seq in sequences {
+                map.insert(pending(seq, now));
+            }
+            assert!(map.remove(removed).is_some());
+            map.insert(pending(2, now));
+            let oldest = sequences.into_iter().find(|seq| *seq != removed).unwrap();
+            map.insert(pending(3, now));
+            assert!(map.remove(oldest).is_none(), "oldest survivor is evicted");
+            for seq in sequences
+                .into_iter()
+                .filter(|seq| *seq != removed && *seq != oldest)
+            {
+                assert!(map.remove(seq).is_some());
+            }
+            assert!(map.remove(2).is_some());
+            assert!(map.remove(3).is_some());
+            assert!(map.probes.map.is_empty());
+            #[cfg(feature = "tokio")]
+            assert_eq!(map.latest_timeout_deadline(), None);
         }
     }
 }
