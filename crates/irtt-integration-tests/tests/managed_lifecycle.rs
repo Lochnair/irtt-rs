@@ -238,23 +238,50 @@ fn quiescent_rejects_empty_initial_targets() {
 
 #[test]
 fn explicit_empty_waits_for_stop() {
+    let server = start_server(ServerBehavior::Echo, None);
     let mut config = config(ManagedPacing::Staggered);
     config.completion = ManagedCompletionPolicy::ExplicitStop;
+    config.client.request.duration = None;
     let (task, handle) = ManagedClient::task(config, vec![]).unwrap();
-    let outcome = runtime().block_on(async move {
-        let mut task = Box::pin(task);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), task.as_mut())
-                .await
-                .is_err()
-        );
-        assert_eq!(handle.status().lifecycle, ManagedLifecycle::Running);
-        let receipt = handle.stop();
-        let outcome = task.await;
-        receipt.await;
-        outcome
+    let mut events = handle.subscribe().unwrap();
+    let outcome = runtime().block_on(async {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut task = Box::pin(task);
+            assert!(poll_once(task.as_mut()).is_pending());
+            assert_eq!(handle.status().lifecycle, ManagedLifecycle::Running);
+            let update = handle
+                .update_targets(vec![target("one", server.addr)])
+                .unwrap();
+            loop {
+                tokio::select! {
+                    _ = task.as_mut() => panic!("explicit-stop task completed before stop"),
+                    event = events.recv() => {
+                        if matches!(event.unwrap(), ManagedEvent::Client {
+                            event: irtt_client::ClientEvent::EchoReply { .. }, ..
+                        }) {
+                            break;
+                        }
+                    }
+                }
+            }
+            update.await.unwrap();
+            let mut receipt = Box::pin(handle.stop());
+            assert!(poll_once(receipt.as_mut()).is_pending());
+            assert!(poll_once(task.as_mut()).is_pending());
+            let status = handle.status();
+            assert_eq!(status.lifecycle, ManagedLifecycle::Stopping);
+            assert!(status.stop_requested);
+            assert!(status.final_outcome.is_none());
+            // The driver is paused during graceful cleanup: receipt readiness must
+            // come from durable stop observation, not eventual task completion.
+            assert!(poll_once(receipt.as_mut()).is_ready());
+            task.await
+        })
+        .await
+        .expect("stop observation and cleanup must complete")
     });
     assert_eq!(outcome.end_reason, ManagedEndReason::StopRequested);
+    assert!(has_close(&server.finish()));
 }
 
 #[test]
@@ -311,6 +338,8 @@ fn pre_poll_stop() {
     )
     .unwrap();
     let mut receipt = Box::pin(handle.stop());
+    assert!(poll_once(receipt.as_mut()).is_pending());
+    assert!(!handle.status().stop_requested);
     let mut task = Box::pin(task);
     let Poll::Ready(outcome) = poll_once(task.as_mut()) else {
         panic!("pre-stopped task did not complete")
@@ -469,6 +498,10 @@ fn event_loss_independence() {
     assert_eq!(outcome.successful_target_outcomes, 1);
     let status = handle.status();
     assert_eq!(status.lifecycle, ManagedLifecycle::Completed);
+    assert!(!status.stop_requested);
+    let mut receipt = Box::pin(handle.stop());
+    assert!(poll_once(receipt.as_mut()).is_ready());
+    assert!(Arc::ptr_eq(&status, &handle.status()));
     assert_eq!(status.targets.len(), 1);
     let target = &status.targets[0];
     assert!(target.desired);
@@ -511,16 +544,32 @@ fn dropping_all_handles_does_not_stop() {
 
 #[test]
 fn task_drop_abandonment() {
-    let (task, handle) = ManagedClient::task(
-        config(ManagedPacing::Staggered),
-        vec![target("one", "127.0.0.1:9".parse().unwrap())],
-    )
-    .unwrap();
-    let mut events = handle.subscribe().unwrap();
-    drop(task);
-    assert_eq!(handle.status().lifecycle, ManagedLifecycle::Abandoned);
-    assert_eq!(handle.status().total_target_outcomes, 0);
-    assert!(matches!(events.try_recv(), Ok(ManagedEvent::Abandoned)));
+    // A latched but unobserved stop must not turn abandonment into completion.
+    for request_stop in [false, true] {
+        let (task, handle) = ManagedClient::task(
+            config(ManagedPacing::Staggered),
+            vec![target("one", "127.0.0.1:9".parse().unwrap())],
+        )
+        .unwrap();
+        let mut events = handle.subscribe().unwrap();
+        let mut receipt = request_stop.then(|| Box::pin(handle.stop()));
+        if let Some(receipt) = &mut receipt {
+            assert!(poll_once(receipt.as_mut()).is_pending());
+        }
+        drop(task);
+        assert_eq!(handle.status().lifecycle, ManagedLifecycle::Abandoned);
+        assert_eq!(handle.status().total_target_outcomes, 0);
+        assert!(!handle.status().stop_requested);
+        assert!(handle.status().final_outcome.is_none());
+        assert!(matches!(events.try_recv(), Ok(ManagedEvent::Abandoned)));
+        if let Some(receipt) = &mut receipt {
+            assert!(poll_once(receipt.as_mut()).is_ready());
+        }
+        let mut late_stop = Box::pin(handle.stop());
+        assert!(poll_once(late_stop.as_mut()).is_ready());
+        assert_eq!(handle.status().lifecycle, ManagedLifecycle::Abandoned);
+        assert!(!handle.status().stop_requested);
+    }
 }
 
 #[test]

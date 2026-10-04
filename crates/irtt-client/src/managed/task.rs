@@ -29,10 +29,10 @@ use super::{
     classify_client_error, ManagedClientConfig, ManagedCommandAcknowledgement,
     ManagedCommandApplyError, ManagedCommandError, ManagedCompletionPolicy, ManagedConfigError,
     ManagedDriverFailure, ManagedEndReason, ManagedEvent, ManagedEventSubscription,
-    ManagedLifecycle, ManagedOutcome, ManagedPacing, ManagedStatus, ManagedSubscribeError,
-    ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure, ManagedTargetFailureKind,
-    ManagedTargetFailurePhase, ManagedTargetLifecycle, ManagedTargetOutcome, ManagedTargetStatus,
-    TargetInstance,
+    ManagedLifecycle, ManagedOutcome, ManagedPacing, ManagedStatus, ManagedStatusSubscription,
+    ManagedSubscribeError, ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetFailure,
+    ManagedTargetFailureKind, ManagedTargetFailurePhase, ManagedTargetLifecycle,
+    ManagedTargetOutcome, ManagedTargetStatus, TargetInstance,
 };
 
 const TARGET_WORK_BUDGET: usize = 128;
@@ -101,8 +101,6 @@ struct StopSignal {
     requested: AtomicBool,
     update_admission: AtomicU8,
     wake: watch::Sender<()>,
-    acknowledged: AtomicBool,
-    acknowledgement: watch::Sender<()>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,12 +160,6 @@ impl StopSignal {
     fn is_requested(&self) -> bool {
         self.requested.load(Ordering::Acquire)
     }
-
-    fn acknowledge(&self) {
-        if !self.acknowledged.swap(true, Ordering::AcqRel) {
-            self.acknowledgement.send_replace(());
-        }
-    }
 }
 
 /// Cloneable control and observation capability for a managed task.
@@ -194,6 +186,16 @@ impl ManagedClientHandle {
         Arc::clone(&self.status.borrow())
     }
 
+    /// Subscribe to authoritative durable latest-state observation.
+    ///
+    /// The current snapshot is immediately available through `borrow()`. Updates
+    /// may coalesce; this is not a lossless event log. After the task terminates,
+    /// the sender closes but the final snapshot remains readable. Use
+    /// [`Self::subscribe`] for the lossy presentation-event stream.
+    pub fn subscribe_status(&self) -> ManagedStatusSubscription {
+        self.status.clone()
+    }
+
     /// Subscribe to future lossy presentation events.
     pub fn subscribe(&self) -> Result<ManagedEventSubscription, ManagedSubscribeError> {
         self.events
@@ -205,7 +207,7 @@ impl ManagedClientHandle {
     /// Request idempotent graceful stop and return a durable-status receipt.
     pub fn stop(&self) -> ManagedStopReceipt {
         self.stop.request();
-        ManagedStopReceipt::new(Arc::clone(&self.stop))
+        ManagedStopReceipt::new(self.subscribe_status())
     }
 
     /// Submit the complete desired target set, replacing any previous one.
@@ -303,17 +305,33 @@ enum ManagedCommand {
 }
 
 /// Receipt resolving once stop is durably observed or the task is terminal.
+///
+/// Resolves from authoritative status as soon as `stop_requested` is true or
+/// the lifecycle is Completed, Failed, or Abandoned. It need not wait for
+/// graceful cleanup after stop observation.
 #[must_use = "await the receipt to observe durable stop acknowledgement"]
 pub struct ManagedStopReceipt {
     future: Pin<Box<dyn Future<Output = ()> + Send>>,
 }
 
 impl ManagedStopReceipt {
-    fn new(stop: Arc<StopSignal>) -> Self {
-        let mut acknowledgement = stop.acknowledgement.subscribe();
+    fn new(mut status: ManagedStatusSubscription) -> Self {
         let future = Box::pin(async move {
-            while !stop.acknowledged.load(Ordering::Acquire) {
-                let _ = acknowledgement.changed().await;
+            while !{
+                let snapshot = status.borrow();
+                snapshot.stop_requested
+                    || matches!(
+                        snapshot.lifecycle,
+                        ManagedLifecycle::Completed
+                            | ManagedLifecycle::Failed
+                            | ManagedLifecycle::Abandoned
+                    )
+            } {
+                // A closed sender retains the terminal snapshot. Never wait
+                // indefinitely if the channel closes.
+                if status.changed().await.is_err() {
+                    break;
+                }
             }
         });
         Self { future }
@@ -688,12 +706,48 @@ struct TaskResources {
     stop: Arc<StopSignal>,
 }
 
-#[derive(Clone, Copy, Eq, PartialEq)]
-enum DriverState {
+enum TaskPhase {
     NotStarted,
     Running,
     Stopping,
-    Finished,
+    Completed { outcome: Arc<ManagedOutcome> },
+    Failed { outcome: Arc<ManagedOutcome> },
+    Abandoned,
+}
+
+impl TaskPhase {
+    fn lifecycle(&self) -> ManagedLifecycle {
+        match self {
+            Self::NotStarted => ManagedLifecycle::NotStarted,
+            Self::Running => ManagedLifecycle::Running,
+            Self::Stopping => ManagedLifecycle::Stopping,
+            Self::Completed { .. } => ManagedLifecycle::Completed,
+            Self::Failed { .. } => ManagedLifecycle::Failed,
+            Self::Abandoned => ManagedLifecycle::Abandoned,
+        }
+    }
+
+    fn final_outcome(&self) -> Option<Arc<ManagedOutcome>> {
+        match self {
+            Self::Completed { outcome } | Self::Failed { outcome } => Some(Arc::clone(outcome)),
+            _ => None,
+        }
+    }
+
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            Self::Completed { .. } | Self::Failed { .. } | Self::Abandoned
+        )
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self, Self::Running)
+    }
+
+    fn is_stopping(&self) -> bool {
+        matches!(self, Self::Stopping)
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -707,8 +761,7 @@ enum OpenSessionFailureCleanup {
 pub struct ManagedClientTask {
     #[cfg(test)]
     timeout_inspections: std::cell::RefCell<Vec<usize>>,
-    state: DriverState,
-    lifecycle: ManagedLifecycle,
+    phase: TaskPhase,
     config: ManagedClientConfig,
     targets: Vec<TargetRuntime>,
     commands: mpsc::Receiver<ManagedCommand>,
@@ -725,8 +778,8 @@ pub struct ManagedClientTask {
     stagger_remaining: usize,
     send_gate: Option<Instant>,
     last_stagger_send: Option<Instant>,
+    // Explicit stop observation is independent of natural stopping or terminality.
     stop_observed: bool,
-    final_outcome: Option<Arc<ManagedOutcome>>,
     next_generation: u64,
     applied_command_sequence: u64,
 }
@@ -779,7 +832,7 @@ impl ManagedClientTask {
             })
             .collect::<Vec<_>>();
         Arc::new(ManagedStatus {
-            lifecycle: self.lifecycle,
+            lifecycle: self.phase.lifecycle(),
             stop_requested: self.stop_observed,
             applied_command_sequence: self.applied_command_sequence,
             desired_target_count: self
@@ -800,7 +853,7 @@ impl ManagedClientTask {
             discarded_target_outcomes: self.history.discarded,
             targets: Arc::from(targets.into_boxed_slice()),
             recent_target_outcomes: self.history.recent(),
-            final_outcome: self.final_outcome.clone(),
+            final_outcome: self.phase.final_outcome(),
         })
     }
 
@@ -890,8 +943,7 @@ impl ManagedClientTask {
 
     fn begin_running(&mut self) -> Result<(), ManagedDriverFailure> {
         tokio::runtime::Handle::try_current().map_err(|_| ManagedDriverFailure::NoTokioRuntime)?;
-        self.state = DriverState::Running;
-        self.lifecycle = ManagedLifecycle::Running;
+        self.phase = TaskPhase::Running;
         self.replace_status();
         self.publish_event(ManagedEvent::Started);
         Ok(())
@@ -903,15 +955,12 @@ impl ManagedClientTask {
         }
         self.stop_observed = true;
         self.resources().stop.begin_stopping();
-        let lifecycle_transition =
-            self.state != DriverState::Stopping || self.lifecycle != ManagedLifecycle::Stopping;
-        self.state = DriverState::Stopping;
-        self.lifecycle = ManagedLifecycle::Stopping;
+        let lifecycle_transition = !self.phase.is_stopping();
+        self.phase = TaskPhase::Stopping;
         self.replace_status();
         if lifecycle_transition {
             self.publish_event(ManagedEvent::Stopping);
         }
-        self.resources().stop.acknowledge();
         self.scan_remaining = self.targets.len();
         self.burst_remaining = 0;
     }
@@ -934,7 +983,7 @@ impl ManagedClientTask {
                     // This check is the driver-side application linearization point.
                     // `apply_targets` cannot suspend, so a stop observed here wins over
                     // this command; once it passes, this command may complete atomically.
-                    let result = if self.state != DriverState::Running
+                    let result = if !self.phase.is_running()
                         || self.resources().stop.update_admission() != UpdateAdmission::Open
                     {
                         Err(ManagedCommandApplyError::Stopping)
@@ -1015,8 +1064,7 @@ impl ManagedClientTask {
             && self.config.completion == ManagedCompletionPolicy::FinishWhenQuiescent;
         if stopping {
             self.resources().stop.begin_stopping();
-            self.state = DriverState::Stopping;
-            self.lifecycle = ManagedLifecycle::Stopping;
+            self.phase = TaskPhase::Stopping;
         }
 
         // A transaction has one externally visible durable point: all runtime and
@@ -1180,7 +1228,7 @@ impl ManagedClientTask {
 
     fn poll_target(&mut self, index: usize, cx: &mut Context<'_>, now: Instant) -> bool {
         let retirement = self.effective_retirement(index);
-        let stopping = self.state == DriverState::Stopping || retirement.is_some();
+        let stopping = self.phase.is_stopping() || retirement.is_some();
         match self.targets[index].phase_mut() {
             TargetPhase::Pending { .. } => {
                 if stopping {
@@ -1956,7 +2004,7 @@ impl ManagedClientTask {
         self.timeout_inspections.borrow_mut().push(index);
         match self.targets[index].phase() {
             TargetPhase::Active { client, .. } => {
-                self.state != DriverState::Stopping
+                !self.phase.is_stopping()
                     && self.effective_retirement(index).is_none()
                     && client
                         .next_probe_timeout_deadline()
@@ -2090,7 +2138,7 @@ impl ManagedClientTask {
                 _ => {}
             }
         }
-        if self.state == DriverState::Running
+        if self.phase.is_running()
             && self.config.pacing == ManagedPacing::Staggered
             && self.active_count() > 0
         {
@@ -2160,11 +2208,14 @@ impl ManagedClientTask {
             self.history
                 .outcome(end_reason, self.applied_command_sequence),
         );
-        self.final_outcome = Some(Arc::clone(&outcome));
-        self.lifecycle = if failed {
-            ManagedLifecycle::Failed
+        self.phase = if failed {
+            TaskPhase::Failed {
+                outcome: Arc::clone(&outcome),
+            }
         } else {
-            ManagedLifecycle::Completed
+            TaskPhase::Completed {
+                outcome: Arc::clone(&outcome),
+            }
         };
         self.replace_status();
         self.publish_event(if failed {
@@ -2176,11 +2227,9 @@ impl ManagedClientTask {
                 outcome: Arc::clone(&outcome),
             }
         });
-        self.resources().stop.acknowledge();
         if let Some(resources) = self.resources.as_mut() {
             resources.events.take();
         }
-        self.state = DriverState::Finished;
         self.wake = None;
         self.timer = None;
         self.resources.take();
@@ -2228,11 +2277,11 @@ impl Future for ManagedClientTask {
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.as_mut().get_mut();
-        if this.state == DriverState::Finished {
+        if this.phase.is_terminal() {
             panic!("ManagedClientTask polled after completion");
         }
 
-        if this.state == DriverState::NotStarted {
+        if matches!(this.phase, TaskPhase::NotStarted) {
             if this.resources().stop.is_requested() {
                 this.observe_stop();
             } else if let Err(failure) = this.begin_running() {
@@ -2251,7 +2300,7 @@ impl Future for ManagedClientTask {
         immediate |= this.poll_timeout_pass(now);
         immediate |= this.poll_target_pass(cx, now);
         this.prune_undesired_terminal();
-        if this.state == DriverState::Running {
+        if this.phase.is_running() {
             immediate |= match this.config.pacing {
                 ManagedPacing::Staggered => this.poll_staggered_send(cx, now),
                 ManagedPacing::Burst => this.poll_burst_sends(cx, now),
@@ -2263,8 +2312,8 @@ impl Future for ManagedClientTask {
         }
 
         if this.all_targets_terminal() {
-            match this.state {
-                DriverState::Stopping => {
+            match this.phase {
+                TaskPhase::Stopping => {
                     return this.seal(
                         if this.stop_observed {
                             ManagedEndReason::StopRequested
@@ -2274,11 +2323,10 @@ impl Future for ManagedClientTask {
                         false,
                     );
                 }
-                DriverState::Running
+                TaskPhase::Running
                     if this.config.completion == ManagedCompletionPolicy::FinishWhenQuiescent =>
                 {
-                    this.state = DriverState::Stopping;
-                    this.lifecycle = ManagedLifecycle::Stopping;
+                    this.phase = TaskPhase::Stopping;
                     this.resources().stop.begin_stopping();
                     this.replace_status();
                     this.publish_event(ManagedEvent::Stopping);
@@ -2301,16 +2349,14 @@ impl Future for ManagedClientTask {
 
 impl Drop for ManagedClientTask {
     fn drop(&mut self) {
-        if self.state == DriverState::Finished || self.resources.is_none() {
+        if self.phase.is_terminal() || self.resources.is_none() {
             return;
         }
-        self.lifecycle = ManagedLifecycle::Abandoned;
-        self.final_outcome = None;
+        self.phase = TaskPhase::Abandoned;
         self.resources().stop.close_updates();
         self.commands.close();
         self.replace_status();
         self.publish_event(ManagedEvent::Abandoned);
-        self.resources().stop.acknowledge();
         if let Some(resources) = self.resources.as_mut() {
             resources.events.take();
         }
@@ -2394,13 +2440,10 @@ fn build_task(
     let (event_sender, _) = broadcast::channel(config.event_capacity);
     let weak_events = event_sender.downgrade();
     let (wake_sender, wake_receiver) = watch::channel(());
-    let (acknowledgement_sender, _) = watch::channel(());
     let stop = Arc::new(StopSignal {
         requested: AtomicBool::new(false),
         update_admission: AtomicU8::new(UpdateAdmission::Open as u8),
         wake: wake_sender,
-        acknowledged: AtomicBool::new(false),
-        acknowledgement: acknowledgement_sender,
     });
     let history = OutcomeHistory::new(config.outcome_history_limit);
     let initial_targets = runtimes
@@ -2414,8 +2457,9 @@ fn build_task(
             remote: None,
         })
         .collect::<Vec<_>>();
+    let phase = TaskPhase::NotStarted;
     let initial = Arc::new(ManagedStatus {
-        lifecycle: ManagedLifecycle::NotStarted,
+        lifecycle: phase.lifecycle(),
         stop_requested: false,
         applied_command_sequence: 0,
         desired_target_count: runtimes.len(),
@@ -2432,7 +2476,7 @@ fn build_task(
         discarded_target_outcomes: 0,
         targets: Arc::from(initial_targets.into_boxed_slice()),
         recent_target_outcomes: history.recent(),
-        final_outcome: None,
+        final_outcome: phase.final_outcome(),
     });
     let (status_sender, status_receiver) = watch::channel(initial);
     let (command_sender, command_receiver) = mpsc::channel(config.command_capacity);
@@ -2445,8 +2489,7 @@ fn build_task(
     let task = ManagedClientTask {
         #[cfg(test)]
         timeout_inspections: std::cell::RefCell::new(Vec::new()),
-        state: DriverState::NotStarted,
-        lifecycle: ManagedLifecycle::NotStarted,
+        phase,
         config,
         targets: runtimes,
         commands: command_receiver,
@@ -2464,7 +2507,6 @@ fn build_task(
         send_gate: None,
         last_stagger_send: None,
         stop_observed: false,
-        final_outcome: None,
         next_generation,
         applied_command_sequence: 0,
     };
@@ -2547,7 +2589,7 @@ mod tests {
                 let client = AsyncClient::connect("127.0.0.1:9", ClientConfig::default())
                     .await
                     .unwrap();
-                task.state = DriverState::Running;
+                task.phase = TaskPhase::Running;
                 task.install_target_phase(
                     0,
                     TargetPhase::Active {

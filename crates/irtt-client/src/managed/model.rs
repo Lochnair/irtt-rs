@@ -155,6 +155,10 @@ pub struct ManagedTargetStatus {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedStatus {
     pub lifecycle: ManagedLifecycle,
+    /// Whether the task durably observed an explicit stop request.
+    ///
+    /// This remains false until the task observes the request latch. Natural
+    /// stopping and terminality alone do not imply a stop request was observed.
     pub stop_requested: bool,
     pub applied_command_sequence: u64,
     pub desired_target_count: usize,
@@ -171,8 +175,20 @@ pub struct ManagedStatus {
     pub discarded_target_outcomes: u64,
     pub targets: Arc<[ManagedTargetStatus]>,
     pub recent_target_outcomes: Arc<[ManagedTargetOutcome]>,
+    /// Authoritative final accounting, present if and only if `lifecycle` is
+    /// [`ManagedLifecycle::Completed`] or [`ManagedLifecycle::Failed`].
+    ///
+    /// Shares the terminal task phase's outcome with [`ManagedEvent::Completed`]
+    /// or [`ManagedEvent::Failed`]. Abandoned deliberately has no outcome.
     pub final_outcome: Option<Arc<ManagedOutcome>>,
 }
+
+/// Receiving half of authoritative durable latest-state observation.
+///
+/// The current snapshot is immediately readable. Updates may coalesce, and the
+/// final snapshot remains available after the sender closes at task termination.
+/// Use [`ManagedEventSubscription`] for lossy presentation events.
+pub type ManagedStatusSubscription = tokio::sync::watch::Receiver<Arc<ManagedStatus>>;
 
 /// Lossy presentation event emitted by the managed task.
 #[allow(clippy::large_enum_variant)]
