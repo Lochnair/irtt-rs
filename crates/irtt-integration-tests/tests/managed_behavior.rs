@@ -238,6 +238,10 @@ async fn target_updates_preserve_identical_sessions_and_retire_removed_generatio
                     let status = handle.status();
                     assert_eq!(status.lifecycle, ManagedLifecycle::Completed);
                     assert_eq!(status.final_outcome.as_ref(), Some(&outcome));
+                    assert!(Arc::ptr_eq(
+                        status.final_outcome.as_ref().unwrap(),
+                        &outcome
+                    ));
                     break;
                 }
                 _ => {}

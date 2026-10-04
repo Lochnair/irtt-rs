@@ -20,6 +20,32 @@ fn config() -> ManagedClientConfig {
 #[test]
 fn stop_resolves_every_accepted_update_and_closes_admission() {
     let (task, handle) = ManagedClient::task(config(), vec![]).unwrap();
+    let mut subscription: ManagedStatusSubscription = handle.subscribe_status();
+    assert_eq!(
+        subscription.borrow().lifecycle,
+        ManagedLifecycle::NotStarted
+    );
+    assert!(!subscription.borrow().stop_requested);
+    assert!(subscription.borrow().final_outcome.is_none());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut task = pin!(task);
+    {
+        let _runtime = runtime.enter();
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(handle.status().lifecycle, ManagedLifecycle::Running);
+    subscription = handle.subscribe_status();
+    assert_eq!(subscription.borrow().lifecycle, ManagedLifecycle::Running);
+    assert!(pin!(subscription.changed())
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
     let receipts: Vec<_> = (0..3)
         .map(|index| {
             handle
@@ -35,15 +61,16 @@ fn stop_resolves_every_accepted_update_and_closes_admission() {
         Err(ManagedCommandError::QueueFull)
     ));
 
-    let stop = handle.stop();
+    let mut stop = pin!(handle.stop());
+    assert!(stop
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
+    assert!(!handle.status().stop_requested);
     assert!(matches!(
         handle.update_targets(vec![]),
         Err(ManagedCommandError::Stopping)
     ));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(2), async {
             let outcome = task.await;
@@ -61,6 +88,16 @@ fn stop_resolves_every_accepted_update_and_closes_admission() {
             assert_eq!(status.lifecycle, ManagedLifecycle::Completed);
             assert!(status.stop_requested);
             assert_eq!(status.final_outcome.as_deref(), Some(&outcome));
+            subscription.changed().await.unwrap();
+            assert!(std::sync::Arc::ptr_eq(
+                &subscription.borrow_and_update(),
+                &status
+            ));
+            assert!(subscription.changed().await.is_err());
+            assert_eq!(
+                subscription.borrow().final_outcome.as_deref(),
+                Some(&outcome)
+            );
             assert!(matches!(
                 handle.update_targets(vec![]),
                 Err(ManagedCommandError::DriverClosed)
@@ -103,12 +140,14 @@ fn failed_driver_resolves_every_accepted_update_with_its_terminal_failure() {
     }
     let status = handle.status();
     assert_eq!(status.lifecycle, ManagedLifecycle::Failed);
+    assert!(!status.stop_requested);
     assert_eq!(status.final_outcome.as_deref(), Some(&outcome));
     assert!(matches!(
         handle.update_targets(vec![]),
         Err(ManagedCommandError::DriverClosed)
     ));
     assert!(pin!(handle.stop()).as_mut().poll(&mut context).is_ready());
+    assert!(!handle.status().stop_requested);
 }
 
 #[test]
