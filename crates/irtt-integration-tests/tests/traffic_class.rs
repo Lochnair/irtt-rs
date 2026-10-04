@@ -217,12 +217,15 @@ async fn opened_session(server_addr: SocketAddr, dscp: u8) -> OpenSession {
         .await
         .unwrap();
     match client.open().await.unwrap() {
-        OpenOutcome::Started { negotiated, .. } => assert_eq!(
-            negotiated.params.dscp,
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        }) => assert_eq!(
+            negotiated.peer_params.dscp,
             i64::from(dscp) << 2,
             "the server negotiates the raw byte the codepoint asks for"
         ),
-        OpenOutcome::NoTestCompleted { .. } => panic!("a normal client unexpectedly ran no-test"),
+        OpenOutcome::NoTestCompleted(_) => panic!("a normal client unexpectedly ran no-test"),
     }
     OpenSession {
         client,

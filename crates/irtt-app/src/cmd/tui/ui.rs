@@ -10,7 +10,7 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use irtt_client::managed::{ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance};
-use irtt_client::{ClientEvent, NegotiatedParams, SignedDuration};
+use irtt_client::{ClientEvent, NegotiationResult, SignedDuration};
 use irtt_stats::{Snapshot, StatsCollector, TimeStats};
 use ratatui::{
     backend::CrosstermBackend,
@@ -266,12 +266,12 @@ impl TuiState {
             };
             target.stats.process(event);
             match event {
-                ClientEvent::SessionStarted {
+                ClientEvent::SessionStarted(irtt_client::SessionStarted {
                     remote,
                     token,
-                    negotiated,
+                    negotiation: negotiated,
                     ..
-                } => {
+                }) => {
                     target.remote = Some(remote.to_string());
                     target.session = Some(format!("{token:#x}"));
                     target.negotiated = Some(negotiated.clone());
@@ -279,9 +279,11 @@ impl TuiState {
                     global_status = Some(TuiStatus::Running);
                     recent = Some(format!("session started token={token:#x}"));
                 }
-                ClientEvent::NoTestCompleted {
-                    remote, negotiated, ..
-                } => {
+                ClientEvent::NoTestCompleted(irtt_client::NoTestCompleted {
+                    remote,
+                    negotiation: negotiated,
+                    ..
+                }) => {
                     target.remote = Some(remote.to_string());
                     target.negotiated = Some(negotiated.clone());
                     target.status = TargetStatus::NoTest;
@@ -541,7 +543,7 @@ pub(super) struct TuiTargetState {
     remote: Option<String>,
     session: Option<String>,
     status: TargetStatus,
-    negotiated: Option<NegotiatedParams>,
+    negotiated: Option<NegotiationResult>,
     graph_history: VecDeque<GraphSample>,
     last_sample: Option<LastSample>,
     last_warning: Option<String>,
@@ -1897,27 +1899,26 @@ fn push_time_line(lines: &mut Vec<Line<'_>>, label: &str, stats: &TimeStats) {
     )));
 }
 
-fn format_negotiated(negotiated: &NegotiatedParams) -> String {
-    let params = &negotiated.params;
-    let duration = if params.duration_ns == 0 {
-        "-".to_owned()
-    } else {
-        format_optional_ns_i128(Some(i128::from(params.duration_ns)))
-    };
-    let restrictions = if negotiated.restrictions.is_empty() {
+fn format_negotiated(negotiated: &NegotiationResult) -> String {
+    let params = &negotiated.accepted;
+    let duration = params.duration.map_or_else(
+        || "-".to_owned(),
+        |duration| format_optional_ns_i128(Some(duration.as_nanos() as i128)),
+    );
+    let changes = if negotiated.changes.is_empty() {
         "none".to_owned()
     } else {
-        negotiated.restrictions.len().to_string()
+        negotiated.changes.len().to_string()
     };
     format!(
-        "duration={} interval={} length={} clock={:?} timestamps={:?} stats={:?} restrictions={}",
+        "duration={} interval={} length={} clock={:?} timestamps={:?} stats={:?} changes={}",
         duration,
-        format_optional_ns_i128(Some(i128::from(params.interval_ns))),
+        format_optional_ns_i128(Some(params.interval.as_nanos() as i128)),
         params.length,
         params.clock,
         params.stamp_at,
         params.received_stats,
-        restrictions
+        changes
     )
 }
 

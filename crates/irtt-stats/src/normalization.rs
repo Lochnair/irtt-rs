@@ -124,8 +124,8 @@ pub(crate) fn normalize_event(event: &ClientEvent) -> Option<StatsEvent> {
             at: (*timeout_at).max(sent_at.mono),
         }),
         ClientEvent::Warning { at, .. } => Some(StatsEvent::Warning { at: at.mono }),
-        ClientEvent::SessionStarted { .. }
-        | ClientEvent::NoTestCompleted { .. }
+        ClientEvent::SessionStarted(_)
+        | ClientEvent::NoTestCompleted(_)
         | ClientEvent::SessionClosed { .. } => None,
     }
 }

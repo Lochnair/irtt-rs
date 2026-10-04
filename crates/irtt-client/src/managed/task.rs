@@ -424,8 +424,8 @@ impl TargetCounters {
             }
             ClientEvent::EchoSent { .. }
             | ClientEvent::EchoLoss { .. }
-            | ClientEvent::SessionStarted { .. }
-            | ClientEvent::NoTestCompleted { .. }
+            | ClientEvent::SessionStarted(_)
+            | ClientEvent::NoTestCompleted(_)
             | ClientEvent::SessionClosed { .. } => {}
         }
     }
@@ -1138,13 +1138,8 @@ impl ManagedClientTask {
                         self.targets[index].state = TargetState::Opening { client, open };
                         false
                     }
-                    Poll::Ready(Ok(OpenOutcome::Started {
-                        event, negotiated, ..
-                    })) => {
-                        let ClientEvent::SessionStarted { at: opened_at, .. } = &event else {
-                            unreachable!("Started carries SessionStarted");
-                        };
-                        match ProbeSchedule::new(opened_at.mono, &negotiated) {
+                    Poll::Ready(Ok(OpenOutcome::Started(started))) => {
+                        match ProbeSchedule::new(started.at.mono, &started.negotiation.accepted) {
                             Ok(schedule) => self.targets[index].schedule = Some(schedule),
                             Err(error) => {
                                 return self.begin_open_session_failure(
@@ -1157,7 +1152,10 @@ impl ManagedClientTask {
                                 )
                             }
                         }
-                        self.publish_client_events(index, vec![event]);
+                        self.publish_client_events(
+                            index,
+                            vec![ClientEvent::SessionStarted(started)],
+                        );
                         if self.state == DriverState::Stopping
                             || self.effective_retirement(index).is_some()
                         {
@@ -1174,8 +1172,11 @@ impl ManagedClientTask {
                             true
                         }
                     }
-                    Poll::Ready(Ok(OpenOutcome::NoTestCompleted { event, .. })) => {
-                        self.publish_client_events(index, vec![event]);
+                    Poll::Ready(Ok(OpenOutcome::NoTestCompleted(completed))) => {
+                        self.publish_client_events(
+                            index,
+                            vec![ClientEvent::NoTestCompleted(completed)],
+                        );
                         let end_reason = if self.state == DriverState::Stopping
                             || self.effective_retirement(index).is_some()
                         {
@@ -2408,13 +2409,15 @@ mod tests {
         runtime.block_on(async {
             let start = Instant::now();
             let end = start + Duration::from_millis(500);
-            let negotiated = crate::NegotiatedParams {
-                params: irtt_proto::Params {
-                    duration_ns: 500_000_000,
-                    interval_ns: 1_000_000,
-                    ..irtt_proto::Params::default()
-                },
-                restrictions: Vec::new(),
+            let accepted = crate::AcceptedSessionParameters {
+                duration: Some(Duration::from_millis(500)),
+                interval: Duration::from_millis(1),
+                length: 0,
+                received_stats: irtt_proto::ReceivedStats::None,
+                stamp_at: irtt_proto::StampAt::None,
+                clock: irtt_proto::Clock::Both,
+                dscp: 0,
+                server_fill: None,
             };
             for pacing in [ManagedPacing::Burst, ManagedPacing::Staggered] {
                 let (mut task, _handle) = ManagedClient::task(
@@ -2434,8 +2437,7 @@ mod tests {
 
                 for send_waiting in [false, true] {
                     task.targets[0].send_waiting = send_waiting;
-                    task.targets[0].schedule =
-                        Some(ProbeSchedule::new(start, &negotiated).unwrap());
+                    task.targets[0].schedule = Some(ProbeSchedule::new(start, &accepted).unwrap());
                     let expected = if pacing == ManagedPacing::Burst && !send_waiting {
                         start
                     } else {
@@ -2451,8 +2453,8 @@ mod tests {
                     assert_eq!(task.next_deadline(), None);
                 }
 
-                let mut continuous = negotiated.clone();
-                continuous.params.duration_ns = 0;
+                let mut continuous = accepted.clone();
+                continuous.duration = None;
                 task.targets[0].schedule = Some(ProbeSchedule::new(start, &continuous).unwrap());
                 assert_eq!(task.next_deadline(), None);
             }

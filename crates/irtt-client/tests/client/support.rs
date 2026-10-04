@@ -222,33 +222,24 @@ pub(super) fn echo_server(params: Params) -> FakeServer {
     })
 }
 
-pub(super) fn assert_open_started(outcome: OpenOutcome) -> NegotiatedParams {
+pub(super) fn assert_open_started(outcome: OpenOutcome) -> NegotiationResult {
     match outcome {
-        OpenOutcome::Started {
-            token, negotiated, ..
-        } => {
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            token,
+            negotiation: negotiated,
+            ..
+        }) => {
             assert_eq!(token, TOKEN);
             negotiated
         }
-        OpenOutcome::NoTestCompleted { .. } => panic!("unexpected no-test outcome"),
+        OpenOutcome::NoTestCompleted(_) => panic!("unexpected no-test outcome"),
     }
 }
 
-pub(super) fn assert_no_test_completed(outcome: OpenOutcome) -> NegotiatedParams {
+pub(super) fn assert_no_test_completed(outcome: OpenOutcome) -> NegotiationResult {
     match outcome {
-        OpenOutcome::NoTestCompleted {
-            negotiated, event, ..
-        } => {
-            assert!(matches!(
-                event,
-                ClientEvent::NoTestCompleted {
-                    negotiated: ref event_params,
-                    ..
-                } if *event_params == negotiated
-            ));
-            negotiated
-        }
-        OpenOutcome::Started { .. } => panic!("unexpected started outcome"),
+        OpenOutcome::NoTestCompleted(completed) => completed.negotiation,
+        OpenOutcome::Started(_) => panic!("unexpected started outcome"),
     }
 }
 

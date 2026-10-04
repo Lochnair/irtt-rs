@@ -162,7 +162,7 @@ async fn target_updates_preserve_identical_sessions_and_retire_removed_generatio
             match events.recv().await.unwrap() {
                 ManagedEvent::Client {
                     target,
-                    event: ClientEvent::SessionStarted { .. },
+                    event: ClientEvent::SessionStarted(_),
                 } if target == first => panic!("identical update reopened the session"),
                 ManagedEvent::Client {
                     target,

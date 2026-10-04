@@ -7,8 +7,8 @@ mod protocol_options {
 use std::time::Duration;
 
 use irtt_client::{
-    Client, ClientConfig, ClientError, ClientEvent, OneWayDelaySample, ReceivedStatsSample,
-    RttSample, ServerTiming, SignedDuration,
+    AcceptedSessionParameters, Client, ClientConfig, ClientError, ClientEvent, OneWayDelaySample,
+    ReceivedStatsSample, RttSample, ServerTiming, SignedDuration,
 };
 use irtt_proto::{Clock, Params, ReceivedStats, StampAt, TimestampFields};
 
@@ -212,7 +212,20 @@ fn loose_open_uses_returned_params_for_echo_layout_and_reply_parsing() {
     });
 
     assert_eq!(open_params(&run), &requested);
-    assert_eq!(run.negotiated.params, returned);
+    assert_eq!(run.negotiated.peer_params, returned);
+    assert_eq!(
+        run.negotiated.accepted,
+        AcceptedSessionParameters {
+            duration: Some(Duration::from_secs(3)),
+            interval: Duration::from_secs(1),
+            length: 28,
+            received_stats: ReceivedStats::Count,
+            stamp_at: StampAt::Receive,
+            clock: Clock::Wall,
+            dscp: 0,
+            server_fill: None,
+        }
+    );
     assert_echo_uses_params(&run, &returned, false);
 
     let reply = expect_echo_reply(&run.reply);
@@ -253,7 +266,7 @@ fn changed_compatibility_params(requested: &Params) -> Vec<Params> {
 }
 
 fn assert_negotiated_echo_use(run: &OneProbeRun, params: &Params, hmac: bool) {
-    assert_eq!(run.negotiated.params, *params);
+    assert_eq!(run.negotiated.peer_params, *params);
     assert_eq!(open_params(run), params);
     assert_echo_uses_params(run, params, hmac);
 }

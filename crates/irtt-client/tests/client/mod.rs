@@ -1,6 +1,6 @@
 use super::*;
 use irtt_client::NegotiationPolicy;
-use irtt_client::{NegotiatedParams, RunMode, WarningKind, MAX_UDP_PAYLOAD_LENGTH};
+use irtt_client::{NegotiationResult, RunMode, WarningKind, MAX_UDP_PAYLOAD_LENGTH};
 use irtt_proto::{flags, Params, TimestampFields};
 use irtt_proto::{
     flags::FLAG_HMAC, flags::FLAG_OPEN, flags::FLAG_REPLY, verify_packet_hmac, Clock, HMAC_SIZE,

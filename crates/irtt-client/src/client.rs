@@ -373,9 +373,11 @@ impl Client {
         self.runtime.poll_timeouts_at(now)
     }
 
-    /// Negotiated parameters of the currently open session.
-    pub fn negotiated_params(&self) -> Option<&crate::NegotiatedParams> {
-        self.runtime.negotiated_params()
+    /// Accepted semantics and exact peer parameters of the currently live session.
+    ///
+    /// Returns `None` before Open, after Close, and after no-test completion.
+    pub fn negotiation(&self) -> Option<&crate::NegotiationResult> {
+        self.runtime.negotiation()
     }
 
     /// Earliest timeout deadline among probes still awaiting a reply.
@@ -496,18 +498,7 @@ impl Client {
             Err(primary) => return Err(Box::new(PreparedClientOpenFailure { primary, machine })),
         };
 
-        let negotiated_traffic_class = match u8::try_from(negotiated.params.dscp) {
-            Ok(traffic_class) => traffic_class,
-            Err(_) => {
-                return Err(Box::new(PreparedClientOpenFailure {
-                    primary: ClientError::InvalidConfig {
-                        reason: "negotiated dscp must be in range 0..=255".to_owned(),
-                    },
-                    machine,
-                }));
-            }
-        };
-
+        let negotiated_traffic_class = negotiated.accepted.dscp << 2;
         Ok(PreparedClientOpen {
             machine,
             recv_buffer_len: Some(recv_buffer_len),

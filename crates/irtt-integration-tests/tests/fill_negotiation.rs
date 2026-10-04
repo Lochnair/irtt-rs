@@ -81,10 +81,16 @@ fn server_fill_negotiated_params_reflect_accepted_value() {
         .unwrap();
     let outcome = client.open().unwrap();
     let negotiated = match outcome {
-        irtt_client::OpenOutcome::Started { negotiated, .. } => negotiated,
+        irtt_client::OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        }) => negotiated,
         other => panic!("expected started outcome, got {other:?}"),
     };
-    assert_eq!(negotiated.params.server_fill, params.server_fill);
+    assert_eq!(
+        negotiated.accepted.server_fill,
+        params.server_fill.map(|fill| fill.value)
+    );
 
     client.send_probe().unwrap();
     assert!(matches!(
@@ -144,7 +150,7 @@ fn server_fill_loose_allows_server_to_remove_fill() {
         open_observation_params(&run).server_fill,
         requested.server_fill
     );
-    assert_eq!(run.negotiated.params.server_fill, None);
+    assert_eq!(run.negotiated.accepted.server_fill, None);
 }
 
 // ─── Echo behavior ───
@@ -169,11 +175,11 @@ fn server_fill_does_not_affect_client_side_packet_layout() {
     let (echo_len_without, _, _, _) = echo_observation(&run_without);
     assert_eq!(echo_len_with, echo_len_without);
     assert_eq!(
-        test_echo_packet_len(false, &run_with.negotiated.params),
+        test_echo_packet_len(false, &run_with.negotiated.peer_params),
         echo_len_with
     );
     assert_eq!(
-        test_echo_packet_len(false, &run_without.negotiated.params),
+        test_echo_packet_len(false, &run_without.negotiated.peer_params),
         echo_len_without
     );
 }

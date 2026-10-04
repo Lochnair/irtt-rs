@@ -93,7 +93,7 @@ fn backend_large_packet_smoke() {
         .unwrap();
 
     let outcome = client.open().unwrap();
-    assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
+    assert!(matches!(outcome, irtt_client::OpenOutcome::Started(_)));
 
     client.send_probe().unwrap();
     let events = client.recv_once().unwrap();

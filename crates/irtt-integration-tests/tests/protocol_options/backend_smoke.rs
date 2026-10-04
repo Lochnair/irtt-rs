@@ -14,7 +14,7 @@ fn backend_basic_open_echo_close() {
         .unwrap();
 
     let outcome = client.open().unwrap();
-    assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
+    assert!(matches!(outcome, irtt_client::OpenOutcome::Started(_)));
 
     let sent = client.send_probe().unwrap();
     assert_eq!(sent.len(), 1);

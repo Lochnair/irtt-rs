@@ -1,117 +1,139 @@
-use std::fmt;
+use std::{fmt, time::Duration};
 
 use irtt_proto::{Clock, Params, ReceivedStats, StampAt, PROTOCOL_VERSION};
 
 use crate::{config::NegotiationPolicy, error::ClientError};
 
-/// Protocol parameters accepted for a session.
+/// Validated session semantics accepted after a successful Open exchange.
 ///
-/// `params` contains the server-returned values that the client will use for
-/// echo packets. `restrictions` records accepted differences from the request
-/// when loose negotiation is enabled.
-///
-/// `params.dscp` is the raw IP TOS / Traffic Class byte, not a DSCP
-/// codepoint: for a configured codepoint of 46 (EF), an unrestricted
-/// negotiation leaves `params.dscp == 184`. [`NegotiationRestriction::DscpChanged`]
-/// reports codepoints instead, for consistency with [`crate::SessionRequest::dscp`].
+/// These values drive ordinary client behavior. The exact peer-returned wire
+/// representation is available separately in [`NegotiationResult::peer_params`].
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NegotiatedParams {
-    /// Server-returned protocol parameters used for the session.
-    pub params: Params,
-    /// Accepted server restrictions or parameter changes.
-    pub restrictions: Vec<NegotiationRestriction>,
+pub struct AcceptedSessionParameters {
+    /// `None` means continuous mode; finite durations are positive.
+    pub duration: Option<Duration>,
+    /// Positive interval between probes when driven by a scheduler.
+    pub interval: Duration,
+    /// Accepted packet length in the usable unsigned domain.
+    pub length: u32,
+    pub received_stats: ReceivedStats,
+    pub stamp_at: StampAt,
+    pub clock: Clock,
+    /// DSCP codepoint (`0..=63`), as in [`crate::SessionRequest::dscp`].
+    pub dscp: u8,
+    /// Accepted server payload fill, preserving the peer's string value.
+    pub server_fill: Option<String>,
 }
 
-/// A server-side restriction applied during session parameter negotiation.
+/// Accepted session semantics, exact protocol evidence, and accepted changes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum NegotiationRestriction {
-    /// Run duration was reduced.
+pub struct NegotiationResult {
+    pub accepted: AcceptedSessionParameters,
+    /// Exact decoded parameters returned by the peer, without normalization.
     ///
-    /// A requested duration of `0` means the client requested continuous mode.
-    /// When `requested_ns == 0` and `negotiated_ns > 0`, the server limited
-    /// that continuous request to a finite duration.
+    /// Echo encoding/decoding uses these accepted wire values. `dscp` here is
+    /// the raw IP TOS / Traffic Class byte, unlike [`AcceptedSessionParameters::dscp`].
+    pub peer_params: Params,
+    /// Differences accepted under [`crate::NegotiationPolicy::Loose`].
+    pub changes: Vec<NegotiationChange>,
+}
+
+/// A semantic parameter change accepted during negotiation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NegotiationChange {
+    /// A finite duration was reduced, or continuous mode was limited.
     DurationReduced {
-        requested_ns: i64,
-        negotiated_ns: i64,
+        /// `None` means the request was continuous.
+        requested: Option<Duration>,
+        negotiated: Duration,
     },
-    /// Probe interval was increased.
     IntervalIncreased {
-        requested_ns: i64,
-        negotiated_ns: i64,
+        requested: Duration,
+        negotiated: Duration,
     },
-    /// Probe interval was reduced.
+    /// Loose policy accepts any positive reduced interval.
     IntervalReduced {
-        requested_ns: i64,
-        negotiated_ns: i64,
+        requested: Duration,
+        negotiated: Duration,
     },
-    /// Packet length was reduced.
-    LengthReduced { requested: i64, negotiated: i64 },
-    /// Returned received-statistics mode differs from the request.
+    LengthReduced {
+        requested: u32,
+        negotiated: u32,
+    },
     ReceivedStatsChanged {
         requested: ReceivedStats,
         negotiated: ReceivedStats,
     },
-    /// Returned timestamp placement differs from the request.
     StampAtChanged {
         requested: StampAt,
         negotiated: StampAt,
     },
-    /// Returned clock source differs from the request.
-    ClockChanged { requested: Clock, negotiated: Clock },
-    /// Returned DSCP codepoint differs from the request.
-    ///
-    /// These values are DSCP codepoints (`0..=63`) for human-facing
-    /// consistency with [`crate::SessionRequest::dscp`], not the raw wire
-    /// `Params::dscp` byte carried by [`NegotiatedParams::params`].
-    DscpChanged { requested: i64, negotiated: i64 },
-    /// Returned server payload fill behavior differs from the request.
-    ServerFillChanged,
+    ClockChanged {
+        requested: Clock,
+        negotiated: Clock,
+    },
+    /// Both values are DSCP codepoints, rather than raw Traffic Class bytes.
+    DscpChanged {
+        requested: u8,
+        negotiated: u8,
+    },
+    ServerFillChanged {
+        requested: Option<String>,
+        negotiated: Option<String>,
+    },
 }
 
-impl NegotiationRestriction {
-    /// Return a human-readable description of this negotiated restriction.
+impl NegotiationChange {
+    /// Return a human-readable description of this accepted change.
     pub fn message(&self) -> String {
         self.to_string()
     }
 }
 
-impl fmt::Display for NegotiationRestriction {
+impl fmt::Display for NegotiationChange {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DurationReduced {
-                requested_ns: 0,
-                negotiated_ns,
+                requested: None,
+                negotiated,
             } => {
                 write!(
                     f,
-                    "server limited continuous duration to {negotiated_ns} ns"
+                    "server limited continuous duration to {} ns",
+                    negotiated.as_nanos()
                 )
             }
             Self::DurationReduced {
-                requested_ns,
-                negotiated_ns,
+                requested: Some(requested),
+                negotiated,
             } => {
                 write!(
                     f,
-                    "server reduced duration from {requested_ns} ns to {negotiated_ns} ns"
+                    "server reduced duration from {} ns to {} ns",
+                    requested.as_nanos(),
+                    negotiated.as_nanos()
                 )
             }
             Self::IntervalIncreased {
-                requested_ns,
-                negotiated_ns,
+                requested,
+                negotiated,
             } => {
                 write!(
                     f,
-                    "server increased interval from {requested_ns} ns to {negotiated_ns} ns"
+                    "server increased interval from {} ns to {} ns",
+                    requested.as_nanos(),
+                    negotiated.as_nanos()
                 )
             }
             Self::IntervalReduced {
-                requested_ns,
-                negotiated_ns,
+                requested,
+                negotiated,
             } => {
                 write!(
                     f,
-                    "server reduced interval from {requested_ns} ns to {negotiated_ns} ns"
+                    "server reduced interval from {} ns to {} ns",
+                    requested.as_nanos(),
+                    negotiated.as_nanos()
                 )
             }
             Self::LengthReduced {
@@ -156,23 +178,32 @@ impl fmt::Display for NegotiationRestriction {
             } => {
                 write!(f, "server changed DSCP from {requested} to {negotiated}")
             }
-            Self::ServerFillChanged => write!(f, "server changed payload fill behavior"),
+            Self::ServerFillChanged { .. } => write!(f, "server changed payload fill behavior"),
         }
     }
+}
+
+// Called only after validating the request and returned numeric domains.
+fn positive_duration(nanos: i64) -> Duration {
+    Duration::from_nanos(u64::try_from(nanos).expect("validated non-negative nanoseconds"))
+}
+
+fn finite_duration(nanos: i64) -> Option<Duration> {
+    (nanos != 0).then(|| positive_duration(nanos))
 }
 
 pub(crate) fn negotiate_params(
     requested: &Params,
     returned: Params,
     policy: NegotiationPolicy,
-) -> Result<NegotiatedParams, ClientError> {
+) -> Result<NegotiationResult, ClientError> {
     if returned.protocol_version != PROTOCOL_VERSION {
         return Err(ClientError::ProtocolVersionMismatch {
             requested: PROTOCOL_VERSION,
             received: returned.protocol_version,
         });
     }
-    let mut restrictions = Vec::new();
+    let mut changes = Vec::new();
 
     validate_duration_restriction(requested.duration_ns, returned.duration_ns)?;
     if returned.length < 0 {
@@ -195,70 +226,70 @@ pub(crate) fn negotiate_params(
     if returned.duration_ns < requested.duration_ns
         || (requested.duration_ns == 0 && returned.duration_ns > 0)
     {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::DurationReduced {
-                requested_ns: requested.duration_ns,
-                negotiated_ns: returned.duration_ns,
+            &mut changes,
+            NegotiationChange::DurationReduced {
+                requested: finite_duration(requested.duration_ns),
+                negotiated: positive_duration(returned.duration_ns),
             },
         )?;
     }
     if returned.interval_ns > requested.interval_ns {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::IntervalIncreased {
-                requested_ns: requested.interval_ns,
-                negotiated_ns: returned.interval_ns,
+            &mut changes,
+            NegotiationChange::IntervalIncreased {
+                requested: positive_duration(requested.interval_ns),
+                negotiated: positive_duration(returned.interval_ns),
             },
         )?;
     }
     if returned.interval_ns < requested.interval_ns {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::IntervalReduced {
-                requested_ns: requested.interval_ns,
-                negotiated_ns: returned.interval_ns,
+            &mut changes,
+            NegotiationChange::IntervalReduced {
+                requested: positive_duration(requested.interval_ns),
+                negotiated: positive_duration(returned.interval_ns),
             },
         )?;
     }
     if returned.length < requested.length {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::LengthReduced {
-                requested: requested.length,
-                negotiated: returned.length,
+            &mut changes,
+            NegotiationChange::LengthReduced {
+                requested: u32::try_from(requested.length).expect("validated requested length"),
+                negotiated: u32::try_from(returned.length).expect("validated returned length"),
             },
         )?;
     }
     if returned.received_stats != requested.received_stats {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::ReceivedStatsChanged {
+            &mut changes,
+            NegotiationChange::ReceivedStatsChanged {
                 requested: requested.received_stats,
                 negotiated: returned.received_stats,
             },
         )?;
     }
     if returned.stamp_at != requested.stamp_at {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::StampAtChanged {
+            &mut changes,
+            NegotiationChange::StampAtChanged {
                 requested: requested.stamp_at,
                 negotiated: returned.stamp_at,
             },
         )?;
     }
     if returned.clock != requested.clock {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::ClockChanged {
+            &mut changes,
+            NegotiationChange::ClockChanged {
                 requested: requested.clock,
                 negotiated: returned.clock,
             },
@@ -270,29 +301,48 @@ pub(crate) fn negotiate_params(
         });
     }
     if returned.dscp == 0 && requested.dscp != 0 {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::DscpChanged {
+            &mut changes,
+            NegotiationChange::DscpChanged {
                 // `requested`/`negotiated` here are raw wire TOS/Traffic Class
                 // bytes; shift back to the codepoint the user actually
-                // configured for a human-facing restriction.
-                requested: requested.dscp >> 2,
-                negotiated: returned.dscp >> 2,
+                // configured for a semantic change record.
+                requested: u8::try_from(requested.dscp >> 2).expect("validated requested DSCP"),
+                negotiated: u8::try_from(returned.dscp >> 2).expect("validated returned DSCP"),
             },
         )?;
     }
     if returned.server_fill != requested.server_fill {
-        record_restriction(
+        record_change(
             policy,
-            &mut restrictions,
-            NegotiationRestriction::ServerFillChanged,
+            &mut changes,
+            NegotiationChange::ServerFillChanged {
+                requested: requested
+                    .server_fill
+                    .as_ref()
+                    .map(|fill| fill.value.clone()),
+                negotiated: returned.server_fill.as_ref().map(|fill| fill.value.clone()),
+            },
         )?;
     }
 
-    Ok(NegotiatedParams {
-        params: returned,
-        restrictions,
+    // Compare the exact wire values above before deriving accepted semantics.
+    // In particular, do not normalize fill or traffic class before Strict policy.
+    let accepted = AcceptedSessionParameters {
+        duration: finite_duration(returned.duration_ns),
+        interval: positive_duration(returned.interval_ns),
+        length: u32::try_from(returned.length).expect("validated returned length"),
+        received_stats: returned.received_stats,
+        stamp_at: returned.stamp_at,
+        clock: returned.clock,
+        dscp: u8::try_from(returned.dscp >> 2).expect("validated returned DSCP"),
+        server_fill: returned.server_fill.as_ref().map(|fill| fill.value.clone()),
+    };
+    Ok(NegotiationResult {
+        accepted,
+        peer_params: returned,
+        changes,
     })
 }
 
@@ -332,17 +382,17 @@ fn validate_dscp_restriction(returned: i64) -> Result<(), ClientError> {
     Ok(())
 }
 
-fn record_restriction(
+fn record_change(
     policy: NegotiationPolicy,
-    restrictions: &mut Vec<NegotiationRestriction>,
-    restriction: NegotiationRestriction,
+    changes: &mut Vec<NegotiationChange>,
+    change: NegotiationChange,
 ) -> Result<(), ClientError> {
     if policy == NegotiationPolicy::Strict {
         return Err(ClientError::NegotiationRejected {
-            reason: restriction.message(),
+            reason: change.message(),
         });
     }
 
-    restrictions.push(restriction);
+    changes.push(change);
     Ok(())
 }
