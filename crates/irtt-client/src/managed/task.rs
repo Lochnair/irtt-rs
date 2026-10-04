@@ -188,12 +188,15 @@ impl ManagedClientHandle {
 
     /// Subscribe to authoritative durable latest-state observation.
     ///
+    /// The current snapshot is marked as seen when subscribing.
     /// The current snapshot is immediately available through `borrow()`. Updates
     /// may coalesce; this is not a lossless event log. After the task terminates,
     /// the sender closes but the final snapshot remains readable. Use
     /// [`Self::subscribe`] for the lossy presentation-event stream.
     pub fn subscribe_status(&self) -> ManagedStatusSubscription {
-        self.status.clone()
+        let mut status = self.status.clone();
+        drop(status.borrow_and_update());
+        status
     }
 
     /// Subscribe to future lossy presentation events.

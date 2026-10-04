@@ -27,6 +27,25 @@ fn stop_resolves_every_accepted_update_and_closes_admission() {
     );
     assert!(!subscription.borrow().stop_requested);
     assert!(subscription.borrow().final_outcome.is_none());
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut task = pin!(task);
+    {
+        let _runtime = runtime.enter();
+        assert!(task
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending());
+    }
+    assert_eq!(handle.status().lifecycle, ManagedLifecycle::Running);
+    subscription = handle.subscribe_status();
+    assert_eq!(subscription.borrow().lifecycle, ManagedLifecycle::Running);
+    assert!(pin!(subscription.changed())
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending());
     let receipts: Vec<_> = (0..3)
         .map(|index| {
             handle
@@ -52,10 +71,6 @@ fn stop_resolves_every_accepted_update_and_closes_admission() {
         handle.update_targets(vec![]),
         Err(ManagedCommandError::Stopping)
     ));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
     runtime.block_on(async {
         tokio::time::timeout(Duration::from_secs(2), async {
             let outcome = task.await;
