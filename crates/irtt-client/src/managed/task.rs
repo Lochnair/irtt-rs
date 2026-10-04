@@ -1968,11 +1968,7 @@ impl ManagedClientTask {
             && self.config.pacing == ManagedPacing::Staggered
             && self.active_count() > 0
         {
-            send_deadline = match (send_deadline, self.send_gate) {
-                (Some(target), Some(gate)) => Some(target.max(gate)),
-                (None, gate) => gate,
-                (target, None) => target,
-            };
+            send_deadline = gated_send_deadline(send_deadline, self.send_gate);
         }
         non_send_deadline.into_iter().chain(send_deadline).min()
     }
@@ -2068,6 +2064,11 @@ impl ManagedClientTask {
     fn fail_driver(&mut self, failure: ManagedDriverFailure) -> Poll<ManagedOutcome> {
         self.seal(ManagedEndReason::DriverFailed(failure), true)
     }
+}
+
+// A release gate delays a send opportunity; it cannot create one.
+fn gated_send_deadline(cadence: Option<Instant>, gate: Option<Instant>) -> Option<Instant> {
+    cadence.map(|deadline| gate.map_or(deadline, |gate| deadline.max(gate)))
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2397,6 +2398,23 @@ fn close_timeout_failure() -> ManagedTargetFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_gate_only_delays_an_existing_send_deadline() {
+        let earlier = Instant::now();
+        let later = earlier + Duration::from_secs(1);
+        for (cadence, gate, expected) in [
+            (None, None, None),
+            (None, Some(earlier), None),
+            (None, Some(later), None),
+            (Some(earlier), None, Some(earlier)),
+            (Some(later), Some(earlier), Some(later)),
+            (Some(earlier), Some(earlier), Some(earlier)),
+            (Some(earlier), Some(later), Some(later)),
+        ] {
+            assert_eq!(gated_send_deadline(cadence, gate), expected);
+        }
+    }
 
     // Poll latency through public events cannot distinguish an O(n) discovery
     // scan from a bounded scan reliably. This tiny inspection trace measures
