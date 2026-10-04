@@ -10,7 +10,8 @@
 use std::time::Duration;
 
 use irtt_client::{
-    AsyncClient, ClientConfig, NegotiationPolicy, NegotiationRestriction, OpenOutcome, SocketConfig,
+    AsyncClient, ClientConfig, NegotiationPolicy, NegotiationRestriction, OpenOutcome, OpenPolicy,
+    SessionRequest,
 };
 use irtt_proto::{
     decode_echo_reply, decode_open_reply, echo_header_len, encode_request, Clock, Params,
@@ -132,24 +133,26 @@ async fn exercise_fallback_negotiation() {
     // `ClientConfig` accepts any non-empty descriptor within the wire bound, so
     // an unknown one genuinely reaches the server.
     let config = |policy| ClientConfig {
-        server_addr: server_addr.to_string(),
-        duration: Some(Duration::from_secs(1)),
-        interval: Duration::from_millis(100),
-        length: 64,
-        server_fill: Some("bogus".to_owned()),
-        negotiation_policy: policy,
-        open_timeouts: vec![Duration::from_millis(200)],
-        socket_config: SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..SocketConfig::default()
+        open: OpenPolicy {
+            negotiation: policy,
+            timeouts: vec![Duration::from_millis(200)],
         },
+        request: SessionRequest {
+            duration: Some(Duration::from_secs(1)),
+            interval: Duration::from_millis(100),
+            length: 64,
+            server_fill: Some("bogus".to_owned()),
+            ..Default::default()
+        },
+
         probe_timeout: Duration::from_millis(200),
         ..ClientConfig::default()
     };
 
-    let mut strict = AsyncClient::connect(config(NegotiationPolicy::Strict))
-        .await
-        .unwrap();
+    let mut strict =
+        AsyncClient::connect(server_addr.to_string(), config(NegotiationPolicy::Strict))
+            .await
+            .unwrap();
     let rejected = strict
         .open()
         .await
@@ -159,7 +162,7 @@ async fn exercise_fallback_negotiation() {
         "the restriction names the fill: {rejected}"
     );
 
-    let mut loose = AsyncClient::connect(config(NegotiationPolicy::Loose))
+    let mut loose = AsyncClient::connect(server_addr.to_string(), config(NegotiationPolicy::Loose))
         .await
         .unwrap();
     match loose.open().await.unwrap() {

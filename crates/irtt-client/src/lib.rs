@@ -53,8 +53,9 @@ pub use async_client::AsyncClient;
 pub use auth::{Authentication, HmacKey};
 pub use client::Client;
 pub use config::{
-    ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig, MAX_DSCP_CODEPOINT,
-    MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
+    AddressFamily, ClientConfig, NegotiationPolicy, OpenPolicy, RecvBudget, RunMode,
+    SessionRequest, SocketConfig, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL,
+    MAX_UDP_PAYLOAD_LENGTH,
 };
 pub use error::ClientError;
 pub use event::{

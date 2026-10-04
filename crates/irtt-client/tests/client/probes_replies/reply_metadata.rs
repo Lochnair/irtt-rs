@@ -19,14 +19,11 @@ fn echo_reply_metadata_propagates_observed_dscp_with_ancillary() {
             echo_reply_packet(TOKEN, seq, &params, &TimestampFields::default(), None);
         socket.send_to(&reply_packet, peer).unwrap();
     });
-    let config = ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();

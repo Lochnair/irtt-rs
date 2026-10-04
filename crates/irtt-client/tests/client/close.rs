@@ -9,9 +9,12 @@ fn operations_fail_after_local_close_without_datagrams() {
         socket.send_to(&reply, peer).unwrap();
         let _ = recv_request(&socket, &tx);
     });
-    let mut config = default_test_config(server.addr);
-    config.socket_config.recv_timeout = Some(Duration::from_millis(50));
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.close().unwrap();
     assert!(matches!(client.open(), Err(ClientError::AlreadyClosed)));
@@ -52,7 +55,7 @@ fn send_probe_fails_after_close() {
             }
         }
     });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
     assert_open_started(client.open().unwrap());
     client.close().unwrap();
     assert!(matches!(
@@ -89,7 +92,7 @@ fn recv_available_stops_after_peer_close() {
             socket.send_to(&close, peer).unwrap();
         }
     });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
@@ -137,14 +140,10 @@ fn close_flagged_duplicate_emits_duplicate_then_closes() {
             socket.send_to(&close, peer).unwrap();
         }
     });
-    let mut client = Client::connect(ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    })
-    .unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
@@ -194,15 +193,17 @@ fn close_flagged_retained_timeout_emits_late_then_closes() {
                 .unwrap();
         }
     });
-    let mut client = Client::connect(ClientConfig {
-        probe_timeout: Duration::from_millis(50),
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
+    let mut client = Client::connect(
+        server.addr.to_string(),
+        ClientConfig {
+            probe_timeout: Duration::from_millis(50),
+            ..default_test_config()
         },
-        ..default_test_config(server.addr)
-    })
+    )
     .unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     let sent = client.send_probe().unwrap();
     let ClientEvent::EchoSent { sent_at, .. } = &sent[0] else {
@@ -289,15 +290,17 @@ fn close_flagged_evicted_sequence_emits_late_then_closes() {
                 .unwrap();
         }
     });
-    let mut client = Client::connect(ClientConfig {
-        max_pending_probes: 1,
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
+    let mut client = Client::connect(
+        server.addr.to_string(),
+        ClientConfig {
+            max_pending_probes: 1,
+            ..default_test_config()
         },
-        ..default_test_config(server.addr)
-    })
+    )
     .unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
@@ -354,14 +357,10 @@ fn close_flagged_untracked_sequence_emits_warning_then_closes() {
                 .unwrap();
         }
     });
-    let mut client = Client::connect(ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    })
-    .unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
 
     assert!(matches!(
@@ -412,14 +411,10 @@ fn wrong_token_close_flag_does_not_close_session() {
             let _ = recv_request(&socket, &tx);
         }
     });
-    let mut client = Client::connect(ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    })
-    .unwrap();
+    let mut client = Client::connect(server.addr.to_string(), default_test_config()).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
@@ -467,14 +462,11 @@ fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
             while recv_request_timeout(&socket, &tx).is_some() {}
         }
     });
-    let config = ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 

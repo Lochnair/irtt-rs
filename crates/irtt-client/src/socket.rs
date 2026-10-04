@@ -1,12 +1,9 @@
-use std::{
-    net::{SocketAddr, ToSocketAddrs, UdpSocket},
-    time::Duration,
-};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 
 use socket2::{Domain, Protocol, Socket, Type};
 
 use crate::{
-    config::{ClientConfig, SocketConfig, DEFAULT_PORT, MIN_OPEN_TIMEOUT},
+    config::{AddressFamily, SocketConfig, DEFAULT_PORT},
     error::ClientError,
     receive::configure_receive_metadata,
     socket_options::apply_ttl_to_socket,
@@ -20,36 +17,27 @@ use crate::{
 ))]
 use crate::socket_options::apply_routing_options;
 
-pub(crate) fn validate_open_timeouts(timeouts: &[Duration]) -> Result<(), ClientError> {
-    if timeouts.is_empty() {
-        return Err(ClientError::NoOpenTimeouts);
-    }
-    for timeout in timeouts {
-        if *timeout < MIN_OPEN_TIMEOUT {
-            return Err(ClientError::OpenTimeoutTooSmall {
-                timeout: *timeout,
-                minimum: MIN_OPEN_TIMEOUT,
-            });
-        }
-    }
-    Ok(())
-}
-
-pub(crate) fn resolve_remote(config: &ClientConfig) -> Result<SocketAddr, ClientError> {
-    let addr = normalize_server_addr(&config.server_addr);
+pub(crate) fn resolve_remote(
+    endpoint: &str,
+    family: AddressFamily,
+) -> Result<SocketAddr, ClientError> {
+    let addr = normalize_server_addr(endpoint);
     let mut addrs = addr
         .to_socket_addrs()
         .map_err(|_| ClientError::Resolve { addr: addr.clone() })?;
     addrs
-        .find(|addr| address_family_allowed(config, *addr))
+        .find(|addr| address_family_allowed(family, *addr))
         .ok_or(ClientError::Resolve { addr })
 }
 
 #[cfg(feature = "tokio")]
-pub(crate) async fn resolve_remote_tokio(config: &ClientConfig) -> Result<SocketAddr, ClientError> {
-    let addr = normalize_server_addr(&config.server_addr);
+pub(crate) async fn resolve_remote_tokio(
+    endpoint: &str,
+    family: AddressFamily,
+) -> Result<SocketAddr, ClientError> {
+    let addr = normalize_server_addr(endpoint);
     if let Ok(remote) = addr.parse::<SocketAddr>() {
-        return address_family_allowed(config, remote)
+        return address_family_allowed(family, remote)
             .then_some(remote)
             .ok_or(ClientError::Resolve { addr });
     }
@@ -58,13 +46,16 @@ pub(crate) async fn resolve_remote_tokio(config: &ClientConfig) -> Result<Socket
         .await
         .map_err(|_| ClientError::Resolve { addr: addr.clone() })?;
     addrs
-        .find(|remote| address_family_allowed(config, *remote))
+        .find(|remote| address_family_allowed(family, *remote))
         .ok_or_else(|| ClientError::Resolve { addr: addr.clone() })
 }
 
-fn address_family_allowed(config: &ClientConfig, remote: SocketAddr) -> bool {
-    (!config.socket_config.ipv4_only || remote.is_ipv4())
-        && (!config.socket_config.ipv6_only || remote.is_ipv6())
+fn address_family_allowed(family: AddressFamily, remote: SocketAddr) -> bool {
+    match family {
+        AddressFamily::Any => true,
+        AddressFamily::Ipv4 => remote.is_ipv4(),
+        AddressFamily::Ipv6 => remote.is_ipv6(),
+    }
 }
 
 pub(crate) fn normalize_server_addr(addr: &str) -> String {
@@ -92,17 +83,9 @@ pub(crate) fn normalize_server_addr(addr: &str) -> String {
 pub(crate) fn connect_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
+    family: AddressFamily,
 ) -> Result<UdpSocket, ClientError> {
-    let socket = create_connected_udp_socket(config, remote)?;
-    socket.set_read_timeout(config.recv_timeout)?;
-    Ok(socket)
-}
-
-fn create_connected_udp_socket(
-    config: &SocketConfig,
-    remote: SocketAddr,
-) -> Result<UdpSocket, ClientError> {
-    let socket = create_prebind_udp_socket(config, remote)?;
+    let socket = create_prebind_udp_socket(remote, family)?;
     #[cfg(any(
         target_os = "android",
         target_os = "freebsd",
@@ -133,8 +116,8 @@ fn create_connected_udp_socket(
 }
 
 fn create_prebind_udp_socket(
-    config: &SocketConfig,
     remote: SocketAddr,
+    family: AddressFamily,
 ) -> Result<Socket, ClientError> {
     let domain = if remote.is_ipv4() {
         Domain::IPV4
@@ -143,7 +126,7 @@ fn create_prebind_udp_socket(
     };
     let socket = Socket::new(domain, Type::DGRAM, Some(Protocol::UDP))?;
 
-    if config.ipv6_only && remote.is_ipv6() {
+    if family == AddressFamily::Ipv6 && remote.is_ipv6() {
         socket.set_only_v6(true)?;
     }
     Ok(socket)
@@ -153,8 +136,9 @@ fn create_prebind_udp_socket(
 pub(crate) fn connect_tokio_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
+    family: AddressFamily,
 ) -> Result<tokio::net::UdpSocket, ClientError> {
-    let socket = create_connected_udp_socket(config, remote)?;
+    let socket = connect_udp_socket(config, remote, family)?;
     socket.set_nonblocking(true)?;
     Ok(tokio::net::UdpSocket::from_std(socket)?)
 }

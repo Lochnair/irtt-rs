@@ -22,14 +22,11 @@ fn duplicate_reply_emits_duplicate_event() {
             socket.send_to(&reply_packet, peer).unwrap();
         }
     });
-    let config = ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     thread::sleep(Duration::from_millis(50));
@@ -76,14 +73,11 @@ fn out_of_order_reply_emits_late_event() {
         let reply0 = echo_reply_packet(TOKEN, seqs[0], &params, &ts, None);
         socket.send_to(&reply0, peer).unwrap();
     });
-    let config = ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
     client.send_probe().unwrap();

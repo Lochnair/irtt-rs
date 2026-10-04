@@ -1,6 +1,8 @@
 use std::time::Duration;
 
-use irtt_client::{AsyncClient, ClientConfig, ClientEvent, OpenOutcome, SocketConfig};
+use irtt_client::{
+    AsyncClient, ClientConfig, ClientEvent, OpenOutcome, OpenPolicy, SessionRequest,
+};
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 use irtt_server::{Server, ServerConfig};
 use tokio::{sync::oneshot, time::timeout};
@@ -27,22 +29,26 @@ async fn exercise_client_server() {
     });
 
     let config = ClientConfig {
-        server_addr: server_addr.to_string(),
-        duration: Some(Duration::from_secs(1)),
-        interval: Duration::from_millis(100),
-        length: 64,
-        received_stats: ReceivedStats::Both,
-        stamp_at: StampAt::Both,
-        clock: Clock::Both,
-        open_timeouts: vec![Duration::from_millis(200)],
-        socket_config: SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..SocketConfig::default()
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(200)],
+            ..Default::default()
         },
+        request: SessionRequest {
+            duration: Some(Duration::from_secs(1)),
+            interval: Duration::from_millis(100),
+            length: 64,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Default::default()
+        },
+
         probe_timeout: Duration::from_millis(200),
         ..ClientConfig::default()
     };
-    let mut client = AsyncClient::connect(config).await.unwrap();
+    let mut client = AsyncClient::connect(server_addr.to_string(), config)
+        .await
+        .unwrap();
 
     let opened = client.open().await.unwrap();
     match &opened {

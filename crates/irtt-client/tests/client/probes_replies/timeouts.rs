@@ -20,9 +20,9 @@ fn probe_timeout_overflow_transmits_no_echo() {
     });
     let config = ClientConfig {
         probe_timeout: Duration::MAX,
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
     assert_open_started(client.open().unwrap());
     assert!(matches!(
         client.send_probe(),
@@ -46,13 +46,12 @@ fn poll_timeouts_emits_echo_loss() {
     let server = silent_open_server(params);
     let config = ClientConfig {
         probe_timeout: Duration::from_millis(100),
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
@@ -97,13 +96,12 @@ fn late_reply_after_timeout_preserves_measurement_metadata() {
     });
     let config = ClientConfig {
         probe_timeout: Duration::from_millis(40),
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();
@@ -157,15 +155,17 @@ fn pending_full_does_not_send_packet() {
     };
     let server = silent_open_server(params);
     let config = ClientConfig {
-        duration: Some(Duration::from_secs(60)),
-        max_pending_probes: 2,
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
+        request: SessionRequest {
+            duration: Some(Duration::from_secs(60)),
+            ..SessionRequest::default()
         },
-        ..default_test_config(server.addr)
+        max_pending_probes: 2,
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();

@@ -4,14 +4,11 @@ use super::*;
 fn recv_once_returns_empty_on_timeout() {
     let params = default_params();
     let server = open_success_server(params);
-    let config = ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(50)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     let events = client.recv_once().unwrap();
     assert!(events.is_empty());
@@ -52,14 +49,11 @@ fn recv_once_decodes_only_received_bytes_after_longer_datagram() {
         );
         socket.send_to(&shorter, peer).unwrap();
     });
-    let config = ClientConfig {
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
-        },
-        ..default_test_config(server.addr)
-    };
-    let mut client = Client::connect(config).unwrap();
+    let config = default_test_config();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
 
     client.send_probe().unwrap();

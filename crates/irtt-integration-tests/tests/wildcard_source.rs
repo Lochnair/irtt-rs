@@ -18,7 +18,9 @@ use std::{
     time::Duration,
 };
 
-use irtt_client::{AsyncClient, ClientConfig, ClientEvent, OpenOutcome, PacketMeta, SocketConfig};
+use irtt_client::{
+    AsyncClient, ClientConfig, ClientEvent, OpenOutcome, OpenPolicy, PacketMeta, SessionRequest,
+};
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 use irtt_server::{Server, ServerConfig, ServerRuntimeError};
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
@@ -193,23 +195,27 @@ fn unthrottled() -> ServerConfig {
 
 async fn connected_client(server_addr: SocketAddr) -> AsyncClient {
     let config = ClientConfig {
-        server_addr: server_addr.to_string(),
-        duration: Some(Duration::from_secs(30)),
-        interval: Duration::from_millis(10),
-        length: 64,
-        dscp: EF_DSCP,
-        received_stats: ReceivedStats::Both,
-        stamp_at: StampAt::Both,
-        clock: Clock::Both,
-        open_timeouts: vec![Duration::from_millis(500)],
-        socket_config: SocketConfig {
-            recv_timeout: Some(Duration::from_millis(500)),
-            ..SocketConfig::default()
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(500)],
+            ..Default::default()
         },
+        request: SessionRequest {
+            duration: Some(Duration::from_secs(30)),
+            interval: Duration::from_millis(10),
+            length: 64,
+            dscp: EF_DSCP,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Default::default()
+        },
+
         probe_timeout: Duration::from_millis(500),
         ..ClientConfig::default()
     };
-    AsyncClient::connect(config).await.unwrap()
+    AsyncClient::connect(server_addr.to_string(), config)
+        .await
+        .unwrap()
 }
 
 async fn assert_started(client: &mut AsyncClient, server_addr: SocketAddr) {

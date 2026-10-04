@@ -1,4 +1,4 @@
-use irtt_client::{Authentication, HmacKey};
+use irtt_client::{Authentication, HmacKey, OpenPolicy};
 mod support;
 mod protocol_options {
     pub mod backend_smoke;
@@ -147,10 +147,10 @@ fn hmac_rich_mode_uses_negotiated_echo_layout_and_decodes_reply() {
     let params = params_for_modes(ReceivedStats::Both, StampAt::Both, Clock::Both);
     let config_params = params.clone();
     let config_key = key.clone();
-    let run = run_one_probe_with_config(params.clone(), standard_timestamps(), Some(key), |addr| {
+    let run = run_one_probe_with_config(params.clone(), standard_timestamps(), Some(key), || {
         ClientConfig {
             auth: Authentication::Hmac(HmacKey::new(config_key)),
-            ..config_for_params(addr, &config_params)
+            ..config_for_params(&config_params)
         }
     });
     assert_negotiated_echo_use(&run, &params, true);
@@ -171,9 +171,11 @@ fn strict_open_rejects_changed_compatibility_params_from_server() {
 
     for returned in changed_compatibility_params(&requested) {
         let server = start_open_server(returned, None);
-        let mut config = config_for_params(server.addr, &requested);
-        config.server_addr = server.addr.to_string();
-        let mut client = Client::connect(config).unwrap();
+        let config = config_for_params(&requested);
+        let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+        client
+            .set_recv_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
         assert!(matches!(
             client.open(),
             Err(ClientError::NegotiationRejected { .. })
@@ -199,10 +201,13 @@ fn loose_open_uses_returned_params_for_echo_layout_and_reply_parsing() {
     returned.server_fill = None;
 
     let requested_for_config = requested.clone();
-    let run = run_one_probe_with_config(returned.clone(), standard_timestamps(), None, |addr| {
+    let run = run_one_probe_with_config(returned.clone(), standard_timestamps(), None, || {
         ClientConfig {
-            negotiation_policy: irtt_client::NegotiationPolicy::Loose,
-            ..config_for_params(addr, &requested_for_config)
+            open: OpenPolicy {
+                negotiation: irtt_client::NegotiationPolicy::Loose,
+                ..config_for_params(&requested_for_config).open
+            },
+            ..config_for_params(&requested_for_config)
         }
     });
 

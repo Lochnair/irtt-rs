@@ -13,7 +13,7 @@ use crate::{config::NegotiationPolicy, error::ClientError};
 /// `params.dscp` is the raw IP TOS / Traffic Class byte, not a DSCP
 /// codepoint: for a configured codepoint of 46 (EF), an unrestricted
 /// negotiation leaves `params.dscp == 184`. [`NegotiationRestriction::DscpChanged`]
-/// reports codepoints instead, for consistency with [`crate::ClientConfig::dscp`].
+/// reports codepoints instead, for consistency with [`crate::SessionRequest::dscp`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NegotiatedParams {
     /// Server-returned protocol parameters used for the session.
@@ -61,7 +61,7 @@ pub enum NegotiationRestriction {
     /// Returned DSCP codepoint differs from the request.
     ///
     /// These values are DSCP codepoints (`0..=63`) for human-facing
-    /// consistency with [`crate::ClientConfig::dscp`], not the raw wire
+    /// consistency with [`crate::SessionRequest::dscp`], not the raw wire
     /// `Params::dscp` byte carried by [`NegotiatedParams::params`].
     DscpChanged { requested: i64, negotiated: i64 },
     /// Returned server payload fill behavior differs from the request.

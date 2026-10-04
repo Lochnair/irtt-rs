@@ -1,5 +1,6 @@
 use irtt_client::{Client, ClientEvent};
 use irtt_proto::{Clock, ReceivedStats, StampAt};
+use std::time::Duration;
 
 use crate::support::{config_for_params, default_params, params_for_modes, BackendPeer};
 
@@ -7,7 +8,10 @@ use crate::support::{config_for_params, default_params, params_for_modes, Backen
 fn backend_basic_open_echo_close() {
     let params = default_params();
     let peer = BackendPeer::start_open_echo(None);
-    let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
+    let mut client = Client::connect(peer.addr().to_string(), config_for_params(&params)).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
 
     let outcome = client.open().unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));
@@ -32,7 +36,11 @@ fn backend_received_stats_smoke() {
     ] {
         let params = params_for_modes(mode, StampAt::None, Clock::Both);
         let peer = BackendPeer::start_open_echo(None);
-        let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
+        let mut client =
+            Client::connect(peer.addr().to_string(), config_for_params(&params)).unwrap();
+        client
+            .set_recv_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
 
         client.open().unwrap();
         client.send_probe().unwrap();
@@ -55,7 +63,11 @@ fn backend_timestamp_smoke() {
     ] {
         let params = params_for_modes(ReceivedStats::None, mode, Clock::Both);
         let peer = BackendPeer::start_open_echo(None);
-        let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
+        let mut client =
+            Client::connect(peer.addr().to_string(), config_for_params(&params)).unwrap();
+        client
+            .set_recv_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
 
         client.open().unwrap();
         client.send_probe().unwrap();
@@ -102,7 +114,11 @@ fn backend_clock_smoke() {
     for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
         let params = params_for_modes(ReceivedStats::None, StampAt::Both, clock);
         let peer = BackendPeer::start_open_echo(None);
-        let mut client = Client::connect(config_for_params(peer.addr(), &params)).unwrap();
+        let mut client =
+            Client::connect(peer.addr().to_string(), config_for_params(&params)).unwrap();
+        client
+            .set_recv_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
 
         client.open().unwrap();
         client.send_probe().unwrap();

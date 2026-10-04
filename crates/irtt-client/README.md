@@ -34,6 +34,38 @@ dependency at all.
 
 See `examples/` in the repository for runnable examples of each tier.
 
+## Reusable configuration
+
+`ClientConfig` contains no endpoint. The low-level APIs take it separately:
+`Client::connect(endpoint, config)` and
+`AsyncClient::connect(endpoint, config).await`, accepting `String` or `&str`
+endpoints. An omitted port defaults to 2112.
+
+Configuration is grouped by ownership:
+
+- `address_family`: `AddressFamily::{Any, Ipv4, Ipv6}`, defaulting to `Any`.
+  It filters remote resolution; `Ipv6` also sets `IPV6_V6ONLY`.
+- `socket`: `SocketConfig` for local bind, device/routing options, and TTL.
+- `request`: `SessionRequest` for duration, interval, length, received stats,
+  timestamps, clock, DSCP, server fill, and run mode.
+- `open`: `OpenPolicy` for attempt `timeouts` and `negotiation` policy.
+- `auth`, `probe_timeout`, and `max_pending_probes`: authentication and local
+  probe tracking policy.
+
+Clone one config to connect to multiple endpoints. Managed targets retain their
+own ID, endpoint, and authentication inheritance/override; shared
+`ManagedClientConfig.client` is reusable without endpoint mutation.
+
+Blocking receive policy belongs to `Client`:
+`client.set_recv_timeout(Some(duration))?` sets it before or after opening,
+and `client.set_recv_timeout(None)?` restores the default indefinite wait.
+Open attempts use only `open.timeouts`, restoring the adapter setting afterward.
+Async and managed clients have no blocking receive-timeout setting.
+
+This breaks the former flat config, endpoint-in-config, socket family flags,
+and `SocketConfig.recv_timeout` APIs. Use the grouped fields and adapter method
+directly; defaults and protocol/runtime behavior are preserved.
+
 ## Authentication
 
 `ClientConfig.auth` is concrete: `Authentication::Unauthenticated` or

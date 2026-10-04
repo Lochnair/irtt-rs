@@ -14,7 +14,9 @@
 
 use std::{io, net::SocketAddr, time::Duration};
 
-use irtt_client::{AsyncClient, ClientConfig, ClientEvent, OpenOutcome, PacketMeta, SocketConfig};
+use irtt_client::{
+    AsyncClient, ClientConfig, ClientEvent, OpenOutcome, OpenPolicy, PacketMeta, SessionRequest,
+};
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 use irtt_server::{Server, ServerConfig, ServerRuntimeError};
 use tokio::{sync::oneshot, task::JoinHandle, time::timeout};
@@ -193,23 +195,27 @@ impl OpenSession {
 /// A client with an open session requesting `dscp` as a codepoint.
 async fn opened_session(server_addr: SocketAddr, dscp: u8) -> OpenSession {
     let config = ClientConfig {
-        server_addr: server_addr.to_string(),
-        duration: Some(Duration::from_secs(30)),
-        interval: Duration::from_millis(10),
-        length: 64,
-        dscp,
-        received_stats: ReceivedStats::Both,
-        stamp_at: StampAt::Both,
-        clock: Clock::Both,
-        open_timeouts: vec![Duration::from_millis(500)],
-        socket_config: SocketConfig {
-            recv_timeout: Some(Duration::from_millis(500)),
-            ..SocketConfig::default()
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(500)],
+            ..Default::default()
         },
+        request: SessionRequest {
+            duration: Some(Duration::from_secs(30)),
+            interval: Duration::from_millis(10),
+            length: 64,
+            dscp,
+            received_stats: ReceivedStats::Both,
+            stamp_at: StampAt::Both,
+            clock: Clock::Both,
+            ..Default::default()
+        },
+
         probe_timeout: Duration::from_millis(500),
         ..ClientConfig::default()
     };
-    let mut client = AsyncClient::connect(config).await.unwrap();
+    let mut client = AsyncClient::connect(server_addr.to_string(), config)
+        .await
+        .unwrap();
     match client.open().await.unwrap() {
         OpenOutcome::Started { negotiated, .. } => assert_eq!(
             negotiated.params.dscp,

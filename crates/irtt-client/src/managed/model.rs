@@ -85,6 +85,8 @@ pub enum ManagedCompletionPolicy {
 /// Shared configuration for one managed task.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedClientConfig {
+    /// Reusable session/socket configuration shared across target generations.
+    /// Each target supplies its endpoint and resolves its authentication policy.
     pub client: ClientConfig,
     pub pacing: ManagedPacing,
     pub completion: ManagedCompletionPolicy,

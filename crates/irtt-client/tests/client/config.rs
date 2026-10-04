@@ -8,7 +8,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "oversized UDP payload",
             ClientConfig {
-                length: MAX_UDP_PAYLOAD_LENGTH + 1,
+                request: SessionRequest {
+                    length: MAX_UDP_PAYLOAD_LENGTH + 1,
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "packet length",
@@ -16,7 +19,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "zero finite duration",
             ClientConfig {
-                duration: Some(Duration::ZERO),
+                request: SessionRequest {
+                    duration: Some(Duration::ZERO),
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "duration must be greater than zero; use None for continuous mode",
@@ -24,7 +30,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "zero interval",
             ClientConfig {
-                interval: Duration::ZERO,
+                request: SessionRequest {
+                    interval: Duration::ZERO,
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "interval must be greater than zero",
@@ -32,7 +41,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "duration nanosecond overflow",
             ClientConfig {
-                duration: Some(too_large),
+                request: SessionRequest {
+                    duration: Some(too_large),
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "duration is too large to encode as nanoseconds",
@@ -40,7 +52,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "interval nanosecond overflow",
             ClientConfig {
-                interval: too_large,
+                request: SessionRequest {
+                    interval: too_large,
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "interval is too large to encode as nanoseconds",
@@ -48,7 +63,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "invalid DSCP codepoint",
             ClientConfig {
-                dscp: 64,
+                request: SessionRequest {
+                    dscp: 64,
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "dscp",
@@ -58,7 +76,10 @@ fn connect_rejects_invalid_configuration() {
             // client mode; a client that needs timestamps must name a clock.
             "unspecified clock",
             ClientConfig {
-                clock: Clock::Unspecified,
+                request: SessionRequest {
+                    clock: Clock::Unspecified,
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "clock must be wall, monotonic, or both",
@@ -66,7 +87,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "empty server fill",
             ClientConfig {
-                server_fill: Some("".to_owned()),
+                request: SessionRequest {
+                    server_fill: Some("".to_owned()),
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "server_fill",
@@ -74,7 +98,10 @@ fn connect_rejects_invalid_configuration() {
         (
             "oversized server fill",
             ClientConfig {
-                server_fill: Some("0123456789abcdef0123456789abcdefx".to_owned()),
+                request: SessionRequest {
+                    server_fill: Some("0123456789abcdef0123456789abcdefx".to_owned()),
+                    ..Default::default()
+                },
                 ..ClientConfig::default()
             },
             "server_fill",
@@ -84,7 +111,7 @@ fn connect_rejects_invalid_configuration() {
     for (name, config, expected_reason) in cases {
         assert!(
             matches!(
-                Client::connect(config),
+                Client::connect("127.0.0.1:2112", config),
                 Err(ClientError::InvalidConfig { .. })
             ),
             "{name} should fail with InvalidConfig ({expected_reason})"
@@ -95,11 +122,14 @@ fn connect_rejects_invalid_configuration() {
 #[test]
 fn minimum_open_timeout_under_200ms_is_rejected() {
     let config = ClientConfig {
-        open_timeouts: vec![Duration::from_millis(199)],
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(199)],
+            ..Default::default()
+        },
         ..ClientConfig::default()
     };
     assert!(matches!(
-        Client::connect(config),
+        Client::connect("127.0.0.1:2112", config),
         Err(ClientError::OpenTimeoutTooSmall { .. })
     ));
 }
@@ -107,11 +137,14 @@ fn minimum_open_timeout_under_200ms_is_rejected() {
 #[test]
 fn empty_open_timeouts_is_rejected() {
     let config = ClientConfig {
-        open_timeouts: vec![],
+        open: OpenPolicy {
+            timeouts: vec![],
+            ..Default::default()
+        },
         ..ClientConfig::default()
     };
     assert!(matches!(
-        Client::connect(config),
+        Client::connect("127.0.0.1:2112", config),
         Err(ClientError::NoOpenTimeouts)
     ));
 }

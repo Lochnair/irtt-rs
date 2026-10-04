@@ -1,3 +1,4 @@
+use irtt_client::{OpenPolicy, SessionRequest};
 use std::{
     net::{SocketAddr, UdpSocket},
     sync::{Arc, Condvar, Mutex},
@@ -146,12 +147,18 @@ fn test_runtime() -> tokio::runtime::Runtime {
 fn config(completion: ManagedCompletionPolicy) -> ManagedClientConfig {
     ManagedClientConfig {
         client: ClientConfig {
-            duration: Some(Duration::from_millis(120)),
-            interval: Duration::from_millis(20),
+            open: OpenPolicy {
+                timeouts: vec![Duration::from_millis(200)],
+                ..Default::default()
+            },
+            request: SessionRequest {
+                duration: Some(Duration::from_millis(120)),
+                interval: Duration::from_millis(20),
+                received_stats: ReceivedStats::None,
+                stamp_at: StampAt::None,
+                ..Default::default()
+            },
             probe_timeout: Duration::from_millis(40),
-            open_timeouts: vec![Duration::from_millis(200)],
-            received_stats: ReceivedStats::None,
-            stamp_at: StampAt::None,
             ..ClientConfig::default()
         },
         pacing: ManagedPacing::Burst,

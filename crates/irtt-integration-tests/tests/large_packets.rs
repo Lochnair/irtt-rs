@@ -1,6 +1,6 @@
 mod support;
 
-use irtt_client::{Client, ClientConfig, ClientEvent, NegotiationPolicy};
+use irtt_client::{Client, ClientEvent, NegotiationPolicy};
 use irtt_proto::{echo_header_len, Params, TimestampFields};
 
 use support::{config_for_params, default_params, run_one_probe, BackendPeer, ServerObservation};
@@ -84,12 +84,13 @@ fn echo_reply_bytes_consistent_with_echo_packet_len_for_various_lengths() {
 fn backend_large_packet_smoke() {
     let params = params_with_length(1472);
     let peer = BackendPeer::start_open_echo(None);
-    let mut client = Client::connect(ClientConfig {
-        negotiation_policy: NegotiationPolicy::Loose,
-        length: 1472,
-        ..config_for_params(peer.addr(), &params)
-    })
-    .unwrap();
+    let mut config = config_for_params(&params);
+    config.open.negotiation = NegotiationPolicy::Loose;
+    config.request.length = 1472;
+    let mut client = Client::connect(peer.addr().to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(std::time::Duration::from_millis(500)))
+        .unwrap();
 
     let outcome = client.open().unwrap();
     assert!(matches!(outcome, irtt_client::OpenOutcome::Started { .. }));

@@ -13,12 +13,14 @@
 //! ```
 //!
 //! Without a reachable server this exits quickly with an open-timeout error
-//! instead of hanging, because the example shortens `open_timeouts` for a
+//! instead of hanging, because the example shortens `open.timeouts` for a
 //! fast demonstration.
 
 use std::time::{Duration, Instant};
 
-use irtt_client::{AsyncClient, ClientConfig, ClientEvent, OpenOutcome};
+use irtt_client::{
+    AsyncClient, ClientConfig, ClientEvent, OpenOutcome, OpenPolicy, SessionRequest,
+};
 
 /// Upper bound on how long the receive wait can go without also calling
 /// `poll_timeouts()`. `AsyncClient` does not expose the earliest pending
@@ -41,16 +43,21 @@ fn main() {
 
 async fn run() {
     let config = ClientConfig {
-        server_addr: "127.0.0.1:2112".to_owned(),
-        duration: Some(Duration::from_secs(2)),
-        interval: Duration::from_millis(200),
-        // A single short attempt keeps this example fast when no server is
-        // reachable; production callers should generally keep the default.
-        open_timeouts: vec![Duration::from_millis(300)],
+        open: OpenPolicy {
+            // A single short attempt keeps this example fast when no server is
+            // reachable; production callers should generally keep the default.
+            timeouts: vec![Duration::from_millis(300)],
+            ..Default::default()
+        },
+        request: SessionRequest {
+            duration: Some(Duration::from_secs(2)),
+            interval: Duration::from_millis(200),
+            ..Default::default()
+        },
         ..Default::default()
     };
 
-    let mut client = match AsyncClient::connect(config).await {
+    let mut client = match AsyncClient::connect("127.0.0.1:2112", config).await {
         Ok(client) => client,
         Err(err) => {
             eprintln!("failed to prepare client socket: {err}");

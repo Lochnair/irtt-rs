@@ -12,7 +12,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use irtt_client::{Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, SocketConfig};
+use irtt_client::{
+    Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, OpenPolicy, SessionRequest,
+};
 use irtt_proto::{
     compute_hmac_in_place, decode_request, echo_packet_len, encode_echo_reply, encode_open_reply,
     flags, verify_packet_hmac, Clock, DecodedRequest, DecodedRequestKind, EchoReply, OpenReply,
@@ -166,12 +168,12 @@ pub fn params_for_modes(received_stats: ReceivedStats, stamp_at: StampAt, clock:
 /// Builds a [`ClientConfig`] whose negotiated `Params` will match `params`.
 ///
 /// `params.dscp` is the raw IP TOS / Traffic Class byte, while
-/// [`ClientConfig::dscp`] is the six-bit codepoint that produces it; shift
+/// [`SessionRequest::dscp`] is the six-bit codepoint that produces it; shift
 /// right by two to recover the codepoint the resulting config must request.
 /// Panics if `params.dscp` has any ECN bits set, since those cannot be
 /// recovered from a codepoint and this helper's contract would silently stop
 /// holding otherwise.
-pub fn config_for_params(addr: SocketAddr, params: &Params) -> ClientConfig {
+pub fn config_for_params(params: &Params) -> ClientConfig {
     let traffic_class =
         u8::try_from(params.dscp).expect("test DSCP must fit the raw traffic-class byte");
     assert_eq!(
@@ -180,26 +182,27 @@ pub fn config_for_params(addr: SocketAddr, params: &Params) -> ClientConfig {
         "test Params::dscp must be representable by ClientConfig's DSCP codepoint"
     );
     ClientConfig {
-        server_addr: addr.to_string(),
-        duration: if params.duration_ns == 0 {
-            None
-        } else {
-            Some(Duration::from_nanos(
-                u64::try_from(params.duration_ns).expect("test duration must be non-negative"),
-            ))
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(200)],
+            ..Default::default()
         },
-        interval: Duration::from_nanos(
-            u64::try_from(params.interval_ns).expect("test interval must be non-negative"),
-        ),
-        length: u32::try_from(params.length).unwrap(),
-        received_stats: params.received_stats,
-        stamp_at: params.stamp_at,
-        clock: params.clock,
-        dscp: traffic_class >> 2,
-        server_fill: params.server_fill.as_ref().map(|fill| fill.value.clone()),
-        open_timeouts: vec![Duration::from_millis(200)],
-        socket_config: SocketConfig {
-            recv_timeout: Some(Duration::from_millis(500)),
+        request: SessionRequest {
+            duration: if params.duration_ns == 0 {
+                None
+            } else {
+                Some(Duration::from_nanos(
+                    u64::try_from(params.duration_ns).expect("test duration must be non-negative"),
+                ))
+            },
+            interval: Duration::from_nanos(
+                u64::try_from(params.interval_ns).expect("test interval must be non-negative"),
+            ),
+            length: u32::try_from(params.length).unwrap(),
+            received_stats: params.received_stats,
+            stamp_at: params.stamp_at,
+            clock: params.clock,
+            dscp: traffic_class >> 2,
+            server_fill: params.server_fill.as_ref().map(|fill| fill.value.clone()),
             ..Default::default()
         },
         ..ClientConfig::default()
@@ -219,8 +222,8 @@ pub fn standard_timestamps() -> TimestampFields {
 
 pub fn run_one_probe(params: Params, timestamps: TimestampFields) -> OneProbeRun {
     let config_params = params.clone();
-    run_one_probe_with_config(params, timestamps, None, |addr| {
-        config_for_params(addr, &config_params)
+    run_one_probe_with_config(params, timestamps, None, || {
+        config_for_params(&config_params)
     })
 }
 
@@ -231,10 +234,13 @@ pub fn run_one_probe_with_config<F>(
     build_config: F,
 ) -> OneProbeRun
 where
-    F: FnOnce(SocketAddr) -> ClientConfig,
+    F: FnOnce() -> ClientConfig,
 {
     let server = start_one_probe_server(server_params, timestamps, hmac_key);
-    let mut client = Client::connect(build_config(server.addr)).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), build_config()).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
     let negotiated = assert_started(client.open().unwrap());
 
     let sent_events = client.send_probe().unwrap();

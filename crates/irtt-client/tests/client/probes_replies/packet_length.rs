@@ -23,14 +23,16 @@ fn short_echo_reply_does_not_emit_echo_reply() {
         }
     });
     let config = ClientConfig {
-        length: 64,
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
+        request: SessionRequest {
+            length: 64,
+            ..default_test_config().request
         },
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
@@ -69,14 +71,16 @@ fn overlong_datagram_detection_uses_extra_receive_byte() {
         }
     });
     let config = ClientConfig {
-        length: 4096,
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
+        request: SessionRequest {
+            length: 4096,
+            ..default_test_config().request
         },
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 
@@ -112,14 +116,16 @@ fn exact_length_echo_reply_still_emits_echo_reply() {
         }
     });
     let config = ClientConfig {
-        length: 4096,
-        socket_config: irtt_client::SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..Default::default()
+        request: SessionRequest {
+            length: 4096,
+            ..default_test_config().request
         },
-        ..default_test_config(server.addr)
+        ..default_test_config()
     };
-    let mut client = Client::connect(config).unwrap();
+    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+    client
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert_open_started(client.open().unwrap());
     client.send_probe().unwrap();
 

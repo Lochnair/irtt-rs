@@ -1,4 +1,4 @@
-use irtt_client::{Authentication, HmacKey};
+use irtt_client::{Authentication, HmacKey, OpenPolicy, SessionRequest};
 use std::{
     future::Future,
     net::UdpSocket,
@@ -17,7 +17,7 @@ use tokio::runtime::{Builder, Runtime};
 mod support;
 
 use irtt_client::{AsyncClient, ClientConfig, ClientError, ClientEvent, OpenOutcome};
-use irtt_client::{Client, RunMode, SocketConfig};
+use irtt_client::{Client, RunMode};
 use irtt_server::ServerConfig;
 use std::{
     io,
@@ -49,26 +49,27 @@ fn runtime() -> Runtime {
         .unwrap()
 }
 
-fn config(addr: SocketAddr, key: Option<Vec<u8>>, dscp: u8) -> ClientConfig {
+fn config(key: Option<Vec<u8>>, dscp: u8) -> ClientConfig {
     ClientConfig {
-        server_addr: addr.to_string(),
-        received_stats: ReceivedStats::None,
-        stamp_at: StampAt::None,
-        dscp,
+        open: OpenPolicy {
+            timeouts: vec![Duration::from_millis(200)],
+            ..Default::default()
+        },
+        request: SessionRequest {
+            received_stats: ReceivedStats::None,
+            stamp_at: StampAt::None,
+            dscp,
+            ..Default::default()
+        },
         auth: key.map_or(Authentication::Unauthenticated, |key| {
             Authentication::Hmac(HmacKey::new(key))
         }),
-        open_timeouts: vec![Duration::from_millis(200)],
-        socket_config: SocketConfig {
-            recv_timeout: Some(Duration::from_millis(200)),
-            ..SocketConfig::default()
-        },
         ..ClientConfig::default()
     }
 }
 
 async fn opened_client(addr: SocketAddr, dscp: u8) -> AsyncClient {
-    let mut client = AsyncClient::connect(config(addr, None, dscp))
+    let mut client = AsyncClient::connect(addr.to_string(), config(None, dscp))
         .await
         .unwrap();
     client.open().await.unwrap();
@@ -251,7 +252,10 @@ fn poll_recv_once(client: &mut AsyncClient) -> Poll<Result<Vec<ClientEvent>, Cli
 
 #[test]
 fn connect_requires_current_runtime_when_polled() {
-    let mut future = Box::pin(AsyncClient::connect(ClientConfig::default()));
+    let mut future = Box::pin(AsyncClient::connect(
+        "127.0.0.1:2112",
+        ClientConfig::default(),
+    ));
     assert!(matches!(
         poll_once(Pin::as_mut(&mut future)),
         Poll::Ready(Err(ClientError::NoTokioRuntime))
@@ -262,7 +266,9 @@ fn connect_requires_current_runtime_when_polled() {
 fn recv_before_open_fails_on_first_poll_without_socket_readiness() {
     runtime().block_on(async {
         let remote = SocketAddr::from(([127, 0, 0, 1], 2112));
-        let mut client = AsyncClient::connect(config(remote, None, 0)).await.unwrap();
+        let mut client = AsyncClient::connect(remote.to_string(), config(None, 0))
+            .await
+            .unwrap();
 
         assert!(matches!(
             poll_recv_once(&mut client),
@@ -312,11 +318,13 @@ fn ignored_open_traffic_cannot_extend_the_absolute_attempt_deadline() {
         }
         panic!("second open request did not arrive after the first absolute deadline");
     });
-    let mut client_config = config(server.addr, None, 0);
-    client_config.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+    let mut client_config = config(None, 0);
+    client_config.open.timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
 
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(client_config).await.unwrap();
+        let mut client = AsyncClient::connect(server.addr.to_string(), client_config)
+            .await
+            .unwrap();
         assert!(matches!(
             client.open().await.unwrap(),
             OpenOutcome::Started { .. }
@@ -339,11 +347,13 @@ fn authenticated_rejection_is_terminal_without_retry() {
             0,
         );
     });
-    let mut client_config = config(server.addr, None, 0);
-    client_config.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+    let mut client_config = config(None, 0);
+    client_config.open.timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
 
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(client_config).await.unwrap();
+        let mut client = AsyncClient::connect(server.addr.to_string(), client_config)
+            .await
+            .unwrap();
         assert!(matches!(
             client.open().await,
             Err(ClientError::ServerRejected)
@@ -371,9 +381,11 @@ fn recv_after_local_close_and_no_test_fails_on_first_poll() {
 
     let no_test_server = start_no_test_server();
     runtime().block_on(async {
-        let mut client_config = config(no_test_server.addr, None, 0);
-        client_config.run_mode = RunMode::NoTest;
-        let mut client = AsyncClient::connect(client_config).await.unwrap();
+        let mut client_config = config(None, 0);
+        client_config.request.run_mode = RunMode::NoTest;
+        let mut client = AsyncClient::connect(no_test_server.addr.to_string(), client_config)
+            .await
+            .unwrap();
         client.open().await.unwrap();
         assert!(matches!(
             poll_recv_once(&mut client),
@@ -388,7 +400,7 @@ fn authenticated_async_lifecycle_negotiates_dscp() {
     let key = b"async-lifecycle-key".to_vec();
     let server = InTreeServer::start(ServerConfig::default().with_hmac_key(key.clone()));
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(server.addr, Some(key), 46))
+        let mut client = AsyncClient::connect(server.addr.to_string(), config(Some(key), 46))
             .await
             .unwrap();
         let opened = client.open().await.unwrap();
@@ -403,7 +415,10 @@ fn authenticated_async_lifecycle_negotiates_dscp() {
 fn blocking_and_async_peer_close_are_semantically_equivalent() {
     let blocking_peer_close_server = start_peer_close_server();
     let mut blocking_peer_close =
-        Client::connect(config(blocking_peer_close_server.addr, None, 0)).unwrap();
+        Client::connect(blocking_peer_close_server.addr.to_string(), config(None, 0)).unwrap();
+    blocking_peer_close
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     blocking_peer_close.open().unwrap();
     blocking_peer_close.send_probe().unwrap();
     let blocking_peer_close_events = blocking_peer_close.recv_once().unwrap();
@@ -412,9 +427,10 @@ fn blocking_and_async_peer_close_are_semantically_equivalent() {
 
     let async_peer_close_server = start_peer_close_server();
     let async_peer_close_events = runtime().block_on(async {
-        let mut client = AsyncClient::connect(config(async_peer_close_server.addr, None, 0))
-            .await
-            .unwrap();
+        let mut client =
+            AsyncClient::connect(async_peer_close_server.addr.to_string(), config(None, 0))
+                .await
+                .unwrap();
         client.open().await.unwrap();
         client.send_probe().await.unwrap();
         let events = client.recv().await.unwrap();
@@ -525,7 +541,10 @@ fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
     // One open attempt is ignored, so the first open times out and the second
     // must be able to open the same connected client.
     let blocking_server = start_silent_then_open_server(1);
-    let mut blocking = Client::connect(config(blocking_server.addr, None, 0)).unwrap();
+    let mut blocking = Client::connect(blocking_server.addr.to_string(), config(None, 0)).unwrap();
+    blocking
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     assert!(!blocking.has_pending_probes());
     let blocking_first = blocking.open().unwrap_err();
     assert!(!blocking.has_pending_probes());
@@ -539,7 +558,7 @@ fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
     let async_server = start_silent_then_open_server(1);
     let (async_first, async_second, async_sent, async_reply, async_close) =
         runtime().block_on(async {
-            let mut client = AsyncClient::connect(config(async_server.addr, None, 0))
+            let mut client = AsyncClient::connect(async_server.addr.to_string(), config(None, 0))
                 .await
                 .unwrap();
             assert!(!client.has_pending_probes());
@@ -580,16 +599,16 @@ fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
 #[test]
 fn blocking_and_async_complete_every_caller_paced_probe() {
     const PROBES: u32 = 3;
-    fn caller_config(addr: SocketAddr) -> ClientConfig {
-        ClientConfig {
-            duration: Some(Duration::from_millis(1)),
-            interval: Duration::from_secs(1),
-            ..config(addr, None, 0)
-        }
-    }
+    let mut caller_config = config(None, 0);
+    caller_config.request.duration = Some(Duration::from_millis(1));
+    caller_config.request.interval = Duration::from_secs(1);
 
     let blocking_server = InTreeServer::start(ServerConfig::default());
-    let mut blocking = Client::connect(caller_config(blocking_server.addr)).unwrap();
+    let mut blocking =
+        Client::connect(blocking_server.addr.to_string(), caller_config.clone()).unwrap();
+    blocking
+        .set_recv_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     let outcome = blocking.open().unwrap();
     assert_eq!(
         blocking.negotiated_params(),
@@ -613,7 +632,7 @@ fn blocking_and_async_complete_every_caller_paced_probe() {
 
     let async_server = InTreeServer::start(ServerConfig::default());
     let (async_sent, async_replies) = runtime().block_on(async {
-        let mut client = AsyncClient::connect(caller_config(async_server.addr))
+        let mut client = AsyncClient::connect(async_server.addr.to_string(), caller_config)
             .await
             .unwrap();
         let outcome = client.open().await.unwrap();
@@ -670,11 +689,13 @@ fn ignored_open_traffic_uses_one_request_and_deadline_per_attempt() {
             }
         }
     });
-    let mut client_config = config(server.addr, None, 0);
-    client_config.open_timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
+    let mut client_config = config(None, 0);
+    client_config.open.timeouts = vec![Duration::from_millis(200), Duration::from_millis(200)];
 
     runtime().block_on(async {
-        let mut client = AsyncClient::connect(client_config).await.unwrap();
+        let mut client = AsyncClient::connect(server.addr.to_string(), client_config)
+            .await
+            .unwrap();
         assert!(matches!(client.open().await, Err(ClientError::OpenTimeout)));
     });
     assert_eq!(server.finish().len(), 2);

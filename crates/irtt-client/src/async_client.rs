@@ -19,7 +19,7 @@ use crate::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
         PreparedProbe, SessionMachine, TimeoutBatch, MAX_OPEN_PACKET_SIZE,
     },
-    socket::{connect_tokio_udp_socket, resolve_remote_tokio, validate_open_timeouts},
+    socket::{connect_tokio_udp_socket, resolve_remote_tokio},
     socket_options::{apply_traffic_class_to_tokio_socket, clear_dscp_on_tokio_socket},
     timing::ClientTimestamp,
 };
@@ -170,7 +170,7 @@ impl AsyncOpenState {
 /// use irtt_client::{AsyncClient, ClientConfig};
 ///
 /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
-/// let mut client = AsyncClient::connect(ClientConfig::default()).await?;
+/// let mut client = AsyncClient::connect("127.0.0.1:2112", ClientConfig::default()).await?;
 /// let outcome = client.open().await?;
 /// println!("opened: {outcome:?}");
 /// let sent = client.send_probe().await?;
@@ -199,19 +199,26 @@ pub struct AsyncClient {
 }
 
 impl AsyncClient {
-    /// Resolve the configured server and construct one connected Tokio UDP
+    /// Resolve the endpoint and construct one connected Tokio UDP
     /// socket.
     ///
     /// Polling this future without a current Tokio runtime returns
     /// [`ClientError::NoTokioRuntime`]. A runtime without enabled I/O or time
     /// drivers is outside this type's runtime contract.
-    pub async fn connect(config: ClientConfig) -> Result<Self, ClientError> {
+    ///
+    /// The endpoint accepts a name or address; an omitted port defaults to 2112.
+    /// IPv6 literals may be bracketed or unbracketed with the default port.
+    /// The reusable config contains no endpoint identity.
+    pub async fn connect(
+        endpoint: impl AsRef<str>,
+        config: ClientConfig,
+    ) -> Result<Self, ClientError> {
         tokio::runtime::Handle::try_current().map_err(|_| ClientError::NoTokioRuntime)?;
-        validate_open_timeouts(&config.open_timeouts)?;
-        let remote = resolve_remote_tokio(&config).await?;
+        config.open.validate()?;
+        let remote = resolve_remote_tokio(endpoint.as_ref(), config.address_family).await?;
         let machine = SessionMachine::new(config.clone(), remote)?;
         let prepared_open = machine.prepare_open_request()?;
-        let socket = connect_tokio_udp_socket(&config.socket_config, remote)?;
+        let socket = connect_tokio_udp_socket(&config.socket, remote, config.address_family)?;
 
         Ok(Self {
             socket,
@@ -307,7 +314,7 @@ impl AsyncClient {
                 return self.poll_open_cleanup(state, cx);
             }
 
-            let attempt_count = self.machine.config().open_timeouts.len();
+            let attempt_count = self.machine.config().open.timeouts.len();
             if state.attempt >= attempt_count {
                 return Poll::Ready(Err(ClientError::OpenTimeout));
             }
@@ -316,7 +323,7 @@ impl AsyncClient {
                 return Poll::Ready(Err(ClientError::OpenTimeout));
             }
             if state.deadline.is_none() {
-                let timeout = self.machine.config().open_timeouts[state.attempt];
+                let timeout = self.machine.config().open.timeouts[state.attempt];
                 if let Err(error) = state.start_attempt(timeout) {
                     return Poll::Ready(Err(error));
                 }
