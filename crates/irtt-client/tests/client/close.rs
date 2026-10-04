@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn open_fails_after_close() {
+fn operations_fail_after_local_close_without_datagrams() {
     let params = default_params();
     let server = start_fake_server(move |socket, tx| {
         let (_, peer) = recv_request(&socket, &tx);
@@ -9,10 +9,26 @@ fn open_fails_after_close() {
         socket.send_to(&reply, peer).unwrap();
         let _ = recv_request(&socket, &tx);
     });
-    let mut client = Client::connect(default_test_config(server.addr)).unwrap();
+    let mut config = default_test_config(server.addr);
+    config.socket_config.recv_timeout = Some(Duration::from_millis(50));
+    let mut client = Client::connect(config).unwrap();
     assert_open_started(client.open().unwrap());
     client.close().unwrap();
     assert!(matches!(client.open(), Err(ClientError::AlreadyClosed)));
+    let results = [
+        client.recv_once(),
+        client.recv_available(RecvBudget { max_packets: 1 }),
+    ];
+    assert!(
+        matches!(
+            results,
+            [
+                Err(ClientError::AlreadyClosed),
+                Err(ClientError::AlreadyClosed)
+            ]
+        ),
+        "unexpected receive results: {results:?}"
+    );
     server.join();
 }
 
@@ -472,6 +488,21 @@ fn close_flagged_echo_reply_emits_reply_then_closes_without_sending_close() {
         Some(ClientEvent::SessionClosed { token: TOKEN, .. })
     ));
     assert_eq!(events.len(), 2);
+
+    let results = [
+        client.recv_once(),
+        client.recv_available(RecvBudget { max_packets: 1 }),
+    ];
+    assert!(
+        matches!(
+            results,
+            [
+                Err(ClientError::AlreadyClosed),
+                Err(ClientError::AlreadyClosed)
+            ]
+        ),
+        "unexpected receive results: {results:?}"
+    );
 
     assert!(matches!(
         client.send_probe(),

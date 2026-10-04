@@ -1,5 +1,31 @@
 use super::*;
 
+#[test]
+fn receive_before_open_returns_not_open_without_datagrams() {
+    let peer = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    let mut config = default_test_config(peer.local_addr().unwrap());
+    // Bound the old implementation's blocking receive without sending a packet.
+    config.socket_config.recv_timeout = Some(Duration::from_millis(50));
+    let mut client = Client::connect(config).unwrap();
+
+    let results = [
+        client.recv_once(),
+        client.recv_available(RecvBudget { max_packets: 1 }),
+        client.recv_available(RecvBudget { max_packets: 0 }),
+    ];
+    assert!(
+        matches!(
+            results,
+            [
+                Err(ClientError::NotOpen),
+                Err(ClientError::NotOpen),
+                Err(ClientError::NotOpen)
+            ]
+        ),
+        "unexpected receive results: {results:?}"
+    );
+}
+
 // Untrusted returned intervals must be rejected before managed scheduling,
 // even when loose negotiation permits legitimate server restrictions.
 #[test]

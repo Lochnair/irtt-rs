@@ -101,14 +101,29 @@ fn send_probe_fails_after_no_test_completed() {
 }
 
 #[test]
-fn open_fails_after_no_test_completed() {
+fn operations_fail_after_no_test_completed_without_datagrams() {
     let mut config = default_test_config(SocketAddr::from(([127, 0, 0, 1], 1)));
     config.run_mode = RunMode::NoTest;
+    config.socket_config.recv_timeout = Some(Duration::from_millis(50));
     let params = default_params();
     let server = no_test_server(params, 0);
     config.server_addr = server.addr.to_string();
     let mut client = Client::connect(config).unwrap();
     assert_no_test_completed(client.open().unwrap());
     assert!(matches!(client.open(), Err(ClientError::AlreadyCompleted)));
+    let results = [
+        client.recv_once(),
+        client.recv_available(RecvBudget { max_packets: 1 }),
+    ];
+    assert!(
+        matches!(
+            results,
+            [
+                Err(ClientError::AlreadyCompleted),
+                Err(ClientError::AlreadyCompleted)
+            ]
+        ),
+        "unexpected receive results: {results:?}"
+    );
     server.join();
 }

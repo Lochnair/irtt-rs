@@ -222,7 +222,9 @@ impl Client {
     ///
     /// Returns an empty event list when the socket read would block or times
     /// out. Malformed or unrelated datagrams are reported as warning events.
+    /// Requires an open session; lifecycle errors are returned before socket I/O.
     pub fn recv_once(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+        self.runtime.ensure_open()?;
         self.socket
             .set_read_timeout(self.runtime.config().socket_config.recv_timeout)?;
         self.recv_once_inner()
@@ -316,7 +318,10 @@ impl Client {
 
     /// Receive and classify datagrams until a receive produces no events or the
     /// receive budget is exhausted.
+    ///
+    /// Requires an open session; lifecycle errors are returned before socket I/O.
     pub fn recv_available(&mut self, budget: RecvBudget) -> Result<Vec<ClientEvent>, ClientError> {
+        self.runtime.ensure_open()?;
         self.socket
             .set_read_timeout(self.runtime.config().socket_config.recv_timeout)?;
         let mut all_events = Vec::new();

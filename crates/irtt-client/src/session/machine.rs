@@ -591,7 +591,6 @@ impl SessionMachine {
         }
     }
 
-    #[cfg(feature = "tokio")]
     pub(crate) fn ensure_open(&self) -> Result<(), ClientError> {
         self.open_session().map(|_| ())
     }
