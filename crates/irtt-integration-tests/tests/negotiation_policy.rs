@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use irtt_client::{
-    AsyncClient, ClientConfig, NegotiationPolicy, NegotiationRestriction, OpenOutcome, OpenPolicy,
+    AsyncClient, ClientConfig, NegotiationChange, NegotiationPolicy, OpenOutcome, OpenPolicy,
     SessionRequest,
 };
 use irtt_proto::{Clock, ReceivedStats, StampAt};
@@ -40,22 +40,25 @@ async fn exercise_timestamp_restriction() {
 
     let mut loose = client(server_addr, NegotiationPolicy::Loose).await;
     let negotiated = match loose.open().await.unwrap() {
-        OpenOutcome::Started { negotiated, .. } => negotiated,
-        OpenOutcome::NoTestCompleted { .. } => panic!("normal client unexpectedly ran no-test"),
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        }) => negotiated,
+        OpenOutcome::NoTestCompleted(_) => panic!("normal client unexpectedly ran no-test"),
     };
     assert_eq!(
-        negotiated.params.stamp_at,
+        negotiated.accepted.stamp_at,
         StampAt::Midpoint,
         "a request for both instants is answered with the midpoint"
     );
     assert_eq!(
-        negotiated.params.clock,
+        negotiated.accepted.clock,
         Clock::Both,
         "the clock is not restricted with it"
     );
     assert!(negotiated
-        .restrictions
-        .contains(&NegotiationRestriction::StampAtChanged {
+        .changes
+        .contains(&NegotiationChange::StampAtChanged {
             requested: StampAt::Both,
             negotiated: StampAt::Midpoint,
         }));
@@ -112,16 +115,19 @@ async fn exercise_dscp_restriction() {
             .await
             .unwrap();
     let negotiated = match loose.open().await.unwrap() {
-        OpenOutcome::Started { negotiated, .. } => negotiated,
-        OpenOutcome::NoTestCompleted { .. } => panic!("normal client unexpectedly ran no-test"),
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        }) => negotiated,
+        OpenOutcome::NoTestCompleted(_) => panic!("normal client unexpectedly ran no-test"),
     };
     assert_eq!(
-        negotiated.params.dscp, 0,
-        "the raw wire parameter is negotiated to zero"
+        negotiated.accepted.dscp, 0,
+        "the accepted DSCP codepoint is zero"
     );
     assert!(negotiated
-        .restrictions
-        .contains(&NegotiationRestriction::DscpChanged {
+        .changes
+        .contains(&NegotiationChange::DscpChanged {
             requested: 46,
             negotiated: 0,
         }));
@@ -159,14 +165,21 @@ async fn exercise_default_policy() {
     .await
     .unwrap();
     let negotiated = match client.open().await.unwrap() {
-        OpenOutcome::Started { negotiated, .. } => negotiated,
-        OpenOutcome::NoTestCompleted { .. } => panic!("normal client unexpectedly ran no-test"),
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        }) => negotiated,
+        OpenOutcome::NoTestCompleted(_) => panic!("normal client unexpectedly ran no-test"),
     };
 
-    assert_eq!(negotiated.restrictions, Vec::new());
-    assert_eq!(negotiated.params.stamp_at, StampAt::Both);
-    assert_eq!(negotiated.params.clock, Clock::Both);
-    assert_eq!(negotiated.params.dscp, 184, "the raw byte for codepoint 46");
+    assert_eq!(negotiated.changes, Vec::new());
+    assert_eq!(negotiated.accepted.stamp_at, StampAt::Both);
+    assert_eq!(negotiated.accepted.clock, Clock::Both);
+    assert_eq!(negotiated.accepted.dscp, 46);
+    assert_eq!(
+        negotiated.peer_params.dscp, 184,
+        "the raw byte for codepoint 46"
+    );
 
     probe(&mut client).await;
     client.close().await.unwrap();

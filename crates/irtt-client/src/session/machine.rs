@@ -12,12 +12,12 @@ use crate::{
     },
     error::ClientError,
     event::{
-        ClientEvent, OneWayDelaySample, OpenOutcome, ReceivedStatsSample, RttSample, ServerTiming,
-        SignedDuration, WarningKind,
+        ClientEvent, NoTestCompleted, OneWayDelaySample, OpenOutcome, ReceivedStatsSample,
+        RttSample, ServerTiming, SessionStarted, SignedDuration, WarningKind,
     },
     metadata::ReceiveMeta,
     probe::{CompletedSet, PendingMap, PendingProbe, TimedOutMap},
-    session::{negotiate_params, NegotiatedParams},
+    session::{negotiate_params, NegotiationResult},
     socket_options::dscp_codepoint_to_traffic_class,
     timing::ClientTimestamp,
 };
@@ -53,7 +53,7 @@ enum CloseSource {
 #[derive(Debug)]
 struct ActiveSession {
     token: u64,
-    negotiated: NegotiatedParams,
+    negotiated: NegotiationResult,
     local_close_packet: Box<[u8]>,
     next_wire_seq: u32,
     highest_received_seq: Option<u32>,
@@ -82,7 +82,7 @@ pub(crate) struct PreparedOpenAcceptance {
 }
 
 impl PreparedOpenAcceptance {
-    pub(crate) fn normal_negotiated(&self) -> Option<&NegotiatedParams> {
+    pub(crate) fn normal_negotiated(&self) -> Option<&NegotiationResult> {
         match &self.next_state {
             MachineState::Open(session) => Some(&session.negotiated),
             _ => None,
@@ -311,7 +311,7 @@ impl SessionMachine {
             RequestToEncode::Echo {
                 token: session.token,
                 sequence: session.next_wire_seq,
-                params: &session.negotiated.params,
+                params: &session.negotiated.peer_params,
                 payload: &[],
             },
             self.config.auth.hmac_key(),
@@ -540,7 +540,7 @@ impl SessionMachine {
         }
     }
 
-    pub(crate) fn negotiated_params(&self) -> Option<&NegotiatedParams> {
+    pub(crate) fn negotiation(&self) -> Option<&NegotiationResult> {
         match &self.state {
             MachineState::Open(session) => Some(&session.negotiated),
             _ => None,
@@ -623,19 +623,12 @@ impl SessionMachine {
             kernel_tx_correlation_valid: true,
         }));
 
-        let event = ClientEvent::SessionStarted {
+        let outcome = OpenOutcome::Started(SessionStarted {
             remote: self.remote,
             token,
-            negotiated: negotiated.clone(),
+            negotiation: negotiated,
             at: now,
-        };
-
-        let outcome = OpenOutcome::Started {
-            remote: self.remote,
-            token,
-            negotiated,
-            event,
-        };
+        });
         Ok(PreparedOpenAcceptance {
             next_state,
             outcome,
@@ -650,16 +643,11 @@ impl SessionMachine {
         let negotiated =
             negotiate_params(&self.requested, reply.params, self.config.open.negotiation)
                 .map_err(OpenAcceptanceFailure::without_cleanup)?;
-        let event = ClientEvent::NoTestCompleted {
+        let outcome = OpenOutcome::NoTestCompleted(NoTestCompleted {
             remote: self.remote,
-            negotiated: negotiated.clone(),
+            negotiation: negotiated,
             at: now,
-        };
-        let outcome = OpenOutcome::NoTestCompleted {
-            remote: self.remote,
-            negotiated,
-            event,
-        };
+        });
         Ok(PreparedOpenAcceptance {
             next_state: MachineState::NoTestCompleted,
             outcome,
@@ -673,7 +661,7 @@ impl SessionMachine {
 
         decode_echo_reply(
             packet,
-            &session.negotiated.params,
+            &session.negotiated.peer_params,
             self.config.auth.hmac_key(),
         )
         .ok()
@@ -873,10 +861,10 @@ impl SessionMachine {
 /// rather than asserted away so that no 64-bit assumption is baked in.
 pub(crate) fn recv_buffer_size(
     has_hmac: bool,
-    negotiated: Option<&NegotiatedParams>,
+    negotiated: Option<&NegotiationResult>,
 ) -> Result<usize, ClientError> {
     Ok(match negotiated {
-        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.params)?
+        Some(negotiated) => echo_packet_len(has_hmac, &negotiated.peer_params)?
             .saturating_add(1)
             .max(MIN_RECV_BUFFER_SIZE),
         None => MIN_RECV_BUFFER_SIZE,

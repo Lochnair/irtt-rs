@@ -10,7 +10,7 @@
 use std::time::Duration;
 
 use irtt_client::{
-    AsyncClient, ClientConfig, NegotiationPolicy, NegotiationRestriction, OpenOutcome, OpenPolicy,
+    AsyncClient, ClientConfig, NegotiationChange, NegotiationPolicy, OpenOutcome, OpenPolicy,
     SessionRequest,
 };
 use irtt_proto::{
@@ -166,21 +166,23 @@ async fn exercise_fallback_negotiation() {
         .await
         .unwrap();
     match loose.open().await.unwrap() {
-        OpenOutcome::Started { negotiated, .. } => {
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        }) => {
             assert_eq!(
-                negotiated
-                    .params
-                    .server_fill
-                    .map(|fill| fill.value)
-                    .as_deref(),
+                negotiated.accepted.server_fill.as_deref(),
                 Some("pattern:69727474"),
                 "the server reports the default descriptor it fell back to"
             );
             assert!(negotiated
-                .restrictions
-                .contains(&NegotiationRestriction::ServerFillChanged));
+                .changes
+                .contains(&NegotiationChange::ServerFillChanged {
+                    requested: Some("bogus".to_owned()),
+                    negotiated: Some("pattern:69727474".to_owned())
+                }));
         }
-        OpenOutcome::NoTestCompleted { .. } => panic!("normal client unexpectedly ran no-test"),
+        OpenOutcome::NoTestCompleted(_) => panic!("normal client unexpectedly ran no-test"),
     }
     loose.close().await.unwrap();
 

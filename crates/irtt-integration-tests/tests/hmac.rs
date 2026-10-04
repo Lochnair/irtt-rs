@@ -31,7 +31,7 @@ fn hmac_open_success_negotiates_without_warnings() {
         },
     );
 
-    assert_eq!(run.negotiated.params, params);
+    assert_eq!(run.negotiated.peer_params, params);
     match &run.observations[0] {
         ServerObservation::Open { params: got, hmac } => {
             assert_eq!(got, &params);
@@ -249,21 +249,13 @@ fn non_hmac_client_open_does_not_set_hmac_flag() {
 
 fn assert_started(outcome: OpenOutcome, expected: &irtt_proto::Params) {
     match outcome {
-        OpenOutcome::Started {
+        OpenOutcome::Started(irtt_client::SessionStarted {
             token,
-            negotiated,
-            event:
-                ClientEvent::SessionStarted {
-                    token: event_token,
-                    negotiated: event_negotiated,
-                    ..
-                },
+            negotiation: negotiated,
             ..
-        } => {
+        }) => {
             assert_eq!(token, TOKEN);
-            assert_eq!(event_token, TOKEN);
-            assert_eq!(negotiated.params, *expected);
-            assert_eq!(event_negotiated.params, *expected);
+            assert_eq!(negotiated.peer_params, *expected);
         }
         other => panic!("expected started open outcome, got {other:?}"),
     }
@@ -297,7 +289,7 @@ fn backend_hmac_correct_key_succeeds() {
         .set_recv_timeout(Some(Duration::from_millis(500)))
         .unwrap();
     let outcome = client.open().unwrap();
-    assert!(matches!(outcome, OpenOutcome::Started { .. }));
+    assert!(matches!(outcome, OpenOutcome::Started(_)));
 
     let sent = client.send_probe().unwrap();
     assert_eq!(sent.len(), 1);

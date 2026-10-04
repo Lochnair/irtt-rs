@@ -220,11 +220,11 @@ async fn connected_client(server_addr: SocketAddr) -> AsyncClient {
 
 async fn assert_started(client: &mut AsyncClient, server_addr: SocketAddr) {
     match client.open().await.unwrap() {
-        OpenOutcome::Started { remote, token, .. } => {
+        OpenOutcome::Started(irtt_client::SessionStarted { remote, token, .. }) => {
             assert_eq!(remote, server_addr);
             assert_ne!(token, 0);
         }
-        OpenOutcome::NoTestCompleted { .. } => panic!("a normal client unexpectedly ran no-test"),
+        OpenOutcome::NoTestCompleted(_) => panic!("a normal client unexpectedly ran no-test"),
     }
 }
 

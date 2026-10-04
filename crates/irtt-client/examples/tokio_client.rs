@@ -66,14 +66,12 @@ async fn run() {
     };
 
     let negotiated = match client.open().await {
-        Ok(OpenOutcome::Started {
-            event, negotiated, ..
-        }) => {
-            println!("session opened: {event:?}");
-            negotiated
+        Ok(OpenOutcome::Started(started)) => {
+            println!("session opened: {started:?}");
+            started.negotiation
         }
-        Ok(OpenOutcome::NoTestCompleted { event, .. }) => {
-            println!("{event:?}");
+        Ok(OpenOutcome::NoTestCompleted(completed)) => {
+            println!("{completed:?}");
             return;
         }
         Err(err) => {
@@ -83,9 +81,13 @@ async fn run() {
     };
 
     // This loop owns cadence and duration. The transport sends whenever called.
-    let interval = Duration::from_nanos(negotiated.params.interval_ns as u64);
+    let interval = negotiated.accepted.interval;
     let start = Instant::now();
-    let end = start + Duration::from_nanos(negotiated.params.duration_ns as u64);
+    let end = start
+        + negotiated
+            .accepted
+            .duration
+            .expect("example requests a finite run");
     let deadline = end + client.probe_timeout();
     let mut next_send = start;
     while Instant::now() < deadline && !client.is_peer_closed() {

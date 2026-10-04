@@ -327,7 +327,7 @@ fn ignored_open_traffic_cannot_extend_the_absolute_attempt_deadline() {
             .unwrap();
         assert!(matches!(
             client.open().await.unwrap(),
-            OpenOutcome::Started { .. }
+            OpenOutcome::Started(_)
         ));
     });
     assert_eq!(server.finish().len(), 2);
@@ -404,7 +404,7 @@ fn authenticated_async_lifecycle_negotiates_dscp() {
             .await
             .unwrap();
         let opened = client.open().await.unwrap();
-        assert_eq!(open_negotiated(&opened).params.dscp, 184);
+        assert_eq!(open_negotiated(&opened).accepted.dscp, 46);
         client.send_probe().await.unwrap();
         assert!(matches!(client.recv().await.unwrap().as_slice(), [ClientEvent::EchoReply { seq: 0, .. }]));
         assert!(matches!(client.close().await.unwrap().as_slice(), [ClientEvent::SessionClosed { token, .. }] if *token == open_token(&opened)));
@@ -450,17 +450,23 @@ fn blocking_and_async_peer_close_are_semantically_equivalent() {
     }
 }
 
-fn open_negotiated(outcome: &OpenOutcome) -> &irtt_client::NegotiatedParams {
+fn open_negotiated(outcome: &OpenOutcome) -> &irtt_client::NegotiationResult {
     match outcome {
-        OpenOutcome::Started { negotiated, .. }
-        | OpenOutcome::NoTestCompleted { negotiated, .. } => negotiated,
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        })
+        | OpenOutcome::NoTestCompleted(irtt_client::NoTestCompleted {
+            negotiation: negotiated,
+            ..
+        }) => negotiated,
     }
 }
 
 fn open_token(outcome: &OpenOutcome) -> u64 {
     match outcome {
-        OpenOutcome::Started { token, .. } => *token,
-        OpenOutcome::NoTestCompleted { .. } => panic!("no-test open has no session token"),
+        OpenOutcome::Started(irtt_client::SessionStarted { token, .. }) => *token,
+        OpenOutcome::NoTestCompleted(_) => panic!("no-test open has no session token"),
     }
 }
 
@@ -577,8 +583,8 @@ fn blocking_and_async_roll_back_a_failed_open_and_accept_a_retry() {
     // state that refuses the retry.
     assert_eq!(error_name(&blocking_first), "open timeout");
     assert_eq!(error_name(&blocking_first), error_name(&async_first));
-    assert!(matches!(blocking_second, OpenOutcome::Started { .. }));
-    assert!(matches!(async_second, OpenOutcome::Started { .. }));
+    assert!(matches!(blocking_second, OpenOutcome::Started(_)));
+    assert!(matches!(async_second, OpenOutcome::Started(_)));
     assert_eq!(
         open_negotiated(&blocking_second),
         open_negotiated(&async_second)
@@ -610,10 +616,7 @@ fn blocking_and_async_complete_every_caller_paced_probe() {
         .set_recv_timeout(Some(Duration::from_millis(200)))
         .unwrap();
     let outcome = blocking.open().unwrap();
-    assert_eq!(
-        blocking.negotiated_params(),
-        Some(open_negotiated(&outcome))
-    );
+    assert_eq!(blocking.negotiation(), Some(open_negotiated(&outcome)));
     assert!(!blocking.has_pending_probes());
     // Oversleeping cannot invalidate this: low-level sends remain caller-owned
     // after the negotiated duration. The compliant server has no duration cap.
@@ -636,7 +639,7 @@ fn blocking_and_async_complete_every_caller_paced_probe() {
             .await
             .unwrap();
         let outcome = client.open().await.unwrap();
-        assert_eq!(client.negotiated_params(), Some(open_negotiated(&outcome)));
+        assert_eq!(client.negotiation(), Some(open_negotiated(&outcome)));
         tokio::time::sleep(Duration::from_millis(2)).await;
         let mut sent = Vec::new();
         let mut replies = Vec::new();

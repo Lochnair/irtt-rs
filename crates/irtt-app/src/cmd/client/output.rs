@@ -5,7 +5,7 @@ use std::{
 };
 
 use irtt_client::{
-    ClientEvent, NegotiatedParams, OneWayDelaySample, PacketMeta, ReceivedStatsSample, RttSample,
+    ClientEvent, NegotiationResult, OneWayDelaySample, PacketMeta, ReceivedStatsSample, RttSample,
     ServerTiming, SignedDuration, WarningKind,
 };
 
@@ -234,22 +234,22 @@ enum OutputRow {
 impl OutputRow {
     fn from_event(event: &ClientEvent) -> Self {
         match event {
-            ClientEvent::SessionStarted {
+            ClientEvent::SessionStarted(irtt_client::SessionStarted {
                 remote,
                 token,
-                negotiated,
+                negotiation: negotiated,
                 at,
-            } => Self::SessionStarted(LifecycleRow::new(
+            }) => Self::SessionStarted(LifecycleRow::new(
                 *remote,
                 Some(*token),
                 negotiated,
                 at.wall,
             )),
-            ClientEvent::NoTestCompleted {
+            ClientEvent::NoTestCompleted(irtt_client::NoTestCompleted {
                 remote,
-                negotiated,
+                negotiation: negotiated,
                 at,
-            } => Self::NoTestCompleted(LifecycleRow::new(*remote, None, negotiated, at.wall)),
+            }) => Self::NoTestCompleted(LifecycleRow::new(*remote, None, negotiated, at.wall)),
             ClientEvent::SessionClosed { remote, token, at } => Self::SessionClosed {
                 remote: *remote,
                 token: *token,
@@ -384,16 +384,19 @@ impl LifecycleRow {
     fn new(
         remote: SocketAddr,
         token: Option<u64>,
-        negotiated: &NegotiatedParams,
+        negotiated: &NegotiationResult,
         event_wall: SystemTime,
     ) -> Self {
         Self {
             remote,
             token,
             event_wall,
-            duration_ns: i128::from(negotiated.params.duration_ns),
-            interval_ns: i128::from(negotiated.params.interval_ns),
-            payload_length: i128::from(negotiated.params.length),
+            duration_ns: negotiated
+                .accepted
+                .duration
+                .map_or(0, |duration| duration.as_nanos() as i128),
+            interval_ns: negotiated.accepted.interval.as_nanos() as i128,
+            payload_length: i128::from(negotiated.accepted.length),
         }
     }
 }

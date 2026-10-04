@@ -60,24 +60,35 @@ fn no_test_strict_negotiation_rejects_changed_params() {
 
 #[test]
 fn no_test_loose_negotiation_accepts_restricted_params() {
-    let mut config = default_test_config();
-    config.request.run_mode = RunMode::NoTest;
-    config.open.negotiation = NegotiationPolicy::Loose;
-    let requested = default_params();
-    let mut params = requested.clone();
-    params.duration_ns /= 2;
-    let server = no_test_server(params.clone(), 0);
-    let mut client = Client::connect(server.addr.to_string(), config).unwrap();
-    let negotiated = assert_no_test_completed(client.open().unwrap());
-    assert_eq!(negotiated.params, params);
-    assert_eq!(
-        negotiated.restrictions,
-        vec![irtt_client::NegotiationRestriction::DurationReduced {
-            requested_ns: requested.duration_ns,
-            negotiated_ns: params.duration_ns,
-        }]
-    );
-    server.join();
+    for requested_duration in [Some(Duration::from_secs(3)), None] {
+        let mut config = default_test_config();
+        config.request.run_mode = RunMode::NoTest;
+        config.request.duration = requested_duration;
+        config.open.negotiation = NegotiationPolicy::Loose;
+        let mut params = default_params();
+        params.duration_ns = 1_500_000_000;
+        let server = no_test_server(params.clone(), 0);
+        let mut client = Client::connect(server.addr.to_string(), config).unwrap();
+        let negotiated = assert_no_test_completed(client.open().unwrap());
+        assert_eq!(negotiated.peer_params, params);
+        assert_eq!(
+            negotiated.accepted.duration,
+            Some(Duration::from_millis(1500))
+        );
+        assert_eq!(
+            negotiated.changes,
+            vec![irtt_client::NegotiationChange::DurationReduced {
+                requested: requested_duration,
+                negotiated: Duration::from_millis(1500),
+            }]
+        );
+        assert_eq!(
+            client.negotiation(),
+            None,
+            "no-test creates no live session"
+        );
+        server.join();
+    }
 }
 
 #[test]

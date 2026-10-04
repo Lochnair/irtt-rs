@@ -47,7 +47,7 @@ pub(crate) const DEFAULT_MAX_PENDING: usize = 4096;
 /// This type describes both the protocol parameters sent in the IRTT open
 /// request and the local client behavior used to drive the UDP socket. Values
 /// that are negotiated by the server are available after opening the session
-/// through [`NegotiatedParams`](crate::NegotiatedParams).
+/// through [`NegotiationResult`](crate::NegotiationResult).
 ///
 /// # Example
 ///
@@ -297,7 +297,7 @@ pub enum NegotiationPolicy {
     /// than requested.
     Strict,
     /// Accept documented server restrictions and report them in
-    /// [`NegotiatedParams`](crate::NegotiatedParams).
+    /// [`NegotiationResult`](crate::NegotiationResult).
     Loose,
 }
 

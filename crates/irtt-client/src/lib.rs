@@ -19,7 +19,7 @@
 //! `tokio` feature, `AsyncClient` provides the corresponding low-level Tokio
 //! adapter for a caller that owns a runtime and drives socket readiness
 //! itself. Both adapters send one probe whenever called; callers own cadence
-//! and run duration, using `negotiated_params()` after Open. [`managed`] owns
+//! and run duration, using `negotiation()` after Open. [`managed`] owns
 //! negotiated-interval scheduling, finite runs, and staggered/burst pacing:
 //! `ManagedClientTask` /
 //! `ManagedClientHandle` (`tokio` feature) run and control one or more
@@ -27,6 +27,17 @@
 //! feature) wraps that in a synchronous owner backed by its own dedicated
 //! current-thread runtime for callers that want managed multi-target
 //! behavior without touching Tokio themselves.
+//!
+//! A successful [`OpenOutcome`] carries either [`SessionStarted`] (with a live
+//! token) or [`NoTestCompleted`] (terminal, with no probe session). Lifecycle
+//! events use these same payload types. Their [`NegotiationResult`] separates
+//! typed [`AcceptedSessionParameters`] from the exact decoded peer `Params` and
+//! accepted [`NegotiationChange`] records. Use `accepted.interval` and
+//! `accepted.duration` for cadence and lifetime, `accepted.dscp` for the public
+//! DSCP codepoint, and `peer_params` for wire diagnostics. Strict/Loose policy
+//! compares the actual request and reply wire values before deriving accepted
+//! semantics. Both adapters' `negotiation()` accessors return only a live
+//! session's result; no-test completion leaves no current session.
 //!
 //! See `examples/` in the repository for a runnable example of each tier.
 //!
@@ -59,8 +70,8 @@ pub use config::{
 };
 pub use error::ClientError;
 pub use event::{
-    ClientEvent, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample, RttSample,
-    ServerTiming, SignedDuration, WarningKind,
+    ClientEvent, NoTestCompleted, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample,
+    RttSample, ServerTiming, SessionStarted, SignedDuration, WarningKind,
 };
-pub use session::{NegotiatedParams, NegotiationRestriction};
+pub use session::{AcceptedSessionParameters, NegotiationChange, NegotiationResult};
 pub use timing::ClientTimestamp;

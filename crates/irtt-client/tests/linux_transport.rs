@@ -160,8 +160,8 @@ fn blocking_probes_use_kernel_tx_timing_and_negotiated_packet_marking() {
             .unwrap();
         client.open().unwrap();
         assert_eq!(
-            client.negotiated_params().unwrap().params.dscp,
-            if allowed { 184 } else { 0 }
+            client.negotiation().unwrap().accepted.dscp,
+            if allowed { 46 } else { 0 }
         );
         for _ in 0..PROBES {
             let before = SystemTime::now();
@@ -202,8 +202,8 @@ fn async_probes_use_kernel_tx_timing_and_negotiated_packet_marking() {
                     .unwrap();
                 client.open().await.unwrap();
                 assert_eq!(
-                    client.negotiated_params().unwrap().params.dscp,
-                    if allowed { 184 } else { 0 }
+                    client.negotiation().unwrap().accepted.dscp,
+                    if allowed { 46 } else { 0 }
                 );
                 for _ in 0..PROBES {
                     let before = SystemTime::now();

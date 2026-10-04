@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{error::ClientError, session::NegotiatedParams};
+use crate::{error::ClientError, session::AcceptedSessionParameters};
 
 #[derive(Debug)]
 pub(crate) struct ProbeSchedule {
@@ -18,24 +18,19 @@ pub(crate) struct ScheduleCommit {
 impl ProbeSchedule {
     pub(crate) fn new(
         start_at: Instant,
-        negotiated: &NegotiatedParams,
+        accepted: &AcceptedSessionParameters,
     ) -> Result<Self, ClientError> {
-        let interval_ns = u64::try_from(negotiated.params.interval_ns)
-            .expect("validated positive negotiated interval");
-        let interval = Duration::from_nanos(interval_ns);
-        let end_at = if negotiated.params.duration_ns > 0 {
-            let duration_ns = u64::try_from(negotiated.params.duration_ns)
-                .expect("validated positive negotiated duration");
-            Some(
+        let interval = accepted.interval;
+        let end_at = accepted
+            .duration
+            .map(|duration| {
                 start_at
-                    .checked_add(Duration::from_nanos(duration_ns))
+                    .checked_add(duration)
                     .ok_or_else(|| ClientError::NegotiationRejected {
                         reason: "duration is too large to schedule".to_owned(),
-                    })?,
-            )
-        } else {
-            None
-        };
+                    })
+            })
+            .transpose()?;
 
         Ok(Self {
             end_at,
@@ -166,15 +161,17 @@ mod tests {
     fn lifetime_deadline_exists_only_for_an_unfinished_finite_schedule() {
         let start = Instant::now();
         let end = start + Duration::from_millis(500);
-        let mut negotiated = NegotiatedParams {
-            params: irtt_proto::Params {
-                duration_ns: 500_000_000,
-                interval_ns: 1_000_000,
-                ..irtt_proto::Params::default()
-            },
-            restrictions: Vec::new(),
+        let mut accepted = AcceptedSessionParameters {
+            duration: Some(Duration::from_millis(500)),
+            interval: Duration::from_millis(1),
+            length: 0,
+            received_stats: irtt_proto::ReceivedStats::None,
+            stamp_at: irtt_proto::StampAt::None,
+            clock: irtt_proto::Clock::Both,
+            dscp: 0,
+            server_fill: None,
         };
-        let mut finite = ProbeSchedule::new(start, &negotiated).unwrap();
+        let mut finite = ProbeSchedule::new(start, &accepted).unwrap();
         assert_eq!(finite.end_deadline(), Some(end));
         assert!(finite.permit_probe_at(end - Duration::from_nanos(1)));
         assert_eq!(finite.end_deadline(), Some(end));
@@ -182,7 +179,7 @@ mod tests {
         assert!(finite.is_finished());
         assert_eq!(finite.end_deadline(), None);
 
-        let mut finite = ProbeSchedule::new(start, &negotiated).unwrap();
+        let mut finite = ProbeSchedule::new(start, &accepted).unwrap();
         let commit = finite
             .preflight_managed_commit(start, end - Duration::from_nanos(1))
             .unwrap();
@@ -190,8 +187,8 @@ mod tests {
         assert!(finite.is_finished());
         assert_eq!(finite.end_deadline(), None);
 
-        negotiated.params.duration_ns = 0;
-        let mut continuous = ProbeSchedule::new(start, &negotiated).unwrap();
+        accepted.duration = None;
+        let mut continuous = ProbeSchedule::new(start, &accepted).unwrap();
         assert!(continuous.permit_probe_at(end));
         assert_eq!(continuous.end_deadline(), None);
     }

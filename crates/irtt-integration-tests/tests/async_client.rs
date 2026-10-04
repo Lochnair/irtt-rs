@@ -52,25 +52,24 @@ async fn exercise_client_server() {
 
     let opened = client.open().await.unwrap();
     match &opened {
-        OpenOutcome::Started {
+        OpenOutcome::Started(irtt_client::SessionStarted {
             remote,
             token,
-            negotiated,
-            event,
-        } => {
+            negotiation: negotiated,
+            ..
+        }) => {
             assert_eq!(*remote, server_addr);
             assert_ne!(*token, 0);
-            assert_eq!(negotiated.params.received_stats, ReceivedStats::Both);
-            assert_eq!(negotiated.params.stamp_at, StampAt::Both);
-            assert_eq!(negotiated.params.clock, Clock::Both);
+            assert_eq!(negotiated.accepted.received_stats, ReceivedStats::Both);
+            assert_eq!(negotiated.accepted.stamp_at, StampAt::Both);
+            assert_eq!(negotiated.accepted.clock, Clock::Both);
             // A default client requests no fill, and this open succeeded under
             // the default strict negotiation policy — which it could not have
             // if the server had answered an absent request with its own default
             // descriptor. The server still fills the payload with it.
-            assert_eq!(negotiated.params.server_fill, None);
-            assert!(matches!(event, ClientEvent::SessionStarted { .. }));
+            assert_eq!(negotiated.accepted.server_fill, None);
         }
-        OpenOutcome::NoTestCompleted { .. } => panic!("normal client unexpectedly ran no-test"),
+        OpenOutcome::NoTestCompleted(_) => panic!("normal client unexpectedly ran no-test"),
     }
 
     assert!(matches!(

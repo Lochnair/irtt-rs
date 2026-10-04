@@ -3,35 +3,36 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{session::NegotiatedParams, timing::ClientTimestamp};
+use crate::{session::NegotiationResult, timing::ClientTimestamp};
 
-/// Result of the IRTT open exchange.
+/// Successful negotiation with a live session ready for echo probes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionStarted {
+    /// Resolved remote socket address.
+    pub remote: SocketAddr,
+    /// Session token used on Echo and Close packets.
+    pub token: u64,
+    pub negotiation: NegotiationResult,
+    /// Client timestamp when the Open reply was accepted.
+    pub at: ClientTimestamp,
+}
+
+/// Successful negotiation-only exchange with no live probe session or token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoTestCompleted {
+    pub remote: SocketAddr,
+    pub negotiation: NegotiationResult,
+    /// Client timestamp when the Open reply was accepted.
+    pub at: ClientTimestamp,
+}
+
+/// Result of the IRTT Open exchange, before any echo probes are driven.
 ///
-/// The lower-level [`Client`](crate::Client) API returns this before any echo
-/// probes are driven. Managed sessions publish the contained lifecycle event to
-/// subscribers immediately after a successful open.
+/// Managed sessions publish the same payload as a [`ClientEvent`] after Open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenOutcome {
-    /// A normal probe session was opened.
-    Started {
-        /// Resolved remote socket address used by the UDP socket.
-        remote: SocketAddr,
-        /// Session token assigned by the server and used on echo/close packets.
-        token: u64,
-        /// Parameters returned by the server after negotiation.
-        negotiated: NegotiatedParams,
-        /// Lifecycle event corresponding to this outcome.
-        event: ClientEvent,
-    },
-    /// A no-test open exchange completed without starting a probe session.
-    NoTestCompleted {
-        /// Resolved remote socket address used by the UDP socket.
-        remote: SocketAddr,
-        /// Parameters returned by the server after negotiation.
-        negotiated: NegotiatedParams,
-        /// Lifecycle event corresponding to this outcome.
-        event: ClientEvent,
-    },
+    Started(SessionStarted),
+    NoTestCompleted(NoTestCompleted),
 }
 
 /// Event emitted by an IRTT client session.
@@ -44,28 +45,12 @@ pub enum OpenOutcome {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClientEvent {
     /// A normal session has opened and is ready to send echo probes.
-    SessionStarted {
-        /// Resolved remote socket address.
-        remote: SocketAddr,
-        /// Session token assigned by the server.
-        token: u64,
-        /// Negotiated protocol parameters for this session.
-        negotiated: NegotiatedParams,
-        /// Client timestamp when the open reply was accepted.
-        at: ClientTimestamp,
-    },
-    /// A negotiation-only no-test exchange completed.
+    SessionStarted(SessionStarted),
+    /// A no-test exchange completed without creating a live session.
     ///
     /// No `EchoSent`, `EchoReply`, `EchoLoss`, or `SessionClosed` events are
-    /// expected for this open outcome.
-    NoTestCompleted {
-        /// Resolved remote socket address.
-        remote: SocketAddr,
-        /// Negotiated protocol parameters returned by the server.
-        negotiated: NegotiatedParams,
-        /// Client timestamp when the open reply was accepted.
-        at: ClientTimestamp,
-    },
+    /// expected for this outcome.
+    NoTestCompleted(NoTestCompleted),
     /// The session closed locally or through an authenticated peer close.
     ///
     /// For a peer close-flagged echo reply, the reply's measurement or

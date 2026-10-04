@@ -13,7 +13,7 @@ use std::{
 };
 
 use irtt_client::{
-    Client, ClientConfig, ClientEvent, NegotiatedParams, OpenOutcome, OpenPolicy, SessionRequest,
+    Client, ClientConfig, ClientEvent, NegotiationResult, OpenOutcome, OpenPolicy, SessionRequest,
 };
 use irtt_proto::{
     compute_hmac_in_place, decode_request, echo_packet_len, encode_echo_reply, encode_open_reply,
@@ -138,7 +138,7 @@ pub enum ServerObservation {
 }
 
 pub struct OneProbeRun {
-    pub negotiated: NegotiatedParams,
+    pub negotiated: NegotiationResult,
     pub sent: ClientEvent,
     pub reply: ClientEvent,
     pub observations: Vec<ServerObservation>,
@@ -514,10 +514,13 @@ fn recv_request_timeout(socket: &UdpSocket) -> Option<Vec<u8>> {
         .map(|(size, _)| buf[..size].to_vec())
 }
 
-fn assert_started(outcome: OpenOutcome) -> NegotiatedParams {
+fn assert_started(outcome: OpenOutcome) -> NegotiationResult {
     match outcome {
-        OpenOutcome::Started { negotiated, .. } => negotiated,
-        OpenOutcome::NoTestCompleted { .. } => panic!("expected started outcome"),
+        OpenOutcome::Started(irtt_client::SessionStarted {
+            negotiation: negotiated,
+            ..
+        }) => negotiated,
+        OpenOutcome::NoTestCompleted(_) => panic!("expected started outcome"),
     }
 }
 
