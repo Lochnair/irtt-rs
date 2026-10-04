@@ -34,6 +34,7 @@
 
 #[cfg(feature = "tokio")]
 mod async_client;
+mod auth;
 mod client;
 mod config;
 mod error;
@@ -49,10 +50,11 @@ mod timing;
 
 #[cfg(feature = "tokio")]
 pub use async_client::AsyncClient;
+pub use auth::{Authentication, HmacKey};
 pub use client::Client;
 pub use config::{
-    ClientAuthConfig, ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig,
-    MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
+    ClientConfig, NegotiationPolicy, RecvBudget, RunMode, SocketConfig, MAX_DSCP_CODEPOINT,
+    MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
 };
 pub use error::ClientError;
 pub use event::{

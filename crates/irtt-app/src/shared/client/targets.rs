@@ -2,8 +2,8 @@ use std::{collections::HashSet, fmt};
 
 use clap::ValueEnum;
 use irtt_client::{
-    managed::{ManagedPacing, ManagedTargetConfig, TargetId},
-    ClientAuthConfig,
+    managed::{ManagedPacing, ManagedTargetConfig, TargetAuth, TargetId},
+    Authentication, HmacKey,
 };
 
 /// One raw positional target captured by Clap.
@@ -36,23 +36,6 @@ pub fn parse_target(input: &str) -> Result<TargetArg, String> {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-pub enum TargetAuth {
-    Inherit,
-    Override(Vec<u8>),
-    Disable,
-}
-
-impl fmt::Debug for TargetAuth {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Inherit => f.write_str("Inherit"),
-            Self::Override(_) => f.write_str("Override(<redacted>)"),
-            Self::Disable => f.write_str("Disable"),
-        }
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
 pub struct TargetSpec {
     pub label: String,
     pub addr: String,
@@ -80,16 +63,7 @@ impl fmt::Debug for PreparedTarget {
         f.debug_struct("PreparedTarget")
             .field("label", &self.label)
             .field("server_addr", &self.managed.server_addr)
-            .field(
-                "auth",
-                &match &self.managed.auth {
-                    None => TargetAuth::Inherit,
-                    Some(ClientAuthConfig { hmac_key: Some(_) }) => {
-                        TargetAuth::Override(Vec::new())
-                    }
-                    Some(ClientAuthConfig { hmac_key: None }) => TargetAuth::Disable,
-                },
-            )
+            .field("auth", &self.managed.auth)
             .finish()
     }
 }
@@ -216,9 +190,9 @@ fn parse_target_syntax(
         Some(index) => {
             let value = unescape(&input[index + "@hmac=".len()..])?;
             let auth = if value.is_empty() {
-                TargetAuth::Disable
+                TargetAuth::Override(Authentication::Unauthenticated)
             } else {
-                TargetAuth::Override(value.into_bytes())
+                TargetAuth::Override(Authentication::Hmac(HmacKey::new(value.into_bytes())))
             };
             (&input[..index], auth)
         }
@@ -287,13 +261,7 @@ pub fn prepare_managed_targets(specs: Vec<TargetSpec>) -> Result<Vec<PreparedTar
     let mut targets = Vec::with_capacity(specs.len());
     for spec in specs {
         let mut managed = ManagedTargetConfig::new(TargetId::from(spec.label.clone()), spec.addr);
-        managed.auth = match spec.auth {
-            TargetAuth::Inherit => None,
-            TargetAuth::Override(hmac_key) => Some(ClientAuthConfig {
-                hmac_key: Some(hmac_key),
-            }),
-            TargetAuth::Disable => Some(ClientAuthConfig { hmac_key: None }),
-        };
+        managed.auth = spec.auth;
         targets.push(PreparedTarget {
             label: spec.label,
             managed,

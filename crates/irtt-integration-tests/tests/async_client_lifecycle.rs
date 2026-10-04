@@ -1,3 +1,4 @@
+use irtt_client::{Authentication, HmacKey};
 use std::{
     future::Future,
     net::UdpSocket,
@@ -54,7 +55,9 @@ fn config(addr: SocketAddr, key: Option<Vec<u8>>, dscp: u8) -> ClientConfig {
         received_stats: ReceivedStats::None,
         stamp_at: StampAt::None,
         dscp,
-        hmac_key: key,
+        auth: key.map_or(Authentication::Unauthenticated, |key| {
+            Authentication::Hmac(HmacKey::new(key))
+        }),
         open_timeouts: vec![Duration::from_millis(200)],
         socket_config: SocketConfig {
             recv_timeout: Some(Duration::from_millis(200)),

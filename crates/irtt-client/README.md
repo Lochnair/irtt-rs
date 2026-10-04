@@ -34,6 +34,25 @@ dependency at all.
 
 See `examples/` in the repository for runnable examples of each tier.
 
+## Authentication
+
+`ClientConfig.auth` is concrete: `Authentication::Unauthenticated` or
+`Authentication::Hmac(HmacKey::new(bytes))`. Keys share their bytes across
+clones and print only `HmacKey([REDACTED])` through `Debug`. Borrowing key
+material requires an explicit `as_bytes()` call. An empty key still selects
+HMAC authentication; textual key syntax belongs to the application.
+
+For managed targets, `ManagedTargetConfig.auth` defaults to `TargetAuth::Inherit`.
+`TargetAuth::Override(Authentication::Unauthenticated)` disables shared
+authentication, and `TargetAuth::Override(Authentication::Hmac(key))` replaces
+the shared key. Initial construction and update planning resolve inheritance
+into concrete session authentication before execution. Switching between
+inheritance and an override replaces the target generation even when their
+resolved authentication is equal.
+
+This replaces the former `ClientConfig.hmac_key` and `ClientAuthConfig` API;
+there are no compatibility aliases.
+
 ## Documentation
 
 Full API documentation is on [docs.rs/irtt-client](https://docs.rs/irtt-client).

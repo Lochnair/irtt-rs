@@ -201,7 +201,7 @@ impl SessionMachine {
     }
 
     pub(crate) fn has_hmac(&self) -> bool {
-        self.config.hmac_key.is_some()
+        self.config.auth.hmac_key().is_some()
     }
 
     pub(crate) fn prepare_open_request(&self) -> Result<PreparedOpenRequest, ClientError> {
@@ -211,7 +211,7 @@ impl SessionMachine {
                 params: &self.requested,
                 no_test: self.config.run_mode == RunMode::NoTest,
             },
-            self.config.hmac_key.as_deref(),
+            self.config.auth.hmac_key(),
         )?;
         Ok(PreparedOpenRequest {
             bytes: bytes.into_boxed_slice(),
@@ -223,7 +223,7 @@ impl SessionMachine {
         packet: &[u8],
     ) -> Result<OpenDatagramDisposition, ClientError> {
         self.ensure_connected()?;
-        match irtt_proto::decode_open_reply(packet, self.config.hmac_key.as_deref()) {
+        match irtt_proto::decode_open_reply(packet, self.config.auth.hmac_key()) {
             Ok(reply) => Ok(OpenDatagramDisposition::Trusted(reply)),
             Err(error @ irtt_proto::ProtoError::ZeroToken) => Err(ClientError::Protocol(error)),
             Err(
@@ -250,7 +250,7 @@ impl SessionMachine {
         let cleanup_close = if !reply_is_close && reply.token != 0 {
             let bytes = encode_request(
                 RequestToEncode::Close { token: reply.token },
-                self.config.hmac_key.as_deref(),
+                self.config.auth.hmac_key(),
             )
             .map_err(ClientError::from)
             .map_err(OpenAcceptanceFailure::without_cleanup)?;
@@ -313,7 +313,7 @@ impl SessionMachine {
                 params: &session.negotiated.params,
                 payload: &[],
             },
-            self.config.hmac_key.as_deref(),
+            self.config.auth.hmac_key(),
         )?;
         Ok(PreparedProbe {
             bytes: bytes.into_boxed_slice(),
@@ -679,7 +679,7 @@ impl SessionMachine {
         decode_echo_reply(
             packet,
             &session.negotiated.params,
-            self.config.hmac_key.as_deref(),
+            self.config.auth.hmac_key(),
         )
         .ok()
     }

@@ -1,3 +1,4 @@
+use irtt_client::{Authentication, HmacKey};
 mod support;
 
 use std::time::Duration;
@@ -27,7 +28,7 @@ fn hmac_open_success_negotiates_without_warnings() {
         TimestampFields::default(),
         Some(key),
         |addr| ClientConfig {
-            hmac_key: Some(config_key),
+            auth: Authentication::Hmac(HmacKey::new(config_key)),
             ..config_for_params(addr, &config_params)
         },
     );
@@ -52,7 +53,7 @@ fn hmac_echo_success_verifies_request_and_accepts_reply() {
 
     let run = run_one_probe_with_config(params.clone(), standard_timestamps(), Some(key), |addr| {
         ClientConfig {
-            hmac_key: Some(config_key),
+            auth: Authentication::Hmac(HmacKey::new(config_key)),
             ..config_for_params(addr, &config_params)
         }
     });
@@ -94,7 +95,7 @@ fn hmac_close_success_sends_authenticated_close_and_closes_session() {
     let params = default_params();
     let server = start_hmac_close_server(params.clone(), key.clone());
     let mut config = config_for_params(server.addr, &params);
-    config.hmac_key = Some(key);
+    config.auth = Authentication::Hmac(HmacKey::new(key));
 
     let mut client = Client::connect(config).unwrap();
     let outcome = client.open().unwrap();
@@ -135,7 +136,9 @@ fn hmac_required_server_rejects_missing_or_wrong_client_key() {
         let server = start_hmac_required_open_drop_server(server_key, Duration::from_millis(250));
         let mut config = config_for_params(server.addr, &default_params());
         config.open_timeouts = vec![Duration::from_millis(200)];
-        config.hmac_key = hmac_key;
+        config.auth = hmac_key.map_or(Authentication::Unauthenticated, |key| {
+            Authentication::Hmac(HmacKey::new(key))
+        });
 
         let mut client = Client::connect(config).unwrap();
         assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
@@ -158,7 +161,7 @@ fn bad_hmac_echo_reply_is_rejected_without_echo_reply_event() {
     let params = default_params();
     let server = start_bad_hmac_echo_reply_server(params.clone(), key.clone());
     let mut config = config_for_params(server.addr, &params);
-    config.hmac_key = Some(key);
+    config.auth = Authentication::Hmac(HmacKey::new(key));
     config.socket_config = SocketConfig {
         recv_timeout: Some(Duration::from_millis(500)),
         ..Default::default()
@@ -205,7 +208,7 @@ fn hmac_open_reply_with_bad_hmac_is_ignored_until_timeout() {
     let params = default_params();
     let server = support::start_bad_hmac_open_reply_server(params.clone(), key.clone(), wrong_key);
     let mut config = config_for_params(server.addr, &params);
-    config.hmac_key = Some(key);
+    config.auth = Authentication::Hmac(HmacKey::new(key));
 
     let mut client = Client::connect(config).unwrap();
     assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
@@ -221,7 +224,7 @@ fn non_hmac_client_open_does_not_set_hmac_flag() {
     );
     let server = support::start_open_server(params.clone(), None);
     let mut config = config_for_params(server.addr, &params);
-    config.hmac_key = None;
+    config.auth = Authentication::Unauthenticated;
 
     let mut client = Client::connect(config).unwrap();
     let outcome = client.open().unwrap();
@@ -278,7 +281,7 @@ fn backend_hmac_correct_key_succeeds() {
     let params = default_params();
     let peer = BackendPeer::start_open_echo(Some(key.clone()));
     let mut config = config_for_params(peer.addr(), &params);
-    config.hmac_key = Some(key);
+    config.auth = Authentication::Hmac(HmacKey::new(key));
 
     let mut client = Client::connect(config).unwrap();
     let outcome = client.open().unwrap();
@@ -301,7 +304,9 @@ fn backend_hmac_required_rejects_missing_or_wrong_client_key() {
         let peer = BackendPeer::start_hmac_required(server_key);
         let mut config = config_for_params(peer.addr(), &default_params());
         config.open_timeouts = vec![Duration::from_millis(200)];
-        config.hmac_key = hmac_key;
+        config.auth = hmac_key.map_or(Authentication::Unauthenticated, |key| {
+            Authentication::Hmac(HmacKey::new(key))
+        });
 
         let mut client = Client::connect(config).unwrap();
         assert!(matches!(client.open(), Err(ClientError::OpenTimeout)));
