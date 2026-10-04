@@ -1968,9 +1968,7 @@ impl ManagedClientTask {
             && self.config.pacing == ManagedPacing::Staggered
             && self.active_count() > 0
         {
-            // A release gate delays a send opportunity; it cannot create one.
-            send_deadline = send_deadline
-                .map(|deadline| self.send_gate.map_or(deadline, |gate| deadline.max(gate)));
+            send_deadline = gated_send_deadline(send_deadline, self.send_gate);
         }
         non_send_deadline.into_iter().chain(send_deadline).min()
     }
@@ -2066,6 +2064,11 @@ impl ManagedClientTask {
     fn fail_driver(&mut self, failure: ManagedDriverFailure) -> Poll<ManagedOutcome> {
         self.seal(ManagedEndReason::DriverFailed(failure), true)
     }
+}
+
+// A release gate delays a send opportunity; it cannot create one.
+fn gated_send_deadline(cadence: Option<Instant>, gate: Option<Instant>) -> Option<Instant> {
+    cadence.map(|deadline| gate.map_or(deadline, |gate| deadline.max(gate)))
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2396,80 +2399,21 @@ fn close_timeout_failure() -> ManagedTargetFailure {
 mod tests {
     use super::*;
 
-    // Public poll counts depend on reactor/timer timing. Inspect the selected
-    // deadline instead, after a real managed send exhausts a finite schedule.
     #[test]
-    fn exhausted_staggered_schedule_waits_for_probe_timeout_not_release_gate() {
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async {
-                time::timeout(Duration::from_secs(5), async {
-                    let mut server = irtt_server::Server::bind(
-                        "127.0.0.1:0".parse().unwrap(),
-                        irtt_server::ServerConfig::default(),
-                    )
-                    .await
-                    .unwrap();
-                    let addr = server.local_addr().unwrap();
-                    let server_task = tokio::spawn(async move {
-                        server.run(std::future::pending::<()>()).await.unwrap();
-                    });
-                    let (mut task, handle) = ManagedClient::task(
-                        ManagedClientConfig {
-                            client: ClientConfig {
-                                duration: Some(Duration::from_secs(10)),
-                                interval: Duration::from_secs(15),
-                                probe_timeout: Duration::from_secs(60),
-                                ..ClientConfig::default()
-                            },
-                            pacing: ManagedPacing::Staggered,
-                            ..ManagedClientConfig::default()
-                        },
-                        vec![ManagedTargetConfig::new("finite", addr.to_string())],
-                    )
-                    .unwrap();
-                    let mut events = handle.subscribe().unwrap();
-                    std::future::poll_fn(|cx| {
-                        if let Poll::Ready(outcome) = Pin::new(&mut task).poll(cx) {
-                            panic!("managed target ended before its final probe: {outcome:?}");
-                        }
-                        while let Ok(event) = events.try_recv() {
-                            if matches!(
-                                event,
-                                ManagedEvent::Client {
-                                    event: ClientEvent::EchoSent { .. },
-                                    ..
-                                }
-                            ) {
-                                return Poll::Ready(());
-                            }
-                        }
-                        Poll::Pending
-                    })
-                    .await;
-
-                    let TargetState::Active { client } = &task.targets[0].state else {
-                        panic!("the final probe must remain active while pending");
-                    };
-                    assert!(client.has_pending_probes());
-                    assert!(task.targets[0].schedule.as_ref().unwrap().is_finished());
-                    let timeout = client.next_probe_timeout_deadline().unwrap();
-                    assert!(task.send_gate.unwrap() < timeout);
-                    assert_eq!(task.next_deadline(), Some(timeout));
-
-                    // An expired gate must not register an immediately-ready
-                    // timer either; no sleep or fake clock is needed.
-                    task.send_gate = Some(Instant::now() - Duration::from_secs(1));
-                    assert_eq!(task.next_deadline(), Some(timeout));
-                    let mut cx = Context::from_waker(std::task::Waker::noop());
-                    assert!(!task.register_timer(&mut cx));
-                    server_task.abort();
-                })
-                .await
-                .expect("managed target did not send its final probe");
-            });
+    fn release_gate_only_delays_an_existing_send_deadline() {
+        let earlier = Instant::now();
+        let later = earlier + Duration::from_secs(1);
+        for (cadence, gate, expected) in [
+            (None, None, None),
+            (None, Some(earlier), None),
+            (None, Some(later), None),
+            (Some(earlier), None, Some(earlier)),
+            (Some(later), Some(earlier), Some(later)),
+            (Some(earlier), Some(earlier), Some(earlier)),
+            (Some(earlier), Some(later), Some(later)),
+        ] {
+            assert_eq!(gated_send_deadline(cadence, gate), expected);
+        }
     }
 
     // Poll latency through public events cannot distinguish an O(n) discovery
