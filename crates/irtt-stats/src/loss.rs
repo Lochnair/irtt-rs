@@ -8,9 +8,20 @@ use crate::PacketCounts;
 /// server-reported counts exceed local expectations.
 ///
 /// The directional fields are derived from
-/// [`PacketCounts::server_packets_received`] and are `None` when the server
-/// reported no receive count. [`PacketCounts::server_received_window`] is never
-/// used to derive loss.
+/// [`PacketCounts::server_packets_received`] for cumulative snapshots. Rolling
+/// snapshots use the increase in the highest observed count over the retained
+/// packet-event arrival interval within one observation segment. The baseline
+/// must be that segment's highest count, reported by the preceding packet event
+/// (zero at the start of the collector's history). They are `None` without a
+/// current baseline or known endpoint, or when time filtering leaves an interior
+/// packet gap. A jump of at least half the
+/// 32-bit counter range starts a new observation segment: wrap and old replies
+/// are ambiguous. Windows crossing that discontinuity have no directional loss;
+/// later windows can use a fresh baseline within the new segment.
+/// The percentage fields are `0.0` when the corresponding estimate is unavailable.
+/// These remain estimates: outstanding sends, excess server counts, or extra
+/// replies can produce signed values. [`PacketCounts::server_received_window`]
+/// is never used to derive loss.
 pub struct LossStats {
     /// Locally inferred total lost packets.
     pub lost_packets: u64,
@@ -30,7 +41,7 @@ pub struct LossStats {
     pub late_packets_percent: f64,
 }
 
-pub(crate) fn loss_stats(packets: PacketCounts) -> LossStats {
+pub(crate) fn loss_stats(packets: PacketCounts, server_received: Option<u64>) -> LossStats {
     let lost = packets.packets_sent.saturating_sub(packets.unique_replies);
     let packet_loss_percent = if packets.packets_sent == 0 {
         0.0
@@ -45,7 +56,7 @@ pub(crate) fn loss_stats(packets: PacketCounts) -> LossStats {
         upstream_loss_percent,
         downstream_loss_packets,
         downstream_loss_percent,
-    ) = if let Some(server_received) = packets.server_packets_received {
+    ) = if let Some(server_received) = server_received {
         let upstream = i128::from(packets.packets_sent) - i128::from(server_received);
         let downstream = i128::from(server_received) - i128::from(packets.packets_received);
         let upstream_percent = if packets.packets_sent == 0 {

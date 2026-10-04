@@ -1,5 +1,6 @@
 //! Independent count and time windows must match a filtered replay through
-//! StatsCollector, while cumulative accounting retains the complete history.
+//! StatsCollector for ordinary metrics, while directional loss has an independent
+//! interval model and cumulative accounting retains the complete history.
 //! Includes delayed timeout discovery and replies with backdated timestamps.
 
 use std::time::{Duration, Instant, UNIX_EPOCH};
@@ -212,6 +213,117 @@ fn replay(events: &[ClientEvent], late_replies: LateReplyMode) -> Snapshot {
     collector.snapshot()
 }
 
+/// Retain ordinary metrics through replay, but derive directional loss directly
+/// from the full public event history, including the discarded prefix.
+fn rolling_reference(
+    history: &[(ClientEvent, u64)],
+    retain: impl Fn(usize, u64) -> bool,
+    late_replies: LateReplyMode,
+) -> Snapshot {
+    let retained: Vec<ClientEvent> = history
+        .iter()
+        .enumerate()
+        .filter(|(index, (_, at))| retain(*index, *at))
+        .map(|(_, (event, _))| event.clone())
+        .collect();
+    let mut snapshot = replay(&retained, late_replies);
+    let packets: Vec<_> = history
+        .iter()
+        .enumerate()
+        .filter(|(_, (event, _))| {
+            matches!(
+                event,
+                ClientEvent::EchoSent { .. }
+                    | ClientEvent::EchoReply { .. }
+                    | ClientEvent::LateReply { .. }
+                    | ClientEvent::DuplicateReply { .. }
+            )
+        })
+        .collect();
+    let selected: Vec<_> = packets
+        .iter()
+        .enumerate()
+        .filter(|(_, (index, (_, at)))| retain(*index, *at))
+        .collect();
+    let count = |event: &ClientEvent| match event {
+        ClientEvent::EchoReply { received_stats, .. }
+        | ClientEvent::LateReply {
+            sent_at: Some(_),
+            rtt: Some(_),
+            received_stats,
+            ..
+        } => received_stats.and_then(|stats| stats.count).map(u64::from),
+        _ => None,
+    };
+    let delta = selected
+        .first()
+        .zip(selected.last())
+        .and_then(|((first, _), (last, _))| {
+            // Timestamp filtering must not omit a packet between the endpoints.
+            if last - first + 1 != selected.len() {
+                return None;
+            }
+            // Partition the full observed history at ambiguous discontinuities.
+            // This independent oracle keeps observation lists for each segment
+            // rather than relying on the collector's retained metadata.
+            let mut observations = Vec::new();
+            let mut segment_start = 0;
+            for (index, (_, (event, _))) in packets[..=*last].iter().enumerate() {
+                if let Some(count) = count(event) {
+                    if observations
+                        .iter()
+                        .max()
+                        .is_some_and(|highest: &u64| highest.abs_diff(count) >= (1_u64 << 31))
+                    {
+                        segment_start = index + 1;
+                        observations.clear();
+                    }
+                    observations.push(count);
+                }
+            }
+            if segment_start > *first {
+                return None;
+            }
+            let baseline = if *first == 0 {
+                Some(0)
+            } else {
+                // The immediately preceding packet must itself report the
+                // highest count. Earlier observations cannot bound this window.
+                let (_, (previous_event, _)) = packets[*first - 1];
+                let previous = count(previous_event)?;
+                if packets[segment_start.saturating_sub(1)..*first - 1]
+                    .iter()
+                    .filter_map(|(_, (event, _))| count(event))
+                    .max()
+                    .is_some_and(|highest| highest > previous)
+                {
+                    return None;
+                }
+                Some(previous)
+            }?;
+            let endpoint = observations.into_iter().max()?;
+            Some(endpoint - baseline)
+        });
+    snapshot.loss.upstream_loss_packets =
+        delta.map(|delta| i128::from(snapshot.packets.packets_sent) - i128::from(delta));
+    snapshot.loss.downstream_loss_packets =
+        delta.map(|delta| i128::from(delta) - i128::from(snapshot.packets.packets_received));
+    snapshot.loss.upstream_loss_percent = if snapshot.packets.packets_sent == 0 {
+        0.0
+    } else {
+        snapshot.loss.upstream_loss_packets.map_or(0.0, |loss| {
+            100.0 * loss as f64 / snapshot.packets.packets_sent as f64
+        })
+    };
+    snapshot.loss.downstream_loss_percent = match delta {
+        Some(delta) if delta != 0 => {
+            100.0 * snapshot.loss.downstream_loss_packets.unwrap() as f64 / delta as f64
+        }
+        _ => 0.0,
+    };
+    snapshot
+}
+
 #[test]
 fn collector_equality_ignores_expired_time_window_bookkeeping() {
     let base = Instant::now();
@@ -342,13 +454,9 @@ proptest! {
             // Count window reference: the last `count_limit` retained
             // events, ignoring the time bound entirely.
             let count_start = history.len().saturating_sub(count_limit);
-            let count_ref: Vec<ClientEvent> = history[count_start..]
-                .iter()
-                .map(|(event, _)| event.clone())
-                .collect();
             prop_assert_eq!(
                 collector.rolling_count(),
-                Some(replay(&count_ref, late_replies)),
+                Some(rolling_reference(&history, |index, _| index >= count_start, late_replies)),
                 "count window diverged from the count-only reference after op {}", idx
             );
 
@@ -358,14 +466,9 @@ proptest! {
             // this anchor backwards.
             if let Some(latest_at_ms) = history.iter().map(|(_, at_ms)| at_ms).max() {
                 let cutoff = latest_at_ms.checked_sub(time_limit_ms);
-                let time_ref: Vec<ClientEvent> = history
-                    .iter()
-                    .filter(|(_, at_ms)| cutoff.is_none_or(|cutoff| *at_ms >= cutoff))
-                    .map(|(event, _)| event.clone())
-                    .collect();
                 prop_assert_eq!(
                     collector.rolling_time(),
-                    Some(replay(&time_ref, late_replies)),
+                    Some(rolling_reference(&history, |_, at_ms| cutoff.is_none_or(|cutoff| at_ms >= cutoff), late_replies)),
                     "time window diverged from the time-only reference after op {}", idx
                 );
             } else {
