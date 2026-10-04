@@ -26,7 +26,9 @@ fn probe_timeout_overflow_transmits_no_echo() {
     assert_open_started(client.open().unwrap());
     assert!(matches!(
         client.send_probe(),
-        Err(ClientError::DurationOverflow)
+        Err(irtt_client::SendProbeError::NotCommitted(
+            ClientError::DurationOverflow
+        ))
     ));
     assert!(!client.has_pending_probes());
     client.close().unwrap();
@@ -181,7 +183,9 @@ fn pending_full_does_not_send_packet() {
 
     assert!(matches!(
         client.send_probe(),
-        Err(ClientError::PendingLimitExceeded { limit: 2 })
+        Err(irtt_client::SendProbeError::NotCommitted(
+            ClientError::PendingLimitExceeded { limit: 2 }
+        ))
     ));
 
     thread::sleep(Duration::from_millis(30));

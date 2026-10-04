@@ -261,10 +261,23 @@ fn a_closed_udp_peer_surfaces_a_socket_error() {
     close_tx.send(()).unwrap();
     task.join().unwrap();
     // Refusal can arrive during send's TX drain or the following receive.
-    let result = client.send_probe().and_then(|_| client.recv_once());
+    // Either way this first Echo was accepted and must stay pending.
+    let (receipt, error) = match client.send_probe() {
+        Ok(receipt) => (receipt, client.recv_once().unwrap_err()),
+        Err(irtt_client::SendProbeError::AfterCommit { receipt, source }) => (receipt, *source),
+        Err(error) => panic!("first Echo should be accepted: {error:?}"),
+    };
+    assert_eq!(receipt.seq, 0);
+    assert_eq!(receipt.remote, addr);
+    assert!(client.has_pending_probes());
     assert!(
-        matches!(result, Err(irtt_client::ClientError::Socket(ref error))
+        matches!(error, irtt_client::ClientError::Socket(ref error)
         if error.kind() == std::io::ErrorKind::ConnectionRefused),
-        "{result:?}"
+        "{error:?}"
     );
+    assert!(matches!(
+        client.poll_timeouts_at(receipt.sent_at.mono + client.probe_timeout())
+            .unwrap().as_slice(),
+        [ClientEvent::EchoLoss { seq: 0, sent_at, .. }] if *sent_at == receipt.sent_at
+    ));
 }

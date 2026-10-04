@@ -83,13 +83,16 @@ fn main() {
         }
         if now < end && now >= next_send {
             match client.send_probe() {
-                Ok(events) => {
-                    events.iter().for_each(print_event);
+                Ok(receipt) => {
+                    print_event(&receipt.into());
                     while next_send <= Instant::now() {
                         next_send += interval;
                     }
                 }
                 Err(err) => {
+                    if let irtt_client::SendProbeError::AfterCommit { receipt, .. } = &err {
+                        print_event(&(*receipt).into());
+                    }
                     eprintln!("send failed: {err}");
                     break;
                 }

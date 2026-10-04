@@ -21,7 +21,7 @@ use crate::{
     async_client::{AsyncClient, AsyncOpenState},
     session::machine::SessionMachine,
     socket_options::validate_ttl,
-    ClientConfig, ClientError, ClientEvent, OpenOutcome,
+    ClientConfig, ClientError, ClientEvent, OpenOutcome, SendProbeError,
 };
 
 use super::schedule::{instant_abs_diff, ProbeSchedule};
@@ -1623,10 +1623,13 @@ impl ManagedClientTask {
                 }
             };
         let scheduled_at = commit.scheduled_at;
-        let before = client.packets_sent();
-        let mut result = client.poll_send_probe(cx);
-        let after = client.packets_sent();
-        let accepted = after > before;
+        let result = client.poll_send_probe(cx);
+        let receipt = match &result {
+            Poll::Ready(Ok(receipt))
+            | Poll::Ready(Err(SendProbeError::AfterCommit { receipt, .. })) => Some(*receipt),
+            Poll::Pending | Poll::Ready(Err(SendProbeError::NotCommitted(_))) => None,
+        };
+        let accepted = receipt.is_some();
         let send_result = match &result {
             Poll::Pending => SendResult::Pending,
             Poll::Ready(Ok(_)) => SendResult::Ready { accepted },
@@ -1639,20 +1642,6 @@ impl ManagedClientTask {
                 .as_mut()
                 .unwrap()
                 .commit(commit);
-            if let Poll::Ready(Ok(events)) = &mut result {
-                for event in events {
-                    if let ClientEvent::EchoSent {
-                        scheduled_at: intended,
-                        sent_at,
-                        timer_error,
-                        ..
-                    } = event
-                    {
-                        *intended = Some(scheduled_at);
-                        *timer_error = Some(instant_abs_diff(sent_at.mono, scheduled_at));
-                    }
-                }
-            }
         }
         let schedule_error = if accepted {
             self.targets[index]
@@ -1664,17 +1653,32 @@ impl ManagedClientTask {
         } else {
             None
         };
-        self.targets[index].counters.packets_sent = after;
+        self.targets[index].sync_packets_sent(&client);
+        // A committed send must reach the lifecycle/accounting stream even
+        // when post-send processing fails. Publish before failure cleanup.
+        let sent_event = receipt.map(|receipt| {
+            let mut event = ClientEvent::from(receipt);
+            if let ClientEvent::EchoSent {
+                scheduled_at: intended,
+                timer_error,
+                ..
+            } = &mut event
+            {
+                *intended = Some(scheduled_at);
+                *timer_error = Some(instant_abs_diff(receipt.sent_at.mono, scheduled_at));
+            }
+            event
+        });
         match result {
             Poll::Pending => {
                 self.targets[index].send_waiting = true;
                 self.targets[index].state = TargetState::Active { client };
                 SendResult::Pending
             }
-            Poll::Ready(Ok(events)) => {
+            Poll::Ready(Ok(_)) => {
                 self.targets[index].send_waiting = false;
                 self.targets[index].state = TargetState::Active { client };
-                self.publish_client_events(index, events);
+                self.publish_client_events(index, vec![sent_event.unwrap()]);
                 if let Some(error) = schedule_error {
                     let TargetState::Active { client } =
                         mem::replace(&mut self.targets[index].state, TargetState::Terminal)
@@ -1696,6 +1700,13 @@ impl ManagedClientTask {
             }
 
             Poll::Ready(Err(error)) => {
+                if let Some(event) = sent_event {
+                    self.publish_client_events(index, vec![event]);
+                }
+                let error = match error {
+                    SendProbeError::NotCommitted(source) => source,
+                    SendProbeError::AfterCommit { source, .. } => *source,
+                };
                 self.targets[index].send_waiting = false;
                 self.begin_open_session_failure(
                     index,

@@ -2,6 +2,42 @@
 
 Repository-wide guidance in the root `AGENTS.md` also applies here.
 
+## Probe-send commitment API
+
+`Client::send_probe` and `AsyncClient::send_probe` return
+`Result<SendReceipt, SendProbeError>`; the Tokio poll driver returns the same
+result inside `Poll`. A receipt represents an Echo datagram accepted by the
+socket and already committed in session state: sequence and sent count advanced,
+and the probe entered pending tracking. It contains `seq`, `remote`, the public
+post-send `sent_at`, accepted `bytes`, and `send_call`, without schedule metadata.
+`ClientEvent::from(receipt)` constructs `EchoSent` with no schedule annotations.
+
+Classify every failure explicitly: `NotCommitted(ClientError)` means no datagram
+was accepted and no probe committed; `AfterCommit { receipt, source }` preserves
+the authoritative accepted send when length validation or TX error-queue
+processing fails. There is no blanket `From<ClientError>` conversion. Do not
+roll back a committed probe or classify a post-send error with an indiscriminate
+`?`.
+
+All fallible state/capacity/counter/allocation and timeout preparation precedes
+submission. Immediately after `send`/`try_send` returns `Ok(bytes)`, capture the
+public post-send timestamp, commit infallibly, and construct the receipt before
+fallible post-send processing. No suspension, readiness wait, fallible allocation,
+or fallible state operation may intervene between acceptance and commitment;
+the Tokio poll must never return `Pending` after acceptance.
+
+The managed driver consumes receipts for cadence/stagger acceptance and constructs
+`EchoSent` with its scheduled timestamp and timer error. A post-commit failure
+advances cadence and publishes that send before failure cleanup; the underlying
+cause remains a sending failure. `NotCommitted` and `Pending` advance neither
+cadence nor stagger gating. Counters are cumulative accounting, never evidence
+of one operation's commitment.
+
+Tokio retains one prepared probe across cancellation/readiness false positives
+and `WouldBlock`, samples a fresh private anchor on each retry, and clears the
+prepared probe after commitment even when post-send processing fails. Failed
+submissions still invalidate kernel TX ID correlation as documented below.
+
 ## Linux kernel TX timestamp capture
 
 On Linux, with the `ancillary` feature, the client best-effort upgrades its
@@ -84,7 +120,9 @@ backlog. `Client`/`AsyncClient` call it after a successful probe send,
 before processing an inbound reply, and before evaluating timeouts; it never
 waits for a timestamp; an absent timestamp after all of those opportunities
 simply stays absent. A genuine `SocketError` record stops the drain and is
-surfaced through the ordinary `ClientError::Socket` path.
+surfaced as `ClientError::Socket`. During post-send processing it is wrapped in
+`SendProbeError::AfterCommit` with the accepted send's receipt; receive/timeout
+operations retain the ordinary `ClientError` path.
 
 The Tokio adapter uses the same raw nonblocking `recvmsg(MSG_ERRQUEUE |
 MSG_DONTWAIT)` rather than `try_io`/`poll_recv_ready`: error-queue readiness

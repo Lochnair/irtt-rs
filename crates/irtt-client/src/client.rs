@@ -10,12 +10,13 @@ use crate::{
     event::{ClientEvent, OpenOutcome},
     receive::{drain_tx_timestamps, recv_datagram, try_enable_tx_timestamping, ReceivedDatagram},
     session::machine::{
-        recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, ProbeSent,
-        SessionMachine, MAX_OPEN_PACKET_SIZE,
+        recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, SessionMachine,
+        MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_udp_socket, resolve_remote},
     socket_options::{apply_traffic_class_to_socket, clear_dscp_on_socket},
     timing::ClientTimestamp,
+    SendProbeError, SendReceipt,
 };
 
 #[derive(Debug)]
@@ -193,18 +194,19 @@ impl Client {
     /// Send one echo probe now. The caller owns pacing and run duration.
     ///
     /// The negotiated interval and duration do not gate low-level sends.
-    pub fn send_probe(&mut self) -> Result<Vec<ClientEvent>, ClientError> {
+    /// A receipt means socket acceptance and infallible session commitment have
+    /// completed. Failures before acceptance return [`SendProbeError::NotCommitted`];
+    /// later validation or TX processing failures preserve the receipt in
+    /// [`SendProbeError::AfterCommit`].
+    pub fn send_probe(&mut self) -> Result<SendReceipt, SendProbeError> {
         let remote = self.remote;
         let (runtime, socket) = (&mut self.runtime, &self.socket);
-        let prepared = runtime.prepare_probe()?;
-        let machine_preflight = runtime.preflight_probe_commit(&prepared)?;
-        let mut events = Vec::new();
-        events
-            .try_reserve(1)
-            .map_err(|source| ClientError::AllocationFailed {
-                operation: "probe event result",
-                source,
-            })?;
+        let prepared = runtime
+            .prepare_probe()
+            .map_err(SendProbeError::NotCommitted)?;
+        let machine_preflight = runtime
+            .preflight_probe_commit(&prepared)
+            .map_err(SendProbeError::NotCommitted)?;
         let expected_bytes = prepared.bytes.len();
 
         // All fallible probe-commit preflight (timeout deadline arithmetic,
@@ -212,14 +214,16 @@ impl Client {
         // this PRIVATE pre-send anchor, before the socket send. It is not
         // the public measurement `sent_at` captured further below.
         let send_anchor = ClientTimestamp::now();
-        let machine_commit = runtime.finalize_probe_commit(machine_preflight, send_anchor)?;
+        let machine_commit = runtime
+            .finalize_probe_commit(machine_preflight, send_anchor)
+            .map_err(SendProbeError::NotCommitted)?;
         let send_call_start = Instant::now();
 
         let bytes = match socket.send(&prepared.bytes) {
             Ok(bytes) => bytes,
             Err(error) => {
                 runtime.invalidate_kernel_tx_correlation();
-                return Err(ClientError::Socket(error));
+                return Err(SendProbeError::NotCommitted(ClientError::Socket(error)));
             }
         };
         let send_finished_at = Instant::now();
@@ -231,11 +235,26 @@ impl Client {
         let sent_at = ClientTimestamp::now();
         let sent = runtime.commit_probe_sent(machine_commit, sent_at, bytes);
         let send_call = send_finished_at.saturating_duration_since(send_call_start);
-        validate_datagram_length(expected_bytes, bytes)?;
-        self.drain_tx_timestamps()?;
+        let receipt = SendReceipt {
+            seq: sent.seq,
+            remote,
+            sent_at: sent.sent_at,
+            bytes: sent.bytes,
+            send_call,
+        };
+        validate_datagram_length(expected_bytes, bytes).map_err(|source| {
+            SendProbeError::AfterCommit {
+                receipt,
+                source: Box::new(source),
+            }
+        })?;
+        self.drain_tx_timestamps()
+            .map_err(|source| SendProbeError::AfterCommit {
+                receipt,
+                source: Box::new(source),
+            })?;
 
-        events.push(echo_sent_event(remote, sent, send_call));
-        Ok(events)
+        Ok(receipt)
     }
 
     /// Receive and classify at most one datagram from the socket.
@@ -601,22 +620,6 @@ impl Client {
         if let Some(packet) = packet {
             let _ = self.socket.send(packet);
         }
-    }
-}
-
-pub(crate) fn echo_sent_event(
-    remote: SocketAddr,
-    sent: ProbeSent,
-    send_call: Duration,
-) -> ClientEvent {
-    ClientEvent::EchoSent {
-        seq: sent.seq,
-        remote,
-        scheduled_at: None,
-        sent_at: sent.sent_at,
-        bytes: sent.bytes,
-        send_call,
-        timer_error: None,
     }
 }
 

@@ -26,8 +26,14 @@ binaries are built on.
 negotiated parameters, pending-probe status, and timeout deadlines; callers
 own cadence and run duration. The managed driver provides fixed cadence,
 missed-slot handling, finite runs, and staggered or burst pacing. Low-level
-`EchoSent` events leave `scheduled_at` and `timer_error` absent; the managed
-driver supplies those schedule measurements.
+sends return `Result<SendReceipt, SendProbeError>` instead of event lists.
+A `SendReceipt` carries the committed sequence, remote, post-send timestamp,
+accepted bytes, and send-call duration. `NotCommitted(ClientError)` guarantees
+no accepted datagram or committed probe; `AfterCommit { receipt, source }`
+preserves the accepted send when subsequent validation or TX processing fails.
+Use `ClientEvent::from(receipt)` for an `EchoSent` event with `scheduled_at` and
+`timer_error` absent; the managed driver supplies those schedule measurements
+and publishes committed sends even when post-send processing fails.
 
 Tokio stays optional: the default build has no runtime and no Tokio
 dependency at all.
