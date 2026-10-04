@@ -121,7 +121,87 @@ fn rolling_windows_distinguish_upstream_and_downstream_loss() {
 }
 
 #[test]
-fn split_probe_boundaries_keep_signed_estimates_and_require_a_baseline() {
+fn rolling_baselines_cannot_include_unobserved_evicted_packets() {
+    let base = Instant::now();
+    let mut collector = StatsCollector::new(StatsConfig {
+        rolling_count: Some(2),
+        rolling_time: Some(Duration::from_millis(2)),
+        ..StatsConfig::continuous()
+    });
+    for event in [
+        sent(base, 0),
+        reply(base, 0, 1),
+        sent(base, 1),
+        sent(base, 2),
+        sent(base, 3),
+        reply(base, 3, 4),
+    ] {
+        collector.process(&event);
+    }
+    for rolling in [collector.rolling_count(), collector.rolling_time()] {
+        let rolling = rolling.unwrap();
+        assert_eq!(rolling.packets.packets_sent, 1);
+        assert_eq!(rolling.packets.packets_received, 1);
+        assert_eq!(rolling.packets.server_packets_received, Some(4));
+        assert_directional(&rolling, None, None);
+    }
+    assert_directional(&collector.snapshot(), Some(0), Some(2));
+
+    // The next pair has an observation at its boundary, so estimates recover.
+    collector.process(&sent(base, 4));
+    collector.process(&reply(base, 4, 5));
+    for rolling in [collector.rolling_count(), collector.rolling_time()] {
+        assert_directional(&rolling.unwrap(), Some(0), Some(0));
+    }
+}
+
+#[test]
+fn rolling_counter_discontinuities_are_unavailable_until_a_fresh_interval() {
+    let base = Instant::now();
+    let mut collector = StatsCollector::new(StatsConfig {
+        rolling_count: Some(2),
+        rolling_time: Some(Duration::from_millis(2)),
+        ..StatsConfig::continuous()
+    });
+    // Also cover an ambiguous high observation after wrap, followed by a return
+    // to post-wrap counts. Neither jump may be treated as a precise delta.
+    let counts = [u32::MAX - 1, u32::MAX, 0, 1, u32::MAX - 2, 2, 3];
+    for (seq, count) in counts.into_iter().enumerate() {
+        let seq = u32::try_from(seq).unwrap();
+        collector.process(&sent(base, seq));
+        collector.process(&reply(base, seq, count));
+        if seq == 0 {
+            continue;
+        }
+        for rolling in [collector.rolling_count(), collector.rolling_time()] {
+            let rolling = rolling.unwrap();
+            if matches!(seq, 1 | 3 | 6) {
+                assert_directional(&rolling, Some(0), Some(0));
+            } else {
+                assert_directional(&rolling, None, None);
+                assert_eq!(rolling.loss.upstream_loss_percent, 0.0);
+                assert_eq!(rolling.loss.downstream_loss_percent, 0.0);
+                assert_eq!(
+                    rolling.packets.server_packets_received,
+                    Some(u64::from(count))
+                );
+            }
+        }
+    }
+    let cumulative = collector.snapshot();
+    assert_eq!(
+        cumulative.packets.server_packets_received,
+        Some(u64::from(u32::MAX))
+    );
+    assert_directional(
+        &cumulative,
+        Some(7 - i128::from(u32::MAX)),
+        Some(i128::from(u32::MAX) - 7),
+    );
+}
+
+#[test]
+fn split_probe_boundaries_require_a_current_server_baseline() {
     let base = Instant::now();
     let mut collector = StatsCollector::new(StatsConfig {
         rolling_count: Some(1),
@@ -151,8 +231,8 @@ fn split_probe_boundaries_keep_signed_estimates_and_require_a_baseline() {
         let rolling = rolling.unwrap();
         assert_eq!(rolling.packets.packets_sent, 0);
         assert_eq!(rolling.packets.packets_received, 1);
-        // The retained reply advances the count, but its send is outside the window.
-        assert_directional(&rolling, Some(-1), Some(0));
+        // The evicted send makes the earlier observation stale at this boundary.
+        assert_directional(&rolling, None, None);
     }
     assert_directional(&collector.snapshot(), Some(0), Some(0));
 

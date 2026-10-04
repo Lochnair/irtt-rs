@@ -263,18 +263,45 @@ fn rolling_reference(
             if last - first + 1 != selected.len() {
                 return None;
             }
+            // Partition the full observed history at ambiguous discontinuities.
+            // This independent oracle keeps observation lists for each segment
+            // rather than relying on the collector's retained metadata.
+            let mut observations = Vec::new();
+            let mut segment_start = 0;
+            for (index, (_, (event, _))) in packets[..=*last].iter().enumerate() {
+                if let Some(count) = count(event) {
+                    if observations
+                        .iter()
+                        .max()
+                        .is_some_and(|highest: &u64| highest.abs_diff(count) >= (1_u64 << 31))
+                    {
+                        segment_start = index + 1;
+                        observations.clear();
+                    }
+                    observations.push(count);
+                }
+            }
+            if segment_start > *first {
+                return None;
+            }
             let baseline = if *first == 0 {
                 Some(0)
             } else {
-                packets[..*first]
+                // The immediately preceding packet must itself report the
+                // highest count. Earlier observations cannot bound this window.
+                let (_, (previous_event, _)) = packets[*first - 1];
+                let previous = count(previous_event)?;
+                if packets[segment_start.saturating_sub(1)..*first - 1]
                     .iter()
                     .filter_map(|(_, (event, _))| count(event))
                     .max()
+                    .is_some_and(|highest| highest > previous)
+                {
+                    return None;
+                }
+                Some(previous)
             }?;
-            let endpoint = packets[..=*last]
-                .iter()
-                .filter_map(|(_, (event, _))| count(event))
-                .max()?;
+            let endpoint = observations.into_iter().max()?;
             Some(endpoint - baseline)
         });
     snapshot.loss.upstream_loss_packets =

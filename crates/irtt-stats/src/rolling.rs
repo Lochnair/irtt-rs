@@ -18,6 +18,8 @@ type ArrivalKey = (Instant, usize);
 struct DirectionalPosition {
     packet_events: u128,
     server_received: Option<u64>,
+    server_observed_at: u128,
+    counter_reset_at: u128,
 }
 
 impl DirectionalPosition {
@@ -26,10 +28,21 @@ impl DirectionalPosition {
             StatsEvent::UniqueReply { sample, .. } => {
                 if let Some(count) = sample.received_count {
                     let count = u64::from(count);
-                    self.server_received = Some(
-                        self.server_received
-                            .map_or(count, |current| current.max(count)),
-                    );
+                    // A jump across half the 32-bit range can be a wrap or an
+                    // old reply from the other side of a wrap. Start a new
+                    // observation segment without guessing an epoch. Windows
+                    // spanning the discontinuity have no directional estimate.
+                    if self
+                        .server_received
+                        .is_some_and(|current| current.abs_diff(count) >= (1_u64 << 31))
+                    {
+                        self.server_received = None;
+                        self.counter_reset_at = self.packet_events + 1;
+                    }
+                    if self.server_received.is_none_or(|current| count >= current) {
+                        self.server_received = Some(count);
+                        self.server_observed_at = self.packet_events + 1;
+                    }
                 }
             }
             StatsEvent::Sent { .. }
@@ -161,12 +174,18 @@ fn snapshot_window<'a>(
         core.apply(event.event.clone());
     }
     let server_delta = start.zip(end).and_then(|(start, end)| {
-        if !contiguous {
+        if !contiguous || start.counter_reset_at != end.counter_reset_at {
             return None;
         }
-        let baseline = start
-            .server_received
-            .or_else(|| (start.packet_events == 0).then_some(0))?;
+        let baseline = if start.packet_events == 0 {
+            0
+        } else if start.server_observed_at == start.packet_events {
+            start.server_received?
+        } else {
+            // Packet events after the observation but outside the window can
+            // have advanced the server count by an unknown amount.
+            return None;
+        };
         end.server_received.map(|count| count - baseline)
     });
     let mut snapshot = core.snapshot();

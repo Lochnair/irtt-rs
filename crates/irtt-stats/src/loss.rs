@@ -10,12 +10,17 @@ use crate::PacketCounts;
 /// The directional fields are derived from
 /// [`PacketCounts::server_packets_received`] for cumulative snapshots. Rolling
 /// snapshots use the increase in the highest observed count over the retained
-/// packet-event arrival interval, with the preceding observation as baseline
+/// packet-event arrival interval within one observation segment. The baseline
+/// must be that segment's highest count, reported by the preceding packet event
 /// (zero at the start of the collector's history). They are `None` without a
-/// known baseline/endpoint or when time filtering leaves an interior packet gap.
+/// current baseline or known endpoint, or when time filtering leaves an interior
+/// packet gap. A jump of at least half the
+/// 32-bit counter range starts a new observation segment: wrap and old replies
+/// are ambiguous. Windows crossing that discontinuity have no directional loss;
+/// later windows can use a fresh baseline within the new segment.
 /// The percentage fields are `0.0` when the corresponding estimate is unavailable.
-/// These remain estimates: outstanding sends and replies crossing a window
-/// boundary can produce signed values. [`PacketCounts::server_received_window`]
+/// These remain estimates: outstanding sends, excess server counts, or extra
+/// replies can produce signed values. [`PacketCounts::server_received_window`]
 /// is never used to derive loss.
 pub struct LossStats {
     /// Locally inferred total lost packets.
