@@ -1,3 +1,4 @@
+use irtt_client::{Authentication, HmacKey};
 mod support;
 mod protocol_options {
     pub mod backend_smoke;
@@ -148,7 +149,7 @@ fn hmac_rich_mode_uses_negotiated_echo_layout_and_decodes_reply() {
     let config_key = key.clone();
     let run = run_one_probe_with_config(params.clone(), standard_timestamps(), Some(key), |addr| {
         ClientConfig {
-            hmac_key: Some(config_key),
+            auth: Authentication::Hmac(HmacKey::new(config_key)),
             ..config_for_params(addr, &config_params)
         }
     });

@@ -149,29 +149,37 @@ fn default_client_output_emits_a_packet_summary() {
 fn target_authentication_inherits_overrides_or_disables_the_global_key() {
     use clap::Parser;
     use irtt_app::cmd::client::args::ClientArgs;
+    use irtt_client::{managed::TargetAuth, Authentication, HmacKey};
     let args = ClientArgs::try_parse_from([
         "irtt-client",
         "--hmac",
-        "global-test-key",
+        "CONSPICUOUS_GLOBAL_HMAC_KEY",
         "inherit=127.0.0.1:2112",
-        "override=127.0.0.1:2113@hmac=target-test-key",
+        "override=127.0.0.1:2113@hmac=CONSPICUOUS_TARGET_HMAC_KEY",
         "disable=127.0.0.1:2114@hmac=",
     ])
     .unwrap();
     let setup = args.prepare().unwrap();
     assert_eq!(
-        setup.managed_config().client.hmac_key.as_deref(),
-        Some(b"global-test-key".as_slice())
+        setup.managed_config().client.auth,
+        Authentication::Hmac(HmacKey::new(b"CONSPICUOUS_GLOBAL_HMAC_KEY".as_slice()))
     );
     let targets = setup.managed_targets();
-    let authentication: Vec<_> = targets
-        .iter()
-        .map(|target| target.auth.as_ref().map(|auth| auth.hmac_key.as_deref()))
-        .collect();
+    let authentication: Vec<_> = targets.iter().map(|target| target.auth.clone()).collect();
     assert_eq!(
         authentication,
-        [None, Some(Some(b"target-test-key".as_slice())), Some(None)]
+        [
+            TargetAuth::Inherit,
+            TargetAuth::Override(Authentication::Hmac(HmacKey::new(
+                b"CONSPICUOUS_TARGET_HMAC_KEY".as_slice()
+            ))),
+            TargetAuth::Override(Authentication::Unauthenticated)
+        ]
     );
+    for output in [format!("{args:?}"), format!("{setup:?}")] {
+        assert!(!output.contains("CONSPICUOUS_GLOBAL_HMAC_KEY"));
+        assert!(!output.contains("CONSPICUOUS_TARGET_HMAC_KEY"));
+    }
 }
 
 // A real authenticated server detects broken client argument-to-config mapping.

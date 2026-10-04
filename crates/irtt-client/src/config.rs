@@ -1,5 +1,7 @@
 use std::{net::SocketAddr, time::Duration};
 
+use crate::Authentication;
+
 /// Protocol compatibility bound for a requested `server_fill` value, in UTF-8
 /// bytes.
 ///
@@ -118,11 +120,10 @@ pub struct ClientConfig {
     /// This is the six-bit DSCP value, not the full traffic-class byte, and
     /// must be less than or equal to [`MAX_DSCP_CODEPOINT`].
     pub dscp: u8,
-    /// Optional HMAC key used to authenticate IRTT packets.
+    /// Concrete authentication for open, echo, and close packets.
     ///
-    /// When present, open, echo, and close packets are encoded and decoded with
-    /// HMAC authentication. The peer must be configured with the same key.
-    pub hmac_key: Option<Vec<u8>>,
+    /// HMAC peers must use the same key. An empty HMAC key remains authenticated.
+    pub auth: Authentication,
     /// Optional server payload fill request.
     ///
     /// `None` leaves server fill behavior unspecified. `Some(value)` requests
@@ -155,30 +156,6 @@ pub struct ClientConfig {
     pub max_pending_probes: usize,
 }
 
-/// Authentication settings used by client sessions.
-///
-/// `ClientConfig` keeps its existing top-level HMAC field for source
-/// compatibility. Managed multi-target callers can use this smaller type for
-/// per-target auth overrides without carrying a full independent
-/// [`ClientConfig`].
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct ClientAuthConfig {
-    /// Optional HMAC key used to authenticate IRTT packets.
-    pub hmac_key: Option<Vec<u8>>,
-}
-
-impl From<Option<Vec<u8>>> for ClientAuthConfig {
-    fn from(hmac_key: Option<Vec<u8>>) -> Self {
-        Self { hmac_key }
-    }
-}
-
-impl From<ClientAuthConfig> for Option<Vec<u8>> {
-    fn from(auth: ClientAuthConfig) -> Self {
-        auth.hmac_key
-    }
-}
-
 impl Default for ClientConfig {
     fn default() -> Self {
         Self {
@@ -190,7 +167,7 @@ impl Default for ClientConfig {
             stamp_at: StampAt::Both,
             clock: Clock::Both,
             dscp: 0,
-            hmac_key: None,
+            auth: Authentication::Unauthenticated,
             server_fill: None,
             open_timeouts: DEFAULT_OPEN_TIMEOUTS.to_vec(),
             run_mode: RunMode::Normal,

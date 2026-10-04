@@ -945,9 +945,7 @@ impl ManagedClientTask {
             }
             let mut client_config = self.config.client.clone();
             client_config.server_addr.clone_from(&target.server_addr);
-            if let Some(auth) = &target.auth {
-                client_config.hmac_key.clone_from(&auth.hmac_key);
-            }
+            client_config.auth = target.auth.resolve(&self.config.client.auth);
             validate_target_config(&client_config).map_err(|source| {
                 ManagedCommandApplyError::InvalidTarget {
                     id: target.id.clone(),
@@ -2251,9 +2249,7 @@ fn build_task(
             .ok_or(ManagedConfigError::GenerationExhausted)?;
         let mut client_config = config.client.clone();
         client_config.server_addr.clone_from(&target.server_addr);
-        if let Some(auth) = &target.auth {
-            client_config.hmac_key.clone_from(&auth.hmac_key);
-        }
+        client_config.auth = target.auth.resolve(&config.client.auth);
         validate_target_config(&client_config).map_err(|source| {
             ManagedConfigError::InvalidTarget {
                 id: target.id.clone(),

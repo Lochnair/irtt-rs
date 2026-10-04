@@ -2,7 +2,7 @@ use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
-use crate::{ClientAuthConfig, ClientConfig, ClientError, ClientEvent};
+use crate::{Authentication, ClientConfig, ClientError, ClientEvent};
 
 use super::TargetId;
 
@@ -26,12 +26,34 @@ pub struct TargetInstance {
     pub generation: u64,
 }
 
-/// Endpoint and optional authentication override for one managed target.
+/// Authentication specification for a managed target.
+///
+/// Equality preserves the specification: inheritance and an explicit override
+/// remain distinct even when they currently resolve to the same authentication.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TargetAuth {
+    /// Use the shared client configuration's authentication.
+    #[default]
+    Inherit,
+    /// Replace shared authentication. `Unauthenticated` explicitly disables it.
+    Override(Authentication),
+}
+
+impl TargetAuth {
+    pub(crate) fn resolve(&self, shared: &Authentication) -> Authentication {
+        match self {
+            Self::Inherit => shared.clone(),
+            Self::Override(auth) => auth.clone(),
+        }
+    }
+}
+
+/// Endpoint and authentication specification for one managed target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedTargetConfig {
     pub id: TargetId,
     pub server_addr: String,
-    pub auth: Option<ClientAuthConfig>,
+    pub auth: TargetAuth,
 }
 
 impl ManagedTargetConfig {
@@ -39,7 +61,7 @@ impl ManagedTargetConfig {
         Self {
             id: id.into(),
             server_addr: server_addr.into(),
-            auth: None,
+            auth: TargetAuth::Inherit,
         }
     }
 }

@@ -1,10 +1,10 @@
-use std::time::Duration;
+use std::{fmt, time::Duration};
 
 use clap::ValueEnum;
 use irtt_client::{MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH};
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
-#[derive(Debug, Clone, clap::Args)]
+#[derive(Clone, clap::Args)]
 pub struct CommonClientArgs {
     /// Probe interval.
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
@@ -61,6 +61,23 @@ pub struct CommonClientArgs {
     /// Accept safe server restrictions during negotiation.
     #[arg(long)]
     pub loose: bool,
+}
+
+impl fmt::Debug for CommonClientArgs {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CommonClientArgs")
+            .field("interval", &self.interval)
+            .field("length", &self.length)
+            .field("hmac", &self.hmac.as_ref().map(|_| "[REDACTED]"))
+            .field("clock", &self.clock)
+            .field("tstamp", &self.tstamp)
+            .field("stats", &self.stats)
+            .field("server_fill", &self.server_fill)
+            .field("dscp", &self.dscp)
+            .field("ttl", &self.ttl)
+            .field("loose", &self.loose)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]

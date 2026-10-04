@@ -1,3 +1,4 @@
+use irtt_client::{Authentication, HmacKey};
 use std::{
     future::Future,
     net::{SocketAddr, UdpSocket},
@@ -14,8 +15,8 @@ use irtt_proto::{
 };
 use tokio::runtime::{Builder, Runtime};
 
+use irtt_client::RunMode;
 use irtt_client::{managed::*, ClientConfig};
-use irtt_client::{ClientAuthConfig, RunMode};
 use tokio::sync::broadcast;
 
 const TOKEN: u64 = 0x1234_5678_90ab_cdef;
@@ -355,9 +356,7 @@ fn authenticated_peer_close_outcome() {
     let key = b"managed-peer-close".to_vec();
     let server = start_server(ServerBehavior::PeerClose, Some(key.clone()));
     let mut configured = target("peer", server.addr);
-    configured.auth = Some(ClientAuthConfig {
-        hmac_key: Some(key),
-    });
+    configured.auth = TargetAuth::Override(Authentication::Hmac(HmacKey::new(key)));
     let (task, _) =
         ManagedClient::task(config(ManagedPacing::Staggered), vec![configured]).unwrap();
     let outcome = runtime().block_on(task);
@@ -418,9 +417,7 @@ fn pending_limit_failure_drains_reply_and_closes_session() {
     managed.client.max_pending_probes = 1;
     managed.final_drain = Duration::from_millis(50);
     let mut configured = target("one", server.addr);
-    configured.auth = Some(ClientAuthConfig {
-        hmac_key: Some(key),
-    });
+    configured.auth = TargetAuth::Override(Authentication::Hmac(HmacKey::new(key)));
     let (task, _) = ManagedClient::task(managed, vec![configured]).unwrap();
     let outcome = runtime().block_on(async {
         tokio::time::timeout(Duration::from_secs(1), task)

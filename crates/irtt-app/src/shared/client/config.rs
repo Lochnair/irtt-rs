@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use irtt_client::{ClientConfig, NegotiationPolicy, SocketConfig};
+use irtt_client::{Authentication, ClientConfig, HmacKey, NegotiationPolicy, SocketConfig};
 
 use super::args::CommonClientArgs;
 
@@ -21,7 +21,12 @@ impl CommonClientArgs {
             stamp_at: self.tstamp.into(),
             clock: self.clock.into(),
             dscp: self.dscp,
-            hmac_key: self.hmac.as_ref().map(|key| key.as_bytes().to_vec()),
+            auth: self
+                .hmac
+                .as_ref()
+                .map_or(Authentication::Unauthenticated, |key| {
+                    Authentication::Hmac(HmacKey::new(key.as_bytes()))
+                }),
             server_fill: self.server_fill.clone(),
             negotiation_policy: if self.loose {
                 NegotiationPolicy::Loose
