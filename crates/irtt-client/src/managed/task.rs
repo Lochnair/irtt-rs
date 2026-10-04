@@ -369,7 +369,10 @@ enum TargetPhase {
         primary_end: ManagedTargetEndReason,
         cleanup_failure: Option<ManagedTargetFailure>,
     },
-    Terminal,
+    /// Terminal state always owns its finalized authoritative outcome.
+    Terminal {
+        outcome: Arc<ManagedTargetOutcome>,
+    },
 }
 
 impl TargetPhase {
@@ -381,7 +384,7 @@ impl TargetPhase {
             Self::Active { .. } => ManagedTargetLifecycle::Active,
             Self::Draining { .. } => ManagedTargetLifecycle::Draining,
             Self::Closing { .. } => ManagedTargetLifecycle::Closing,
-            Self::Terminal => ManagedTargetLifecycle::Terminal,
+            Self::Terminal { .. } => ManagedTargetLifecycle::Terminal,
         }
     }
 
@@ -589,9 +592,9 @@ struct UpdatePlan {
 
 fn synchronously_retireable(phase: &TargetPhase) -> bool {
     match phase {
-        TargetPhase::Pending { .. } | TargetPhase::Connecting { .. } | TargetPhase::Terminal => {
-            true
-        }
+        TargetPhase::Pending { .. }
+        | TargetPhase::Connecting { .. }
+        | TargetPhase::Terminal { .. } => true,
         TargetPhase::Opening { open, .. } => !open.has_in_flight_work(),
         TargetPhase::Active { .. } | TargetPhase::Draining { .. } | TargetPhase::Closing { .. } => {
             false
@@ -601,7 +604,7 @@ fn synchronously_retireable(phase: &TargetPhase) -> bool {
 
 fn runtime_satisfies_target(runtime: &TargetRuntime, target: &ManagedTargetConfig) -> bool {
     runtime.membership.is_desired()
-        && !matches!(runtime.phase(), TargetPhase::Terminal)
+        && !matches!(runtime.phase(), TargetPhase::Terminal { .. })
         && runtime.config == *target
 }
 
@@ -766,6 +769,10 @@ impl ManagedClientTask {
                     target: target.instance.clone(),
                     desired: target.membership.is_desired(),
                     lifecycle,
+                    outcome: match target.phase() {
+                        TargetPhase::Terminal { outcome } => Some(Arc::clone(outcome)),
+                        _ => None,
+                    },
                     server_addr: Arc::clone(&target.server_addr),
                     remote: target.remote,
                 }
@@ -841,13 +848,17 @@ impl ManagedClientTask {
         end_reason: ManagedTargetEndReason,
         cleanup_failure: Option<ManagedTargetFailure>,
     ) {
-        self.install_target_phase(index, TargetPhase::Terminal);
-        let outcome = self.targets[index].outcome(end_reason, cleanup_failure);
-        self.history.record(outcome.clone());
-        self.replace_status();
-        self.publish_event(ManagedEvent::TargetFinished {
-            outcome: Arc::new(outcome),
-        });
+        let outcome = Arc::new(self.targets[index].outcome(end_reason, cleanup_failure));
+        // Finalize history before the phase publisher installs Terminal, updates
+        // pacing and publishes one complete status followed by the lifecycle event.
+        self.history.record(outcome.as_ref().clone());
+        self.install_target_phase(
+            index,
+            TargetPhase::Terminal {
+                outcome: Arc::clone(&outcome),
+            },
+        );
+        self.publish_event(ManagedEvent::TargetFinished { outcome });
     }
 
     fn fail_target(&mut self, index: usize, phase: ManagedTargetFailurePhase, error: ClientError) {
@@ -955,12 +966,10 @@ impl ManagedClientTask {
             target.membership = TargetMembership::Withdrawn(retirement.reason);
             if retirement.synchronous {
                 synchronous.insert(retirement.index);
-                if !matches!(target.phase(), TargetPhase::Terminal) {
-                    let outcome = target.outcome(retirement.reason.into(), None);
-                    self.history.record(outcome.clone());
-                    finished.push(ManagedEvent::TargetFinished {
-                        outcome: Arc::new(outcome),
-                    });
+                if !matches!(target.phase(), TargetPhase::Terminal { .. }) {
+                    let outcome = Arc::new(target.outcome(retirement.reason.into(), None));
+                    self.history.record(outcome.as_ref().clone());
+                    finished.push(ManagedEvent::TargetFinished { outcome });
                 }
             } else if was_paced_active {
                 // Removal is directional: it may discard an elapsed gate but never
@@ -1130,12 +1139,14 @@ impl ManagedClientTask {
 
     fn prune_undesired_terminal(&mut self) {
         if !self.targets.iter().any(|target| {
-            !target.membership.is_desired() && matches!(target.phase(), TargetPhase::Terminal)
+            !target.membership.is_desired()
+                && matches!(target.phase(), TargetPhase::Terminal { .. })
         }) {
             return;
         }
         self.targets.retain(|target| {
-            target.membership.is_desired() || !matches!(target.phase(), TargetPhase::Terminal)
+            target.membership.is_desired()
+                || !matches!(target.phase(), TargetPhase::Terminal { .. })
         });
         self.rebase_target_cursors();
         self.replace_status();
@@ -1505,7 +1516,7 @@ impl ManagedClientTask {
                     }
                 }
             }
-            TargetPhase::Terminal => false,
+            TargetPhase::Terminal { .. } => false,
         }
     }
 
@@ -2039,7 +2050,7 @@ impl ManagedClientTask {
     fn all_targets_terminal(&self) -> bool {
         self.targets
             .iter()
-            .all(|target| matches!(target.phase(), TargetPhase::Terminal))
+            .all(|target| matches!(target.phase(), TargetPhase::Terminal { .. }))
     }
 
     fn next_deadline(&self) -> Option<Instant> {
@@ -2398,6 +2409,7 @@ fn build_task(
             target: target.instance.clone(),
             desired: target.membership.is_desired(),
             lifecycle: ManagedTargetLifecycle::Pending,
+            outcome: None,
             server_addr: Arc::clone(&target.server_addr),
             remote: None,
         })

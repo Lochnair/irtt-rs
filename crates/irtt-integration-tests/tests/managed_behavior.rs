@@ -1,6 +1,6 @@
 mod support;
 
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use irtt_client::{managed::*, ClientConfig, ClientEvent, OpenPolicy, SessionRequest};
 use irtt_server::ServerConfig;
@@ -186,6 +186,9 @@ async fn target_updates_preserve_identical_sessions_and_retire_removed_generatio
                 );
                 assert!(status.targets.iter().all(|target| target.target != first
                     || target.lifecycle == ManagedTargetLifecycle::Terminal));
+                if let Some(target) = status.targets.iter().find(|target| target.target == first) {
+                    assert!(Arc::ptr_eq(target.outcome.as_ref().unwrap(), &outcome));
+                }
                 break;
             }
         }
@@ -224,6 +227,12 @@ async fn target_updates_preserve_identical_sessions_and_retire_removed_generatio
                     );
                     assert!(status.targets.iter().all(|target| target.target != second
                         || target.lifecycle == ManagedTargetLifecycle::Terminal));
+                    let target = status
+                        .targets
+                        .iter()
+                        .find(|target| target.target == second)
+                        .unwrap();
+                    assert!(Arc::ptr_eq(target.outcome.as_ref().unwrap(), &outcome));
                 }
                 ManagedEvent::Completed { outcome } => {
                     let status = handle.status();
