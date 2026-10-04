@@ -2,7 +2,6 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt,
     future::Future,
-    mem,
     pin::Pin,
     sync::{
         atomic::{AtomicBool, AtomicU8, Ordering},
@@ -340,7 +339,7 @@ fn arm_wake(mut receiver: watch::Receiver<()>) -> WakeFuture {
     })
 }
 
-enum TargetState {
+enum TargetPhase {
     Pending {
         client_config: ClientConfig,
     },
@@ -353,6 +352,8 @@ enum TargetState {
     },
     Active {
         client: AsyncClient,
+        schedule: ProbeSchedule,
+        send_waiting: bool,
     },
     Draining {
         client: AsyncClient,
@@ -371,7 +372,7 @@ enum TargetState {
     Terminal,
 }
 
-impl TargetState {
+impl TargetPhase {
     fn lifecycle(&self) -> ManagedTargetLifecycle {
         match self {
             Self::Pending { .. } => ManagedTargetLifecycle::Pending,
@@ -381,6 +382,26 @@ impl TargetState {
             Self::Draining { .. } => ManagedTargetLifecycle::Draining,
             Self::Closing { .. } => ManagedTargetLifecycle::Closing,
             Self::Terminal => ManagedTargetLifecycle::Terminal,
+        }
+    }
+
+    fn client(&self) -> &AsyncClient {
+        match self {
+            Self::Opening { client, .. }
+            | Self::Active { client, .. }
+            | Self::Draining { client, .. }
+            | Self::Closing { client, .. } => client,
+            _ => panic!("managed target has no client in this phase"),
+        }
+    }
+
+    fn into_client(self) -> AsyncClient {
+        match self {
+            Self::Opening { client, .. }
+            | Self::Active { client, .. }
+            | Self::Draining { client, .. }
+            | Self::Closing { client, .. } => client,
+            _ => panic!("managed target has no client in this phase"),
         }
     }
 }
@@ -431,27 +452,92 @@ impl TargetCounters {
     }
 }
 
+#[derive(Clone, Copy)]
+enum RetirementReason {
+    Removed,
+    Replaced,
+}
+
+impl From<RetirementReason> for ManagedTargetEndReason {
+    fn from(reason: RetirementReason) -> Self {
+        match reason {
+            RetirementReason::Removed => Self::Removed,
+            RetirementReason::Replaced => Self::Replaced,
+        }
+    }
+}
+
+enum TargetMembership {
+    Desired,
+    Withdrawn(RetirementReason),
+}
+
+impl TargetMembership {
+    fn is_desired(&self) -> bool {
+        matches!(self, Self::Desired)
+    }
+
+    fn retirement_reason(&self) -> Option<RetirementReason> {
+        match self {
+            Self::Desired => None,
+            Self::Withdrawn(reason) => Some(*reason),
+        }
+    }
+}
+
 struct TargetRuntime {
-    schedule: Option<ProbeSchedule>,
     instance: TargetInstance,
     config: ManagedTargetConfig,
-    desired: bool,
-    retirement: Option<ManagedTargetEndReason>,
+    membership: TargetMembership,
     server_addr: Arc<str>,
     remote: Option<std::net::SocketAddr>,
     counters: TargetCounters,
-    send_waiting: bool,
-    active: bool,
-    state: TargetState,
+    // None only while a synchronous operation owns the phase locally.
+    phase: Option<TargetPhase>,
 }
 
 impl TargetRuntime {
+    fn phase(&self) -> &TargetPhase {
+        self.phase
+            .as_ref()
+            .expect("managed target phase is extracted")
+    }
+
+    fn phase_mut(&mut self) -> &mut TargetPhase {
+        self.phase
+            .as_mut()
+            .expect("managed target phase is extracted")
+    }
+
+    fn take_phase(&mut self) -> TargetPhase {
+        self.phase
+            .take()
+            .expect("managed target phase is extracted")
+    }
+
+    fn restore_phase(&mut self, phase: TargetPhase) {
+        assert!(
+            self.phase.is_none(),
+            "managed target phase is already installed"
+        );
+        self.phase = Some(phase);
+    }
+
+    fn is_paced_active(&self) -> bool {
+        let phase = self.phase();
+        self.membership.is_desired() && matches!(phase, TargetPhase::Active { .. })
+    }
+
     /// Adopt the underlying client's authoritative sent count.
     ///
     /// The client owns `packets_sent`; this runtime only mirrors it so a
     /// terminal outcome can report it after the client is gone.
     fn sync_packets_sent(&mut self, client: &AsyncClient) {
         self.counters.packets_sent = client.packets_sent();
+    }
+
+    fn sync_live_packets_sent(&mut self) {
+        self.counters.packets_sent = self.phase().client().packets_sent();
     }
 
     /// Build this target's durable outcome.
@@ -489,7 +575,7 @@ struct PlannedTarget {
 
 struct PlannedRetirement {
     index: usize,
-    reason: ManagedTargetEndReason,
+    reason: RetirementReason,
     synchronous: bool,
 }
 
@@ -501,20 +587,22 @@ struct UpdatePlan {
     prospective_live_count: usize,
 }
 
-fn synchronously_retireable(state: &TargetState) -> bool {
-    match state {
-        TargetState::Pending { .. } | TargetState::Connecting { .. } | TargetState::Terminal => {
+fn synchronously_retireable(phase: &TargetPhase) -> bool {
+    match phase {
+        TargetPhase::Pending { .. } | TargetPhase::Connecting { .. } | TargetPhase::Terminal => {
             true
         }
-        TargetState::Opening { open, .. } => !open.has_in_flight_work(),
-        TargetState::Active { .. } | TargetState::Draining { .. } | TargetState::Closing { .. } => {
+        TargetPhase::Opening { open, .. } => !open.has_in_flight_work(),
+        TargetPhase::Active { .. } | TargetPhase::Draining { .. } | TargetPhase::Closing { .. } => {
             false
         }
     }
 }
 
 fn runtime_satisfies_target(runtime: &TargetRuntime, target: &ManagedTargetConfig) -> bool {
-    runtime.desired && !matches!(runtime.state, TargetState::Terminal) && runtime.config == *target
+    runtime.membership.is_desired()
+        && !matches!(runtime.phase(), TargetPhase::Terminal)
+        && runtime.config == *target
 }
 
 #[derive(Default)]
@@ -664,7 +752,7 @@ impl ManagedClientTask {
             .targets
             .iter()
             .map(|target| {
-                let lifecycle = target.state.lifecycle();
+                let lifecycle = target.phase().lifecycle();
                 match lifecycle {
                     ManagedTargetLifecycle::Pending => {}
                     ManagedTargetLifecycle::Connecting => connecting += 1,
@@ -676,7 +764,7 @@ impl ManagedClientTask {
                 }
                 ManagedTargetStatus {
                     target: target.instance.clone(),
-                    desired: target.desired,
+                    desired: target.membership.is_desired(),
                     lifecycle,
                     server_addr: Arc::clone(&target.server_addr),
                     remote: target.remote,
@@ -687,7 +775,11 @@ impl ManagedClientTask {
             lifecycle: self.lifecycle,
             stop_requested: self.stop_observed,
             applied_command_sequence: self.applied_command_sequence,
-            desired_target_count: self.targets.iter().filter(|target| target.desired).count(),
+            desired_target_count: self
+                .targets
+                .iter()
+                .filter(|target| target.membership.is_desired())
+                .count(),
             connecting_target_count: connecting,
             opening_target_count: opening,
             active_target_count: active,
@@ -709,14 +801,19 @@ impl ManagedClientTask {
         self.resources().status.send_replace(self.snapshot());
     }
 
-    fn install_target_state(&mut self, index: usize, state: TargetState) {
-        let lifecycle = state.lifecycle();
-        let active = matches!(state, TargetState::Active { .. });
-        let was_active = self.targets[index].active;
-        self.targets[index].active = active;
-        self.targets[index].state = state;
+    fn install_target_phase(&mut self, index: usize, phase: TargetPhase) {
+        let previous = self.targets[index].phase().lifecycle();
+        self.targets[index].phase = Some(phase);
+        self.publish_target_phase(index, previous);
+    }
+
+    fn publish_target_phase(&mut self, index: usize, previous: ManagedTargetLifecycle) {
+        let lifecycle = self.targets[index].phase().lifecycle();
+        let desired = self.targets[index].membership.is_desired();
+        let was_paced_active = desired && previous == ManagedTargetLifecycle::Active;
+        let paced_active = self.targets[index].is_paced_active();
         let now = Instant::now();
-        match (was_active, active) {
+        match (was_paced_active, paced_active) {
             (false, true) => self.stagger_target_added(now),
             (true, false) => self.stagger_target_removed(now),
             _ => {}
@@ -744,7 +841,7 @@ impl ManagedClientTask {
         end_reason: ManagedTargetEndReason,
         cleanup_failure: Option<ManagedTargetFailure>,
     ) {
-        self.install_target_state(index, TargetState::Terminal);
+        self.install_target_phase(index, TargetPhase::Terminal);
         let outcome = self.targets[index].outcome(end_reason, cleanup_failure);
         self.history.record(outcome.clone());
         self.replace_status();
@@ -761,20 +858,22 @@ impl ManagedClientTask {
     fn begin_open_session_failure(
         &mut self,
         index: usize,
-        mut client: AsyncClient,
         phase: ManagedTargetFailurePhase,
         error: ClientError,
         now: Instant,
         cleanup: OpenSessionFailureCleanup,
     ) -> bool {
         let primary_end = ManagedTargetEndReason::Failed(classify_client_error(phase, &error));
+        let (TargetPhase::Opening { client, .. } | TargetPhase::Active { client, .. }) =
+            self.targets[index].phase_mut()
+        else {
+            unreachable!("open-session failure requires an opening or active target")
+        };
         client.discard_prepared_probe();
-        self.targets[index].sync_packets_sent(&client);
+        self.targets[index].sync_live_packets_sent();
         match cleanup {
-            OpenSessionFailureCleanup::Drain => self.begin_drain(index, client, primary_end, now),
-            OpenSessionFailureCleanup::Close => {
-                self.begin_close(index, client, primary_end, None, now)
-            }
+            OpenSessionFailureCleanup::Drain => self.begin_drain(index, primary_end, now),
+            OpenSessionFailureCleanup::Close => self.begin_close(index, primary_end, None, now),
         }
     }
 
@@ -807,7 +906,10 @@ impl ManagedClientTask {
     }
 
     fn effective_retirement(&self, index: usize) -> Option<ManagedTargetEndReason> {
-        self.targets[index].retirement.clone()
+        self.targets[index]
+            .membership
+            .retirement_reason()
+            .map(Into::into)
     }
 
     fn process_commands(&mut self, cx: &mut Context<'_>) -> bool {
@@ -849,24 +951,21 @@ impl ManagedClientTask {
         let mut finished = Vec::new();
         for retirement in &plan.retirements {
             let target = &mut self.targets[retirement.index];
-            target.desired = false;
+            let was_paced_active = target.is_paced_active();
+            target.membership = TargetMembership::Withdrawn(retirement.reason);
             if retirement.synchronous {
                 synchronous.insert(retirement.index);
-                if !matches!(target.state, TargetState::Terminal) {
-                    let outcome = target.outcome(retirement.reason.clone(), None);
+                if !matches!(target.phase(), TargetPhase::Terminal) {
+                    let outcome = target.outcome(retirement.reason.into(), None);
                     self.history.record(outcome.clone());
                     finished.push(ManagedEvent::TargetFinished {
                         outcome: Arc::new(outcome),
                     });
                 }
-            } else {
-                target.retirement = Some(retirement.reason.clone());
-                if target.active {
-                    target.active = false;
-                    // Removal is directional: it may discard an elapsed gate but never
-                    // lengthens an existing future stagger gate.
-                    self.stagger_target_removed(now);
-                }
+            } else if was_paced_active {
+                // Removal is directional: it may discard an elapsed gate but never
+                // lengthens an existing future stagger gate.
+                self.stagger_target_removed(now);
             }
         }
         if !synchronous.is_empty() {
@@ -887,24 +986,23 @@ impl ManagedClientTask {
             };
             created_instances.push(instance.clone());
             self.targets.push(TargetRuntime {
-                schedule: None,
                 instance,
                 server_addr: Arc::from(planned.target.server_addr.clone()),
                 config: planned.target,
-                desired: true,
-                retirement: None,
+                membership: TargetMembership::Desired,
                 remote: None,
                 counters: TargetCounters::default(),
-                send_waiting: false,
-                active: false,
-                state: TargetState::Pending {
+                phase: Some(TargetPhase::Pending {
                     client_config: planned.client_config,
-                },
+                }),
             });
         }
         self.next_generation = plan.next_generation;
         self.applied_command_sequence = plan.next_command_sequence;
-        let stopping = self.targets.iter().all(|runtime| !runtime.desired)
+        let stopping = self
+            .targets
+            .iter()
+            .all(|runtime| !runtime.membership.is_desired())
             && self.config.completion == ManagedCompletionPolicy::FinishWhenQuiescent;
         if stopping {
             self.resources().stop.begin_stopping();
@@ -957,7 +1055,7 @@ impl ManagedClientTask {
         }
         let mut retirements = Vec::new();
         for (index, runtime) in self.targets.iter().enumerate() {
-            if !runtime.desired
+            if !runtime.membership.is_desired()
                 || prepared
                     .iter()
                     .any(|(target, _)| runtime_satisfies_target(runtime, target))
@@ -968,14 +1066,14 @@ impl ManagedClientTask {
                 .iter()
                 .any(|(target, _)| target.id == runtime.instance.id)
             {
-                ManagedTargetEndReason::Replaced
+                RetirementReason::Replaced
             } else {
-                ManagedTargetEndReason::Removed
+                RetirementReason::Removed
             };
             retirements.push(PlannedRetirement {
                 index,
                 reason,
-                synchronous: synchronously_retireable(&runtime.state),
+                synchronous: synchronously_retireable(runtime.phase()),
             });
         }
 
@@ -1031,15 +1129,14 @@ impl ManagedClientTask {
     }
 
     fn prune_undesired_terminal(&mut self) {
-        if !self
-            .targets
-            .iter()
-            .any(|target| !target.desired && matches!(target.state, TargetState::Terminal))
-        {
+        if !self.targets.iter().any(|target| {
+            !target.membership.is_desired() && matches!(target.phase(), TargetPhase::Terminal)
+        }) {
             return;
         }
-        self.targets
-            .retain(|target| target.desired || !matches!(target.state, TargetState::Terminal));
+        self.targets.retain(|target| {
+            target.membership.is_desired() || !matches!(target.phase(), TargetPhase::Terminal)
+        });
         self.rebase_target_cursors();
         self.replace_status();
     }
@@ -1060,51 +1157,53 @@ impl ManagedClientTask {
         self.stagger_remaining = self.stagger_remaining.min(len);
     }
 
-    fn start_connecting(&mut self, index: usize, config: ClientConfig) {
+    fn start_connecting(&mut self, index: usize) {
+        let TargetPhase::Pending { client_config } = self.targets[index].take_phase() else {
+            unreachable!("connecting starts from a pending target")
+        };
         let endpoint = Arc::clone(&self.targets[index].server_addr);
-        let future = Box::pin(async move { AsyncClient::connect(endpoint, config).await });
-        self.install_target_state(index, TargetState::Connecting { future });
+        let future = Box::pin(async move { AsyncClient::connect(endpoint, client_config).await });
+        self.targets[index].restore_phase(TargetPhase::Connecting { future });
+        self.publish_target_phase(index, ManagedTargetLifecycle::Pending);
     }
 
     fn poll_target(&mut self, index: usize, cx: &mut Context<'_>, now: Instant) -> bool {
-        let state = mem::replace(&mut self.targets[index].state, TargetState::Terminal);
-        match state {
-            TargetState::Pending { client_config } => {
-                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
-                {
+        let retirement = self.effective_retirement(index);
+        let stopping = self.state == DriverState::Stopping || retirement.is_some();
+        match self.targets[index].phase_mut() {
+            TargetPhase::Pending { .. } => {
+                if stopping {
                     self.finish_target(
                         index,
-                        self.effective_retirement(index)
+                        retirement
+                            .clone()
                             .unwrap_or(ManagedTargetEndReason::Stopped),
                         None,
                     );
                     false
                 } else {
-                    self.start_connecting(index, client_config);
+                    self.start_connecting(index);
                     true
                 }
             }
-            TargetState::Connecting { mut future } => {
-                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
-                {
+            TargetPhase::Connecting { future } => {
+                if stopping {
                     self.finish_target(
                         index,
-                        self.effective_retirement(index)
+                        retirement
+                            .clone()
                             .unwrap_or(ManagedTargetEndReason::Stopped),
                         None,
                     );
                     return false;
                 }
                 match future.as_mut().poll(cx) {
-                    Poll::Pending => {
-                        self.targets[index].state = TargetState::Connecting { future };
-                        false
-                    }
+                    Poll::Pending => false,
                     Poll::Ready(Ok(client)) => {
                         self.targets[index].remote = Some(client.remote_addr());
-                        self.install_target_state(
+                        self.install_target_phase(
                             index,
-                            TargetState::Opening {
+                            TargetPhase::Opening {
                                 client,
                                 open: Box::new(AsyncOpenState::new()),
                             },
@@ -1117,58 +1216,57 @@ impl ManagedClientTask {
                     }
                 }
             }
-            TargetState::Opening {
-                mut client,
-                mut open,
-            } => {
-                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
-                {
-                    let retirement = self
-                        .effective_retirement(index)
+            TargetPhase::Opening { client, open } => {
+                if stopping {
+                    let retirement = retirement
+                        .clone()
                         .unwrap_or(ManagedTargetEndReason::Stopped);
                     if !open.has_in_flight_work() {
-                        self.targets[index].sync_packets_sent(&client);
+                        self.targets[index].sync_live_packets_sent();
                         self.finish_target(index, retirement, None);
                         return false;
                     }
                     open.request_stop_after_current_attempt();
                 }
-                match client.poll_open(&mut open, cx) {
-                    Poll::Pending => {
-                        self.targets[index].state = TargetState::Opening { client, open };
-                        false
-                    }
+                match client.poll_open(open, cx) {
+                    Poll::Pending => false,
                     Poll::Ready(Ok(OpenOutcome::Started(started))) => {
-                        match ProbeSchedule::new(started.at.mono, &started.negotiation.accepted) {
-                            Ok(schedule) => self.targets[index].schedule = Some(schedule),
+                        let schedule = match ProbeSchedule::new(
+                            started.at.mono,
+                            &started.negotiation.accepted,
+                        ) {
+                            Ok(schedule) => schedule,
                             Err(error) => {
                                 return self.begin_open_session_failure(
                                     index,
-                                    client,
                                     ManagedTargetFailurePhase::Timing,
                                     error,
                                     now,
                                     OpenSessionFailureCleanup::Close,
                                 )
                             }
-                        }
+                        };
                         self.publish_client_events(
                             index,
                             vec![ClientEvent::SessionStarted(started)],
                         );
-                        if self.state == DriverState::Stopping
-                            || self.effective_retirement(index).is_some()
-                        {
-                            self.targets[index].sync_packets_sent(&client);
+                        if stopping {
+                            self.targets[index].sync_live_packets_sent();
                             self.begin_drain(
                                 index,
-                                client,
-                                self.effective_retirement(index)
+                                retirement
+                                    .clone()
                                     .unwrap_or(ManagedTargetEndReason::Stopped),
                                 now,
                             )
                         } else {
-                            self.install_target_state(index, TargetState::Active { client });
+                            let previous = self.targets[index].take_phase();
+                            self.targets[index].restore_phase(TargetPhase::Active {
+                                client: previous.into_client(),
+                                schedule,
+                                send_waiting: false,
+                            });
+                            self.publish_target_phase(index, ManagedTargetLifecycle::Opening);
                             true
                         }
                     }
@@ -1177,10 +1275,9 @@ impl ManagedClientTask {
                             index,
                             vec![ClientEvent::NoTestCompleted(completed)],
                         );
-                        let end_reason = if self.state == DriverState::Stopping
-                            || self.effective_retirement(index).is_some()
-                        {
-                            self.effective_retirement(index)
+                        let end_reason = if stopping {
+                            retirement
+                                .clone()
                                 .unwrap_or(ManagedTargetEndReason::Stopped)
                         } else {
                             ManagedTargetEndReason::NoTestComplete
@@ -1189,9 +1286,11 @@ impl ManagedClientTask {
                         false
                     }
                     Poll::Ready(Err(error)) => {
-                        if self.state == DriverState::Stopping
-                            || self.effective_retirement(index).is_some()
-                        {
+                        if stopping {
+                            let TargetPhase::Opening { open, .. } = self.targets[index].phase()
+                            else {
+                                unreachable!()
+                            };
                             let cleanup_failure =
                                 (!open.stopped_after_current_attempt()).then(|| {
                                     classify_client_error(
@@ -1201,7 +1300,8 @@ impl ManagedClientTask {
                                 });
                             self.finish_target(
                                 index,
-                                self.effective_retirement(index)
+                                retirement
+                                    .clone()
                                     .unwrap_or(ManagedTargetEndReason::Stopped),
                                 cleanup_failure,
                             );
@@ -1212,15 +1312,14 @@ impl ManagedClientTask {
                     }
                 }
             }
-            TargetState::Active { mut client } => {
-                if self.state == DriverState::Stopping || self.effective_retirement(index).is_some()
-                {
+            TargetPhase::Active { client, .. } => {
+                if stopping {
                     client.discard_prepared_probe();
-                    self.targets[index].sync_packets_sent(&client);
+                    self.targets[index].sync_live_packets_sent();
                     return self.begin_drain(
                         index,
-                        client,
-                        self.effective_retirement(index)
+                        retirement
+                            .clone()
                             .unwrap_or(ManagedTargetEndReason::Stopped),
                         now,
                     );
@@ -1229,7 +1328,6 @@ impl ManagedClientTask {
                     .next_probe_timeout_deadline()
                     .is_some_and(|deadline| deadline <= now)
                 {
-                    self.targets[index].state = TargetState::Active { client };
                     return true;
                 }
                 let received = match client.poll_recv(cx) {
@@ -1241,7 +1339,6 @@ impl ManagedClientTask {
                     Poll::Ready(Err(error)) => {
                         return self.begin_open_session_failure(
                             index,
-                            client,
                             ManagedTargetFailurePhase::Receiving,
                             error,
                             now,
@@ -1249,54 +1346,31 @@ impl ManagedClientTask {
                         );
                     }
                 };
-                if client.is_peer_closed() {
-                    self.targets[index].sync_packets_sent(&client);
+                if self.targets[index].phase().client().is_peer_closed() {
+                    self.targets[index].sync_live_packets_sent();
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, None);
                     return false;
                 }
-                if self.targets[index]
-                    .schedule
-                    .as_mut()
-                    .is_some_and(|schedule| {
-                        schedule.permit_probe_at(now);
-                        schedule.is_finished()
-                    })
-                    && !client.has_pending_probes()
-                {
-                    self.targets[index].sync_packets_sent(&client);
-                    return self.begin_drain(
-                        index,
-                        client,
-                        ManagedTargetEndReason::TestComplete,
-                        now,
-                    );
+                let TargetPhase::Active {
+                    client, schedule, ..
+                } = self.targets[index].phase_mut()
+                else {
+                    unreachable!()
+                };
+                schedule.permit_probe_at(now);
+                if schedule.is_finished() && !client.has_pending_probes() {
+                    self.targets[index].sync_live_packets_sent();
+                    return self.begin_drain(index, ManagedTargetEndReason::TestComplete, now);
                 }
-                self.targets[index].state = TargetState::Active { client };
                 received
             }
-            TargetState::Draining {
-                mut client,
-                drain_started_at,
-                deadline,
-                primary_end,
-                mut cleanup_failure,
-                mut post_deadline_receives_remaining,
-            } => {
+            TargetPhase::Draining { client, .. } => {
                 if client
                     .next_probe_timeout_deadline()
                     .is_some_and(|timeout| timeout <= now)
                 {
-                    self.targets[index].state = TargetState::Draining {
-                        client,
-                        drain_started_at,
-                        deadline,
-                        primary_end,
-                        cleanup_failure,
-                        post_deadline_receives_remaining,
-                    };
                     return true;
                 }
-
                 let mut retained_state_changed = false;
                 let received = match client.poll_recv(cx) {
                     Poll::Pending => false,
@@ -1306,137 +1380,163 @@ impl ManagedClientTask {
                         true
                     }
                     Poll::Ready(Err(error)) => {
-                        self.targets[index].sync_packets_sent(&client);
+                        self.targets[index].sync_live_packets_sent();
+                        let TargetPhase::Draining {
+                            primary_end,
+                            cleanup_failure,
+                            ..
+                        } = self.targets[index].phase_mut()
+                        else {
+                            unreachable!()
+                        };
                         cleanup_failure.get_or_insert_with(|| {
                             classify_client_error(ManagedTargetFailurePhase::Receiving, &error)
                         });
-                        return self.begin_close(index, client, primary_end, cleanup_failure, now);
+                        let primary_end = primary_end.clone();
+                        let cleanup_failure = cleanup_failure.clone();
+                        return self.begin_close(index, primary_end, cleanup_failure, now);
                     }
                 };
-
-                if client.is_peer_closed() {
-                    self.targets[index].sync_packets_sent(&client);
-                    self.finish_target(index, ManagedTargetEndReason::PeerClosed, cleanup_failure);
+                if self.targets[index].phase().client().is_peer_closed() {
+                    self.targets[index].sync_live_packets_sent();
+                    let TargetPhase::Draining {
+                        cleanup_failure, ..
+                    } = self.targets[index].phase()
+                    else {
+                        unreachable!()
+                    };
+                    self.finish_target(
+                        index,
+                        ManagedTargetEndReason::PeerClosed,
+                        cleanup_failure.clone(),
+                    );
                     return false;
                 }
-                let deadline = if retained_state_changed {
-                    match self.drain_deadline(&client, drain_started_at) {
-                        Some(candidate) => deadline.min(candidate),
-                        None => {
-                            cleanup_failure.get_or_insert_with(duration_overflow_failure);
-                            return self.begin_close(
-                                index,
-                                client,
-                                primary_end,
-                                cleanup_failure,
-                                now,
-                            );
-                        }
-                    }
-                } else {
-                    deadline
-                };
-                if now >= deadline {
-                    if received && post_deadline_receives_remaining > 1 {
-                        post_deadline_receives_remaining -= 1;
-                        self.targets[index].state = TargetState::Draining {
-                            client,
-                            drain_started_at,
-                            deadline,
-                            primary_end,
-                            cleanup_failure,
-                            post_deadline_receives_remaining,
-                        };
-                        true
-                    } else {
-                        self.begin_close(index, client, primary_end, cleanup_failure, now)
-                    }
-                } else {
-                    self.targets[index].state = TargetState::Draining {
+                if retained_state_changed {
+                    let TargetPhase::Draining {
                         client,
                         drain_started_at,
+                        ..
+                    } = self.targets[index].phase()
+                    else {
+                        unreachable!()
+                    };
+                    let candidate = self.drain_deadline(client, *drain_started_at);
+                    let TargetPhase::Draining {
                         deadline,
                         primary_end,
                         cleanup_failure,
-                        post_deadline_receives_remaining,
+                        ..
+                    } = self.targets[index].phase_mut()
+                    else {
+                        unreachable!()
                     };
+                    match candidate {
+                        Some(candidate) => *deadline = (*deadline).min(candidate),
+                        None => {
+                            cleanup_failure.get_or_insert_with(duration_overflow_failure);
+                            let primary_end = primary_end.clone();
+                            let cleanup_failure = cleanup_failure.clone();
+                            return self.begin_close(index, primary_end, cleanup_failure, now);
+                        }
+                    }
+                }
+                let TargetPhase::Draining {
+                    deadline,
+                    primary_end,
+                    cleanup_failure,
+                    post_deadline_receives_remaining,
+                    ..
+                } = self.targets[index].phase_mut()
+                else {
+                    unreachable!()
+                };
+                if now >= *deadline {
+                    if received && *post_deadline_receives_remaining > 1 {
+                        *post_deadline_receives_remaining -= 1;
+                        true
+                    } else {
+                        let primary_end = primary_end.clone();
+                        let cleanup_failure = cleanup_failure.clone();
+                        self.begin_close(index, primary_end, cleanup_failure, now)
+                    }
+                } else {
                     received
                 }
             }
-            TargetState::Closing {
-                mut client,
-                deadline,
-                primary_end,
-                cleanup_failure,
-            } => match client.poll_close(cx) {
-                Poll::Pending => {
-                    if now >= deadline {
-                        self.targets[index].sync_packets_sent(&client);
-                        self.finish_target(
-                            index,
-                            primary_end,
-                            cleanup_failure.or_else(|| Some(close_timeout_failure())),
-                        );
+            TargetPhase::Closing { client, .. } => {
+                let result = client.poll_close(cx);
+                let TargetPhase::Closing {
+                    deadline,
+                    primary_end,
+                    cleanup_failure,
+                    ..
+                } = self.targets[index].phase()
+                else {
+                    unreachable!()
+                };
+                let deadline = *deadline;
+                let primary_end = primary_end.clone();
+                let cleanup_failure = cleanup_failure.clone();
+                match result {
+                    Poll::Pending => {
+                        if now >= deadline {
+                            self.targets[index].sync_live_packets_sent();
+                            self.finish_target(
+                                index,
+                                primary_end,
+                                cleanup_failure.or_else(|| Some(close_timeout_failure())),
+                            );
+                        }
                         false
-                    } else {
-                        self.targets[index].state = TargetState::Closing {
-                            client,
-                            deadline,
-                            primary_end,
-                            cleanup_failure,
-                        };
+                    }
+                    Poll::Ready(Ok(events)) => {
+                        self.targets[index].sync_live_packets_sent();
+                        self.publish_client_events(index, events);
+                        self.finish_target(index, primary_end, cleanup_failure);
+                        false
+                    }
+                    Poll::Ready(Err(error)) => {
+                        self.targets[index].sync_live_packets_sent();
+                        let cleanup =
+                            classify_client_error(ManagedTargetFailurePhase::Closing, &error);
+                        self.finish_target(index, primary_end, cleanup_failure.or(Some(cleanup)));
                         false
                     }
                 }
-                Poll::Ready(Ok(events)) => {
-                    self.targets[index].sync_packets_sent(&client);
-                    self.publish_client_events(index, events);
-                    self.finish_target(index, primary_end, cleanup_failure);
-                    false
-                }
-                Poll::Ready(Err(error)) => {
-                    self.targets[index].sync_packets_sent(&client);
-                    let cleanup = classify_client_error(ManagedTargetFailurePhase::Closing, &error);
-                    self.finish_target(index, primary_end, cleanup_failure.or(Some(cleanup)));
-                    false
-                }
-            },
-            TargetState::Terminal => {
-                self.targets[index].state = TargetState::Terminal;
-                false
             }
+            TargetPhase::Terminal => false,
         }
     }
 
     fn begin_drain(
         &mut self,
         index: usize,
-        client: AsyncClient,
         primary_end: ManagedTargetEndReason,
         _now: Instant,
     ) -> bool {
         let drain_started_at = Instant::now();
-        let Some(deadline) = self.drain_deadline(&client, drain_started_at) else {
-            let cleanup_failure = Some(duration_overflow_failure());
+        let Some(deadline) =
+            self.drain_deadline(self.targets[index].phase().client(), drain_started_at)
+        else {
             return self.begin_close(
                 index,
-                client,
                 primary_end,
-                cleanup_failure,
+                Some(duration_overflow_failure()),
                 drain_started_at,
             );
         };
-        self.install_target_state(
-            index,
-            TargetState::Draining {
-                client,
-                drain_started_at,
-                deadline,
-                primary_end,
-                cleanup_failure: None,
-                post_deadline_receives_remaining: POST_DEADLINE_RECEIVE_BUDGET,
-            },
-        );
+        let previous = self.targets[index].take_phase();
+        let lifecycle = previous.lifecycle();
+        self.targets[index].restore_phase(TargetPhase::Draining {
+            client: previous.into_client(),
+            drain_started_at,
+            deadline,
+            primary_end,
+            cleanup_failure: None,
+            post_deadline_receives_remaining: POST_DEADLINE_RECEIVE_BUDGET,
+        });
+        self.publish_target_phase(index, lifecycle);
         true
     }
 
@@ -1451,7 +1551,6 @@ impl ManagedClientTask {
     fn begin_close(
         &mut self,
         index: usize,
-        client: AsyncClient,
         primary_end: ManagedTargetEndReason,
         mut cleanup_failure: Option<ManagedTargetFailure>,
         now: Instant,
@@ -1460,22 +1559,22 @@ impl ManagedClientTask {
             cleanup_failure.get_or_insert_with(duration_overflow_failure);
             now
         });
-        self.install_target_state(
-            index,
-            TargetState::Closing {
-                client,
-                deadline,
-                primary_end,
-                cleanup_failure,
-            },
-        );
+        let previous = self.targets[index].take_phase();
+        let lifecycle = previous.lifecycle();
+        self.targets[index].restore_phase(TargetPhase::Closing {
+            client: previous.into_client(),
+            deadline,
+            primary_end,
+            cleanup_failure,
+        });
+        self.publish_target_phase(index, lifecycle);
         true
     }
 
     fn active_count(&self) -> usize {
         self.targets
             .iter()
-            .filter(|target| target.active && target.desired && target.retirement.is_none())
+            .filter(|target| target.is_paced_active())
             .count()
     }
 
@@ -1483,19 +1582,14 @@ impl ManagedClientTask {
         let mut active = 0;
         let mut minimum: Option<Duration> = None;
         for target in &self.targets {
-            if !target.desired || target.retirement.is_some() {
-                continue;
-            }
-            let TargetState::Active { .. } = &target.state else {
+            let TargetPhase::Active { schedule, .. } = target.phase() else {
                 continue;
             };
+            if !target.membership.is_desired() {
+                continue;
+            }
             active += 1;
-            let interval = target
-                .schedule
-                .as_ref()
-                .expect("active managed targets have a probe schedule")
-                .interval();
-            minimum = minimum.into_iter().chain(Some(interval)).min();
+            minimum = minimum.into_iter().chain(Some(schedule.interval())).min();
         }
         minimum.map(|interval| stagger_spacing(interval, active))
     }
@@ -1564,13 +1658,20 @@ impl ManagedClientTask {
         now: Instant,
         stagger_spacing: Option<Duration>,
     ) -> SendResult {
-        if !self.targets[index].desired || self.targets[index].retirement.is_some() {
-            self.targets[index].send_waiting = false;
+        if !self.targets[index].membership.is_desired() {
+            if let TargetPhase::Active { send_waiting, .. } = self.targets[index].phase_mut() {
+                *send_waiting = false;
+            }
             return SendResult::NotAttempted;
         }
-        let state = mem::replace(&mut self.targets[index].state, TargetState::Terminal);
-        let TargetState::Active { mut client } = state else {
-            self.targets[index].state = state;
+        let phase = self.targets[index].take_phase();
+        let TargetPhase::Active {
+            mut client,
+            mut schedule,
+            mut send_waiting,
+        } = phase
+        else {
+            self.targets[index].restore_phase(phase);
             return SendResult::NotAttempted;
         };
         // A burst pass may span several slots; validate this target against
@@ -1580,40 +1681,54 @@ impl ManagedClientTask {
             .next_probe_timeout_deadline()
             .is_some_and(|deadline| deadline <= now)
         {
-            self.targets[index].send_waiting = false;
-            self.targets[index].state = TargetState::Active { client };
+            send_waiting = false;
+            self.targets[index].restore_phase(TargetPhase::Active {
+                client,
+                schedule,
+                send_waiting,
+            });
             return SendResult::NotAttempted;
         }
-        let schedule = self.targets[index]
-            .schedule
-            .as_mut()
-            .expect("active managed targets have a probe schedule");
         if !schedule.permit_probe_at(now) {
-            self.targets[index].send_waiting = false;
-            if client.has_pending_probes() {
-                self.targets[index].state = TargetState::Active { client };
+            send_waiting = false;
+            let pending = client.has_pending_probes();
+            if !pending {
+                self.targets[index].sync_packets_sent(&client);
+            }
+            self.targets[index].restore_phase(TargetPhase::Active {
+                client,
+                schedule,
+                send_waiting,
+            });
+            if pending {
                 return SendResult::NotAttempted;
             }
-            self.targets[index].sync_packets_sent(&client);
-            self.begin_drain(index, client, ManagedTargetEndReason::TestComplete, now);
+            self.begin_drain(index, ManagedTargetEndReason::TestComplete, now);
             return SendResult::Ready { accepted: false };
         }
         if schedule
             .next_send_deadline()
             .is_none_or(|deadline| deadline > now)
         {
-            self.targets[index].send_waiting = false;
-            self.targets[index].state = TargetState::Active { client };
+            send_waiting = false;
+            self.targets[index].restore_phase(TargetPhase::Active {
+                client,
+                schedule,
+                send_waiting,
+            });
             return SendResult::NotAttempted;
         }
-        let schedule = self.targets[index].schedule.as_ref().unwrap();
         let commit =
             match schedule.preflight_managed_commit(schedule.next_send_deadline().unwrap(), now) {
                 Ok(commit) => commit,
                 Err(error) => {
+                    self.targets[index].restore_phase(TargetPhase::Active {
+                        client,
+                        schedule,
+                        send_waiting,
+                    });
                     self.begin_open_session_failure(
                         index,
-                        client,
                         ManagedTargetFailurePhase::Timing,
                         error,
                         now,
@@ -1637,23 +1752,20 @@ impl ManagedClientTask {
         };
         self.record_stagger_acceptance(send_result, stagger_spacing, Instant::now());
         if accepted {
-            self.targets[index]
-                .schedule
-                .as_mut()
-                .unwrap()
-                .commit(commit);
+            schedule.commit(commit);
         }
         let schedule_error = if accepted {
-            self.targets[index]
-                .schedule
-                .as_mut()
-                .unwrap()
-                .skip_missed_slots_at(Instant::now())
-                .err()
+            schedule.skip_missed_slots_at(Instant::now()).err()
         } else {
             None
         };
         self.targets[index].sync_packets_sent(&client);
+        send_waiting = result.is_pending();
+        self.targets[index].restore_phase(TargetPhase::Active {
+            client,
+            schedule,
+            send_waiting,
+        });
         // A committed send must reach the lifecycle/accounting stream even
         // when post-send processing fails. Publish before failure cleanup.
         let sent_event = receipt.map(|receipt| {
@@ -1670,24 +1782,12 @@ impl ManagedClientTask {
             event
         });
         match result {
-            Poll::Pending => {
-                self.targets[index].send_waiting = true;
-                self.targets[index].state = TargetState::Active { client };
-                SendResult::Pending
-            }
+            Poll::Pending => SendResult::Pending,
             Poll::Ready(Ok(_)) => {
-                self.targets[index].send_waiting = false;
-                self.targets[index].state = TargetState::Active { client };
                 self.publish_client_events(index, vec![sent_event.unwrap()]);
                 if let Some(error) = schedule_error {
-                    let TargetState::Active { client } =
-                        mem::replace(&mut self.targets[index].state, TargetState::Terminal)
-                    else {
-                        unreachable!("sender remained active")
-                    };
                     self.begin_open_session_failure(
                         index,
-                        client,
                         ManagedTargetFailurePhase::Timing,
                         error,
                         now,
@@ -1698,7 +1798,6 @@ impl ManagedClientTask {
                     SendResult::Ready { accepted }
                 }
             }
-
             Poll::Ready(Err(error)) => {
                 if let Some(event) = sent_event {
                     self.publish_client_events(index, vec![event]);
@@ -1707,10 +1806,8 @@ impl ManagedClientTask {
                     SendProbeError::NotCommitted(source) => source,
                     SendProbeError::AfterCommit { source, .. } => *source,
                 };
-                self.targets[index].send_waiting = false;
                 self.begin_open_session_failure(
                     index,
-                    client,
                     ManagedTargetFailurePhase::Sending,
                     error,
                     now,
@@ -1733,10 +1830,7 @@ impl ManagedClientTask {
             let index = self.send_cursor % self.targets.len();
             self.send_cursor = (self.send_cursor + 1) % self.targets.len();
             self.stagger_remaining -= 1;
-            if !self.targets[index].desired
-                || self.targets[index].retirement.is_some()
-                || !matches!(self.targets[index].state, TargetState::Active { .. })
-            {
+            if !self.targets[index].is_paced_active() {
                 continue;
             }
             let stagger_spacing = self.active_stagger_spacing();
@@ -1849,15 +1943,15 @@ impl ManagedClientTask {
     fn target_has_due_timeout(&self, index: usize, now: Instant) -> bool {
         #[cfg(test)]
         self.timeout_inspections.borrow_mut().push(index);
-        match &self.targets[index].state {
-            TargetState::Active { client } => {
+        match self.targets[index].phase() {
+            TargetPhase::Active { client, .. } => {
                 self.state != DriverState::Stopping
                     && self.effective_retirement(index).is_none()
                     && client
                         .next_probe_timeout_deadline()
                         .is_some_and(|deadline| deadline <= now)
             }
-            TargetState::Draining { client, .. } => client
+            TargetPhase::Draining { client, .. } => client
                 .next_probe_timeout_deadline()
                 .is_some_and(|timeout| timeout <= now),
             _ => false,
@@ -1865,12 +1959,10 @@ impl ManagedClientTask {
     }
 
     fn poll_target_timeout(&mut self, index: usize, now: Instant) -> TimeoutStep {
-        let state = mem::replace(&mut self.targets[index].state, TargetState::Terminal);
-        match state {
-            TargetState::Active { mut client } => match client.poll_timeouts_bounded_at(now, 1) {
+        match self.targets[index].phase_mut() {
+            TargetPhase::Active { client, .. } => match client.poll_timeouts_bounded_at(now, 1) {
                 Ok(batch) => {
                     self.publish_client_events(index, batch.events);
-                    self.targets[index].state = TargetState::Active { client };
                     TimeoutStep {
                         more_due: batch.more_due,
                     }
@@ -1878,7 +1970,6 @@ impl ManagedClientTask {
                 Err(error) => {
                     self.begin_open_session_failure(
                         index,
-                        client,
                         ManagedTargetFailurePhase::Timing,
                         error,
                         now,
@@ -1887,87 +1978,93 @@ impl ManagedClientTask {
                     TimeoutStep::NONE
                 }
             },
-            TargetState::Draining {
-                mut client,
-                drain_started_at,
-                deadline,
-                primary_end,
-                mut cleanup_failure,
-                post_deadline_receives_remaining,
-            } => match client.poll_timeouts_bounded_at(now, 1) {
+            TargetPhase::Draining { client, .. } => match client.poll_timeouts_bounded_at(now, 1) {
                 Ok(batch) => {
                     self.publish_client_events(index, batch.events);
-                    let deadline = match self.drain_deadline(&client, drain_started_at) {
-                        Some(candidate) => deadline.min(candidate),
-                        None => {
-                            cleanup_failure.get_or_insert_with(duration_overflow_failure);
-                            self.begin_close(index, client, primary_end, cleanup_failure, now);
-                            return TimeoutStep::NONE;
-                        }
-                    };
-                    self.targets[index].state = TargetState::Draining {
+                    let TargetPhase::Draining {
                         client,
                         drain_started_at,
+                        ..
+                    } = self.targets[index].phase()
+                    else {
+                        unreachable!()
+                    };
+                    let candidate = self.drain_deadline(client, *drain_started_at);
+                    let TargetPhase::Draining {
                         deadline,
                         primary_end,
                         cleanup_failure,
-                        post_deadline_receives_remaining,
+                        ..
+                    } = self.targets[index].phase_mut()
+                    else {
+                        unreachable!()
                     };
+                    match candidate {
+                        Some(candidate) => *deadline = (*deadline).min(candidate),
+                        None => {
+                            cleanup_failure.get_or_insert_with(duration_overflow_failure);
+                            let primary_end = primary_end.clone();
+                            let cleanup_failure = cleanup_failure.clone();
+                            self.begin_close(index, primary_end, cleanup_failure, now);
+                            return TimeoutStep::NONE;
+                        }
+                    }
                     TimeoutStep {
                         more_due: batch.more_due,
                     }
                 }
                 Err(error) => {
-                    self.targets[index].sync_packets_sent(&client);
+                    self.targets[index].sync_live_packets_sent();
+                    let TargetPhase::Draining {
+                        primary_end,
+                        cleanup_failure,
+                        ..
+                    } = self.targets[index].phase_mut()
+                    else {
+                        unreachable!()
+                    };
                     cleanup_failure.get_or_insert_with(|| {
                         classify_client_error(ManagedTargetFailurePhase::Timing, &error)
                     });
-                    self.begin_close(index, client, primary_end, cleanup_failure, now);
+                    let primary_end = primary_end.clone();
+                    let cleanup_failure = cleanup_failure.clone();
+                    self.begin_close(index, primary_end, cleanup_failure, now);
                     TimeoutStep::NONE
                 }
             },
-            state => {
-                self.targets[index].state = state;
-                TimeoutStep::NONE
-            }
+            _ => TimeoutStep::NONE,
         }
     }
 
     fn all_targets_terminal(&self) -> bool {
         self.targets
             .iter()
-            .all(|target| matches!(target.state, TargetState::Terminal))
+            .all(|target| matches!(target.phase(), TargetPhase::Terminal))
     }
 
     fn next_deadline(&self) -> Option<Instant> {
         let mut non_send_deadline = None;
         let mut send_deadline = None;
         for target in &self.targets {
-            match &target.state {
-                TargetState::Active { client } => {
+            match target.phase() {
+                TargetPhase::Active {
+                    client,
+                    schedule,
+                    send_waiting,
+                } => {
                     non_send_deadline = non_send_deadline
                         .into_iter()
                         .chain(client.next_probe_timeout_deadline())
-                        .chain(
-                            target
-                                .schedule
-                                .as_ref()
-                                .and_then(ProbeSchedule::end_deadline),
-                        )
+                        .chain(schedule.end_deadline())
                         .min();
-                    if target.desired && target.retirement.is_none() && !target.send_waiting {
+                    if target.membership.is_desired() && !send_waiting {
                         send_deadline = send_deadline
                             .into_iter()
-                            .chain(
-                                target
-                                    .schedule
-                                    .as_ref()
-                                    .and_then(ProbeSchedule::next_send_deadline),
-                            )
+                            .chain(schedule.next_send_deadline())
                             .min();
                     }
                 }
-                TargetState::Draining {
+                TargetPhase::Draining {
                     client, deadline, ..
                 } => {
                     non_send_deadline = non_send_deadline
@@ -1976,7 +2073,7 @@ impl ManagedClientTask {
                         .chain(Some(*deadline))
                         .min();
                 }
-                TargetState::Closing { deadline, .. } => {
+                TargetPhase::Closing { deadline, .. } => {
                     non_send_deadline = non_send_deadline.into_iter().chain(Some(*deadline)).min();
                 }
                 _ => {}
@@ -2270,20 +2367,16 @@ fn build_task(
             }
         })?;
         runtimes.push(TargetRuntime {
-            schedule: None,
             instance: TargetInstance {
                 id: target.id.clone(),
                 generation,
             },
             config: target.clone(),
-            desired: true,
-            retirement: None,
+            membership: TargetMembership::Desired,
             server_addr: Arc::from(target.server_addr),
             remote: None,
             counters: TargetCounters::default(),
-            send_waiting: false,
-            active: false,
-            state: TargetState::Pending { client_config },
+            phase: Some(TargetPhase::Pending { client_config }),
         });
     }
 
@@ -2303,7 +2396,7 @@ fn build_task(
         .iter()
         .map(|target| ManagedTargetStatus {
             target: target.instance.clone(),
-            desired: true,
+            desired: target.membership.is_desired(),
             lifecycle: ManagedTargetLifecycle::Pending,
             server_addr: Arc::clone(&target.server_addr),
             remote: None,
@@ -2443,12 +2536,27 @@ mod tests {
                     .await
                     .unwrap();
                 task.state = DriverState::Running;
-                task.install_target_state(0, TargetState::Active { client });
+                task.install_target_phase(
+                    0,
+                    TargetPhase::Active {
+                        client,
+                        schedule: ProbeSchedule::new(start, &accepted).unwrap(),
+                        send_waiting: false,
+                    },
+                );
                 task.send_gate = Some(end + Duration::from_secs(1));
 
                 for send_waiting in [false, true] {
-                    task.targets[0].send_waiting = send_waiting;
-                    task.targets[0].schedule = Some(ProbeSchedule::new(start, &accepted).unwrap());
+                    let TargetPhase::Active {
+                        schedule,
+                        send_waiting: waiting,
+                        ..
+                    } = task.targets[0].phase_mut()
+                    else {
+                        unreachable!()
+                    };
+                    *waiting = send_waiting;
+                    *schedule = ProbeSchedule::new(start, &accepted).unwrap();
                     let expected = if pacing == ManagedPacing::Burst && !send_waiting {
                         start
                     } else {
@@ -2456,17 +2564,19 @@ mod tests {
                     };
                     assert_eq!(task.next_deadline(), Some(expected));
 
-                    task.targets[0]
-                        .schedule
-                        .as_mut()
-                        .unwrap()
-                        .permit_probe_at(end);
+                    let TargetPhase::Active { schedule, .. } = task.targets[0].phase_mut() else {
+                        unreachable!()
+                    };
+                    schedule.permit_probe_at(end);
                     assert_eq!(task.next_deadline(), None);
                 }
 
                 let mut continuous = accepted.clone();
                 continuous.duration = None;
-                task.targets[0].schedule = Some(ProbeSchedule::new(start, &continuous).unwrap());
+                let TargetPhase::Active { schedule, .. } = task.targets[0].phase_mut() else {
+                    unreachable!()
+                };
+                *schedule = ProbeSchedule::new(start, &continuous).unwrap();
                 assert_eq!(task.next_deadline(), None);
             }
         });
