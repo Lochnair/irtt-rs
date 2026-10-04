@@ -1936,6 +1936,12 @@ impl ManagedClientTask {
                     non_send_deadline = non_send_deadline
                         .into_iter()
                         .chain(client.next_probe_timeout_deadline())
+                        .chain(
+                            target
+                                .schedule
+                                .as_ref()
+                                .and_then(ProbeSchedule::end_deadline),
+                        )
                         .min();
                     if target.desired && target.retirement.is_none() && !target.send_waiting {
                         send_deadline = send_deadline
@@ -2398,6 +2404,71 @@ fn close_timeout_failure() -> ManagedTargetFailure {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Real EAGAIN needs privileged queue shaping. Inspect only the owning
+    // deadline selection here, using a production socket without sending.
+    #[test]
+    fn finite_lifetime_deadline_survives_send_waiting_and_stagger_gating() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let start = Instant::now();
+            let end = start + Duration::from_millis(500);
+            let negotiated = crate::NegotiatedParams {
+                params: irtt_proto::Params {
+                    duration_ns: 500_000_000,
+                    interval_ns: 1_000_000,
+                    ..irtt_proto::Params::default()
+                },
+                restrictions: Vec::new(),
+            };
+            for pacing in [ManagedPacing::Burst, ManagedPacing::Staggered] {
+                let (mut task, _handle) = ManagedClient::task(
+                    ManagedClientConfig {
+                        pacing,
+                        ..ManagedClientConfig::default()
+                    },
+                    vec![ManagedTargetConfig::new("target", "127.0.0.1:9")],
+                )
+                .unwrap();
+                let client = AsyncClient::connect(ClientConfig {
+                    server_addr: "127.0.0.1:9".into(),
+                    ..ClientConfig::default()
+                })
+                .await
+                .unwrap();
+                task.state = DriverState::Running;
+                task.install_target_state(0, TargetState::Active { client });
+                task.send_gate = Some(end + Duration::from_secs(1));
+
+                for send_waiting in [false, true] {
+                    task.targets[0].send_waiting = send_waiting;
+                    task.targets[0].schedule =
+                        Some(ProbeSchedule::new(start, &negotiated).unwrap());
+                    let expected = if pacing == ManagedPacing::Burst && !send_waiting {
+                        start
+                    } else {
+                        end
+                    };
+                    assert_eq!(task.next_deadline(), Some(expected));
+
+                    task.targets[0]
+                        .schedule
+                        .as_mut()
+                        .unwrap()
+                        .permit_probe_at(end);
+                    assert_eq!(task.next_deadline(), None);
+                }
+
+                let mut continuous = negotiated.clone();
+                continuous.params.duration_ns = 0;
+                task.targets[0].schedule = Some(ProbeSchedule::new(start, &continuous).unwrap());
+                assert_eq!(task.next_deadline(), None);
+            }
+        });
+    }
 
     #[test]
     fn release_gate_only_delays_an_existing_send_deadline() {

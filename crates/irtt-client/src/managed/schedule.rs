@@ -48,6 +48,11 @@ impl ProbeSchedule {
         self.next_send_at
     }
 
+    /// Wake for finite expiry independently of send readiness until finished.
+    pub(crate) fn end_deadline(&self) -> Option<Instant> {
+        self.end_at.filter(|_| !self.is_finished())
+    }
+
     pub(crate) fn interval(&self) -> Duration {
         self.interval
     }
@@ -151,4 +156,43 @@ pub(crate) fn instant_abs_diff(left: Instant, right: Instant) -> Duration {
     left.checked_duration_since(right)
         .or_else(|| right.checked_duration_since(left))
         .unwrap_or(Duration::ZERO)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifetime_deadline_exists_only_for_an_unfinished_finite_schedule() {
+        let start = Instant::now();
+        let end = start + Duration::from_millis(500);
+        let mut negotiated = NegotiatedParams {
+            params: irtt_proto::Params {
+                duration_ns: 500_000_000,
+                interval_ns: 1_000_000,
+                ..irtt_proto::Params::default()
+            },
+            restrictions: Vec::new(),
+        };
+        let mut finite = ProbeSchedule::new(start, &negotiated).unwrap();
+        assert_eq!(finite.end_deadline(), Some(end));
+        assert!(finite.permit_probe_at(end - Duration::from_nanos(1)));
+        assert_eq!(finite.end_deadline(), Some(end));
+        assert!(!finite.permit_probe_at(end));
+        assert!(finite.is_finished());
+        assert_eq!(finite.end_deadline(), None);
+
+        let mut finite = ProbeSchedule::new(start, &negotiated).unwrap();
+        let commit = finite
+            .preflight_managed_commit(start, end - Duration::from_nanos(1))
+            .unwrap();
+        finite.commit(commit);
+        assert!(finite.is_finished());
+        assert_eq!(finite.end_deadline(), None);
+
+        negotiated.params.duration_ns = 0;
+        let mut continuous = ProbeSchedule::new(start, &negotiated).unwrap();
+        assert!(continuous.permit_probe_at(end));
+        assert_eq!(continuous.end_deadline(), None);
+    }
 }
