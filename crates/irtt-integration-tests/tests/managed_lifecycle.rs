@@ -454,6 +454,12 @@ fn event_loss_independence() {
     let mut config = config(ManagedPacing::Staggered);
     config.event_capacity = 1;
     let (task, handle) = ManagedClient::task(config, vec![target("one", server.addr)]).unwrap();
+    let initial = handle.status();
+    assert_eq!(
+        initial.targets[0].lifecycle,
+        ManagedTargetLifecycle::Pending
+    );
+    assert!(initial.targets[0].outcome.is_none());
     let mut events = handle.subscribe().unwrap();
     let outcome = runtime().block_on(task);
     assert!(matches!(
@@ -461,7 +467,31 @@ fn event_loss_independence() {
         Err(broadcast::error::TryRecvError::Lagged(_))
     ));
     assert_eq!(outcome.successful_target_outcomes, 1);
-    assert_eq!(handle.status().lifecycle, ManagedLifecycle::Completed);
+    let status = handle.status();
+    assert_eq!(status.lifecycle, ManagedLifecycle::Completed);
+    assert_eq!(status.targets.len(), 1);
+    let target = &status.targets[0];
+    assert!(target.desired);
+    assert_eq!(target.lifecycle, ManagedTargetLifecycle::Terminal);
+    let terminal = target
+        .outcome
+        .as_ref()
+        .expect("terminal details are durable");
+    assert_eq!(terminal.target, target.target);
+    assert_eq!(status.terminal_target_count, 1);
+    assert_eq!(status.total_target_outcomes, 1);
+    assert_eq!(status.successful_target_outcomes, 1);
+    assert_eq!(status.failed_target_outcomes, 0);
+    assert_eq!(status.peer_closed_target_outcomes, 0);
+    assert_eq!(status.discarded_target_outcomes, 0);
+    assert_eq!(
+        status.recent_target_outcomes.as_ref(),
+        &[terminal.as_ref().clone()]
+    );
+    assert_eq!(
+        status.recent_target_outcomes,
+        outcome.recent_target_outcomes
+    );
     server.finish();
 }
 

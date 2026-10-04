@@ -141,6 +141,12 @@ pub struct ManagedTargetStatus {
     pub target: TargetInstance,
     pub desired: bool,
     pub lifecycle: ManagedTargetLifecycle,
+    /// Authoritative completed accounting for this target generation.
+    ///
+    /// Present if and only if `lifecycle` is [`ManagedTargetLifecycle::Terminal`].
+    /// This shares the terminal phase's outcome with [`ManagedEvent::TargetFinished`],
+    /// so terminal details remain durable even when presentation events are lost.
+    pub outcome: Option<Arc<ManagedTargetOutcome>>,
     pub server_addr: Arc<str>,
     pub remote: Option<SocketAddr>,
 }
