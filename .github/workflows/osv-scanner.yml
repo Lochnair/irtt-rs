@@ -3,8 +3,7 @@
 # separate terms of service, privacy policy, and support
 # documentation.
 
-# A sample workflow which sets up periodic OSV-Scanner scanning for vulnerabilities,
-# in addition to a PR check which fails if new vulnerabilities are introduced.
+# Scan all dependencies on main and compare newly introduced vulnerabilities on PRs.
 #
 # For more examples and options, including how to ignore specific vulnerabilities,
 # see https://google.github.io/osv-scanner/github-action/
@@ -20,6 +19,7 @@ on:
     - cron: "45 8 * * 1"
   push:
     branches: ["main"]
+  workflow_dispatch:
 
 permissions:
   # Require writing security events to upload SARIF file to security tab
@@ -29,21 +29,12 @@ permissions:
   actions: read
 
 jobs:
+  # Both pinned workflows default to a recursive scan of ./, including fuzz/.
+  # OSV v2 excludes the root Git repository unless --include-git-root is set;
+  # the old --skip-git flag is no longer supported.
   scan-scheduled:
-    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' }}
+    if: ${{ github.event_name == 'push' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc" # v2.6.0
-    with:
-      # Example of specifying custom arguments
-      scan-args: |-
-        -r
-        --skip-git
-        ./
   scan-pr:
     if: ${{ github.event_name == 'pull_request' || github.event_name == 'merge_group' }}
     uses: "google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@a345acffa64b0eaede81a3d9aae6141214d9c8fc" # v2.6.0
-    with:
-      # Example of specifying custom arguments
-      scan-args: |-
-        -r
-        --skip-git
-        ./
