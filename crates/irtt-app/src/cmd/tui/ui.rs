@@ -106,7 +106,6 @@ pub(super) struct TuiState {
     details_open: bool,
     details_scroll: (u16, u16),
     pub(super) paused: bool,
-    pub(super) quit_requested: bool,
 }
 
 impl TuiState {
@@ -143,7 +142,6 @@ impl TuiState {
             details_open: false,
             details_scroll: (0, 0),
             paused: false,
-            quit_requested: false,
         }
     }
 
@@ -937,10 +935,6 @@ pub(super) fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState) {
         render_graph_area(frame, rows[2], state);
     }
     frame.render_widget(status_line(state), rows[3]);
-}
-
-pub(super) fn should_render(now: Instant, next_render: Instant, paused: bool, force: bool) -> bool {
-    force || (!paused && now >= next_render)
 }
 
 fn dashboard_layout(area: Rect, state: &TuiState) -> [Rect; 4] {

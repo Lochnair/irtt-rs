@@ -1,9 +1,9 @@
-#[cfg(any(feature = "server", feature = "tui"))]
+#[cfg(feature = "server")]
 use std::sync::{atomic::AtomicBool, Arc};
 use std::{env, ffi::OsString, process::ExitCode};
 
 use crate::applet::{dispatch_from_argv, AppletDispatch, RequestedApplet};
-#[cfg(any(feature = "server", feature = "tui"))]
+#[cfg(feature = "server")]
 use crate::signal::install_signal_handler;
 
 /// Entry point for the `irtt-rs` multicall dispatcher binary.
@@ -77,7 +77,7 @@ fn run_dispatcher_from_env() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Installs the shutdown signal handler for synchronous applets and hands the
 /// resulting flag to `f`.
-#[cfg(any(feature = "server", feature = "tui"))]
+#[cfg(feature = "server")]
 fn with_shutdown_flag(
     f: impl FnOnce(&AtomicBool) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -124,10 +124,13 @@ fn run_server_applet(_argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Err
 fn run_tui_applet(argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser;
 
-    with_shutdown_flag(|shutdown_requested| {
-        let args = crate::cmd::tui::TuiArgs::parse_from(argv);
-        crate::cmd::tui::run_tui(args, shutdown_requested)
-    })
+    let shutdown = crate::signal::install_async_signal_handler()
+        .map_err(|err| format!("failed to install signal handler: {err}"))?;
+    let args = crate::cmd::tui::TuiArgs::parse_from(argv);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(crate::cmd::tui::run_tui(args, shutdown))
 }
 
 #[cfg(not(feature = "tui"))]

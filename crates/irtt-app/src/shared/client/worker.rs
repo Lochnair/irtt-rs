@@ -5,14 +5,14 @@ use tokio::sync::oneshot;
 
 /// Keeps measurement scheduling separate from frontend output and statistics.
 /// Drop also stops and joins on frontend errors or cancellation.
-pub(super) struct ManagedWorker {
+pub(crate) struct ManagedWorker {
     handle: ManagedClientHandle,
     thread: Option<thread::JoinHandle<()>>,
     completion: oneshot::Receiver<io::Result<ManagedOutcome>>,
 }
 
 impl ManagedWorker {
-    pub(super) fn start(task: ManagedClientTask, handle: ManagedClientHandle) -> io::Result<Self> {
+    pub(crate) fn start(task: ManagedClientTask, handle: ManagedClientHandle) -> io::Result<Self> {
         let (completed, completion) = oneshot::channel();
         let thread = thread::Builder::new()
             .name("irtt-managed".to_owned())
@@ -41,7 +41,7 @@ impl ManagedWorker {
         })
     }
 
-    pub(super) async fn join(mut self) -> Result<ManagedOutcome, Box<dyn std::error::Error>> {
+    pub(crate) async fn join(mut self) -> Result<ManagedOutcome, Box<dyn std::error::Error>> {
         let outcome = (&mut self.completion).await;
         self.join_thread()?;
         Ok(outcome

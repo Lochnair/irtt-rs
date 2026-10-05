@@ -7,9 +7,8 @@ use std::{
 
 use irtt_client::{
     managed::{
-        ManagedClient, ManagedCommandApplyError, ManagedEndReason, ManagedEvent,
-        ManagedEventSubscription, ManagedEventTryRecvError, ManagedStatus, ManagedTargetConfig,
-        ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
+        ManagedClient, ManagedCommandApplyError, ManagedEndReason, ManagedEvent, ManagedStatus,
+        ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
     },
     ClientEvent,
 };
@@ -17,15 +16,15 @@ use irtt_client::{
 use super::{
     args::ClientArgs,
     output::{EventRenderStats, OutputConfig},
-    worker::ManagedWorker,
 };
 
 use crate::shared::client::{
     expected_probe_count, parse_stdin_target_set,
     session::{
-        peer_close_run_error, request_managed_stop_for_peer_close, request_managed_stop_once,
-        should_print_final_summary,
+        drain_final_events, peer_close_run_error, request_managed_stop_for_peer_close,
+        request_managed_stop_once, should_print_final_summary,
     },
+    worker::ManagedWorker,
     ManagedRunSetup, STDIN_MAX_DESIRED_TARGETS, STDIN_OUTCOME_HISTORY_LIMIT,
 };
 
@@ -624,23 +623,6 @@ fn process_event<W: Write>(
             report_target_failure(&outcome);
         }
         _ => {}
-    }
-    Ok(())
-}
-
-fn drain_final_events<E>(
-    events: &mut ManagedEventSubscription,
-    dropped_events: &mut u64,
-    mut process: impl FnMut(ManagedEvent) -> Result<(), E>,
-) -> Result<(), E> {
-    loop {
-        match events.try_recv() {
-            Ok(event) => process(event)?,
-            Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
-            Err(ManagedEventTryRecvError::Lagged(count)) => {
-                *dropped_events = dropped_events.saturating_add(count);
-            }
-        }
     }
     Ok(())
 }
