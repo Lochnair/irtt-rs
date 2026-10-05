@@ -31,21 +31,65 @@ a finite run:
 irtt-tui <server> --duration 30s
 ```
 
+## DASHBOARD
+
+One dashboard is used for every target count and terminal size. It shows:
+
+- Run status, elapsed time, and finite duration or continuous mode.
+- The selected target's label and remote address, plus latest signed
+  client-to-server and server-to-client delays (`-` means unavailable).
+- Target rows with latest effective RTT, cumulative loss percentage, jitter
+  (standard deviation of round-trip IPDV), and age of the last primary reply.
+- A graph overlaying all targets, with matching target colors and a visible
+  live/history indicator and window size.
+
+An active session with no primary replies shows `waiting`. Reply age makes a
+stale RTT distinguishable from a fresh measurement. Loss follows the shared
+statistics collector: outstanding sends can temporarily contribute to the
+cumulative loss estimate. Jitter is `-` until an IPDV pair is available.
+
+`Tab` / `Shift-Tab` selects a target, bringing its row into view when necessary.
+Up to six target rows are shown; smaller terminals show fewer. Selecting a target
+changes the identification, one-way summary and details; the graph continues to
+compare every target.
+
+`d` opens a details sheet in the graph's space. It contains the selected target's
+session and negotiation, packet counters, progress, latest timing sample, full
+timing statistics, warnings, and recent events from all targets. Scroll it with
+the arrows or page keys. Long lines and timing columns can be read with horizontal
+scrolling, including full labels and remote addresses that do not fit in the
+header. `d` or `Esc` returns to the graph, preserving its metric and viewport.
+The former large/compact Dashboard screens have been replaced by this sheet;
+`g` remains an alias for `d`.
+
+The minimum terminal size is 56 columns by 18 rows. Below that size the UI asks
+for a resize and continues acquiring measurements. Resize and important status
+redraws still work while the display is paused.
+
 ## CONTROLS
 
 | Key | Action |
 | --- | --- |
 | `q`, `Ctrl-C` | Quit |
-| `p` | Toggle display pause (probing continues; only redraws stop) |
-| `g` | Toggle Graph / Dashboard view |
-| `m` | Cycle graph metric |
-| `r` | Clear visible graph history |
-| `←` / `→` | Pan graph |
-| `PageUp` / `PageDown` | Page-pan graph |
-| `Home` / `End` | Jump to oldest / jump to live |
-| `+` / `=` | Zoom graph in |
-| `-` | Zoom graph out |
-| `0` | Reset graph window and zoom |
+| `p` | Toggle display pause (probing and acquisition continue) |
+| `Tab` / `Shift-Tab` | Select next / previous target |
+| `d`, `g` | Toggle target details |
+| `Esc` | Close target details |
+| `r` | Clear graph history for all targets; keep latest samples and statistics |
+| `m` | Cycle graph metric (graph visible) |
+| `←` / `→` | Pan graph; scroll columns in details |
+| `↑` / `↓` | Scroll details |
+| `PageUp` / `PageDown` | Page-pan graph; page-scroll details |
+| `Home` / `End` | Oldest / live graph; top / bottom of details |
+| `+` / `=` | Zoom graph in (graph visible) |
+| `-` | Zoom graph out (graph visible) |
+| `0` | Reset graph window and zoom, keeping live/history position (graph visible) |
+
+The six graph metrics are effective RTT, raw RTT, adjusted RTT,
+client-to-server delay, server-to-client delay, and server processing time.
+Signed effective/adjusted RTT and one-way values are preserved. Graph windows
+range from 5 seconds to one hour and default to one minute. The footer shows
+controls appropriate to the currently open graph or details sheet.
 
 ## RETAINED HISTORY
 
@@ -55,7 +99,7 @@ retention described in `irtt-client(1)`:
 - Up to 100,000 graph samples per target.
 - Up to 80 recent status/log messages.
 
-`r` clears the currently visible graph history and returns the viewport to
+`r` clears graph history for all targets and returns the viewport to
 live; it does not change the 100,000-sample cap itself. These are
 presentation bounds on top of the client's own statistics retention (see
 `irtt-client(1)` MEASUREMENTS AND MEMORY) — a long continuous TUI session's

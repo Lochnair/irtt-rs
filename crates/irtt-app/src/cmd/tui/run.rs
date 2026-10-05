@@ -17,11 +17,15 @@ use crate::{
         },
     },
 };
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    terminal,
+};
 use irtt_client::managed::{
     BlockingManagedClient, ManagedEndReason, ManagedEvent, ManagedEventSubscription,
     ManagedEventTryRecvError, TargetInstance,
 };
+use ratatui::layout::Rect;
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_WAIT_SLICE: Duration = Duration::from_millis(20);
@@ -218,8 +222,13 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
         if !event::poll(Duration::ZERO)? {
             break;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Resize(_, _) => {
+                force_render = true;
+                continue;
+            }
+            _ => continue,
         };
         if key.kind == KeyEventKind::Release {
             continue;
@@ -234,59 +243,10 @@ fn handle_input(state: &mut TuiState, shutdown_requested: &AtomicBool) -> io::Re
                 force_render = true;
                 break;
             }
-            KeyCode::Char('r') => {
-                state.clear_visible_history();
-                force_render = true;
+            _ => {
+                let (width, height) = terminal::size()?;
+                force_render |= state.handle_key(key.code, Rect::new(0, 0, width, height));
             }
-            KeyCode::Char('p') => {
-                state.toggle_pause();
-                force_render = true;
-            }
-            KeyCode::Char('g') => {
-                state.toggle_view();
-                force_render = true;
-            }
-            KeyCode::Char('m') => {
-                state.cycle_graph_metric();
-                force_render = true;
-            }
-            KeyCode::Left => {
-                state.pan_graph_left();
-                force_render = true;
-            }
-            KeyCode::Right => {
-                state.pan_graph_right();
-                force_render = true;
-            }
-            KeyCode::PageUp => {
-                state.pan_graph_page_left();
-                force_render = true;
-            }
-            KeyCode::PageDown => {
-                state.pan_graph_page_right();
-                force_render = true;
-            }
-            KeyCode::Home => {
-                state.jump_graph_oldest();
-                force_render = true;
-            }
-            KeyCode::End => {
-                state.jump_graph_live();
-                force_render = true;
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') => {
-                state.zoom_graph_in();
-                force_render = true;
-            }
-            KeyCode::Char('-') => {
-                state.zoom_graph_out();
-                force_render = true;
-            }
-            KeyCode::Char('0') => {
-                state.reset_graph_window();
-                force_render = true;
-            }
-            _ => {}
         }
     }
     Ok(force_render)
