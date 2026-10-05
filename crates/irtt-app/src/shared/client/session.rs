@@ -1,42 +1,20 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-
-#[cfg(any(feature = "client", feature = "tui"))]
 use irtt_client::managed::{ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError};
 
-#[cfg(any(feature = "client", feature = "tui"))]
-pub(crate) const MANAGED_EVENT_WORK_BUDGET: usize = 128;
-
-#[cfg(any(feature = "client", feature = "tui"))]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ManagedDrainState {
-    Empty,
-    Closed,
-    BudgetExhausted,
-}
-
-/// Drain a bounded amount of lossy presentation work before returning to the
-/// frontend control loop.
-#[cfg(any(feature = "client", feature = "tui"))]
-pub(crate) fn drain_managed_events<E>(
+pub(crate) fn drain_final_events<E>(
     events: &mut ManagedEventSubscription,
     dropped_events: &mut u64,
     mut process: impl FnMut(ManagedEvent) -> Result<(), E>,
-) -> Result<ManagedDrainState, E> {
-    for _ in 0..MANAGED_EVENT_WORK_BUDGET {
+) -> Result<(), E> {
+    loop {
         match events.try_recv() {
             Ok(event) => process(event)?,
+            Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
             Err(ManagedEventTryRecvError::Lagged(count)) => {
                 *dropped_events = dropped_events.saturating_add(count);
             }
-            Err(ManagedEventTryRecvError::Empty) => return Ok(ManagedDrainState::Empty),
-            Err(ManagedEventTryRecvError::Closed) => return Ok(ManagedDrainState::Closed),
         }
     }
-    Ok(ManagedDrainState::BudgetExhausted)
-}
-
-pub fn is_shutdown_requested(shutdown_requested: &AtomicBool) -> bool {
-    shutdown_requested.load(Ordering::Relaxed)
+    Ok(())
 }
 
 pub fn should_print_final_summary(continuous: bool, interrupted: bool) -> bool {

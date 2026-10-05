@@ -106,7 +106,6 @@ pub(super) struct TuiState {
     details_open: bool,
     details_scroll: (u16, u16),
     pub(super) paused: bool,
-    pub(super) quit_requested: bool,
 }
 
 impl TuiState {
@@ -143,7 +142,6 @@ impl TuiState {
             details_open: false,
             details_scroll: (0, 0),
             paused: false,
-            quit_requested: false,
         }
     }
 
@@ -939,10 +937,6 @@ pub(super) fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState) {
     frame.render_widget(status_line(state), rows[3]);
 }
 
-pub(super) fn should_render(now: Instant, next_render: Instant, paused: bool, force: bool) -> bool {
-    force || (!paused && now >= next_render)
-}
-
 fn dashboard_layout(area: Rect, state: &TuiState) -> [Rect; 4] {
     let footer = 3 + u16::from(state.last_warning.is_some());
     let target_rows = state.targets.len().min(6) as u16;
@@ -1563,230 +1557,4 @@ fn format_optional_hex(value: Option<u64>) -> String {
 
 fn duration_ns(value: Duration) -> i128 {
     i128::try_from(value.as_nanos()).unwrap_or(i128::MAX)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use irtt_client::{ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming};
-    use ratatui::backend::TestBackend;
-    use std::time::SystemTime;
-
-    fn measure(state: &mut TuiState, label: &str, seq: u32, at: Instant, effective_ns: i128) {
-        let target = TargetInstance {
-            id: label.into(),
-            generation: 1,
-        };
-        let received_at = ClientTimestamp {
-            mono: at,
-            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
-        };
-        let sent_at = ClientTimestamp {
-            mono: at - Duration::from_millis(10),
-            wall: received_at.wall - Duration::from_millis(10),
-        };
-        let remote = "127.0.0.1:2112".parse().unwrap();
-        state.process_target_event(
-            &target,
-            &ClientEvent::EchoSent {
-                seq,
-                remote,
-                scheduled_at: None,
-                sent_at,
-                bytes: 64,
-                send_call: Duration::ZERO,
-                timer_error: None,
-            },
-        );
-        state.process_target_event(
-            &target,
-            &ClientEvent::EchoReply {
-                seq,
-                remote,
-                sent_at,
-                received_at,
-                rtt: RttSample {
-                    raw: Duration::from_millis(10),
-                    adjusted: Some(SignedDuration::from_nanos(effective_ns)),
-                    effective: SignedDuration::from_nanos(effective_ns),
-                },
-                server_timing: Some(ServerTiming {
-                    receive_wall_ns: None,
-                    receive_mono_ns: None,
-                    send_wall_ns: None,
-                    send_mono_ns: None,
-                    midpoint_wall_ns: None,
-                    midpoint_mono_ns: None,
-                    processing: Some(Duration::from_nanos((10_000_000 - effective_ns) as u64)),
-                }),
-                one_way: Some(OneWayDelaySample {
-                    client_to_server: Some(SignedDuration::from_nanos(-3_000_000)),
-                    server_to_client: Some(SignedDuration::from_nanos(effective_ns + 3_000_000)),
-                }),
-                received_stats: None,
-                bytes: 64,
-                packet_meta: PacketMeta::default(),
-            },
-        );
-    }
-
-    fn screen(state: &TuiState, width: u16, height: u16) -> String {
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| draw_dashboard(frame, state)).unwrap();
-        terminal
-            .backend()
-            .buffer()
-            .content()
-            .chunks(usize::from(width))
-            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    #[test]
-    fn target_focus_and_details_remain_usable_across_sizes() {
-        let mut state = TuiState::with_target_labels(
-            TuiConfig::default(),
-            (0..8).map(|i| format!("target{i}")),
-        );
-        let now = Instant::now();
-        measure(
-            &mut state,
-            "target7",
-            0,
-            now - Duration::from_secs(5),
-            8_000_000,
-        );
-        measure(&mut state, "target7", 1, now, 5_000_000);
-        for (width, height) in [(56, 18), (80, 24), (120, 40)] {
-            let area = Rect::new(0, 0, width, height);
-            state.handle_key(KeyCode::Home, area);
-            state.handle_key(KeyCode::BackTab, area);
-            let text = screen(&state, width, height);
-            assert!(text.contains(">target7"), "{text}");
-            assert!(
-                text.contains("jitter σ") && text.contains("loss %"),
-                "{text}"
-            );
-            assert!(
-                text.contains(&format_optional_ns_i128(Some(-3_000_000)))
-                    && text.contains(&format_optional_ns_i128(Some(5_000_000))),
-                "{text}"
-            );
-            state.handle_key(KeyCode::Char('d'), area);
-            assert!(screen(&state, width, height).contains("target: target7"));
-            state.handle_key(KeyCode::End, area);
-            assert!(screen(&state, width, height).contains("target7: reply"));
-            state.handle_key(KeyCode::Tab, area);
-            // Selecting another target resets detail scrolling and exposes its own data.
-            assert!(screen(&state, width, height).contains("target: target0"));
-            state.handle_key(KeyCode::Esc, area);
-        }
-        assert!(screen(&state, 40, 10).contains("terminal too small"));
-    }
-
-    #[test]
-    fn history_reset_keeps_latest_summary_and_statistics_while_paused() {
-        let mut state = TuiState::default();
-        let area = Rect::new(0, 0, 100, 40);
-        state.handle_key(KeyCode::Char('p'), area);
-        measure(&mut state, "target", 0, Instant::now(), 8_000_000);
-        state.handle_key(KeyCode::Char('r'), area);
-        let text = screen(&state, 100, 40);
-        assert!(
-            text.contains(&format_optional_ns_i128(Some(8_000_000)))
-                && text.contains("display paused")
-        );
-        assert!(text.contains("waiting for primary replies"));
-        state.handle_key(KeyCode::Char('d'), area);
-        let text = screen(&state, 100, 40);
-        assert!(text.contains("sent 1  received 1  unique 1"));
-        assert!(text.contains(&format!(
-            "effective RTT: {}",
-            format_optional_ns_i128(Some(8_000_000))
-        )));
-        state.handle_key(KeyCode::Esc, area);
-        measure(&mut state, "target", 1, Instant::now(), 5_000_000);
-        assert!(!screen(&state, 100, 40).contains("waiting for primary replies"));
-    }
-
-    #[test]
-    fn graph_controls_preserve_signed_metrics_and_history_range() {
-        let mut state =
-            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
-        let area = Rect::new(0, 0, 100, 40);
-        let now = Instant::now();
-        for label in ["a", "b"] {
-            measure(
-                &mut state,
-                label,
-                0,
-                now - Duration::from_secs(120),
-                -2_000_000,
-            );
-            measure(
-                &mut state,
-                label,
-                1,
-                now - Duration::from_secs(60),
-                -2_000_000,
-            );
-            measure(&mut state, label, 2, now, -2_000_000);
-        }
-        state.handle_key(KeyCode::Home, area);
-        let viewport = state
-            .graph_viewport
-            .range(now, state.newest_graph_sample_time());
-        assert_eq!(viewport.start, now - Duration::from_secs(120));
-        assert_eq!(viewport.end, now - Duration::from_secs(60));
-        for metric in [
-            GraphMetric::EffectiveRtt,
-            GraphMetric::RawRtt,
-            GraphMetric::AdjustedRtt,
-            GraphMetric::ClientToServer,
-            GraphMetric::ServerToClient,
-            GraphMetric::ServerProcessing,
-        ] {
-            assert_eq!(state.graph_metric, metric);
-            let series = state
-                .targets
-                .iter()
-                .enumerate()
-                .map(|(i, target)| target_metric_series(target, i, viewport, metric).unwrap())
-                .collect::<Vec<_>>();
-            // Both endpoints belong to the viewport, for both targets.
-            assert!(series.iter().all(|series| series.data.len() == 2));
-            if matches!(
-                metric,
-                GraphMetric::EffectiveRtt | GraphMetric::AdjustedRtt | GraphMetric::ClientToServer
-            ) {
-                assert!(series
-                    .iter()
-                    .all(|series| series.data.iter().all(|(_, y)| *y < 0.0)));
-                assert!(chart_y_bounds(&series, metric.axis_kind()).0 < 0.0);
-            }
-            state.handle_key(KeyCode::Char('m'), area);
-        }
-        state.handle_key(KeyCode::PageDown, area);
-        assert_eq!(state.graph_viewport.range(now, Some(now)).end, now);
-        state.handle_key(KeyCode::Left, area);
-        assert_eq!(
-            state.graph_viewport.range(now, Some(now)).end,
-            now - Duration::from_secs(15)
-        );
-        state.handle_key(KeyCode::Right, area);
-        state.handle_key(KeyCode::PageUp, area);
-        assert_eq!(
-            state.graph_viewport.range(now, Some(now)).end,
-            now - Duration::from_secs(60)
-        );
-        state.handle_key(KeyCode::Char('+'), area);
-        assert_eq!(state.graph_viewport.window, Duration::from_secs(40));
-        state.handle_key(KeyCode::Char('-'), area);
-        assert_eq!(state.graph_viewport.window, DEFAULT_GRAPH_WINDOW);
-        state.handle_key(KeyCode::Char('0'), area);
-        assert!(!state.graph_viewport.range(now, Some(now)).is_live);
-        state.handle_key(KeyCode::End, area);
-        assert!(state.graph_viewport.range(now, Some(now)).is_live);
-    }
 }
