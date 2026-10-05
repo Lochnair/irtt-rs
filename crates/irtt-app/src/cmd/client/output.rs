@@ -9,6 +9,8 @@ use irtt_client::{
     ServerTiming, SignedDuration, WarningKind,
 };
 
+use irtt_stats::{EventStatsUpdate, IpdvPairUpdate};
+
 use super::args::{HeaderMode, OutputFormat};
 use crate::cmd::format::{format_duration, format_signed_duration, ABSENT};
 
@@ -94,7 +96,7 @@ impl OutputConfig {
         &self,
         event: &ClientEvent,
         target: Option<&str>,
-        stats: Option<&EventRenderStats>,
+        stats: Option<&EventStatsUpdate>,
     ) -> Option<String> {
         let row = OutputRow::from_event(event);
         if self.default_table_rows && row.is_default_table_hidden() {
@@ -133,10 +135,12 @@ impl OutputConfig {
         }
         writeln!(out).unwrap();
         writeln!(out, "Aliases:").unwrap();
-        writeln!(out, "  receive_delay, receive_delay_us").unwrap();
-        writeln!(out, "  send_delay, send_delay_us").unwrap();
-        writeln!(out, "  server_processing").unwrap();
-        writeln!(out, "  server_received_count, server_received_window").unwrap();
+        for column in ALL_COLUMNS {
+            let aliases = column.aliases();
+            if !aliases.is_empty() {
+                writeln!(out, "  {} ({})", aliases.join(", "), column.name()).unwrap();
+            }
+        }
         writeln!(out).unwrap();
         writeln!(out, "Special column sets:").unwrap();
         writeln!(
@@ -149,45 +153,9 @@ impl OutputConfig {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct EventRenderStats {
-    pub contributed_sample: bool,
-    pub ipdv_pairs: Vec<IpdvPair>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct IpdvPair {
-    pub previous_seq: u32,
-    pub current_seq: u32,
-    pub rtt_ipdv: Duration,
-    pub send_ipdv: Option<Duration>,
-    pub receive_ipdv: Option<Duration>,
-}
-
-impl From<irtt_stats::EventStatsUpdate> for EventRenderStats {
-    fn from(value: irtt_stats::EventStatsUpdate) -> Self {
-        Self {
-            contributed_sample: value.contributed_sample,
-            ipdv_pairs: value.ipdv_pairs.into_iter().map(Into::into).collect(),
-        }
-    }
-}
-
-impl From<irtt_stats::IpdvPairUpdate> for IpdvPair {
-    fn from(value: irtt_stats::IpdvPairUpdate) -> Self {
-        Self {
-            previous_seq: value.previous_seq,
-            current_seq: value.current_seq,
-            rtt_ipdv: value.rtt_ipdv,
-            send_ipdv: value.send_ipdv,
-            receive_ipdv: value.receive_ipdv,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct RenderContext<'a> {
-    stats: Option<&'a EventRenderStats>,
+    stats: Option<&'a EventStatsUpdate>,
     target: Option<&'a str>,
     verbose: bool,
 }
@@ -368,6 +336,106 @@ impl OutputRow {
             _ => None,
         }
     }
+
+    fn seq(&self) -> Option<u32> {
+        match self {
+            Self::EchoSent { seq, .. } | Self::Loss { seq, .. } | Self::Duplicate { seq, .. } => {
+                Some(*seq)
+            }
+            Self::EchoReply(reply) | Self::Late { reply, .. } => Some(reply.seq),
+            _ => None,
+        }
+    }
+
+    fn remote(&self) -> Option<SocketAddr> {
+        match self {
+            Self::SessionStarted(row) | Self::NoTestCompleted(row) => Some(row.remote),
+            Self::SessionClosed { remote, .. }
+            | Self::EchoSent { remote, .. }
+            | Self::Duplicate { remote, .. } => Some(*remote),
+            Self::EchoReply(reply) | Self::Late { reply, .. } => Some(reply.remote),
+            _ => None,
+        }
+    }
+
+    fn token(&self) -> Option<u64> {
+        match self {
+            Self::SessionStarted(row) | Self::NoTestCompleted(row) => row.token,
+            Self::SessionClosed { token, .. } => Some(*token),
+            _ => None,
+        }
+    }
+
+    fn bytes(&self) -> Option<usize> {
+        match self {
+            Self::EchoSent { bytes, .. } | Self::Duplicate { bytes, .. } => Some(*bytes),
+            Self::EchoReply(reply) | Self::Late { reply, .. } => Some(reply.bytes),
+            _ => None,
+        }
+    }
+
+    fn message(&self, context: RenderContext<'_>) -> Option<String> {
+        match self {
+            Self::SessionStarted(row) => Some(format!(
+                "token={:#x} duration_ns={} interval_ns={} length={}",
+                row.token?, row.duration_ns, row.interval_ns, row.payload_length
+            )),
+            Self::NoTestCompleted(row) => Some(format!(
+                "duration_ns={} interval_ns={} length={}",
+                row.duration_ns, row.interval_ns, row.payload_length
+            )),
+            Self::SessionClosed { token, .. } => Some(format!("token={token:#x}")),
+            Self::Late { highest_seen, .. } => Some(format!("highest_seen={highest_seen}")),
+            Self::Warning { message, .. } => Some(message.clone()),
+            Self::Loss { .. } => Some("timeout".to_owned()),
+            Self::Duplicate { .. } if context.verbose => Some("duplicate reply".to_owned()),
+            _ => None,
+        }
+    }
+
+    fn event_wall(&self) -> Option<SystemTime> {
+        match self {
+            Self::SessionStarted(row) | Self::NoTestCompleted(row) => Some(row.event_wall),
+            Self::SessionClosed { event_wall, .. } | Self::Warning { event_wall, .. } => {
+                Some(*event_wall)
+            }
+            Self::EchoSent {
+                client_send_wall, ..
+            }
+            | Self::Loss {
+                client_send_wall, ..
+            } => Some(*client_send_wall),
+            Self::Duplicate {
+                client_receive_wall,
+                ..
+            } => Some(*client_receive_wall),
+            Self::EchoReply(reply) | Self::Late { reply, .. } => Some(reply.client_receive_wall),
+        }
+    }
+
+    fn client_send_wall(&self) -> Option<SystemTime> {
+        match self {
+            Self::EchoSent {
+                client_send_wall, ..
+            }
+            | Self::Loss {
+                client_send_wall, ..
+            } => Some(*client_send_wall),
+            Self::EchoReply(reply) | Self::Late { reply, .. } => reply.client_send_wall,
+            _ => None,
+        }
+    }
+
+    fn client_receive_wall(&self) -> Option<SystemTime> {
+        match self {
+            Self::Duplicate {
+                client_receive_wall,
+                ..
+            } => Some(*client_receive_wall),
+            Self::EchoReply(reply) | Self::Late { reply, .. } => Some(reply.client_receive_wall),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -415,274 +483,91 @@ struct ReplyRow {
     packet_meta: PacketMeta,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Column {
-    Target,
-    Event,
-    Seq,
-    Remote,
-    Token,
-    Rtt,
-    RttUs,
-    RawRttUs,
-    EffectiveRttUs,
-    AdjustedRttUs,
-    ReceiveDelay,
-    ReceiveDelayUs,
-    SendDelay,
-    SendDelayUs,
-    Ipdv,
-    IpdvUs,
-    ServerProcessing,
-    ServerProcessingUs,
-    Bytes,
-    SendCallUs,
-    TimerErrorUs,
-    HighestSeen,
-    ServerReceivedCount,
-    ServerReceivedWindow,
-    Dscp,
-    Ecn,
-    TrafficClass,
-    KernelRxNs,
-    WarningKind,
-    Message,
-    EventWallNs,
-    ClientSendWallNs,
-    ClientReceiveWallNs,
-    DurationNs,
-    IntervalNs,
-    PayloadLength,
-    ServerReceiveWallNs,
-    ServerReceiveMonoNs,
-    ServerSendWallNs,
-    ServerSendMonoNs,
-    ServerMidpointWallNs,
-    ServerMidpointMonoNs,
+// Only schema metadata is generated here; cell_for keeps rendering behavior explicit.
+macro_rules! columns {
+    ($($variant:ident($name:literal, [$($alias:literal),*], $width:expr, $align:ident, $description:literal);)*) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        enum Column { $($variant),* }
+
+        const ALL_COLUMNS: &[Column] = &[$(Column::$variant),*];
+
+        impl Column {
+            fn name(self) -> &'static str {
+                match self { $(Self::$variant => $name),* }
+            }
+
+            fn parse(input: &str) -> Option<Self> {
+                match input {
+                    $($name $(| $alias)* => Some(Self::$variant),)*
+                    _ => None,
+                }
+            }
+
+            fn aliases(self) -> &'static [&'static str] {
+                match self { $(Self::$variant => &[$($alias),*]),* }
+            }
+
+            fn description(self) -> &'static str {
+                match self { $(Self::$variant => $description),* }
+            }
+
+            fn table_width(self) -> usize {
+                match self { $(Self::$variant => $width),* }
+            }
+
+            fn align_right(self) -> bool {
+                match self { $(Self::$variant => columns!(@align $align)),* }
+            }
+        }
+    };
+    (@align left) => { false };
+    (@align right) => { true };
 }
 
-const ALL_COLUMNS: &[Column] = &[
-    Column::Target,
-    Column::Event,
-    Column::Seq,
-    Column::Remote,
-    Column::Token,
-    Column::Rtt,
-    Column::RttUs,
-    Column::RawRttUs,
-    Column::EffectiveRttUs,
-    Column::AdjustedRttUs,
-    Column::ReceiveDelay,
-    Column::ReceiveDelayUs,
-    Column::SendDelay,
-    Column::SendDelayUs,
-    Column::Ipdv,
-    Column::IpdvUs,
-    Column::ServerProcessing,
-    Column::ServerProcessingUs,
-    Column::Bytes,
-    Column::SendCallUs,
-    Column::TimerErrorUs,
-    Column::HighestSeen,
-    Column::ServerReceivedCount,
-    Column::ServerReceivedWindow,
-    Column::Dscp,
-    Column::Ecn,
-    Column::TrafficClass,
-    Column::KernelRxNs,
-    Column::WarningKind,
-    Column::Message,
-    Column::EventWallNs,
-    Column::ClientSendWallNs,
-    Column::ClientReceiveWallNs,
-    Column::DurationNs,
-    Column::IntervalNs,
-    Column::PayloadLength,
-    Column::ServerReceiveWallNs,
-    Column::ServerReceiveMonoNs,
-    Column::ServerSendWallNs,
-    Column::ServerSendMonoNs,
-    Column::ServerMidpointWallNs,
-    Column::ServerMidpointMonoNs,
-];
-
-impl Column {
-    fn name(self) -> &'static str {
-        match self {
-            Self::Target => "target",
-            Self::Event => "event",
-            Self::Seq => "seq",
-            Self::Remote => "remote",
-            Self::Token => "token",
-            Self::Rtt => "rtt",
-            Self::RttUs => "rtt_us",
-            Self::RawRttUs => "raw_rtt_us",
-            Self::EffectiveRttUs => "effective_rtt_us",
-            Self::AdjustedRttUs => "adjusted_rtt_us",
-            Self::ReceiveDelay => "rd",
-            Self::ReceiveDelayUs => "rd_us",
-            Self::SendDelay => "sd",
-            Self::SendDelayUs => "sd_us",
-            Self::Ipdv => "ipdv",
-            Self::IpdvUs => "ipdv_us",
-            Self::ServerProcessing => "proc",
-            Self::ServerProcessingUs => "server_processing_us",
-            Self::Bytes => "bytes",
-            Self::SendCallUs => "send_call_us",
-            Self::TimerErrorUs => "timer_error_us",
-            Self::HighestSeen => "highest_seen",
-            Self::ServerReceivedCount => "server_received",
-            Self::ServerReceivedWindow => "server_window",
-            Self::Dscp => "dscp",
-            Self::Ecn => "ecn",
-            Self::TrafficClass => "traffic_class",
-            Self::KernelRxNs => "kernel_rx_ns",
-            Self::WarningKind => "warning_kind",
-            Self::Message => "message",
-            Self::EventWallNs => "event_wall_ns",
-            Self::ClientSendWallNs => "client_send_wall_ns",
-            Self::ClientReceiveWallNs => "client_receive_wall_ns",
-            Self::DurationNs => "duration_ns",
-            Self::IntervalNs => "interval_ns",
-            Self::PayloadLength => "payload_length",
-            Self::ServerReceiveWallNs => "server_receive_wall_ns",
-            Self::ServerReceiveMonoNs => "server_receive_mono_ns",
-            Self::ServerSendWallNs => "server_send_wall_ns",
-            Self::ServerSendMonoNs => "server_send_mono_ns",
-            Self::ServerMidpointWallNs => "server_midpoint_wall_ns",
-            Self::ServerMidpointMonoNs => "server_midpoint_mono_ns",
-        }
-    }
-
-    fn parse(input: &str) -> Option<Self> {
-        Some(match input {
-            "target" => Self::Target,
-            "event" => Self::Event,
-            "seq" => Self::Seq,
-            "remote" => Self::Remote,
-            "token" => Self::Token,
-            "rtt" => Self::Rtt,
-            "rtt_us" => Self::RttUs,
-            "raw_rtt_us" => Self::RawRttUs,
-            "effective_rtt_us" => Self::EffectiveRttUs,
-            "adjusted_rtt_us" => Self::AdjustedRttUs,
-            "rd" | "receive_delay" => Self::ReceiveDelay,
-            "rd_us" | "receive_delay_us" => Self::ReceiveDelayUs,
-            "sd" | "send_delay" => Self::SendDelay,
-            "sd_us" | "send_delay_us" => Self::SendDelayUs,
-            "ipdv" => Self::Ipdv,
-            "ipdv_us" => Self::IpdvUs,
-            "proc" | "server_processing" => Self::ServerProcessing,
-            "server_processing_us" => Self::ServerProcessingUs,
-            "bytes" => Self::Bytes,
-            "send_call_us" => Self::SendCallUs,
-            "timer_error_us" => Self::TimerErrorUs,
-            "highest_seen" => Self::HighestSeen,
-            "server_received" | "server_received_count" => Self::ServerReceivedCount,
-            "server_window" | "server_received_window" => Self::ServerReceivedWindow,
-            "dscp" => Self::Dscp,
-            "ecn" => Self::Ecn,
-            "traffic_class" => Self::TrafficClass,
-            "kernel_rx_ns" => Self::KernelRxNs,
-            "warning_kind" => Self::WarningKind,
-            "message" => Self::Message,
-            "event_wall_ns" => Self::EventWallNs,
-            "client_send_wall_ns" => Self::ClientSendWallNs,
-            "client_receive_wall_ns" => Self::ClientReceiveWallNs,
-            "duration_ns" => Self::DurationNs,
-            "interval_ns" => Self::IntervalNs,
-            "payload_length" => Self::PayloadLength,
-            "server_receive_wall_ns" => Self::ServerReceiveWallNs,
-            "server_receive_mono_ns" => Self::ServerReceiveMonoNs,
-            "server_send_wall_ns" => Self::ServerSendWallNs,
-            "server_send_mono_ns" => Self::ServerSendMonoNs,
-            "server_midpoint_wall_ns" => Self::ServerMidpointWallNs,
-            "server_midpoint_mono_ns" => Self::ServerMidpointMonoNs,
-            _ => return None,
-        })
-    }
-
-    fn description(self) -> &'static str {
-        match self {
-            Self::Target => "logical CLI target label",
-            Self::Event => "event kind",
-            Self::Seq => "probe sequence number",
-            Self::Remote => "remote socket address",
-            Self::Token => "session token as hexadecimal",
-            Self::Rtt => "human-readable effective RTT",
-            Self::RttUs => "effective RTT in signed microseconds",
-            Self::RawRttUs => "raw client send-to-receive RTT in microseconds",
-            Self::EffectiveRttUs => "effective RTT in signed microseconds",
-            Self::AdjustedRttUs => "adjusted RTT in signed microseconds",
-            Self::ReceiveDelay => "human-readable server-to-client delay",
-            Self::ReceiveDelayUs => "server-to-client delay in signed microseconds",
-            Self::SendDelay => "human-readable client-to-server delay",
-            Self::SendDelayUs => "client-to-server delay in signed microseconds",
-            Self::Ipdv => "human-readable round-trip IPDV for adjacent samples",
-            Self::IpdvUs => "round-trip IPDV in microseconds",
-            Self::ServerProcessing => "human-readable server processing time",
-            Self::ServerProcessingUs => "server processing time in microseconds",
-            Self::Bytes => "packet bytes for packet events",
-            Self::SendCallUs => "send system call duration in microseconds",
-            Self::TimerErrorUs => "scheduled-vs-actual send timer error in microseconds",
-            Self::HighestSeen => "highest sequence seen when a late reply arrived",
-            Self::ServerReceivedCount => "server-reported received packet count",
-            Self::ServerReceivedWindow => "server-reported received window as hexadecimal",
-            Self::Dscp => "received packet DSCP codepoint",
-            Self::Ecn => "received packet ECN bits",
-            Self::TrafficClass => "received packet traffic class byte",
-            Self::KernelRxNs => "kernel receive timestamp as Unix nanoseconds",
-            Self::WarningKind => "warning classifier",
-            Self::Message => "warning or lifecycle message",
-            Self::EventWallNs => "event wall timestamp as Unix nanoseconds",
-            Self::ClientSendWallNs => "client send wall timestamp as Unix nanoseconds",
-            Self::ClientReceiveWallNs => "client receive wall timestamp as Unix nanoseconds",
-            Self::DurationNs => "negotiated test duration in nanoseconds",
-            Self::IntervalNs => "negotiated probe interval in nanoseconds",
-            Self::PayloadLength => "negotiated payload length",
-            Self::ServerReceiveWallNs => "server receive wall timestamp in nanoseconds",
-            Self::ServerReceiveMonoNs => "server receive monotonic timestamp in nanoseconds",
-            Self::ServerSendWallNs => "server send wall timestamp in nanoseconds",
-            Self::ServerSendMonoNs => "server send monotonic timestamp in nanoseconds",
-            Self::ServerMidpointWallNs => "server midpoint wall timestamp in nanoseconds",
-            Self::ServerMidpointMonoNs => "server midpoint monotonic timestamp in nanoseconds",
-        }
-    }
-
-    fn table_width(self) -> usize {
-        match self {
-            Self::Target => 18,
-            Self::Event => 17,
-            Self::Seq => 6,
-            Self::Remote => 21,
-            Self::Token => 18,
-            Self::Rtt
-            | Self::ReceiveDelay
-            | Self::SendDelay
-            | Self::Ipdv
-            | Self::ServerProcessing => 9,
-            Self::Message => 24,
-            Self::WarningKind => 28,
-            Self::ServerReceivedWindow => 13,
-            Self::ServerReceivedCount | Self::HighestSeen => 15,
-            Self::Dscp | Self::Ecn => 4,
-            Self::TrafficClass => 13,
-            _ => self.name().len().max(10),
-        }
-    }
-
-    fn align_right(self) -> bool {
-        !matches!(
-            self,
-            Self::Target
-                | Self::Event
-                | Self::Remote
-                | Self::Token
-                | Self::Message
-                | Self::WarningKind
-                | Self::ServerReceivedWindow
-        )
-    }
+// Variant(canonical name, aliases, table width, alignment, description).
+columns! {
+    Target("target", [], 18, left, "logical CLI target label");
+    Event("event", [], 17, left, "event kind");
+    Seq("seq", [], 6, right, "probe sequence number");
+    Remote("remote", [], 21, left, "remote socket address");
+    Token("token", [], 18, left, "session token as hexadecimal");
+    Rtt("rtt", [], 9, right, "human-readable effective RTT");
+    RttUs("rtt_us", [], 10, right, "effective RTT in signed microseconds");
+    RawRttUs("raw_rtt_us", [], 10, right, "raw client send-to-receive RTT in microseconds");
+    EffectiveRttUs("effective_rtt_us", [], 16, right, "effective RTT in signed microseconds");
+    AdjustedRttUs("adjusted_rtt_us", [], 15, right, "adjusted RTT in signed microseconds");
+    ReceiveDelay("rd", ["receive_delay"], 9, right, "human-readable server-to-client delay");
+    ReceiveDelayUs("rd_us", ["receive_delay_us"], 10, right, "server-to-client delay in signed microseconds");
+    SendDelay("sd", ["send_delay"], 9, right, "human-readable client-to-server delay");
+    SendDelayUs("sd_us", ["send_delay_us"], 10, right, "client-to-server delay in signed microseconds");
+    Ipdv("ipdv", [], 9, right, "human-readable round-trip IPDV for adjacent samples");
+    IpdvUs("ipdv_us", [], 10, right, "round-trip IPDV in microseconds");
+    ServerProcessing("proc", ["server_processing"], 9, right, "human-readable server processing time");
+    ServerProcessingUs("server_processing_us", [], 20, right, "server processing time in microseconds");
+    Bytes("bytes", [], 10, right, "packet bytes for packet events");
+    SendCallUs("send_call_us", [], 12, right, "send system call duration in microseconds");
+    TimerErrorUs("timer_error_us", [], 14, right, "scheduled-vs-actual send timer error in microseconds");
+    HighestSeen("highest_seen", [], 15, right, "highest sequence seen when a late reply arrived");
+    ServerReceivedCount("server_received", ["server_received_count"], 15, right, "server-reported received packet count");
+    ServerReceivedWindow("server_window", ["server_received_window"], 13, left, "server-reported received window as hexadecimal");
+    Dscp("dscp", [], 4, right, "received packet DSCP codepoint");
+    Ecn("ecn", [], 4, right, "received packet ECN bits");
+    TrafficClass("traffic_class", [], 13, right, "received packet traffic class byte");
+    KernelRxNs("kernel_rx_ns", [], 12, right, "kernel receive timestamp as Unix nanoseconds");
+    WarningKind("warning_kind", [], 28, left, "warning classifier");
+    Message("message", [], 24, left, "warning or lifecycle message");
+    EventWallNs("event_wall_ns", [], 13, right, "event wall timestamp as Unix nanoseconds");
+    ClientSendWallNs("client_send_wall_ns", [], 19, right, "client send wall timestamp as Unix nanoseconds");
+    ClientReceiveWallNs("client_receive_wall_ns", [], 22, right, "client receive wall timestamp as Unix nanoseconds");
+    DurationNs("duration_ns", [], 11, right, "negotiated test duration in nanoseconds");
+    IntervalNs("interval_ns", [], 11, right, "negotiated probe interval in nanoseconds");
+    PayloadLength("payload_length", [], 14, right, "negotiated payload length");
+    ServerReceiveWallNs("server_receive_wall_ns", [], 22, right, "server receive wall timestamp in nanoseconds");
+    ServerReceiveMonoNs("server_receive_mono_ns", [], 22, right, "server receive monotonic timestamp in nanoseconds");
+    ServerSendWallNs("server_send_wall_ns", [], 19, right, "server send wall timestamp in nanoseconds");
+    ServerSendMonoNs("server_send_mono_ns", [], 19, right, "server send monotonic timestamp in nanoseconds");
+    ServerMidpointWallNs("server_midpoint_wall_ns", [], 23, right, "server midpoint wall timestamp in nanoseconds");
+    ServerMidpointMonoNs("server_midpoint_mono_ns", [], 23, right, "server midpoint monotonic timestamp in nanoseconds");
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -890,9 +775,11 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
     match column {
         Column::Target => context.target.map(CellValue::text),
         Column::Event => Some(CellValue::text(row.event_name())),
-        Column::Seq => row_seq(row).map(|seq| CellValue::Unsigned(u128::from(seq))),
-        Column::Remote => row_remote(row).map(|remote| CellValue::text(remote.to_string())),
-        Column::Token => row_token(row).map(|token| CellValue::Hex(u128::from(token))),
+        Column::Seq => row.seq().map(|seq| CellValue::Unsigned(u128::from(seq))),
+        Column::Remote => row
+            .remote()
+            .map(|remote| CellValue::text(remote.to_string())),
+        Column::Token => row.token().map(|token| CellValue::Hex(u128::from(token))),
         Column::Rtt => row.reply().and_then(|reply| {
             reply
                 .rtt
@@ -930,10 +817,12 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
             .reply()
             .and_then(|reply| reply.one_way.and_then(|one_way| one_way.client_to_server))
             .map(|value| CellValue::Integer(signed_duration_us(value))),
-        Column::Ipdv => row_seq(row)
+        Column::Ipdv => row
+            .seq()
             .and_then(|seq| ipdv_pair(context.stats, seq))
             .map(|pair| CellValue::text(format_duration(pair.rtt_ipdv))),
-        Column::IpdvUs => row_seq(row)
+        Column::IpdvUs => row
+            .seq()
             .and_then(|seq| ipdv_pair(context.stats, seq))
             .map(|pair| CellValue::Unsigned(duration_us(pair.rtt_ipdv))),
         Column::ServerProcessing => row
@@ -944,7 +833,7 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
             .reply()
             .and_then(|reply| reply.server_timing.and_then(|timing| timing.processing))
             .map(|value| CellValue::Unsigned(duration_us(value))),
-        Column::Bytes => row_bytes(row).map(|bytes| CellValue::Unsigned(bytes as u128)),
+        Column::Bytes => row.bytes().map(|bytes| CellValue::Unsigned(bytes as u128)),
         Column::SendCallUs => match row {
             OutputRow::EchoSent { send_call, .. } => {
                 Some(CellValue::Unsigned(duration_us(*send_call)))
@@ -992,14 +881,17 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
             OutputRow::Warning { kind, .. } => Some(CellValue::text(warning_kind(*kind))),
             _ => None,
         },
-        Column::Message => row_message(row, context).map(CellValue::text),
-        Column::EventWallNs => row_event_wall(row)
+        Column::Message => row.message(context).map(CellValue::text),
+        Column::EventWallNs => row
+            .event_wall()
             .and_then(wall_time_ns)
             .map(CellValue::Unsigned),
-        Column::ClientSendWallNs => row_client_send_wall(row)
+        Column::ClientSendWallNs => row
+            .client_send_wall()
             .and_then(wall_time_ns)
             .map(CellValue::Unsigned),
-        Column::ClientReceiveWallNs => row_client_receive_wall(row)
+        Column::ClientReceiveWallNs => row
+            .client_receive_wall()
             .and_then(wall_time_ns)
             .map(CellValue::Unsigned),
         Column::DurationNs => match row {
@@ -1029,110 +921,6 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
     }
 }
 
-fn row_seq(row: &OutputRow) -> Option<u32> {
-    match row {
-        OutputRow::EchoSent { seq, .. }
-        | OutputRow::Loss { seq, .. }
-        | OutputRow::Duplicate { seq, .. } => Some(*seq),
-        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => Some(reply.seq),
-        _ => None,
-    }
-}
-
-fn row_remote(row: &OutputRow) -> Option<SocketAddr> {
-    match row {
-        OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => Some(row.remote),
-        OutputRow::SessionClosed { remote, .. }
-        | OutputRow::EchoSent { remote, .. }
-        | OutputRow::Duplicate { remote, .. } => Some(*remote),
-        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => Some(reply.remote),
-        _ => None,
-    }
-}
-
-fn row_token(row: &OutputRow) -> Option<u64> {
-    match row {
-        OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => row.token,
-        OutputRow::SessionClosed { token, .. } => Some(*token),
-        _ => None,
-    }
-}
-
-fn row_bytes(row: &OutputRow) -> Option<usize> {
-    match row {
-        OutputRow::EchoSent { bytes, .. } | OutputRow::Duplicate { bytes, .. } => Some(*bytes),
-        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => Some(reply.bytes),
-        _ => None,
-    }
-}
-
-fn row_message(row: &OutputRow, context: RenderContext<'_>) -> Option<String> {
-    match row {
-        OutputRow::SessionStarted(row) => Some(format!(
-            "token={:#x} duration_ns={} interval_ns={} length={}",
-            row.token?, row.duration_ns, row.interval_ns, row.payload_length
-        )),
-        OutputRow::NoTestCompleted(row) => Some(format!(
-            "duration_ns={} interval_ns={} length={}",
-            row.duration_ns, row.interval_ns, row.payload_length
-        )),
-        OutputRow::SessionClosed { token, .. } => Some(format!("token={token:#x}")),
-        OutputRow::Late { highest_seen, .. } => Some(format!("highest_seen={highest_seen}")),
-        OutputRow::Warning { message, .. } => Some(message.clone()),
-        OutputRow::Loss { .. } => Some("timeout".to_owned()),
-        OutputRow::Duplicate { .. } if context.verbose => Some("duplicate reply".to_owned()),
-        _ => None,
-    }
-}
-
-fn row_event_wall(row: &OutputRow) -> Option<SystemTime> {
-    match row {
-        OutputRow::SessionStarted(row) | OutputRow::NoTestCompleted(row) => Some(row.event_wall),
-        OutputRow::SessionClosed { event_wall, .. } | OutputRow::Warning { event_wall, .. } => {
-            Some(*event_wall)
-        }
-        OutputRow::EchoSent {
-            client_send_wall, ..
-        }
-        | OutputRow::Loss {
-            client_send_wall, ..
-        } => Some(*client_send_wall),
-        OutputRow::Duplicate {
-            client_receive_wall,
-            ..
-        } => Some(*client_receive_wall),
-        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => {
-            Some(reply.client_receive_wall)
-        }
-    }
-}
-
-fn row_client_send_wall(row: &OutputRow) -> Option<SystemTime> {
-    match row {
-        OutputRow::EchoSent {
-            client_send_wall, ..
-        }
-        | OutputRow::Loss {
-            client_send_wall, ..
-        } => Some(*client_send_wall),
-        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => reply.client_send_wall,
-        _ => None,
-    }
-}
-
-fn row_client_receive_wall(row: &OutputRow) -> Option<SystemTime> {
-    match row {
-        OutputRow::Duplicate {
-            client_receive_wall,
-            ..
-        } => Some(*client_receive_wall),
-        OutputRow::EchoReply(reply) | OutputRow::Late { reply, .. } => {
-            Some(reply.client_receive_wall)
-        }
-        _ => None,
-    }
-}
-
 fn server_timing_i64(
     row: &OutputRow,
     select: impl FnOnce(ServerTiming) -> Option<i64>,
@@ -1143,7 +931,7 @@ fn server_timing_i64(
         .map(|value| CellValue::Integer(i128::from(value)))
 }
 
-fn ipdv_pair(stats: Option<&EventRenderStats>, seq: u32) -> Option<&IpdvPair> {
+fn ipdv_pair(stats: Option<&EventStatsUpdate>, seq: u32) -> Option<&IpdvPairUpdate> {
     let stats = stats?;
     stats
         .ipdv_pairs
