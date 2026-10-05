@@ -13,10 +13,7 @@ use irtt_client::{
     ClientEvent,
 };
 
-use super::{
-    args::ClientArgs,
-    output::{EventRenderStats, OutputConfig},
-};
+use super::{args::ClientArgs, output::OutputConfig};
 
 use crate::shared::client::{
     expected_probe_count, parse_stdin_target_set,
@@ -28,7 +25,7 @@ use crate::shared::client::{
     ManagedRunSetup, STDIN_MAX_DESIRED_TARGETS, STDIN_OUTCOME_HISTORY_LIMIT,
 };
 
-use irtt_stats::{StatsCollector, StatsConfig};
+use irtt_stats::{EventStatsUpdate, StatsCollector, StatsConfig};
 
 const MIB: u64 = 1024 * 1024;
 
@@ -373,12 +370,8 @@ fn process_stdin_event<W: Write>(
             let collector = stats
                 .entry(target.clone())
                 .or_insert_with(|| StatsCollector::new(stats_config(true)));
-            print_events_with_stats(
-                stream_output,
-                std::slice::from_ref(&event),
-                Some(target.id.as_str()),
-                collector,
-            )?;
+            let update = collector.process(&event);
+            stream_output.print_event(&event, Some(target.id.as_str()), &update)?;
         }
         ManagedEvent::TargetFinished { outcome }
             if terminal_targets.insert(outcome.target.clone()) =>
@@ -611,12 +604,8 @@ fn process_event<W: Write>(
             let collector = stats
                 .entry(target.id.as_str().to_owned())
                 .or_insert_with(|| StatsCollector::new(stats_config(false)));
-            print_events_with_stats(
-                stream_output,
-                std::slice::from_ref(&event),
-                Some(target.id.as_str()),
-                collector,
-            )?;
+            let update = collector.process(&event);
+            stream_output.print_event(&event, Some(target.id.as_str()), &update)?;
         }
         ManagedEvent::TargetFinished { outcome } => {
             terminal_targets.insert(outcome.target.clone());
@@ -661,17 +650,15 @@ struct StreamOutput<'a, W: Write> {
     out: &'a mut W,
 }
 impl<W: Write> StreamOutput<'_, W> {
-    fn print_events(
+    fn print_event(
         &mut self,
-        events: &[ClientEvent],
+        event: &ClientEvent,
         target: Option<&str>,
-        stats_updates: &[EventRenderStats],
+        update: &EventStatsUpdate,
     ) -> io::Result<()> {
         self.print_header()?;
-        for (event, stats_update) in events.iter().zip(stats_updates) {
-            if let Some(line) = self.config.render_event(event, target, Some(stats_update)) {
-                writeln!(self.out, "{line}")?;
-            }
+        if let Some(line) = self.config.render_event(event, target, Some(update)) {
+            writeln!(self.out, "{line}")?;
         }
         Ok(())
     }
@@ -702,19 +689,6 @@ impl<W: Write> StreamOutput<'_, W> {
         }
         Ok(())
     }
-}
-
-fn print_events_with_stats<W: Write>(
-    stream_output: &mut StreamOutput<'_, W>,
-    events: &[ClientEvent],
-    target: Option<&str>,
-    stats: &mut StatsCollector,
-) -> io::Result<()> {
-    let updates = events
-        .iter()
-        .map(|event| EventRenderStats::from(stats.process(event)))
-        .collect::<Vec<_>>();
-    stream_output.print_events(events, target, &updates)
 }
 
 fn stats_config(continuous: bool) -> StatsConfig {
