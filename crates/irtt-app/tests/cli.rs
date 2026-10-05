@@ -442,7 +442,7 @@ fn targets_stdin_supersedes_the_active_set_and_stops_on_eof() {
     let mut stdin = client.0.stdin.take().unwrap();
     let mut rows = Vec::new();
     for target in ["first", "second"] {
-        writeln!(stdin, "{target}={}", server.addr).unwrap();
+        write!(stdin, "\r\n{target}={}\r\n", server.addr).unwrap();
         stdin.flush().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -484,4 +484,47 @@ fn targets_stdin_supersedes_the_active_set_and_stops_on_eof() {
         .iter()
         .any(|row| row.contains("\"target\":\"second\"")
             && row.contains("\"event\":\"session_closed\"")));
+}
+
+// Record bounds and decoding errors must terminate the real stdin frontend,
+// even when no managed events are available to wake it.
+#[cfg(feature = "client")]
+#[test]
+fn targets_stdin_invalid_records_are_fatal_and_empty_eof_is_normal() {
+    use std::{
+        io::{Read, Write},
+        process::Stdio,
+    };
+    for (record, success, diagnostic) in [
+        (Vec::new(), true, ""),
+        (b"\r\n\n".to_vec(), true, ""),
+        (b"\n=127.0.0.1:9\n".to_vec(), false, "line 2"),
+        (vec![0xff, b'\n'], false, "line 1"),
+        (vec![b'x'; 64 * 1024 + 2], false, "line 1"),
+    ] {
+        let mut client = ClientProcess(
+            Command::new(env!("CARGO_BIN_EXE_irtt-client"))
+                .env_clear()
+                .args(["--duration", "0", "--targets-stdin"])
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap(),
+        );
+        let mut stdin = client.0.stdin.take().unwrap();
+        stdin.write_all(&record).unwrap();
+        drop(stdin);
+        let status = client.wait();
+        let mut stderr = String::new();
+        client
+            .0
+            .stderr
+            .take()
+            .unwrap()
+            .read_to_string(&mut stderr)
+            .unwrap();
+        assert_eq!(status.success(), success, "{stderr}");
+        assert!(stderr.contains(diagnostic), "{stderr}");
+    }
 }

@@ -1,9 +1,9 @@
-#[cfg(any(feature = "client", feature = "server", feature = "tui"))]
+#[cfg(any(feature = "server", feature = "tui"))]
 use std::sync::{atomic::AtomicBool, Arc};
 use std::{env, ffi::OsString, process::ExitCode};
 
 use crate::applet::{dispatch_from_argv, AppletDispatch, RequestedApplet};
-#[cfg(any(feature = "client", feature = "server", feature = "tui"))]
+#[cfg(any(feature = "server", feature = "tui"))]
 use crate::signal::install_signal_handler;
 
 /// Entry point for the `irtt-rs` multicall dispatcher binary.
@@ -75,9 +75,9 @@ fn run_dispatcher_from_env() -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Installs the shutdown signal handler shared by every applet and hands the
+/// Installs the shutdown signal handler for synchronous applets and hands the
 /// resulting flag to `f`.
-#[cfg(any(feature = "client", feature = "server", feature = "tui"))]
+#[cfg(any(feature = "server", feature = "tui"))]
 fn with_shutdown_flag(
     f: impl FnOnce(&AtomicBool) -> Result<(), Box<dyn std::error::Error>>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -91,10 +91,13 @@ fn with_shutdown_flag(
 fn run_client_applet(argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
     use clap::Parser;
 
-    with_shutdown_flag(|shutdown_requested| {
-        let args = crate::cmd::client::ClientArgs::parse_from(argv);
-        crate::cmd::client::run_stream(args, shutdown_requested)
-    })
+    let shutdown = crate::signal::install_async_signal_handler()
+        .map_err(|err| format!("failed to install signal handler: {err}"))?;
+    let args = crate::cmd::client::ClientArgs::parse_from(argv);
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(crate::cmd::client::run_stream(args, shutdown))
 }
 
 #[cfg(not(feature = "client"))]

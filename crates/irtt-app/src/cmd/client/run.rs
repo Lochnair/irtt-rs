@@ -1,16 +1,15 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
     io::{self, BufRead, Write},
-    sync::{atomic::AtomicBool, Arc, Mutex},
+    sync::Arc,
     thread,
-    time::Duration,
 };
 
 use irtt_client::{
     managed::{
-        BlockingManagedClient, ManagedClientHandle, ManagedCommandApplyError, ManagedEndReason,
-        ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError, ManagedStatus,
-        ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
+        ManagedClient, ManagedCommandApplyError, ManagedEndReason, ManagedEvent,
+        ManagedEventSubscription, ManagedEventTryRecvError, ManagedStatus, ManagedTargetConfig,
+        ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
     },
     ClientEvent,
 };
@@ -18,13 +17,14 @@ use irtt_client::{
 use super::{
     args::ClientArgs,
     output::{EventRenderStats, OutputConfig},
+    worker::ManagedWorker,
 };
 
 use crate::shared::client::{
-    expected_probe_count, is_shutdown_requested, parse_stdin_target_set,
+    expected_probe_count, parse_stdin_target_set,
     session::{
-        drain_managed_events, peer_close_run_error, request_managed_stop_for_peer_close,
-        request_managed_stop_once, should_print_final_summary, ManagedDrainState,
+        peer_close_run_error, request_managed_stop_for_peer_close, request_managed_stop_once,
+        should_print_final_summary,
     },
     ManagedRunSetup, STDIN_MAX_DESIRED_TARGETS, STDIN_OUTCOME_HISTORY_LIMIT,
 };
@@ -40,12 +40,11 @@ const FINITE_STATS_MEMORY_WARNING_BYTES: u64 = 128 * MIB;
 const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
 
 const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
-const MANAGED_EVENT_WAIT_SLICE: Duration = Duration::from_millis(20);
 const MAX_STDIN_RECORD_BYTES: usize = 64 * 1024;
 
-pub fn run_stream(
+pub async fn run_stream(
     args: ClientArgs,
-    shutdown_requested: &AtomicBool,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if args.list_columns {
         print!("{}", OutputConfig::list_columns());
@@ -63,7 +62,7 @@ pub fn run_stream(
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     if setup.stdin_controlled {
-        return run_stdin_stream(setup, output_config, shutdown_requested);
+        return run_stdin_stream(setup, output_config, shutdown).await;
     }
     let continuous = args.is_continuous();
     let target_count = setup.target_count();
@@ -71,14 +70,13 @@ pub fn run_stream(
     if let Some(warning) = finite_stats_memory_warning(&args, target_count) {
         eprintln!("{warning}");
     }
-    if is_shutdown_requested(shutdown_requested) {
+    if *shutdown.borrow() {
         return Ok(());
     }
-    let (owner, mut events) = BlockingManagedClient::start_with_subscription(
-        setup.managed_config(),
-        setup.managed_targets(),
-    )?;
-    let handle = owner.handle();
+    let (task, handle) = ManagedClient::task(setup.managed_config(), setup.managed_targets())?;
+    let mut events = handle.subscribe()?;
+    let mut status = handle.subscribe_status();
+    let owner = ManagedWorker::start(task, handle.clone())?;
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     let mut stream_output = StreamOutput {
         config: output_config,
@@ -102,9 +100,9 @@ pub fn run_stream(
     let mut dropped_events = 0_u64;
     let mut interrupted = false;
     let mut stop_requested = false;
-    let mut subscription_closed = false;
     loop {
-        if is_shutdown_requested(shutdown_requested) {
+        let snapshot = status.borrow_and_update().clone();
+        if *shutdown.borrow() {
             interrupted = true;
             if request_managed_stop_once(&mut stop_requested) {
                 drop(handle.stop());
@@ -113,38 +111,33 @@ pub fn run_stream(
         if request_managed_stop_for_peer_close(
             continuous,
             interrupted,
-            handle.status().peer_closed_target_outcomes,
+            snapshot.peer_closed_target_outcomes,
             &mut stop_requested,
         ) {
             drop(handle.stop());
         }
-        let drain_state = drain_events(
-            &mut events,
-            &mut stream_output,
-            &mut stats,
-            &mut terminal_targets,
-            &mut dropped_events,
-        )?;
-        match drain_state {
-            ManagedDrainState::Empty => thread::sleep(MANAGED_EVENT_WAIT_SLICE),
-            ManagedDrainState::Closed => subscription_closed = true,
-            ManagedDrainState::BudgetExhausted => {}
-        }
-        if handle.status().final_outcome.is_some() || subscription_closed {
+        if snapshot.final_outcome.is_some() {
             break;
+        }
+        tokio::select! {
+            _ = shutdown.changed(), if !interrupted => {}
+            changed = status.changed() => { if changed.is_err() { break; } }
+            event = events.recv() => match event {
+                Ok(event) => process_event(event, &mut stream_output, &mut stats, &mut terminal_targets)?,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    dropped_events = dropped_events.saturating_add(count);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     }
     if interrupted {
         eprintln!("interrupted, closing managed run...");
     }
-    let outcome = owner.join()?;
-    drain_final_events(
-        &mut events,
-        &mut stream_output,
-        &mut stats,
-        &mut terminal_targets,
-        &mut dropped_events,
-    )?;
+    let outcome = owner.join().await?;
+    drain_final_events(&mut events, &mut dropped_events, |event| {
+        process_event(event, &mut stream_output, &mut stats, &mut terminal_targets)
+    })?;
     if let Some(warning) = dropped_event_warning(dropped_events) {
         eprintln!("{warning}");
     }
@@ -159,7 +152,7 @@ pub fn run_stream(
             report_target_failure(target);
         }
     }
-    interrupted |= is_shutdown_requested(shutdown_requested);
+    interrupted |= *shutdown.borrow();
     let terminal_error = match &outcome.end_reason {
         ManagedEndReason::DriverFailed(failure) => {
             Some(format!("managed driver failed: {failure}"))
@@ -201,98 +194,9 @@ pub fn run_stream(
 }
 
 #[derive(Clone)]
-struct StdinTargetSet {
-    revision: u64,
-    targets: Vec<ManagedTargetConfig>,
-}
-
-#[derive(Default)]
-struct StdinMailboxState {
-    next_revision: u64,
-    latest: Option<StdinTargetSet>,
-    eof: bool,
-    fatal: Option<String>,
-}
-
-#[derive(Default)]
-struct StdinMailbox {
-    state: Mutex<StdinMailboxState>,
-}
-
-impl StdinMailbox {
-    fn publish(&self, targets: Vec<ManagedTargetConfig>) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.next_revision = state.next_revision.saturating_add(1);
-        state.latest = Some(StdinTargetSet {
-            revision: state.next_revision,
-            targets,
-        });
-    }
-
-    fn finish(&self) {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .eof = true;
-    }
-
-    fn fail(&self, error: String) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.fatal = Some(error);
-        state.latest = None;
-    }
-
-    fn latest(&self) -> Option<StdinTargetSet> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .latest
-            .clone()
-    }
-
-    fn clear_if_current(&self, revision: u64) {
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if state
-            .latest
-            .as_ref()
-            .is_some_and(|set| set.revision == revision)
-        {
-            state.latest = None;
-        }
-    }
-
-    fn is_current(&self, revision: u64) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .latest
-            .as_ref()
-            .is_some_and(|set| set.revision == revision)
-    }
-
-    fn fatal(&self) -> Option<String> {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .fatal
-            .clone()
-    }
-
-    fn is_finished(&self) -> bool {
-        self.state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .eof
-    }
+enum StdinUpdate {
+    Targets(Vec<ManagedTargetConfig>),
+    Stop(StdinStop),
 }
 
 fn read_stdin_record<R: BufRead>(
@@ -371,7 +275,10 @@ fn read_stdin_record<R: BufRead>(
     }
 }
 
-fn read_stdin_target_sets<R: BufRead>(reader: &mut R, mailbox: &StdinMailbox) {
+fn read_stdin_target_sets<R: BufRead>(
+    reader: &mut R,
+    updates: &tokio::sync::watch::Sender<StdinUpdate>,
+) {
     let mut line = 0_u64;
     let mut record = Vec::with_capacity(MAX_STDIN_RECORD_BYTES + 1);
     loop {
@@ -383,99 +290,41 @@ fn read_stdin_target_sets<R: BufRead>(reader: &mut R, mailbox: &StdinMailbox) {
                 }
                 match parse_stdin_target_set(&record, STDIN_MAX_DESIRED_TARGETS) {
                     Ok(targets) => {
-                        mailbox.publish(targets.into_iter().map(|target| target.managed).collect())
+                        updates.send_replace(StdinUpdate::Targets(
+                            targets.into_iter().map(|target| target.managed).collect(),
+                        ));
                     }
                     Err(error) => {
-                        mailbox.fail(format!("invalid --targets-stdin line {line}: {error}"));
+                        updates.send_replace(StdinUpdate::Stop(StdinStop::Fatal(format!(
+                            "invalid --targets-stdin line {line}: {error}"
+                        ))));
                         return;
                     }
                 }
             }
             Ok(None) => {
-                mailbox.finish();
+                updates.send_replace(StdinUpdate::Stop(StdinStop::Eof));
                 return;
             }
             Err(_) => {
-                mailbox.fail(format!("failed to read --targets-stdin line {}", line + 1));
+                updates.send_replace(StdinUpdate::Stop(StdinStop::Fatal(format!(
+                    "failed to read --targets-stdin line {}",
+                    line + 1
+                ))));
                 return;
             }
         }
     }
 }
 
-fn spawn_stdin_target_reader(mailbox: Arc<StdinMailbox>) -> io::Result<()> {
+fn spawn_stdin_target_reader(updates: tokio::sync::watch::Sender<StdinUpdate>) -> io::Result<()> {
     thread::Builder::new()
         .name("irtt-targets-stdin".to_owned())
         .spawn(move || {
             let stdin = io::stdin();
-            read_stdin_target_sets(&mut stdin.lock(), &mailbox);
+            read_stdin_target_sets(&mut stdin.lock(), &updates);
         })
         .map(|_| ())
-}
-
-#[derive(Clone)]
-struct RetryAfterStatus {
-    revision: u64,
-    status: Arc<ManagedStatus>,
-}
-
-fn retry_waits_for_status_change(
-    retry_after: &mut Option<RetryAfterStatus>,
-    target_set: &StdinTargetSet,
-    status: &Arc<ManagedStatus>,
-) -> bool {
-    let Some(retry) = retry_after else {
-        return false;
-    };
-    if retry.revision != target_set.revision {
-        *retry_after = None;
-        return false;
-    }
-    Arc::ptr_eq(&retry.status, status)
-}
-
-fn retry_after_capacity_rejection(
-    mailbox: &StdinMailbox,
-    target_set: &StdinTargetSet,
-    status: Arc<ManagedStatus>,
-) -> Option<RetryAfterStatus> {
-    mailbox
-        .is_current(target_set.revision)
-        .then_some(RetryAfterStatus {
-            revision: target_set.revision,
-            status,
-        })
-}
-
-fn apply_latest_stdin_target_set(
-    handle: &ManagedClientHandle,
-    mailbox: &StdinMailbox,
-    retry_after: &mut Option<RetryAfterStatus>,
-) -> Result<(), String> {
-    let Some(target_set) = mailbox.latest() else {
-        *retry_after = None;
-        return Ok(());
-    };
-    let status = handle.status();
-    if retry_waits_for_status_change(retry_after, &target_set, &status) {
-        return Ok(());
-    }
-
-    let receipt = handle
-        .update_targets(target_set.targets.clone())
-        .map_err(|_| "failed to submit --targets-stdin update".to_owned())?;
-    match receipt.blocking_wait() {
-        Ok(_) => {
-            mailbox.clear_if_current(target_set.revision);
-            *retry_after = None;
-            Ok(())
-        }
-        Err(ManagedCommandApplyError::LiveGenerationLimitExceeded { .. }) => {
-            *retry_after = retry_after_capacity_rejection(mailbox, &target_set, status);
-            Ok(())
-        }
-        Err(_) => Err("--targets-stdin update was rejected".to_owned()),
-    }
 }
 
 struct BoundedTargetSet {
@@ -542,37 +391,6 @@ fn process_stdin_event<W: Write>(
     Ok(())
 }
 
-fn drain_stdin_events<W: Write>(
-    events: &mut ManagedEventSubscription,
-    stream_output: &mut StreamOutput<'_, W>,
-    stats: &mut BTreeMap<TargetInstance, StatsCollector>,
-    terminal_targets: &mut BoundedTargetSet,
-    dropped_events: &mut u64,
-) -> io::Result<ManagedDrainState> {
-    drain_managed_events(events, dropped_events, |event| {
-        process_stdin_event(event, stream_output, stats, terminal_targets)
-    })
-}
-
-fn drain_final_stdin_events<W: Write>(
-    events: &mut ManagedEventSubscription,
-    stream_output: &mut StreamOutput<'_, W>,
-    stats: &mut BTreeMap<TargetInstance, StatsCollector>,
-    terminal_targets: &mut BoundedTargetSet,
-    dropped_events: &mut u64,
-) -> io::Result<()> {
-    loop {
-        match events.try_recv() {
-            Ok(event) => process_stdin_event(event, stream_output, stats, terminal_targets)?,
-            Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
-            Err(ManagedEventTryRecvError::Lagged(count)) => {
-                *dropped_events = dropped_events.saturating_add(count);
-            }
-        }
-    }
-    Ok(())
-}
-
 fn reconcile_stdin_stats(
     stats: &mut BTreeMap<TargetInstance, StatsCollector>,
     status: &ManagedStatus,
@@ -613,36 +431,20 @@ enum StdinStop {
     Fatal(String),
 }
 
-fn stdin_stop_request(
-    shutdown_requested: &AtomicBool,
-    mailbox: &StdinMailbox,
-) -> Option<StdinStop> {
-    if is_shutdown_requested(shutdown_requested) {
-        Some(StdinStop::Interrupted)
-    } else if let Some(error) = mailbox.fatal() {
-        Some(StdinStop::Fatal(error))
-    } else if mailbox.is_finished() {
-        Some(StdinStop::Eof)
-    } else {
-        None
-    }
-}
-
-fn run_stdin_stream(
+async fn run_stdin_stream(
     setup: ManagedRunSetup,
     output_config: OutputConfig,
-    shutdown_requested: &AtomicBool,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if is_shutdown_requested(shutdown_requested) {
+    if *shutdown.borrow() {
         return Ok(());
     }
-    let (owner, mut events) = BlockingManagedClient::start_with_subscription(
-        setup.managed_config(),
-        setup.managed_targets(),
-    )?;
-    let handle = owner.handle();
-    let mailbox = Arc::new(StdinMailbox::default());
-    spawn_stdin_target_reader(Arc::clone(&mailbox))?;
+    let (task, handle) = ManagedClient::task(setup.managed_config(), setup.managed_targets())?;
+    let mut events = handle.subscribe()?;
+    let mut status = handle.subscribe_status();
+    let owner = ManagedWorker::start(task, handle.clone())?;
+    let (updates, mut stdin) = tokio::sync::watch::channel(StdinUpdate::Targets(Vec::new()));
+    spawn_stdin_target_reader(updates)?;
 
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     let mut stream_output = StreamOutput {
@@ -654,59 +456,103 @@ fn run_stdin_stream(
     };
     let mut stats = BTreeMap::new();
     let mut terminal_targets = BoundedTargetSet::new(STDIN_OUTCOME_HISTORY_LIMIT);
+    let mut stdin_changed = false;
+    let mut desired = None;
+    let mut pending = None;
+    let mut submitted = Vec::new();
     let mut retry_after = None;
     let mut dropped_events = 0_u64;
     let mut stop_requested = false;
     let mut stop = None;
     let mut summary_targets = None;
-    let mut subscription_closed = false;
-
     loop {
-        let status = handle.status();
+        let snapshot = status.borrow_and_update().clone();
         if stop.is_none() {
-            if let Some(requested_stop) = stdin_stop_request(shutdown_requested, &mailbox) {
-                summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status));
-                stop = Some(requested_stop);
-                if request_managed_stop_once(&mut stop_requested) {
-                    drop(handle.stop());
+            if *shutdown.borrow() {
+                stop = Some(StdinStop::Interrupted);
+            } else if stdin_changed || stdin.has_changed().unwrap_or(true) {
+                stdin_changed = false;
+                match stdin.borrow_and_update().clone() {
+                    StdinUpdate::Targets(targets) => {
+                        desired = Some(targets);
+                        retry_after = None;
+                    }
+                    StdinUpdate::Stop(reason) => stop = Some(reason),
                 }
-            } else if let Err(error) =
-                apply_latest_stdin_target_set(&handle, &mailbox, &mut retry_after)
+            }
+            if stop.is_none()
+                && pending.is_none()
+                && !retry_after
+                    .as_ref()
+                    .is_some_and(|previous| Arc::ptr_eq(previous, &snapshot))
             {
-                summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status));
-                stop = Some(StdinStop::Fatal(error));
+                if let Some(targets) = desired.take() {
+                    submitted = targets;
+                    match handle.update_targets(submitted.clone()) {
+                        Ok(receipt) => {
+                            pending = Some(receipt);
+                            retry_after = Some(snapshot.clone());
+                        }
+                        Err(_) => {
+                            stop = Some(StdinStop::Fatal(
+                                "failed to submit --targets-stdin update".to_owned(),
+                            ))
+                        }
+                    }
+                }
+            }
+            if stop.is_some() {
+                summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &snapshot));
                 if request_managed_stop_once(&mut stop_requested) {
                     drop(handle.stop());
                 }
             }
         }
-
-        let drain_state = drain_stdin_events(
-            &mut events,
-            &mut stream_output,
-            &mut stats,
-            &mut terminal_targets,
-            &mut dropped_events,
-        )?;
-        reconcile_stdin_stats(&mut stats, &handle.status(), summary_targets.as_ref());
-        match drain_state {
-            ManagedDrainState::Empty => thread::sleep(MANAGED_EVENT_WAIT_SLICE),
-            ManagedDrainState::Closed => subscription_closed = true,
-            ManagedDrainState::BudgetExhausted => {}
-        }
-        if handle.status().final_outcome.is_some() || subscription_closed {
+        reconcile_stdin_stats(&mut stats, &snapshot, summary_targets.as_ref());
+        if snapshot.final_outcome.is_some() {
             break;
+        }
+        tokio::select! {
+            _ = shutdown.changed(), if stop.is_none() => {}
+            _ = stdin.changed(), if stop.is_none() => { stdin_changed = true; }
+            changed = status.changed() => { if changed.is_err() { break; } }
+            result = async { pending.as_mut().expect("guarded pending receipt").await }, if pending.is_some() && stop.is_none() => {
+                pending = None;
+                match result {
+                    Ok(_) => retry_after = None,
+                    Err(ManagedCommandApplyError::LiveGenerationLimitExceeded { .. }) => {
+                        // A newer desired set supersedes this rejected set. Otherwise,
+                        // retry only after the driver's status advances from submission.
+                        if desired.is_none() {
+                            desired = Some(std::mem::take(&mut submitted));
+                        } else {
+                            retry_after = None;
+                        }
+                    }
+                    Err(_) => {
+                        stop = Some(StdinStop::Fatal("--targets-stdin update was rejected".to_owned()));
+                        summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow()));
+                        if request_managed_stop_once(&mut stop_requested) { drop(handle.stop()); }
+                    }
+                }
+            }
+            event = events.recv() => match event {
+                Ok(event) => {
+                    process_stdin_event(event, &mut stream_output, &mut stats, &mut terminal_targets)?;
+                    reconcile_stdin_stats(&mut stats, &status.borrow(), summary_targets.as_ref());
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
+                    dropped_events = dropped_events.saturating_add(count);
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
         }
     }
 
-    let outcome = owner.join()?;
-    drain_final_stdin_events(
-        &mut events,
-        &mut stream_output,
-        &mut stats,
-        &mut terminal_targets,
-        &mut dropped_events,
-    )?;
+    let outcome = owner.join().await?;
+    drain_final_events(&mut events, &mut dropped_events, |event| {
+        process_stdin_event(event, &mut stream_output, &mut stats, &mut terminal_targets)
+    })?;
     if let Some(warning) = dropped_event_warning(dropped_events) {
         eprintln!("{warning}");
     }
@@ -782,28 +628,14 @@ fn process_event<W: Write>(
     Ok(())
 }
 
-fn drain_events<W: Write>(
+fn drain_final_events<E>(
     events: &mut ManagedEventSubscription,
-    stream_output: &mut StreamOutput<'_, W>,
-    stats: &mut BTreeMap<String, StatsCollector>,
-    terminal_targets: &mut HashSet<TargetInstance>,
     dropped_events: &mut u64,
-) -> io::Result<ManagedDrainState> {
-    drain_managed_events(events, dropped_events, |event| {
-        process_event(event, stream_output, stats, terminal_targets)
-    })
-}
-
-fn drain_final_events<W: Write>(
-    events: &mut ManagedEventSubscription,
-    stream_output: &mut StreamOutput<'_, W>,
-    stats: &mut BTreeMap<String, StatsCollector>,
-    terminal_targets: &mut HashSet<TargetInstance>,
-    dropped_events: &mut u64,
-) -> io::Result<()> {
+    mut process: impl FnMut(ManagedEvent) -> Result<(), E>,
+) -> Result<(), E> {
     loop {
         match events.try_recv() {
-            Ok(event) => process_event(event, stream_output, stats, terminal_targets)?,
+            Ok(event) => process(event)?,
             Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
             Err(ManagedEventTryRecvError::Lagged(count)) => {
                 *dropped_events = dropped_events.saturating_add(count);

@@ -42,7 +42,7 @@ doc = false
 
 [features]
 default = ["client", "server", "tui"]
-client = ["dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats"]
+client = ["dep:tokio", "dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats"]
 server = ["dep:irtt-server", "dep:tokio"]
 tui =["dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats", "dep:ratatui", "dep:crossterm"]
 
@@ -55,7 +55,7 @@ irtt-proto = { workspace = true, optional = true }
 irtt-server = { workspace = true, optional = true }
 irtt-stats = { workspace = true, optional = true }
 ratatui = { version = "0.30.2", optional = true }
-tokio = { version = "1.53.2", default-features = false, features = ["rt", "time"], optional = true }
+tokio = { version = "1.53.2", default-features = false, features = ["rt", "time", "sync", "macros"], optional = true }
 
 [dev-dependencies]
 irtt-server.workspace = true
