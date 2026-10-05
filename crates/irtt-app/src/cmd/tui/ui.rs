@@ -6,6 +6,7 @@ use std::{
 
 use crossterm::{
     cursor::Show,
+    event::KeyCode,
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -14,11 +15,11 @@ use irtt_client::{ClientEvent, NegotiationResult, SignedDuration};
 use irtt_stats::{Snapshot, StatsCollector, TimeStats};
 use ratatui::{
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style},
     symbols,
-    text::{Line, Span},
-    widgets::{Axis, Block, Borders, Chart, Dataset, GraphType, Paragraph, Wrap},
+    text::{Line, Span, Text},
+    widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph, Row, Table, Wrap},
     Frame, Terminal,
 };
 
@@ -40,8 +41,6 @@ const MIN_HEIGHT: u16 = 18;
 const DEFAULT_GRAPH_WINDOW: Duration = Duration::from_secs(60);
 const MIN_GRAPH_WINDOW: Duration = Duration::from_secs(5);
 const MAX_GRAPH_WINDOW: Duration = Duration::from_secs(60 * 60);
-const PAN_STEP_NUMERATOR: u32 = 1;
-const PAN_STEP_DENOMINATOR: u32 = 4;
 
 pub(super) struct TuiTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -103,7 +102,9 @@ pub(super) struct TuiState {
     dropped_events: u64,
     graph_metric: GraphMetric,
     graph_viewport: GraphViewport,
-    view: TuiView,
+    selected_target: usize,
+    details_open: bool,
+    details_scroll: (u16, u16),
     pub(super) paused: bool,
     pub(super) quit_requested: bool,
 }
@@ -138,7 +139,9 @@ impl TuiState {
             dropped_events: 0,
             graph_metric: GraphMetric::EffectiveRtt,
             graph_viewport: GraphViewport::default(),
-            view: TuiView::Graph,
+            selected_target: 0,
+            details_open: false,
+            details_scroll: (0, 0),
             paused: false,
             quit_requested: false,
         }
@@ -230,7 +233,7 @@ impl TuiState {
             }
         }
         if let Some(warning) = warning {
-            self.last_warning = Some(warning);
+            self.last_warning = Some(format!("{label}: {warning}"));
         }
         self.push_event(format!("{label}: {recent}"));
         if let Some(cleanup_warning) = cleanup_warning {
@@ -297,7 +300,7 @@ impl TuiState {
                     recent = Some(format!("session closed token={token:#x}"));
                 }
                 ClientEvent::EchoSent { seq, bytes, .. } => {
-                    recent = Some(format!("sent seq={} bytes={bytes}", format_seq(*seq)));
+                    recent = Some(format!("sent seq={} bytes={bytes}", seq));
                 }
                 ClientEvent::EchoReply {
                     seq,
@@ -326,26 +329,17 @@ impl TuiState {
                         server_to_client_ns,
                         server_processing_ns,
                     });
-                    target.last_sample = Some(LastSample {
-                        seq: *seq,
-                        raw_ns: duration_ns(rtt.raw),
-                        adjusted_ns: rtt.adjusted.map(SignedDuration::as_nanos),
-                        effective_ns: rtt.effective.as_nanos(),
-                        client_to_server_ns,
-                        server_to_client_ns,
-                        server_processing_ns,
-                    });
                     recent = Some(format!(
                         "reply seq={} effective={}",
-                        format_seq(*seq),
+                        seq,
                         format_optional_ns_i128(Some(rtt.effective.as_nanos()))
                     ));
                 }
                 ClientEvent::EchoLoss { seq, .. } => {
-                    recent = Some(format!("loss seq={}", format_seq(*seq)));
+                    recent = Some(format!("loss seq={}", seq));
                 }
                 ClientEvent::DuplicateReply { seq, remote, .. } => {
-                    recent = Some(format!("duplicate seq={} from {remote}", format_seq(*seq)));
+                    recent = Some(format!("duplicate seq={} from {remote}", seq));
                 }
                 ClientEvent::LateReply {
                     seq,
@@ -363,9 +357,7 @@ impl TuiState {
                         .unwrap_or_default();
                     recent = Some(format!(
                         "late seq={} highest_seen={}{}",
-                        format_seq(*seq),
-                        format_seq(*highest_seen),
-                        timing
+                        seq, highest_seen, timing
                     ));
                 }
                 ClientEvent::Warning { kind, message, .. } => {
@@ -379,7 +371,6 @@ impl TuiState {
         };
         if let Some(status) = global_status {
             self.status = if status == TuiStatus::Complete
-                && self.is_multi_target()
                 && !self
                     .targets
                     .iter()
@@ -391,7 +382,7 @@ impl TuiState {
             };
         }
         if let Some(warning) = global_warning {
-            self.last_warning = Some(warning);
+            self.last_warning = Some(format!("{label}: {warning}"));
         }
         if let Some(recent) = recent {
             self.push_event(format!("{label}: {recent}"));
@@ -450,58 +441,63 @@ impl TuiState {
         self.paused = !self.paused;
     }
 
-    pub(super) fn cycle_graph_metric(&mut self) {
-        self.graph_metric = self.graph_metric.next();
-    }
-
-    pub(super) fn toggle_view(&mut self) {
-        self.view = self.view.next();
-    }
-
-    pub(super) fn pan_graph_left(&mut self) {
-        let oldest = self.oldest_graph_sample_time();
-        let newest = self.newest_graph_sample_time();
-        self.graph_viewport.pan_backward(oldest, newest);
-    }
-
-    pub(super) fn pan_graph_right(&mut self) {
-        let newest = self.newest_graph_sample_time();
-        self.graph_viewport.pan_forward(newest);
-    }
-
-    pub(super) fn pan_graph_page_left(&mut self) {
-        let oldest = self.oldest_graph_sample_time();
-        let newest = self.newest_graph_sample_time();
-        self.graph_viewport.page_backward(oldest, newest);
-    }
-
-    pub(super) fn pan_graph_page_right(&mut self) {
-        let newest = self.newest_graph_sample_time();
-        self.graph_viewport.page_forward(newest);
-    }
-
-    pub(super) fn jump_graph_oldest(&mut self) {
-        let oldest = self.oldest_graph_sample_time();
-        let newest = self.newest_graph_sample_time();
-        self.graph_viewport.jump_oldest(oldest, newest);
-    }
-
-    pub(super) fn jump_graph_live(&mut self) {
-        self.graph_viewport.follow_live();
-    }
-
-    pub(super) fn zoom_graph_in(&mut self) {
-        self.graph_viewport.zoom_in(self.newest_graph_sample_time());
-    }
-
-    pub(super) fn zoom_graph_out(&mut self) {
-        self.graph_viewport
-            .zoom_out(self.newest_graph_sample_time());
-    }
-
-    pub(super) fn reset_graph_window(&mut self) {
-        self.graph_viewport
-            .reset_window(self.newest_graph_sample_time());
+    pub(super) fn handle_key(&mut self, key: KeyCode, area: Rect) -> bool {
+        match key {
+            KeyCode::Char('d' | 'g') | KeyCode::Esc if key != KeyCode::Esc || self.details_open => {
+                self.details_open = !self.details_open;
+                self.details_scroll = (0, 0);
+            }
+            KeyCode::Tab | KeyCode::BackTab => {
+                let count = self.targets.len();
+                if count != 0 {
+                    self.selected_target = if key == KeyCode::Tab {
+                        (self.selected_target + 1) % count
+                    } else {
+                        (self.selected_target + count - 1) % count
+                    };
+                    self.details_scroll = (0, 0);
+                }
+            }
+            KeyCode::Char('p') => self.toggle_pause(),
+            KeyCode::Char('r') => self.clear_visible_history(),
+            _ if self.details_open => {
+                let text = details_text(self);
+                let body = dashboard_layout(area, self)[2];
+                let inner = Block::bordered().inner(body);
+                let (max_y, max_x) = details_scroll_limits(&text, body);
+                let (y, x) = self.details_scroll;
+                let (y, x) = (y.min(max_y), x.min(max_x));
+                self.details_scroll = match key {
+                    KeyCode::Up => (y.saturating_sub(1), x),
+                    KeyCode::Down => (y.saturating_add(1).min(max_y), x),
+                    KeyCode::PageUp => (y.saturating_sub(inner.height.max(1)), x),
+                    KeyCode::PageDown => (y.saturating_add(inner.height.max(1)).min(max_y), x),
+                    KeyCode::Home => (0, 0),
+                    KeyCode::End => (max_y, x),
+                    KeyCode::Left => (y, x.saturating_sub(8)),
+                    KeyCode::Right => (y, x.saturating_add(8).min(max_x)),
+                    _ => return false,
+                };
+            }
+            _ => {
+                let oldest = self.oldest_graph_sample_time();
+                let newest = self.newest_graph_sample_time();
+                match key {
+                    KeyCode::Char('m') => self.graph_metric = self.graph_metric.next(),
+                    KeyCode::Left => self.graph_viewport.pan_backward(oldest, newest),
+                    KeyCode::Right => self.graph_viewport.pan_forward(newest),
+                    KeyCode::PageUp => self.graph_viewport.page_backward(oldest, newest),
+                    KeyCode::PageDown => self.graph_viewport.page_forward(newest),
+                    KeyCode::Home => self.graph_viewport.jump_oldest(oldest, newest),
+                    KeyCode::End => self.graph_viewport.follow_live(),
+                    KeyCode::Char('+' | '=') => self.graph_viewport.zoom_in(newest),
+                    KeyCode::Char('-') => self.graph_viewport.zoom_out(newest),
+                    KeyCode::Char('0') => self.graph_viewport.reset_window(newest),
+                    _ => return false,
+                }
+            }
+        }
+        true
     }
 
     fn push_event(&mut self, event: String) {
@@ -509,17 +505,13 @@ impl TuiState {
     }
 
     fn selected_target(&self) -> Option<&TuiTargetState> {
-        self.targets.first()
+        self.targets.get(self.selected_target)
     }
 
     fn selected_snapshot(&self) -> Snapshot {
         self.selected_target()
             .map(|target| target.stats.snapshot())
             .unwrap_or_else(|| StatsCollector::new(stats_config(true)).snapshot())
-    }
-
-    fn is_multi_target(&self) -> bool {
-        self.targets.len() > 1
     }
 
     fn oldest_graph_sample_time(&self) -> Option<Instant> {
@@ -545,7 +537,7 @@ pub(super) struct TuiTargetState {
     status: TargetStatus,
     negotiated: Option<NegotiationResult>,
     graph_history: VecDeque<GraphSample>,
-    last_sample: Option<LastSample>,
+    last_sample: Option<GraphSample>,
     last_warning: Option<String>,
     stats: StatsCollector,
 }
@@ -566,6 +558,7 @@ impl TuiTargetState {
     }
 
     fn push_graph_sample(&mut self, sample: GraphSample) {
+        self.last_sample = Some(sample);
         push_bounded(&mut self.graph_history, sample, HISTORY_LIMIT);
     }
 }
@@ -706,21 +699,6 @@ impl TuiStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TuiView {
-    Graph,
-    Dashboard,
-}
-
-impl TuiView {
-    fn next(self) -> Self {
-        match self {
-            Self::Graph => Self::Dashboard,
-            Self::Dashboard => Self::Graph,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GraphViewport {
     mode: GraphViewportMode,
     window: Duration,
@@ -754,27 +732,19 @@ impl GraphViewport {
     }
 
     fn pan_backward(&mut self, oldest: Option<Instant>, newest: Option<Instant>) {
-        self.pan_by(
-            -duration_fraction(self.window, PAN_STEP_NUMERATOR, PAN_STEP_DENOMINATOR),
-            oldest,
-            newest,
-        );
+        self.pan_by(self.window / 4, true, oldest, newest);
     }
 
     fn pan_forward(&mut self, newest: Option<Instant>) {
-        self.pan_by(
-            duration_fraction(self.window, PAN_STEP_NUMERATOR, PAN_STEP_DENOMINATOR),
-            None,
-            newest,
-        );
+        self.pan_by(self.window / 4, false, None, newest);
     }
 
     fn page_backward(&mut self, oldest: Option<Instant>, newest: Option<Instant>) {
-        self.pan_by(-signed_duration(self.window), oldest, newest);
+        self.pan_by(self.window, true, oldest, newest);
     }
 
     fn page_forward(&mut self, newest: Option<Instant>) {
-        self.pan_by(signed_duration(self.window), None, newest);
+        self.pan_by(self.window, false, None, newest);
     }
 
     fn jump_oldest(&mut self, oldest: Option<Instant>, newest: Option<Instant>) {
@@ -788,11 +758,11 @@ impl GraphViewport {
     }
 
     fn zoom_in(&mut self, newest: Option<Instant>) {
-        self.set_window(duration_fraction(self.window, 2, 3).duration, newest);
+        self.set_window(self.window * 2 / 3, newest);
     }
 
     fn zoom_out(&mut self, newest: Option<Instant>) {
-        self.set_window(duration_fraction(self.window, 3, 2).duration, newest);
+        self.set_window(self.window * 3 / 2, newest);
     }
 
     fn reset_window(&mut self, newest: Option<Instant>) {
@@ -810,7 +780,8 @@ impl GraphViewport {
 
     fn pan_by(
         &mut self,
-        delta: SignedViewportDuration,
+        amount: Duration,
+        backward: bool,
         oldest: Option<Instant>,
         newest: Option<Instant>,
     ) {
@@ -821,7 +792,11 @@ impl GraphViewport {
             GraphViewportMode::Follow => newest,
             GraphViewportMode::Historical { end } => end,
         };
-        let mut end = delta.apply(current_end);
+        let mut end = if backward {
+            current_end.checked_sub(amount).unwrap_or(current_end)
+        } else {
+            current_end + amount
+        };
         if let Some(oldest) = oldest {
             end = end.max(oldest + self.window);
         }
@@ -842,54 +817,6 @@ struct GraphViewportRange {
     end: Instant,
     window: Duration,
     is_live: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct SignedViewportDuration {
-    duration: Duration,
-    negative: bool,
-}
-
-impl SignedViewportDuration {
-    fn apply(self, instant: Instant) -> Instant {
-        if self.negative {
-            instant.checked_sub(self.duration).unwrap_or(instant)
-        } else {
-            instant + self.duration
-        }
-    }
-}
-
-impl std::ops::Neg for SignedViewportDuration {
-    type Output = Self;
-
-    fn neg(self) -> Self::Output {
-        Self {
-            duration: self.duration,
-            negative: !self.negative,
-        }
-    }
-}
-
-fn signed_duration(duration: Duration) -> SignedViewportDuration {
-    SignedViewportDuration {
-        duration,
-        negative: false,
-    }
-}
-
-fn duration_fraction(
-    duration: Duration,
-    numerator: u32,
-    denominator: u32,
-) -> SignedViewportDuration {
-    let nanos =
-        duration.as_nanos().saturating_mul(u128::from(numerator)) / u128::from(denominator.max(1));
-    let nanos = nanos.max(1).min(u128::from(u64::MAX));
-    SignedViewportDuration {
-        duration: Duration::from_nanos(nanos as u64),
-        negative: false,
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -925,17 +852,6 @@ impl GraphMetric {
         }
     }
 
-    fn title(self) -> &'static str {
-        match self {
-            Self::EffectiveRtt => "effective RTT",
-            Self::RawRtt => "raw RTT",
-            Self::AdjustedRtt => "adjusted RTT",
-            Self::ClientToServer => "client to server delay",
-            Self::ServerToClient => "server to client delay",
-            Self::ServerProcessing => "server processing",
-        }
-    }
-
     fn empty_message(self) -> &'static str {
         match self {
             Self::EffectiveRtt | Self::RawRtt => "waiting for primary replies",
@@ -958,23 +874,11 @@ impl GraphMetric {
 
     fn axis_kind(self) -> ChartAxisKind {
         match self {
-            Self::EffectiveRtt | Self::RawRtt | Self::ServerProcessing => {
-                ChartAxisKind::NonNegative
-            }
-            Self::AdjustedRtt | Self::ClientToServer | Self::ServerToClient => {
-                ChartAxisKind::Signed
-            }
-        }
-    }
-
-    fn style(self) -> Style {
-        match self {
-            Self::EffectiveRtt | Self::RawRtt | Self::AdjustedRtt => {
-                target_style(0).add_modifier(Modifier::BOLD)
-            }
-            Self::ClientToServer => Style::default().fg(Color::Magenta),
-            Self::ServerToClient => Style::default().fg(Color::LightBlue),
-            Self::ServerProcessing => Style::default().fg(Color::Green),
+            Self::RawRtt | Self::ServerProcessing => ChartAxisKind::NonNegative,
+            Self::EffectiveRtt
+            | Self::AdjustedRtt
+            | Self::ClientToServer
+            | Self::ServerToClient => ChartAxisKind::Signed,
         }
     }
 }
@@ -986,17 +890,6 @@ pub(super) struct GraphSample {
     effective_ns: i128,
     raw_ns: i128,
     adjusted_ns: Option<i128>,
-    client_to_server_ns: Option<i128>,
-    server_to_client_ns: Option<i128>,
-    server_processing_ns: Option<i128>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct LastSample {
-    seq: u32,
-    raw_ns: i128,
-    adjusted_ns: Option<i128>,
-    effective_ns: i128,
     client_to_server_ns: Option<i128>,
     server_to_client_ns: Option<i128>,
     server_processing_ns: Option<i128>,
@@ -1017,390 +910,330 @@ fn push_bounded<T>(items: &mut VecDeque<T>, item: T, limit: usize) {
 pub(super) fn draw_dashboard(frame: &mut Frame<'_>, state: &TuiState) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
-        frame.render_widget(too_small(), area);
+        frame.render_widget(
+            Paragraph::new("terminal too small\nresize, or press q / Ctrl-C to quit gracefully")
+                .block(Block::bordered().title("irtt-rs"))
+                .wrap(Wrap { trim: true }),
+            area,
+        );
         return;
     }
-
-    let snapshot = state.selected_snapshot();
-    match state.view {
-        TuiView::Graph => draw_graph_view(frame, area, state, &snapshot),
-        TuiView::Dashboard => draw_dashboard_view(frame, area, state, &snapshot),
+    let rows = dashboard_layout(area, state);
+    frame.render_widget(header(state), rows[0]);
+    frame.render_widget(target_table(state, rows[1]), rows[1]);
+    if state.details_open {
+        let text = details_text(state);
+        let (max_y, max_x) = details_scroll_limits(&text, rows[2]);
+        frame.render_widget(
+            Paragraph::new(text)
+                .scroll((
+                    state.details_scroll.0.min(max_y),
+                    state.details_scroll.1.min(max_x),
+                ))
+                .block(Block::bordered().title("target details | arrows scroll | d graph")),
+            rows[2],
+        );
+    } else {
+        render_graph_area(frame, rows[2], state);
     }
+    frame.render_widget(status_line(state), rows[3]);
 }
 
 pub(super) fn should_render(now: Instant, next_render: Instant, paused: bool, force: bool) -> bool {
     force || (!paused && now >= next_render)
 }
 
-fn draw_graph_view(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
-    let header_height = if state.is_multi_target() { 7 } else { 3 };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(header_height),
-            Constraint::Min(10),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    if state.is_multi_target() {
-        frame.render_widget(target_table_panel(state, rows[0].height), rows[0]);
-    } else {
-        frame.render_widget(graph_summary_panel(state, snapshot), rows[0]);
-    }
-    render_graph_area(frame, rows[1], state);
-    frame.render_widget(status_line(state), rows[2]);
-}
-
-fn draw_dashboard_view(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
-    if area.width >= 110 && area.height >= 32 {
-        draw_large(frame, area, state, snapshot);
-    } else {
-        draw_compact(frame, area, state, snapshot);
-    }
-}
-
-fn draw_large(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8),
-            Constraint::Min(12),
-            Constraint::Length(9),
-            Constraint::Length(3),
-        ])
-        .split(area);
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
-        .split(rows[0]);
-    let middle = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(36), Constraint::Percentage(64)])
-        .split(rows[1]);
-    let bottom = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
-        .split(rows[2]);
-
-    frame.render_widget(header(state, HeaderDensity::Large), top[0]);
-    frame.render_widget(packet_panel(state, snapshot, top[1].height), top[1]);
-    frame.render_widget(timing_panel(state, snapshot), middle[0]);
-    render_graph_area(frame, middle[1], state);
-    frame.render_widget(recent_events_panel(state, bottom[0].height), bottom[0]);
-    frame.render_widget(sample_panel(state, snapshot), bottom[1]);
-    frame.render_widget(status_line(state), rows[3]);
-}
-
-fn draw_compact(frame: &mut Frame<'_>, area: Rect, state: &TuiState, snapshot: &Snapshot) {
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(6),
-            Constraint::Length(7),
-            Constraint::Min(7),
-            Constraint::Length(3),
-        ])
-        .split(area);
-
-    frame.render_widget(header(state, HeaderDensity::Compact), rows[0]);
-    frame.render_widget(packet_panel(state, snapshot, rows[1].height), rows[1]);
-    render_graph_area(frame, rows[2], state);
-    frame.render_widget(status_line(state), rows[3]);
-}
-
-fn too_small() -> Paragraph<'static> {
-    Paragraph::new(vec![
-        Line::from("terminal too small"),
-        Line::from("resize, or press q / Ctrl-C to quit gracefully"),
+fn dashboard_layout(area: Rect, state: &TuiState) -> [Rect; 4] {
+    let footer = 3 + u16::from(state.last_warning.is_some());
+    let target_rows = state.targets.len().min(6) as u16;
+    let target_height = (target_rows + 3).min(area.height.saturating_sub(3 + footer + 7));
+    Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Length(target_height),
+        Constraint::Min(7),
+        Constraint::Length(footer),
     ])
-    .block(Block::default().title("irtt-rs").borders(Borders::ALL))
-    .wrap(Wrap { trim: true })
+    .areas(area)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HeaderDensity {
-    Large,
-    Compact,
-}
-
-fn header(state: &TuiState, density: HeaderDensity) -> Paragraph<'_> {
+fn header(state: &TuiState) -> Paragraph<'static> {
     let selected = state.selected_target();
-    let selected_label = selected
-        .map(|target| target.label.as_str())
-        .unwrap_or("target");
-    let remote = selected
-        .and_then(|target| target.remote.as_deref())
-        .unwrap_or("-");
-    let session = selected
-        .and_then(|target| target.session.as_deref())
-        .unwrap_or("-");
-    let elapsed = format_span(state.started_at.elapsed());
-    let duration = format_optional_span(state.config.duration);
-    let mode = if state.config.duration.is_some() {
-        "finite"
+    let last = selected.and_then(|target| target.last_sample);
+    let incomplete = if state.dropped_events > 0 {
+        format!(" incomplete:dropped={}", state.dropped_events)
     } else {
-        "continuous"
+        String::new()
     };
-    let negotiated = selected
-        .and_then(|target| target.negotiated.as_ref())
-        .map(|params| format!("negotiated: {}", format_negotiated(params)))
-        .unwrap_or_else(|| "negotiated: -".to_owned());
-    let target_count = state.targets.len();
-    let pacing = state.config.pacing.label();
-
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("irtt-rs", Style::default().add_modifier(Modifier::BOLD)),
-            Span::raw(format!(
-                "  status: {}  targets: {target_count}  pacing: {pacing}",
-                state.status.label()
-            )),
-        ]),
-        Line::from(if state.is_multi_target() {
-            format!("first target: {selected_label}  remote: {remote}")
-        } else {
-            format!("remote: {remote}")
-        }),
-    ];
-    match density {
-        HeaderDensity::Large => {
-            lines.extend([
-                Line::from(format!("session: {session}")),
-                Line::from(format!(
-                    "mode: {mode}  elapsed: {elapsed}  duration: {duration}"
-                )),
-                Line::from(format!(
-                    "interval: {}  timeout: {}",
-                    format_span(state.config.interval),
-                    format_span(state.config.timeout)
-                )),
-                Line::from(negotiated),
-            ]);
-        }
-        HeaderDensity::Compact => {
-            lines.extend([
-                Line::from(format!("session: {session}")),
-                Line::from(format!(
-                    "{mode}  elapsed: {elapsed}  interval: {}",
-                    format_span(state.config.interval)
-                )),
-            ]);
-        }
-    }
-
-    Paragraph::new(lines)
-        .block(Block::default().title("session").borders(Borders::ALL))
-        .wrap(Wrap { trim: true })
-}
-
-fn graph_summary_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
-    let selected = state.selected_target();
-    let selected_label = selected
-        .map(|target| target.label.as_str())
-        .unwrap_or("target");
-    let remote = selected
-        .and_then(|target| target.remote.as_deref())
-        .unwrap_or("-");
-    let elapsed = format_span(state.started_at.elapsed());
-    let packets = snapshot.packets;
-    let last = state
-        .selected_target()
-        .and_then(|target| target.last_sample)
-        .map(|sample| format_optional_ns_i128(Some(sample.effective_ns)))
-        .unwrap_or_else(|| "-".to_owned());
-
-    let target_context = if state.is_multi_target() {
-        format!("first target {selected_label} remote {remote}")
-    } else {
-        format!("remote {remote}")
-    };
-
-    Paragraph::new(Line::from(format!(
-        "irtt-rs  {}  {target_context}  elapsed {elapsed}  sent {}  replies {}  last {last}",
-        state.status.label(),
-        format_count(packets.packets_sent),
-        format_count(packets.unique_replies)
-    )))
-    .block(
-        Block::default()
-            .title(if state.is_multi_target() {
-                "session - first target"
-            } else {
-                "session"
-            })
-            .borders(Borders::ALL),
-    )
-}
-
-fn packet_panel(state: &TuiState, snapshot: &Snapshot, panel_height: u16) -> Paragraph<'static> {
-    if state.is_multi_target() {
-        return target_table_panel(state, panel_height);
-    }
-
-    let packets = snapshot.packets;
-    let loss = snapshot.loss;
-    let progress = state
-        .config
-        .target_probes
-        .map(|target| {
-            format!(
-                "{}/{} ({})",
-                packets.packets_sent,
-                target,
-                format_percent_ratio(packets.packets_sent, target)
-            )
-        })
-        .unwrap_or_else(|| "-".to_owned());
-    let elapsed = state.started_at.elapsed();
-    let recv_rate = format_rate(packets.unique_replies, elapsed);
-
     Paragraph::new(vec![
         Line::from(format!(
-            "sent {:>8}   received {:>8}   unique {:>8}",
-            format_count(packets.packets_sent),
-            format_count(packets.packets_received),
-            format_count(packets.unique_replies)
+            "irtt-rs | {}{}{} | {} / {}",
+            state.status.label(),
+            if state.paused { " display paused" } else { "" },
+            incomplete,
+            format_span(state.started_at.elapsed()),
+            state
+                .config
+                .duration
+                .map(format_span)
+                .unwrap_or_else(|| "continuous".to_owned()),
         )),
         Line::from(format!(
-            "lost {:>8}   duplicates {:>6}   late {:>10}   warnings {:>6}",
-            format_count(loss.lost_packets),
-            format_count(packets.duplicates),
-            format_count(packets.late_packets),
-            format_count(snapshot.events.warning_events)
+            "{} | {}",
+            selected
+                .map(|target| target.label.as_str())
+                .unwrap_or("target"),
+            selected
+                .and_then(|target| target.remote.as_deref())
+                .unwrap_or(ABSENT),
         )),
         Line::from(format!(
-            "loss {:>8}   reply rate {:>10}   progress {progress}",
-            format_percent(loss.packet_loss_percent),
-            recv_rate
+            "one-way c2s {} / s2c {}",
+            format_optional_ns_i128(last.and_then(|sample| sample.client_to_server_ns)),
+            format_optional_ns_i128(last.and_then(|sample| sample.server_to_client_ns)),
+        )),
+    ])
+}
+
+fn target_table(state: &TuiState, area: Rect) -> Table<'static> {
+    let visible = usize::from(area.height.saturating_sub(3)).max(1);
+    // Derive the page from focus and terminal height; no separate scroll state.
+    let start = state.selected_target / visible * visible;
+    let rows = state
+        .targets
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(visible)
+        .map(|(idx, target)| {
+            let snapshot = target.stats.snapshot();
+            Row::new(vec![
+                format!(
+                    "{}{}",
+                    if idx == state.selected_target {
+                        ">"
+                    } else {
+                        " "
+                    },
+                    target.label
+                ),
+                if target.status == TargetStatus::Active && target.last_sample.is_none() {
+                    "waiting".to_owned()
+                } else {
+                    target.status.label().to_owned()
+                },
+                format_optional_ns_i128(target.last_sample.map(|sample| sample.effective_ns)),
+                if snapshot.packets.packets_sent == 0 {
+                    ABSENT.to_owned()
+                } else {
+                    format_percent(snapshot.loss.packet_loss_percent)
+                },
+                if snapshot.ipdv.round_trip.count == 0 {
+                    ABSENT.to_owned()
+                } else {
+                    format_ns_f64(snapshot.ipdv.round_trip.stddev_ns())
+                },
+                target
+                    .last_sample
+                    .map(|sample| format_span(sample.timestamp.elapsed()))
+                    .unwrap_or_else(|| ABSENT.to_owned()),
+            ])
+            .style(target_style(idx))
+        });
+    Table::new(
+        rows,
+        [
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Length(9),
+            Constraint::Length(7),
+            Constraint::Length(9),
+            Constraint::Length(6),
+        ],
+    )
+    .header(
+        Row::new(["target", "state", "RTT", "loss %", "jitter σ", "age"])
+            .style(Style::default().add_modifier(Modifier::BOLD)),
+    )
+    .block(Block::bordered().title(format!(
+        "targets {}/{} | Tab select",
+        state.selected_target + 1,
+        state.targets.len()
+    )))
+}
+
+fn details_text(state: &TuiState) -> Text<'static> {
+    let snapshot = state.selected_snapshot();
+    let target = state.selected_target();
+    let last = target.and_then(|target| target.last_sample);
+    let packets = snapshot.packets;
+    let mut lines = vec![
+        Line::from(format!(
+            "target: {}",
+            target.map(|target| target.label.as_str()).unwrap_or(ABSENT)
         )),
         Line::from(format!(
-            "bytes sent {}   received {}",
-            format_count(packets.bytes_sent),
-            format_count(packets.bytes_received)
+            "remote: {}  session: {}",
+            target
+                .and_then(|target| target.remote.as_deref())
+                .unwrap_or(ABSENT),
+            target
+                .and_then(|target| target.session.as_deref())
+                .unwrap_or(ABSENT)
         )),
         Line::from(format!(
-            "server received {}   window {}",
+            "interval: {}  timeout: {}  pacing: {}",
+            format_span(state.config.interval),
+            format_span(state.config.timeout),
+            state.config.pacing.label()
+        )),
+        Line::from(format!(
+            "negotiated: {}",
+            target
+                .and_then(|target| target.negotiated.as_ref())
+                .map(format_negotiated)
+                .unwrap_or_else(|| ABSENT.to_owned())
+        )),
+        Line::from(format!(
+            "target warning: {}",
+            target
+                .and_then(|target| target.last_warning.as_deref())
+                .unwrap_or(ABSENT)
+        )),
+        Line::from(format!(
+            "run warning: {}",
+            state.last_warning.as_deref().unwrap_or(ABSENT)
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "sent {}  received {}  unique {}",
+            packets.packets_sent, packets.packets_received, packets.unique_replies
+        )),
+        Line::from(format!(
+            "lost {} ({})  duplicates {}  late {}  warnings {}",
+            snapshot.loss.lost_packets,
+            format_percent(snapshot.loss.packet_loss_percent),
+            packets.duplicates,
+            packets.late_packets,
+            snapshot.events.warning_events
+        )),
+        Line::from(format!(
+            "bytes sent {}  received {}",
+            packets.bytes_sent, packets.bytes_received
+        )),
+        Line::from(format!(
+            "server received {}  window {}",
             format_optional_count(packets.server_packets_received),
             format_optional_hex(packets.server_received_window)
         )),
-    ])
-    .block(Block::default().title("packets").borders(Borders::ALL))
-    .wrap(Wrap { trim: true })
-}
-
-fn target_table_panel(state: &TuiState, panel_height: u16) -> Paragraph<'static> {
-    let visible = usize::from(panel_height.saturating_sub(3));
-    let mut lines = vec![Line::from(format!(
-        "{:<16} {:<8} {:>9} {:>5} {:>4} {:>4} {:>4}",
-        "target", "status", "last", "loss", "dup", "late", "warn"
-    ))];
-
-    for (idx, target) in state.targets.iter().enumerate().take(visible) {
-        let snapshot = target.stats.snapshot();
-        let last = target
-            .last_sample
-            .map(|sample| format_optional_ns_i128(Some(sample.effective_ns)))
-            .unwrap_or_else(|| "-".to_owned());
-        lines.push(Line::from(vec![
-            target_label_span(&target.label, idx, 16),
-            Span::raw(format!(
-                " {:<8} {:>9} {:>5} {:>4} {:>4} {:>4}",
-                target.status.label(),
-                last,
-                format_count(snapshot.loss.lost_packets),
-                format_count(snapshot.packets.duplicates),
-                format_count(snapshot.packets.late_packets),
-                format_count(snapshot.events.warning_events)
-            )),
-        ]));
+        Line::from(format!(
+            "progress: {}",
+            state
+                .config
+                .target_probes
+                .map(|count| format!(
+                    "{}/{} ({})",
+                    packets.packets_sent,
+                    count,
+                    format_percent_ratio(packets.packets_sent, count)
+                ))
+                .unwrap_or_else(|| "continuous".to_owned())
+        )),
+        Line::from(""),
+        Line::from(format!(
+            "latest seq: {}",
+            last.map(|sample| sample.seq.to_string())
+                .unwrap_or_else(|| ABSENT.to_owned())
+        )),
+    ];
+    for metric in [
+        GraphMetric::EffectiveRtt,
+        GraphMetric::RawRtt,
+        GraphMetric::AdjustedRtt,
+        GraphMetric::ClientToServer,
+        GraphMetric::ServerToClient,
+        GraphMetric::ServerProcessing,
+    ] {
+        lines.push(Line::from(format!(
+            "{}: {}",
+            metric.label(),
+            format_optional_ns_i128(last.and_then(|sample| metric.value_ns(&sample)))
+        )));
     }
-
-    Paragraph::new(lines)
-        .block(Block::default().title("targets").borders(Borders::ALL))
-        .wrap(Wrap { trim: false })
+    lines.extend([
+        Line::from(""),
+        Line::from(format!(
+            "{:<18} {:>5} {:>9} {:>9} {:>9} {:>9}",
+            "metric", "n", "min", "mean", "max", "stddev"
+        )),
+    ]);
+    for (label, stats) in [
+        ("effective RTT", &snapshot.rtt.primary),
+        ("raw RTT", &snapshot.rtt.raw),
+        ("adjusted RTT", &snapshot.rtt.adjusted),
+        ("IPDV/jitter", &snapshot.ipdv.round_trip),
+        ("send IPDV", &snapshot.ipdv.send),
+        ("receive IPDV", &snapshot.ipdv.receive),
+        ("send delay", &snapshot.one_way_delay.send_delay),
+        ("receive delay", &snapshot.one_way_delay.receive_delay),
+        ("server process", &snapshot.server_processing.processing),
+        ("send call", &snapshot.send_call),
+        ("timer error", &snapshot.timer_error),
+    ] {
+        push_time_line(&mut lines, label, stats);
+    }
+    lines.extend([
+        Line::from(""),
+        Line::from("recent events (all targets, newest first)"),
+    ]);
+    lines.extend(
+        state
+            .recent_events
+            .iter()
+            .rev()
+            .map(|event| Line::from(event.clone())),
+    );
+    Text::from(lines)
 }
 
-fn target_label_span(label: &str, target_idx: usize, width: usize) -> Span<'static> {
-    Span::styled(
-        format!("{:<width$}", truncate(label, width), width = width),
-        target_style(target_idx).add_modifier(Modifier::BOLD),
+fn details_scroll_limits(text: &Text<'_>, area: Rect) -> (u16, u16) {
+    let inner = Block::bordered().inner(area);
+    (
+        text.height()
+            .saturating_sub(usize::from(inner.height))
+            .min(usize::from(u16::MAX)) as u16,
+        text.width()
+            .saturating_sub(usize::from(inner.width))
+            .min(usize::from(u16::MAX)) as u16,
     )
 }
 
-fn timing_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
-    let mut lines = vec![Line::from(format!(
-        "{:<18} {:>5} {:>9} {:>9} {:>9} {:>9}",
-        "metric", "n", "min", "mean", "max", "stddev"
-    ))];
-    push_time_line(&mut lines, "effective RTT", &snapshot.rtt.primary);
-    push_time_line(&mut lines, "raw RTT", &snapshot.rtt.raw);
-    push_time_line(&mut lines, "adjusted RTT", &snapshot.rtt.adjusted);
-    push_time_line(&mut lines, "IPDV/jitter", &snapshot.ipdv.round_trip);
-    push_time_line(&mut lines, "send IPDV", &snapshot.ipdv.send);
-    push_time_line(&mut lines, "receive IPDV", &snapshot.ipdv.receive);
-    push_time_line(&mut lines, "send delay", &snapshot.one_way_delay.send_delay);
-    push_time_line(
-        &mut lines,
-        "receive delay",
-        &snapshot.one_way_delay.receive_delay,
-    );
-    push_time_line(
-        &mut lines,
-        "server process",
-        &snapshot.server_processing.processing,
-    );
-    push_time_line(&mut lines, "send call", &snapshot.send_call);
-    push_time_line(&mut lines, "timer error", &snapshot.timer_error);
-
+fn status_line(state: &TuiState) -> Paragraph<'static> {
+    let mut lines = if state.details_open {
+        vec![
+            Line::from("q quit | p pause | d graph | Tab target"),
+            Line::from("↑/↓ scroll | ←/→ columns | PgUp/PgDn page"),
+            Line::from("Home top | End bottom | r clear graph history"),
+        ]
+    } else {
+        vec![
+            Line::from("q quit | p pause | d details | Tab target | m metric"),
+            Line::from("←/→ pan | PgUp/PgDn page | Home oldest | End live"),
+            Line::from("+/- zoom | 0 reset window | r clear graph history"),
+        ]
+    };
+    if let Some(warning) = &state.last_warning {
+        lines.push(Line::styled(
+            warning.clone(),
+            Style::default().fg(Color::LightRed),
+        ));
+    }
     Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title(if state.is_multi_target() {
-                    "timing - first target"
-                } else {
-                    "timing"
-                })
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: false })
 }
 
 fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let viewport = state
         .graph_viewport
         .range(Instant::now(), state.newest_graph_sample_time());
-    if state.is_multi_target() {
-        render_multi_target_graph(frame, area, state, viewport);
-        return;
-    }
-
-    let history = state
-        .selected_target()
-        .map(|target| &target.graph_history)
-        .expect("TuiState always has at least one target");
-    let visible = visible_history_window(history, viewport);
-    let series = graph_series(state.graph_metric, &visible, viewport);
-
-    render_chart(
-        frame,
-        area,
-        &visible,
-        &series,
-        ChartRenderConfig {
-            metric: state.graph_metric,
-            context: graph_context(state, viewport),
-            viewport,
-        },
-    );
-}
-
-fn render_multi_target_graph(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    state: &TuiState,
-    viewport: GraphViewportRange,
-) {
     let metric = state.graph_metric;
     let series = state
         .targets
@@ -1408,92 +1241,34 @@ fn render_multi_target_graph(
         .enumerate()
         .filter_map(|(idx, target)| target_metric_series(target, idx, viewport, metric))
         .collect::<Vec<_>>();
+    let block = Block::bordered().title(format!(
+        "{} | {} | window {}",
+        metric.label(),
+        graph_viewport_status(state),
+        format_span(viewport.window)
+    ));
     if series.is_empty() {
-        frame.render_widget(
-            Paragraph::new(metric.empty_message())
-                .block(
-                    Block::default()
-                        .title(graph_chart_title(metric, &graph_context(state, viewport)))
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: true }),
-            area,
-        );
+        frame.render_widget(Paragraph::new(metric.empty_message()).block(block), area);
         return;
     }
-
     let (min_y, max_y) = chart_y_bounds(&series, metric.axis_kind());
-    let datasets = chart_datasets(&series);
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(graph_chart_title(metric, &graph_context(state, viewport)))
-                .borders(Borders::ALL),
-        )
-        .x_axis(
-            Axis::default()
-                .bounds(viewport_x_bounds(viewport))
-                .labels(viewport_x_axis_labels(viewport))
-                .style(Style::default().fg(Color::Gray)),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds([min_y, max_y])
-                .labels(y_axis_labels(min_y, max_y, y_axis_label_count(area.height)))
-                .style(Style::default().fg(Color::Gray)),
-        );
-    frame.render_widget(chart, area);
-}
-
-fn render_chart(
-    frame: &mut Frame<'_>,
-    area: Rect,
-    _visible: &[&GraphSample],
-    series: &[ChartSeries],
-    config: ChartRenderConfig,
-) {
-    if series.is_empty() {
-        frame.render_widget(
-            Paragraph::new(config.metric.empty_message())
-                .block(
-                    Block::default()
-                        .title(graph_chart_title(config.metric, &config.context))
-                        .borders(Borders::ALL),
-                )
-                .wrap(Wrap { trim: true }),
-            area,
-        );
-        return;
-    }
-
-    let (min_y, max_y) = chart_y_bounds(series, config.metric.axis_kind());
-    let datasets = chart_datasets(series);
-    let chart = Chart::new(datasets)
-        .block(
-            Block::default()
-                .title(graph_chart_title(config.metric, &config.context))
-                .borders(Borders::ALL),
-        )
-        .x_axis(
-            Axis::default()
-                .bounds(viewport_x_bounds(config.viewport))
-                .labels(viewport_x_axis_labels(config.viewport))
-                .style(Style::default().fg(Color::Gray)),
-        )
-        .y_axis(
-            Axis::default()
-                .bounds([min_y, max_y])
-                .labels(y_axis_labels(min_y, max_y, y_axis_label_count(area.height)))
-                .style(Style::default().fg(Color::Gray)),
-        );
-    frame.render_widget(chart, area);
-}
-
-#[derive(Debug, Clone)]
-struct ChartRenderConfig {
-    metric: GraphMetric,
-    context: String,
-    viewport: GraphViewportRange,
+    frame.render_widget(
+        Chart::new(chart_datasets(&series))
+            .block(block)
+            .x_axis(
+                Axis::default()
+                    .bounds(viewport_x_bounds(viewport))
+                    .labels(viewport_x_axis_labels(viewport))
+                    .style(Style::default().fg(Color::Gray)),
+            )
+            .y_axis(
+                Axis::default()
+                    .bounds([min_y, max_y])
+                    .labels(y_axis_labels(min_y, max_y, y_axis_label_count(area.height)))
+                    .style(Style::default().fg(Color::Gray)),
+            ),
+        area,
+    );
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1507,47 +1282,6 @@ struct ChartSeries {
 enum ChartAxisKind {
     NonNegative,
     Signed,
-}
-
-fn visible_history_window(
-    history: &VecDeque<GraphSample>,
-    viewport: GraphViewportRange,
-) -> Vec<&GraphSample> {
-    history
-        .iter()
-        .filter(|sample| sample.timestamp >= viewport.start && sample.timestamp <= viewport.end)
-        .collect()
-}
-
-fn graph_series(
-    metric: GraphMetric,
-    visible: &[&GraphSample],
-    viewport: GraphViewportRange,
-) -> Vec<ChartSeries> {
-    chart_series(metric, visible, viewport)
-        .into_iter()
-        .collect()
-}
-
-fn chart_series(
-    metric: GraphMetric,
-    visible: &[&GraphSample],
-    viewport: GraphViewportRange,
-) -> Option<ChartSeries> {
-    let data: Vec<(f64, f64)> = visible
-        .iter()
-        .filter_map(|sample| {
-            metric
-                .value_ns(sample)
-                .map(|ns| (sample_x(sample, viewport), ns as f64 / 1_000_000.0))
-        })
-        .collect();
-
-    (!data.is_empty()).then_some(ChartSeries {
-        name: metric.label().to_owned(),
-        style: metric.style(),
-        data,
-    })
 }
 
 fn target_metric_series(
@@ -1566,7 +1300,6 @@ fn target_metric_series(
                 .map(|ns| (sample_x(sample, viewport), ns as f64 / 1_000_000.0))
         })
         .collect::<Vec<_>>();
-
     (!data.is_empty()).then_some(ChartSeries {
         name: target.label.clone(),
         style: target_style(target_idx),
@@ -1686,18 +1419,6 @@ fn viewport_x_axis_labels(viewport: GraphViewportRange) -> Vec<Span<'static>> {
     ]
 }
 
-fn graph_context(state: &TuiState, viewport: GraphViewportRange) -> String {
-    format!(
-        "{} | window {}",
-        graph_viewport_status(state),
-        format_span(viewport.window)
-    )
-}
-
-fn graph_chart_title(metric: GraphMetric, context: &str) -> String {
-    format!("{} | {context}", metric.title())
-}
-
 fn y_axis_label_count(height: u16) -> usize {
     let inner = height.saturating_sub(2);
     if inner >= 14 {
@@ -1752,118 +1473,6 @@ fn format_axis_time_ms(value_ms: f64) -> String {
             format!("{sign}{secs:.0}s")
         }
     }
-}
-
-fn recent_events_panel(state: &TuiState, panel_height: u16) -> Paragraph<'_> {
-    let lines: Vec<Line<'_>> = state
-        .recent_events
-        .iter()
-        .rev()
-        .take(recent_events_visible_count(panel_height))
-        .map(|event| Line::from(event.as_str()))
-        .collect();
-    Paragraph::new(lines)
-        .block(
-            Block::default()
-                .title("recent events")
-                .borders(Borders::ALL),
-        )
-        .wrap(Wrap { trim: true })
-}
-
-fn recent_events_visible_count(panel_height: u16) -> usize {
-    usize::from(panel_height.saturating_sub(2))
-}
-
-fn sample_panel(state: &TuiState, snapshot: &Snapshot) -> Paragraph<'static> {
-    let selected = state.selected_target();
-    let last = selected.and_then(|target| target.last_sample);
-    let warning = selected
-        .and_then(|target| target.last_warning.clone())
-        .or_else(|| state.last_warning.clone())
-        .unwrap_or_else(|| "-".to_owned());
-    Paragraph::new(vec![
-        Line::from(format!(
-            "last seq: {}",
-            last.map(|sample| format_seq(sample.seq))
-                .unwrap_or_else(|| "-".to_owned())
-        )),
-        Line::from(format!(
-            "raw / adjusted / effective: {} / {} / {}",
-            last.map(|sample| format_optional_ns_i128(Some(sample.raw_ns)))
-                .unwrap_or_else(|| "-".to_owned()),
-            last.map(|sample| format_optional_ns_i128(sample.adjusted_ns))
-                .unwrap_or_else(|| "-".to_owned()),
-            last.map(|sample| format_optional_ns_i128(Some(sample.effective_ns)))
-                .unwrap_or_else(|| "-".to_owned())
-        )),
-        Line::from(format!(
-            "one-way c2s / s2c: {} / {}",
-            last.map(|sample| format_optional_ns_i128(sample.client_to_server_ns))
-                .unwrap_or_else(|| "-".to_owned()),
-            last.map(|sample| format_optional_ns_i128(sample.server_to_client_ns))
-                .unwrap_or_else(|| "-".to_owned())
-        )),
-        Line::from(format!(
-            "server processing: {}",
-            last.map(|sample| format_optional_ns_i128(sample.server_processing_ns))
-                .unwrap_or_else(|| "-".to_owned())
-        )),
-        Line::from(format!(
-            "events sent={} replies={} losses={} warnings={}",
-            format_count(snapshot.events.sent_events),
-            format_count(snapshot.events.echo_replies),
-            format_count(snapshot.events.loss_events),
-            format_count(snapshot.events.warning_events)
-        )),
-        Line::from(format!("last warning: {warning}")),
-    ])
-    .block(
-        Block::default()
-            .title(if state.is_multi_target() {
-                "sample - first target"
-            } else {
-                "sample"
-            })
-            .borders(Borders::ALL),
-    )
-    .wrap(Wrap { trim: true })
-}
-
-fn status_line(state: &TuiState) -> Paragraph<'_> {
-    let paused = if state.paused { " display paused" } else { "" };
-    let quitting = if state.quit_requested {
-        " quit requested"
-    } else {
-        ""
-    };
-    let view_hint = match state.view {
-        TuiView::Graph => "g dashboard",
-        TuiView::Dashboard => "g graph",
-    };
-    let incomplete = if state.dropped_events > 0 {
-        format!(" incomplete:dropped={}", state.dropped_events)
-    } else {
-        String::new()
-    };
-    let controls = if state.graph_viewport.mode == GraphViewportMode::Follow {
-        format!(
-            "q quit | r reset | p pause | {view_hint} | m metric | arrows pan | +/- zoom | 0 reset window"
-        )
-    } else {
-        format!(
-            "q quit | End live | {view_hint} | m metric | arrows pan | PgUp/PgDn page | +/- zoom | 0 reset window"
-        )
-    };
-    let lines = vec![Line::from(format!(
-        "{}{}{}{} | {}",
-        state.status.label(),
-        paused,
-        quitting,
-        incomplete,
-        controls
-    ))];
-    Paragraph::new(lines).block(Block::default().borders(Borders::ALL))
 }
 
 fn graph_viewport_status(state: &TuiState) -> String {
@@ -1922,10 +1531,6 @@ fn format_negotiated(negotiated: &NegotiationResult) -> String {
     )
 }
 
-fn format_optional_span(value: Option<Duration>) -> String {
-    value.map(format_span).unwrap_or_else(|| ABSENT.to_owned())
-}
-
 /// Format a wall-clock span shown in the TUI's headers, config lines, and
 /// graph window labels.
 ///
@@ -1950,30 +1555,6 @@ fn format_span(value: Duration) -> String {
     }
 }
 
-fn format_rate(count: u64, elapsed: Duration) -> String {
-    let secs = elapsed.as_secs_f64();
-    if secs <= f64::EPSILON {
-        ABSENT.to_owned()
-    } else {
-        format!("{:.2}/s", count as f64 / secs)
-    }
-}
-
-fn truncate(value: &str, max_chars: usize) -> String {
-    if value.chars().count() <= max_chars {
-        return value.to_owned();
-    }
-    value
-        .chars()
-        .take(max_chars.saturating_sub(1))
-        .chain(std::iter::once('~'))
-        .collect()
-}
-
-fn format_seq(value: u32) -> String {
-    value.to_string()
-}
-
 fn format_optional_hex(value: Option<u64>) -> String {
     value
         .map(|value| format!("0x{value:x}"))
@@ -1982,4 +1563,230 @@ fn format_optional_hex(value: Option<u64>) -> String {
 
 fn duration_ns(value: Duration) -> i128 {
     i128::try_from(value.as_nanos()).unwrap_or(i128::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use irtt_client::{ClientTimestamp, OneWayDelaySample, PacketMeta, RttSample, ServerTiming};
+    use ratatui::backend::TestBackend;
+    use std::time::SystemTime;
+
+    fn measure(state: &mut TuiState, label: &str, seq: u32, at: Instant, effective_ns: i128) {
+        let target = TargetInstance {
+            id: label.into(),
+            generation: 1,
+        };
+        let received_at = ClientTimestamp {
+            mono: at,
+            wall: SystemTime::UNIX_EPOCH + Duration::from_secs(1),
+        };
+        let sent_at = ClientTimestamp {
+            mono: at - Duration::from_millis(10),
+            wall: received_at.wall - Duration::from_millis(10),
+        };
+        let remote = "127.0.0.1:2112".parse().unwrap();
+        state.process_target_event(
+            &target,
+            &ClientEvent::EchoSent {
+                seq,
+                remote,
+                scheduled_at: None,
+                sent_at,
+                bytes: 64,
+                send_call: Duration::ZERO,
+                timer_error: None,
+            },
+        );
+        state.process_target_event(
+            &target,
+            &ClientEvent::EchoReply {
+                seq,
+                remote,
+                sent_at,
+                received_at,
+                rtt: RttSample {
+                    raw: Duration::from_millis(10),
+                    adjusted: Some(SignedDuration::from_nanos(effective_ns)),
+                    effective: SignedDuration::from_nanos(effective_ns),
+                },
+                server_timing: Some(ServerTiming {
+                    receive_wall_ns: None,
+                    receive_mono_ns: None,
+                    send_wall_ns: None,
+                    send_mono_ns: None,
+                    midpoint_wall_ns: None,
+                    midpoint_mono_ns: None,
+                    processing: Some(Duration::from_nanos((10_000_000 - effective_ns) as u64)),
+                }),
+                one_way: Some(OneWayDelaySample {
+                    client_to_server: Some(SignedDuration::from_nanos(-3_000_000)),
+                    server_to_client: Some(SignedDuration::from_nanos(effective_ns + 3_000_000)),
+                }),
+                received_stats: None,
+                bytes: 64,
+                packet_meta: PacketMeta::default(),
+            },
+        );
+    }
+
+    fn screen(state: &TuiState, width: u16, height: u16) -> String {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw_dashboard(frame, state)).unwrap();
+        terminal
+            .backend()
+            .buffer()
+            .content()
+            .chunks(usize::from(width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn target_focus_and_details_remain_usable_across_sizes() {
+        let mut state = TuiState::with_target_labels(
+            TuiConfig::default(),
+            (0..8).map(|i| format!("target{i}")),
+        );
+        let now = Instant::now();
+        measure(
+            &mut state,
+            "target7",
+            0,
+            now - Duration::from_secs(5),
+            8_000_000,
+        );
+        measure(&mut state, "target7", 1, now, 5_000_000);
+        for (width, height) in [(56, 18), (80, 24), (120, 40)] {
+            let area = Rect::new(0, 0, width, height);
+            state.handle_key(KeyCode::Home, area);
+            state.handle_key(KeyCode::BackTab, area);
+            let text = screen(&state, width, height);
+            assert!(text.contains(">target7"), "{text}");
+            assert!(
+                text.contains("jitter σ") && text.contains("loss %"),
+                "{text}"
+            );
+            assert!(
+                text.contains(&format_optional_ns_i128(Some(-3_000_000)))
+                    && text.contains(&format_optional_ns_i128(Some(5_000_000))),
+                "{text}"
+            );
+            state.handle_key(KeyCode::Char('d'), area);
+            assert!(screen(&state, width, height).contains("target: target7"));
+            state.handle_key(KeyCode::End, area);
+            assert!(screen(&state, width, height).contains("target7: reply"));
+            state.handle_key(KeyCode::Tab, area);
+            // Selecting another target resets detail scrolling and exposes its own data.
+            assert!(screen(&state, width, height).contains("target: target0"));
+            state.handle_key(KeyCode::Esc, area);
+        }
+        assert!(screen(&state, 40, 10).contains("terminal too small"));
+    }
+
+    #[test]
+    fn history_reset_keeps_latest_summary_and_statistics_while_paused() {
+        let mut state = TuiState::default();
+        let area = Rect::new(0, 0, 100, 40);
+        state.handle_key(KeyCode::Char('p'), area);
+        measure(&mut state, "target", 0, Instant::now(), 8_000_000);
+        state.handle_key(KeyCode::Char('r'), area);
+        let text = screen(&state, 100, 40);
+        assert!(
+            text.contains(&format_optional_ns_i128(Some(8_000_000)))
+                && text.contains("display paused")
+        );
+        assert!(text.contains("waiting for primary replies"));
+        state.handle_key(KeyCode::Char('d'), area);
+        let text = screen(&state, 100, 40);
+        assert!(text.contains("sent 1  received 1  unique 1"));
+        assert!(text.contains(&format!(
+            "effective RTT: {}",
+            format_optional_ns_i128(Some(8_000_000))
+        )));
+        state.handle_key(KeyCode::Esc, area);
+        measure(&mut state, "target", 1, Instant::now(), 5_000_000);
+        assert!(!screen(&state, 100, 40).contains("waiting for primary replies"));
+    }
+
+    #[test]
+    fn graph_controls_preserve_signed_metrics_and_history_range() {
+        let mut state =
+            TuiState::with_target_labels(TuiConfig::default(), ["a".to_owned(), "b".to_owned()]);
+        let area = Rect::new(0, 0, 100, 40);
+        let now = Instant::now();
+        for label in ["a", "b"] {
+            measure(
+                &mut state,
+                label,
+                0,
+                now - Duration::from_secs(120),
+                -2_000_000,
+            );
+            measure(
+                &mut state,
+                label,
+                1,
+                now - Duration::from_secs(60),
+                -2_000_000,
+            );
+            measure(&mut state, label, 2, now, -2_000_000);
+        }
+        state.handle_key(KeyCode::Home, area);
+        let viewport = state
+            .graph_viewport
+            .range(now, state.newest_graph_sample_time());
+        assert_eq!(viewport.start, now - Duration::from_secs(120));
+        assert_eq!(viewport.end, now - Duration::from_secs(60));
+        for metric in [
+            GraphMetric::EffectiveRtt,
+            GraphMetric::RawRtt,
+            GraphMetric::AdjustedRtt,
+            GraphMetric::ClientToServer,
+            GraphMetric::ServerToClient,
+            GraphMetric::ServerProcessing,
+        ] {
+            assert_eq!(state.graph_metric, metric);
+            let series = state
+                .targets
+                .iter()
+                .enumerate()
+                .map(|(i, target)| target_metric_series(target, i, viewport, metric).unwrap())
+                .collect::<Vec<_>>();
+            // Both endpoints belong to the viewport, for both targets.
+            assert!(series.iter().all(|series| series.data.len() == 2));
+            if matches!(
+                metric,
+                GraphMetric::EffectiveRtt | GraphMetric::AdjustedRtt | GraphMetric::ClientToServer
+            ) {
+                assert!(series
+                    .iter()
+                    .all(|series| series.data.iter().all(|(_, y)| *y < 0.0)));
+                assert!(chart_y_bounds(&series, metric.axis_kind()).0 < 0.0);
+            }
+            state.handle_key(KeyCode::Char('m'), area);
+        }
+        state.handle_key(KeyCode::PageDown, area);
+        assert_eq!(state.graph_viewport.range(now, Some(now)).end, now);
+        state.handle_key(KeyCode::Left, area);
+        assert_eq!(
+            state.graph_viewport.range(now, Some(now)).end,
+            now - Duration::from_secs(15)
+        );
+        state.handle_key(KeyCode::Right, area);
+        state.handle_key(KeyCode::PageUp, area);
+        assert_eq!(
+            state.graph_viewport.range(now, Some(now)).end,
+            now - Duration::from_secs(60)
+        );
+        state.handle_key(KeyCode::Char('+'), area);
+        assert_eq!(state.graph_viewport.window, Duration::from_secs(40));
+        state.handle_key(KeyCode::Char('-'), area);
+        assert_eq!(state.graph_viewport.window, DEFAULT_GRAPH_WINDOW);
+        state.handle_key(KeyCode::Char('0'), area);
+        assert!(!state.graph_viewport.range(now, Some(now)).is_live);
+        state.handle_key(KeyCode::End, area);
+        assert!(state.graph_viewport.range(now, Some(now)).is_live);
+    }
 }
