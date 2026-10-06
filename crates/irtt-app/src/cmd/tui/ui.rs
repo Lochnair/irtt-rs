@@ -1272,30 +1272,51 @@ fn target_metric_series(
     viewport: GraphViewportRange,
     metric: GraphMetric,
 ) -> Option<ChartSeries> {
-    let data = target
-        .graph_history
-        .iter()
-        .filter(|sample| {
-            sample.timestamp.mono >= viewport.start && sample.timestamp.mono <= viewport.end
-        })
-        .filter_map(|sample| {
-            metric
-                .value_ns(sample)
-                .map(|ns| (sample_x(sample, viewport), ns as f64 / 1_000_000.0))
-        })
-        .collect::<Vec<_>>();
+    let points = target.graph_history.iter().filter_map(|sample| {
+        metric
+            .value_ns(sample)
+            .map(|ns| (sample.timestamp.mono, ns as f64 / 1_000_000.0))
+    });
+    let mut data = Vec::new();
+    let mut previous: Option<(Instant, f64)> = None;
+    for point in points {
+        if let Some(before) = previous {
+            // Only genuine crossing segments contribute boundary points. In
+            // particular, never extend the latest sample to the live edge.
+            if before.0 < viewport.start && point.0 > viewport.start {
+                data.push((0.0, interpolate_graph_value(before, point, viewport.start)));
+            }
+            if before.0 < viewport.end && point.0 > viewport.end {
+                data.push((
+                    viewport.window.as_secs_f64(),
+                    interpolate_graph_value(before, point, viewport.end),
+                ));
+            }
+        }
+        if point.0 > viewport.end {
+            break;
+        }
+        if point.0 >= viewport.start {
+            data.push((
+                point.0.duration_since(viewport.start).as_secs_f64(),
+                point.1,
+            ));
+        }
+        previous = Some(point);
+    }
     (!data.is_empty()).then_some(ChartSeries {
         style: target_style(target_idx),
         data,
     })
 }
 
-fn sample_x(sample: &GraphSample, viewport: GraphViewportRange) -> f64 {
-    sample
-        .timestamp
-        .mono
-        .saturating_duration_since(viewport.start)
-        .as_secs_f64()
+fn interpolate_graph_value(a: (Instant, f64), b: (Instant, f64), at: Instant) -> f64 {
+    let whole = b.0.duration_since(a.0).as_secs_f64();
+    if whole == 0.0 {
+        return b.1;
+    }
+    let part = at.duration_since(a.0).as_secs_f64();
+    a.1 + (b.1 - a.1) * (part / whole)
 }
 
 fn chart_datasets(series: &[ChartSeries]) -> Vec<Dataset<'_>> {
