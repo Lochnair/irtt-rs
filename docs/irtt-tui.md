@@ -31,6 +31,18 @@ a finite run:
 irtt-tui <server> --duration 30s
 ```
 
+Continuous runs reconnect after target-local failures, peer closure, or a
+session completing because the server restricted its duration. After a
+1.5-second delay, one coalesced retry reopens completed targets while healthy
+sessions continue undisturbed. Even if every target fails, the TUI stays alive
+until you quit. Explicit stops, removed or replaced targets, and no-test
+completion do not trigger retries. Quitting cancels pending retry work.
+
+Each reconnect keeps the same logical target row. Statistics reset when a new
+session generation is accepted, including attempts that fail before opening.
+Retained graph history and the age of the last actual reply remain; the graph
+leaves a gap between generations instead of connecting their samples.
+
 ## DASHBOARD
 
 One dashboard is used for every target count and terminal size. It shows:
@@ -88,7 +100,7 @@ redraws still work while the display is paused.
 The six graph metrics are effective RTT, raw RTT, adjusted RTT,
 client-to-server delay, server-to-client delay, and server processing time.
 Signed effective/adjusted RTT and one-way values are preserved. Graph windows
-range from 5 seconds to one hour and default to one minute. The footer shows
+range from 5 seconds to 24 hours and default to one minute. The footer shows
 controls appropriate to the currently open graph or details sheet.
 
 ## RETAINED HISTORY
@@ -116,9 +128,14 @@ corrupt the display. Size a long finite TUI run from the figures in
 
 ## EXIT BEHAVIOR
 
-Quitting with `q` or `Ctrl-C` is an interrupted, successful exit. Otherwise,
-exit status follows the same peer-close and driver-failure rules as
-`irtt-client(1)`.
+Quitting with `q` or `Ctrl-C` is an interrupted, successful exit. In continuous
+mode, peer closure and target failures trigger reconnect rather than ending the
+run. A managed driver failure or an unexpected reconnect-update failure still
+ends the TUI with an error.
+
+Finite runs do not reconnect. They complete after their target sessions end;
+a peer closure is a normal session ending, while a run whose targets all fail
+exits with an error.
 
 ## EXAMPLES
 

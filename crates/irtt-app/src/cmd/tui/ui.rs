@@ -11,7 +11,10 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use irtt_client::managed::{ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance};
+use irtt_client::managed::{
+    ManagedStatus, ManagedTargetEndReason, ManagedTargetLifecycle, ManagedTargetOutcome,
+    TargetInstance,
+};
 use irtt_client::{
     ClientEvent, ClientTimestamp, NegotiationResult, OneWayDelaySample, RttSample, SignedDuration,
 };
@@ -22,7 +25,10 @@ use ratatui::{
     style::{Color, Modifier, Style},
     symbols,
     text::{Line, Span, Text},
-    widgets::{Axis, Block, Chart, Dataset, GraphType, Paragraph, Row, Table, Wrap},
+    widgets::{
+        canvas::{Canvas, Line as CanvasLine, Painter, Shape},
+        Axis, Block, Chart, Paragraph, Row, Table, Wrap,
+    },
     Frame, Terminal,
 };
 
@@ -183,13 +189,91 @@ impl TuiState {
 
     pub(super) fn process_target_event(&mut self, target: &TargetInstance, event: &ClientEvent) {
         let idx = self.ensure_target(target.id.as_str());
+        if !self.accept_generation(idx, target.generation) {
+            return;
+        }
+        if self.targets[idx].terminal_generation == Some(target.generation) {
+            self.targets[idx].process_session_metadata(event);
+            if matches!(
+                event,
+                ClientEvent::SessionStarted(_)
+                    | ClientEvent::NoTestCompleted(_)
+                    | ClientEvent::SessionClosed { .. }
+            ) {
+                return;
+            }
+        }
         self.process_event_for_target(idx, event);
+    }
+
+    fn accept_generation(&mut self, idx: usize, generation: u64) -> bool {
+        let target = &mut self.targets[idx];
+        if target
+            .generation
+            .is_some_and(|current| current > generation)
+        {
+            return false;
+        }
+        if target.generation != Some(generation) {
+            target.generation = Some(generation);
+            target.stats = StatsCollector::new(stats_config(self.config.duration.is_none()));
+            target.session = None;
+            target.negotiated = None;
+        }
+        true
+    }
+
+    pub(super) fn process_target_opening(&mut self, instance: &TargetInstance) {
+        let idx = self.ensure_target(instance.id.as_str());
+        let new_generation = self.targets[idx].generation != Some(instance.generation);
+        if self.accept_generation(idx, instance.generation) && new_generation {
+            self.targets[idx].status = TargetStatus::Opening;
+        }
+    }
+
+    pub(super) fn process_managed_status(&mut self, status: &ManagedStatus) {
+        // Consume durable endings before accepting replacement generations.
+        // Receipts retain this history even if a watch update was coalesced.
+        for outcome in status.recent_target_outcomes.iter().chain(
+            status
+                .targets
+                .iter()
+                .filter_map(|target| target.outcome.as_deref()),
+        ) {
+            self.process_target_outcome(outcome);
+        }
+        for target in status.targets.iter() {
+            if matches!(
+                target.lifecycle,
+                ManagedTargetLifecycle::Pending
+                    | ManagedTargetLifecycle::Connecting
+                    | ManagedTargetLifecycle::Opening
+            ) {
+                self.process_target_opening(&target.target);
+            } else {
+                let idx = self.ensure_target(target.target.id.as_str());
+                if self.accept_generation(idx, target.target.generation)
+                    && self.targets[idx].terminal_generation != Some(target.target.generation)
+                    && target.lifecycle == ManagedTargetLifecycle::Active
+                {
+                    self.targets[idx].status = TargetStatus::Active;
+                }
+            }
+        }
     }
 
     pub(super) fn process_target_outcome(&mut self, outcome: &ManagedTargetOutcome) {
         let label = outcome.target.id.as_str();
         let idx = self.ensure_target(label);
 
+        if self.targets[idx]
+            .terminal_generation
+            .is_some_and(|generation| generation >= outcome.target.generation)
+        {
+            return;
+        }
+        let current = self.accept_generation(idx, outcome.target.generation);
+        self.targets[idx].terminal_generation = Some(outcome.target.generation);
         let (status, recent, primary_warning) = match &outcome.end_reason {
             ManagedTargetEndReason::TestComplete => {
                 (TargetStatus::Closed, "test completed".to_owned(), None)
@@ -237,8 +321,10 @@ impl TuiState {
         };
 
         let target = &mut self.targets[idx];
-        target.remote = outcome.remote.map(|remote| remote.to_string());
-        target.status = status;
+        if current {
+            target.remote = outcome.remote.map(|remote| remote.to_string());
+            target.status = status;
+        }
         if let Some(warning) = &warning {
             target.last_warning = Some(warning.clone());
         }
@@ -250,10 +336,11 @@ impl TuiState {
             self.push_event(format!("{label}: {cleanup_warning}"));
         }
 
-        if self
-            .targets
-            .iter()
-            .all(|target| target.status.is_terminal())
+        if self.config.duration.is_some()
+            && self
+                .targets
+                .iter()
+                .all(|target| target.status.is_terminal())
         {
             self.status = if self.targets.iter().any(|target| target.status.is_success()) {
                 TuiStatus::Complete
@@ -319,6 +406,7 @@ impl TuiState {
                     ..
                 } => {
                     target.push_graph_sample(GraphSample {
+                        generation: target.generation.expect("client event has a generation"),
                         timestamp: *received_at,
                         seq: *seq,
                         rtt: *rtt,
@@ -364,10 +452,11 @@ impl TuiState {
         };
         if let Some(status) = global_status {
             self.status = if status == TuiStatus::Complete
-                && !self
-                    .targets
-                    .iter()
-                    .all(|target| target.status.is_terminal())
+                && (self.config.duration.is_none()
+                    || !self
+                        .targets
+                        .iter()
+                        .all(|target| target.status.is_terminal()))
             {
                 TuiStatus::Running
             } else {
@@ -519,6 +608,8 @@ impl TuiState {
 #[derive(Debug)]
 struct TuiTargetState {
     label: String,
+    generation: Option<u64>,
+    terminal_generation: Option<u64>,
     remote: Option<String>,
     session: Option<String>,
     status: TargetStatus,
@@ -533,6 +624,8 @@ impl TuiTargetState {
     fn new(label: String, stats_config: irtt_stats::StatsConfig) -> Self {
         Self {
             label,
+            generation: None,
+            terminal_generation: None,
             remote: None,
             session: None,
             status: TargetStatus::Opening,
@@ -541,6 +634,25 @@ impl TuiTargetState {
             last_sample: None,
             last_warning: None,
             stats: StatsCollector::new(stats_config),
+        }
+    }
+
+    fn process_session_metadata(&mut self, event: &ClientEvent) {
+        match event {
+            ClientEvent::SessionStarted(started) => {
+                self.remote = Some(started.remote.to_string());
+                self.session = Some(format!("{:#x}", started.token));
+                self.negotiated = Some(started.negotiation.clone());
+            }
+            ClientEvent::NoTestCompleted(completed) => {
+                self.remote = Some(completed.remote.to_string());
+                self.negotiated = Some(completed.negotiation.clone());
+            }
+            ClientEvent::SessionClosed { remote, token, .. } => {
+                self.remote = Some(remote.to_string());
+                self.session = Some(format!("{token:#x}"));
+            }
+            _ => {}
         }
     }
 
@@ -886,6 +998,7 @@ impl GraphMetric {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GraphSample {
+    generation: u64,
     timestamp: ClientTimestamp,
     seq: u32,
     rtt: RttSample,
@@ -1235,22 +1348,57 @@ fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         return;
     }
     let (min_y, max_y) = chart_y_bounds(&series, metric.axis_kind());
+    let x_labels = viewport_x_axis_labels(state, viewport, area.width);
+    let y_labels = y_axis_labels(min_y, max_y, y_axis_label_count(area.height));
+    let inner = block.inner(area);
+    // This chart has labels on both axes, no axis titles and no legend.
+    // Match the pinned Chart's label gutter and its two bottom axis rows.
+    let gutter = y_labels
+        .iter()
+        .map(Span::width)
+        .max()
+        .unwrap_or(0)
+        .max(
+            x_labels
+                .first()
+                .map_or(0, |label| label.width().saturating_sub(1)),
+        )
+        .min(usize::from(inner.width / 3)) as u16
+        + 1;
+    let plot = Rect::new(
+        inner.x + gutter,
+        inner.y,
+        inner.width.saturating_sub(gutter),
+        inner.height.saturating_sub(2),
+    );
     frame.render_widget(
-        Chart::new(chart_datasets(&series))
+        Chart::new(vec![])
             .block(block)
             .x_axis(
                 Axis::default()
                     .bounds(viewport_x_bounds(viewport))
-                    .labels(viewport_x_axis_labels(state, viewport, area.width))
+                    .labels(x_labels)
                     .style(Style::default().fg(Color::Gray)),
             )
             .y_axis(
                 Axis::default()
                     .bounds([min_y, max_y])
-                    .labels(y_axis_labels(min_y, max_y, y_axis_label_count(area.height)))
+                    .labels(y_labels)
                     .style(Style::default().fg(Color::Gray)),
             ),
         area,
+    );
+    frame.render_widget(
+        Canvas::default()
+            .marker(symbols::Marker::Braille)
+            .x_bounds(viewport_x_bounds(viewport))
+            .y_bounds([min_y, max_y])
+            .paint(|ctx| {
+                for target in &series {
+                    ctx.draw(target);
+                }
+            }),
+        plot,
     );
 }
 
@@ -1278,23 +1426,40 @@ fn target_metric_series(
     let first = target
         .graph_history
         .partition_point(|sample| sample.timestamp.mono < viewport.start);
+    let predecessor_generation = target
+        .graph_history
+        .get(first.saturating_sub(1))
+        .map(|sample| sample.generation);
     let mut previous = target
         .graph_history
         .range(..first)
         .rev()
+        .take_while(|sample| Some(sample.generation) == predecessor_generation)
         .find_map(|sample| {
-            metric
-                .value_ns(sample)
-                .map(|ns| (sample.timestamp.mono, ns as f64 / 1_000_000.0))
+            metric.value_ns(sample).map(|ns| {
+                (
+                    sample.generation,
+                    (sample.timestamp.mono, ns as f64 / 1_000_000.0),
+                )
+            })
         });
     let points = target.graph_history.range(first..).filter_map(|sample| {
-        metric
-            .value_ns(sample)
-            .map(|ns| (sample.timestamp.mono, ns as f64 / 1_000_000.0))
+        metric.value_ns(sample).map(|ns| {
+            (
+                sample.generation,
+                (sample.timestamp.mono, ns as f64 / 1_000_000.0),
+            )
+        })
     });
     let mut data = Vec::new();
-    for point in points {
-        if let Some(before) = previous {
+    for (generation, point) in points {
+        if previous.is_some_and(|(before_generation, _)| before_generation != generation) {
+            if !data.is_empty() {
+                data.push((f64::NAN, f64::NAN));
+            }
+            previous = None;
+        }
+        if let Some((_, before)) = previous {
             // Only genuine crossing segments contribute boundary points. In
             // particular, never extend the latest sample to the live edge.
             if before.0 < viewport.start && point.0 > viewport.start {
@@ -1316,7 +1481,11 @@ fn target_metric_series(
                 point.1,
             ));
         }
-        previous = Some(point);
+        previous = Some((generation, point));
+    }
+    // A boundary beyond the viewport needs no trailing break.
+    if data.last().is_some_and(|(x, _)| !x.is_finite()) {
+        data.pop();
     }
     (!data.is_empty()).then_some(ChartSeries {
         style: target_style(target_idx),
@@ -1333,17 +1502,32 @@ fn interpolate_graph_value(a: (Instant, f64), b: (Instant, f64), at: Instant) ->
     a.1 + (b.1 - a.1) * (part / whole)
 }
 
-fn chart_datasets(series: &[ChartSeries]) -> Vec<Dataset<'_>> {
-    series
-        .iter()
-        .map(|series| {
-            Dataset::default()
-                .marker(symbols::Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(series.style)
-                .data(&series.data)
-        })
-        .collect()
+// Ratatui 0.30.2 casts NaN coordinates to grid positions. Filter breaks
+// ourselves so one canvas shape and one backing buffer suffice per target.
+impl Shape for ChartSeries {
+    fn draw(&self, painter: &mut Painter) {
+        let color = self.style.fg.unwrap_or(Color::Reset);
+        for &(x, y) in &self.data {
+            if x.is_finite() && y.is_finite() {
+                if let Some((x, y)) = painter.get_point(x, y) {
+                    painter.paint(x, y, color);
+                }
+            }
+        }
+        for pair in self.data.windows(2) {
+            let [(x1, y1), (x2, y2)] = [pair[0], pair[1]];
+            if [x1, y1, x2, y2].iter().all(|value| value.is_finite()) {
+                CanvasLine {
+                    x1,
+                    y1,
+                    x2,
+                    y2,
+                    color,
+                }
+                .draw(painter);
+            }
+        }
+    }
 }
 
 fn target_style(idx: usize) -> Style {
@@ -1365,11 +1549,11 @@ fn chart_y_bounds(series: &[ChartSeries], axis_kind: ChartAxisKind) -> (f64, f64
         series
             .data
             .iter()
+            .filter(|(_, value)| value.is_finite())
             .map(|(_, value)| match axis_kind {
                 ChartAxisKind::NonNegative => (*value).max(0.0),
                 ChartAxisKind::Signed => *value,
             })
-            .filter(|value| value.is_finite())
     });
     let Some(first) = values.next() else {
         return default_y_bounds(axis_kind);
@@ -1691,4 +1875,268 @@ fn format_optional_hex(value: Option<u64>) -> String {
     value
         .map(|value| format!("0x{value:x}"))
         .unwrap_or_else(|| ABSENT.to_owned())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_failure_and_replacement_reset_stats_without_client_events() {
+        use irtt_client::managed::{
+            ManagedClient, ManagedClientConfig, ManagedCompletionPolicy, ManagedTargetConfig,
+        };
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let desired = vec![ManagedTargetConfig::new("monitor", "127.0.0.1:99999")];
+            let (task, handle) = ManagedClient::task(
+                ManagedClientConfig {
+                    completion: ManagedCompletionPolicy::ExplicitStop,
+                    ..Default::default()
+                },
+                desired.clone(),
+            )
+            .unwrap();
+            let mut status = handle.subscribe_status();
+            let instance = status.borrow().targets[0].target.clone();
+            let mut state = TuiState::with_target_labels(
+                TuiConfig {
+                    interval: Duration::from_secs(1),
+                    duration: None,
+                    timeout: Duration::from_secs(4),
+                    target_probes: None,
+                    pacing: GroupPacingArg::Staggered,
+                },
+                ["monitor".to_owned()],
+            );
+            state.process_target_event(
+                &instance,
+                &ClientEvent::EchoSent {
+                    seq: 42,
+                    remote: "127.0.0.1:2112".parse().unwrap(),
+                    scheduled_at: None,
+                    sent_at: ClientTimestamp::now(),
+                    bytes: 60,
+                    send_call: Duration::ZERO,
+                    timer_error: None,
+                },
+            );
+            assert_eq!(state.targets[0].stats.snapshot().packets.packets_sent, 1);
+            let run = tokio::spawn(task);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    status.changed().await.unwrap();
+                    if status.borrow().targets[0].outcome.is_some() {
+                        break;
+                    }
+                }
+                // Never consume broadcast events: status owns the failure evidence.
+                let snapshot = status.borrow_and_update().clone();
+                let outcome = snapshot.targets[0].outcome.as_ref().unwrap();
+                state.process_managed_status(&snapshot);
+                assert_eq!(state.targets[0].status, TargetStatus::Failed);
+                assert!(state.targets[0].last_warning.is_some());
+                let negotiation = NegotiationResult {
+                    accepted: irtt_client::AcceptedSessionParameters {
+                        duration: None,
+                        interval: Duration::from_secs(1),
+                        length: 60,
+                        received_stats: irtt_proto::ReceivedStats::Both,
+                        stamp_at: irtt_proto::StampAt::Both,
+                        clock: irtt_proto::Clock::Both,
+                        dscp: 0,
+                        server_fill: None,
+                    },
+                    peer_params: irtt_proto::Params::default(),
+                    changes: vec![],
+                };
+                let remote = "127.0.0.1:2112".parse().unwrap();
+                let global_status = state.status;
+                for event in [
+                    ClientEvent::SessionStarted(irtt_client::SessionStarted {
+                        remote,
+                        token: 123,
+                        negotiation: negotiation.clone(),
+                        at: ClientTimestamp::now(),
+                    }),
+                    ClientEvent::NoTestCompleted(irtt_client::NoTestCompleted {
+                        remote,
+                        negotiation: negotiation.clone(),
+                        at: ClientTimestamp::now(),
+                    }),
+                    ClientEvent::SessionClosed {
+                        remote,
+                        token: 123,
+                        at: ClientTimestamp::now(),
+                    },
+                ] {
+                    state.process_target_event(&instance, &event);
+                    assert_eq!(state.targets[0].remote.as_deref(), Some("127.0.0.1:2112"));
+                    assert_eq!(state.targets[0].session.as_deref(), Some("0x7b"));
+                    assert_eq!(state.targets[0].negotiated.as_ref(), Some(&negotiation));
+                    assert_eq!(state.targets[0].status, TargetStatus::Failed);
+                    assert_eq!(state.status, global_status);
+                    assert_eq!(state.targets[0].stats.snapshot().packets.packets_sent, 1);
+                }
+                let event_count = state.recent_events.len();
+                state.process_target_outcome(outcome);
+                assert_eq!(
+                    state.recent_events.len(),
+                    event_count,
+                    "no duplicate ending"
+                );
+
+                let ack = handle.update_targets(desired).unwrap().await.unwrap();
+                // Opening events may arrive before their update receipt.
+                let mut late_state =
+                    TuiState::with_target_labels(state.config.clone(), ["monitor".to_owned()]);
+                late_state.process_target_opening(&ack.status.targets[0].target);
+                late_state.process_managed_status(&ack.status);
+                assert_eq!(late_state.targets[0].status, TargetStatus::Opening);
+                assert!(late_state.targets[0].last_warning.is_some());
+
+                state.process_managed_status(&ack.status);
+                assert_eq!(state.targets[0].status, TargetStatus::Opening);
+                assert_eq!(state.targets[0].stats.snapshot().packets.packets_sent, 0);
+                assert!(
+                    state.targets[0].last_warning.is_some(),
+                    "failure evidence survives reprovisioning"
+                );
+                loop {
+                    status.changed().await.unwrap();
+                    if status.borrow().targets[0].outcome.is_some() {
+                        break;
+                    }
+                }
+                state.process_managed_status(&status.borrow_and_update());
+                assert_eq!(state.targets[0].status, TargetStatus::Failed);
+                assert_eq!(state.targets[0].stats.snapshot().packets.packets_sent, 0);
+                // An older receipt must not revive a durably failed generation.
+                state.process_managed_status(&ack.status);
+                assert_eq!(state.targets[0].status, TargetStatus::Failed);
+                handle.stop().await;
+                run.await.unwrap();
+            })
+            .await
+            .unwrap();
+        });
+    }
+
+    #[test]
+    fn reconnect_history_clips_within_sessions_and_leaves_the_outage_empty() {
+        let start = Instant::now();
+        let mut target = TuiTargetState::new("monitor".into(), stats_config(true));
+        for (generation, seconds) in [(0, 0), (0, 2), (1, 6), (1, 8)] {
+            let raw = Duration::from_millis(seconds + 1);
+            target.push_graph_sample(GraphSample {
+                generation,
+                timestamp: ClientTimestamp {
+                    mono: start + Duration::from_secs(seconds),
+                    wall: SystemTime::UNIX_EPOCH + Duration::from_secs(seconds),
+                },
+                seq: 0,
+                rtt: RttSample {
+                    raw,
+                    adjusted: None,
+                    effective: SignedDuration::from_nanos(raw.as_nanos() as i128),
+                },
+                one_way: None,
+                server_processing: None,
+            });
+        }
+        let series = |left, right| {
+            target_metric_series(
+                &target,
+                0,
+                GraphViewportRange {
+                    start: start + Duration::from_secs(left),
+                    end: start + Duration::from_secs(right),
+                    window: Duration::from_secs(right - left),
+                },
+                GraphMetric::RawRtt,
+            )
+        };
+        let clipped = series(1, 7).unwrap();
+        assert_eq!(clipped.data.len(), 5);
+        assert_eq!(&clipped.data[..2], [(0.0, 2.0), (1.0, 3.0)]);
+        assert!(clipped.data[2].0.is_nan() && clipped.data[2].1.is_nan());
+        assert_eq!(&clipped.data[3..], [(5.0, 7.0), (6.0, 8.0)]);
+        // Check the pinned renderer: one guarded shape must render exactly
+        // like independent finite datasets, including their isolated points.
+        use ratatui::{
+            buffer::Buffer,
+            widgets::{Dataset, GraphType, Widget},
+        };
+        let area = Rect::new(0, 0, 50, 20);
+        let mut actual = Buffer::empty(area);
+        Canvas::default()
+            .marker(symbols::Marker::Braille)
+            .x_bounds([0.0, 6.0])
+            .y_bounds([0.0, 10.0])
+            .paint(|ctx| ctx.draw(&clipped))
+            .render(area, &mut actual);
+        let datasets = [&clipped.data[..2], &clipped.data[3..]].map(|data| {
+            Dataset::default()
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(clipped.style)
+                .data(data)
+        });
+        let mut expected = Buffer::empty(area);
+        Chart::new(datasets.to_vec())
+            .x_axis(Axis::default().bounds([0.0, 6.0]))
+            .y_axis(Axis::default().bounds([0.0, 10.0]))
+            .render(area, &mut expected);
+        assert_eq!(
+            actual, expected,
+            "no bogus pixels or lines through NaN breaks"
+        );
+        let finite = ChartSeries {
+            style: clipped.style,
+            data: clipped
+                .data
+                .iter()
+                .copied()
+                .filter(|(x, _)| x.is_finite())
+                .collect(),
+        };
+        assert_eq!(
+            chart_y_bounds(std::slice::from_ref(&clipped), ChartAxisKind::NonNegative),
+            chart_y_bounds(&[finite], ChartAxisKind::NonNegative)
+        );
+        assert!(series(3, 5).is_none(), "no interpolation across sessions");
+        assert!(series(9, 10).is_none(), "no extrapolation to the live edge");
+        let template = target.graph_history[0];
+        target.graph_history.clear();
+        for generation in 0..10_000 {
+            target.push_graph_sample(GraphSample {
+                generation,
+                timestamp: ClientTimestamp {
+                    mono: start + Duration::from_secs(generation),
+                    ..template.timestamp
+                },
+                ..template
+            });
+        }
+        let visible = target_metric_series(
+            &target,
+            0,
+            GraphViewportRange {
+                start: start + Duration::from_secs(9_994),
+                end: start + Duration::from_secs(9_999),
+                window: Duration::from_secs(5),
+            },
+            GraphMetric::RawRtt,
+        )
+        .unwrap();
+        assert_eq!(
+            visible.data.len(),
+            11,
+            "six visible generations in one buffer"
+        );
+    }
 }
