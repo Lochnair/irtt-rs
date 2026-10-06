@@ -26,7 +26,7 @@ use tokio::{
     time::{sleep, Instant},
 };
 
-const RENDER_INTERVAL: Duration = Duration::from_millis(250);
+const RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
 pub async fn run_tui(
     args: TuiArgs,

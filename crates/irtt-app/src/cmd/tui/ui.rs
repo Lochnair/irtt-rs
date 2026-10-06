@@ -1272,13 +1272,27 @@ fn target_metric_series(
     viewport: GraphViewportRange,
     metric: GraphMetric,
 ) -> Option<ChartSeries> {
-    let points = target.graph_history.iter().filter_map(|sample| {
+    // Histories are monotonic. Skip old samples without converting every
+    // retained measurement on each repaint, then keep the nearest valid
+    // predecessor for interpolation across the left boundary.
+    let first = target
+        .graph_history
+        .partition_point(|sample| sample.timestamp.mono < viewport.start);
+    let mut previous = target
+        .graph_history
+        .range(..first)
+        .rev()
+        .find_map(|sample| {
+            metric
+                .value_ns(sample)
+                .map(|ns| (sample.timestamp.mono, ns as f64 / 1_000_000.0))
+        });
+    let points = target.graph_history.range(first..).filter_map(|sample| {
         metric
             .value_ns(sample)
             .map(|ns| (sample.timestamp.mono, ns as f64 / 1_000_000.0))
     });
     let mut data = Vec::new();
-    let mut previous: Option<(Instant, f64)> = None;
     for point in points {
         if let Some(before) = previous {
             // Only genuine crossing segments contribute boundary points. In
@@ -1423,12 +1437,10 @@ fn graph_timestamp_anchor(state: &TuiState, end: Instant) -> Option<ClientTimest
         .targets
         .iter()
         .filter_map(|target| {
-            target
+            let after = target
                 .graph_history
-                .iter()
-                .rev()
-                .find(|sample| sample.timestamp.mono <= end)
-                .or_else(|| target.graph_history.front())
+                .partition_point(|sample| sample.timestamp.mono <= end);
+            target.graph_history.get(after.saturating_sub(1))
         })
         .map(|sample| sample.timestamp)
         .min_by_key(|timestamp| {
