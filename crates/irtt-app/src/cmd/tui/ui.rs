@@ -1256,7 +1256,6 @@ fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
 #[derive(Debug, Clone, PartialEq)]
 struct ChartSeries {
-    name: String,
     style: Style,
     data: Vec<(f64, f64)>,
 }
@@ -1286,7 +1285,6 @@ fn target_metric_series(
         })
         .collect::<Vec<_>>();
     (!data.is_empty()).then_some(ChartSeries {
-        name: target.label.clone(),
         style: target_style(target_idx),
         data,
     })
@@ -1305,7 +1303,6 @@ fn chart_datasets(series: &[ChartSeries]) -> Vec<Dataset<'_>> {
         .iter()
         .map(|series| {
             Dataset::default()
-                .name(series.name.as_str())
                 .marker(symbols::Marker::Braille)
                 .graph_type(GraphType::Line)
                 .style(series.style)
