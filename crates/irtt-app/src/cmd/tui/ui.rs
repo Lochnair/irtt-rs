@@ -1,9 +1,10 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{self, Stdout},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
+use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::{
     cursor::Show,
     event::KeyCode,
@@ -11,7 +12,9 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use irtt_client::managed::{ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance};
-use irtt_client::{ClientEvent, NegotiationResult, OneWayDelaySample, RttSample, SignedDuration};
+use irtt_client::{
+    ClientEvent, ClientTimestamp, NegotiationResult, OneWayDelaySample, RttSample, SignedDuration,
+};
 use irtt_stats::{StatsCollector, TimeStats};
 use ratatui::{
     backend::CrosstermBackend,
@@ -40,7 +43,26 @@ const MIN_WIDTH: u16 = 56;
 const MIN_HEIGHT: u16 = 18;
 const DEFAULT_GRAPH_WINDOW: Duration = Duration::from_secs(60);
 const MIN_GRAPH_WINDOW: Duration = Duration::from_secs(5);
-const MAX_GRAPH_WINDOW: Duration = Duration::from_secs(60 * 60);
+const MAX_GRAPH_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+const GRAPH_WINDOWS: &[Duration] = &[
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(2 * 60),
+    Duration::from_secs(5 * 60),
+    Duration::from_secs(10 * 60),
+    Duration::from_secs(15 * 60),
+    Duration::from_secs(30 * 60),
+    Duration::from_secs(60 * 60),
+    Duration::from_secs(2 * 60 * 60),
+    Duration::from_secs(4 * 60 * 60),
+    Duration::from_secs(8 * 60 * 60),
+    Duration::from_secs(12 * 60 * 60),
+    Duration::from_secs(24 * 60 * 60),
+];
 
 pub(super) struct TuiTerminal {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -297,7 +319,7 @@ impl TuiState {
                     ..
                 } => {
                     target.push_graph_sample(GraphSample {
-                        timestamp: received_at.mono,
+                        timestamp: *received_at,
                         seq: *seq,
                         rtt: *rtt,
                         one_way: *one_way,
@@ -472,14 +494,24 @@ impl TuiState {
     fn oldest_graph_sample_time(&self) -> Option<Instant> {
         self.targets
             .iter()
-            .filter_map(|target| target.graph_history.front().map(|sample| sample.timestamp))
+            .filter_map(|target| {
+                target
+                    .graph_history
+                    .front()
+                    .map(|sample| sample.timestamp.mono)
+            })
             .min()
     }
 
     fn newest_graph_sample_time(&self) -> Option<Instant> {
         self.targets
             .iter()
-            .filter_map(|target| target.graph_history.back().map(|sample| sample.timestamp))
+            .filter_map(|target| {
+                target
+                    .graph_history
+                    .back()
+                    .map(|sample| sample.timestamp.mono)
+            })
             .max()
     }
 }
@@ -660,7 +692,6 @@ impl GraphViewport {
             start: end.checked_sub(self.window).unwrap_or(end),
             end,
             window: self.window,
-            is_live: matches!(self.mode, GraphViewportMode::Follow),
         }
     }
 
@@ -695,11 +726,11 @@ impl GraphViewport {
     }
 
     fn zoom_in(&mut self, newest: Option<Instant>) {
-        self.set_window(self.window * 2 / 3, newest);
+        self.set_window(graph_zoom_window(self.window, false), newest);
     }
 
     fn zoom_out(&mut self, newest: Option<Instant>) {
-        self.set_window(self.window * 3 / 2, newest);
+        self.set_window(graph_zoom_window(self.window, true), newest);
     }
 
     fn reset_window(&mut self, newest: Option<Instant>) {
@@ -742,6 +773,23 @@ impl GraphViewport {
     }
 }
 
+fn graph_zoom_window(current: Duration, larger: bool) -> Duration {
+    if larger {
+        GRAPH_WINDOWS
+            .iter()
+            .copied()
+            .find(|&window| window > current)
+            .unwrap_or(MAX_GRAPH_WINDOW)
+    } else {
+        GRAPH_WINDOWS
+            .iter()
+            .copied()
+            .rev()
+            .find(|&window| window < current)
+            .unwrap_or(MIN_GRAPH_WINDOW)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GraphViewportMode {
     Follow,
@@ -753,7 +801,6 @@ struct GraphViewportRange {
     start: Instant,
     end: Instant,
     window: Duration,
-    is_live: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -839,7 +886,7 @@ impl GraphMetric {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct GraphSample {
-    timestamp: Instant,
+    timestamp: ClientTimestamp,
     seq: u32,
     rtt: RttSample,
     one_way: Option<OneWayDelaySample>,
@@ -985,7 +1032,7 @@ fn target_table(state: &TuiState, area: Rect) -> Table<'static> {
                 },
                 target
                     .last_sample
-                    .map(|sample| format_span(sample.timestamp.elapsed()))
+                    .map(|sample| format_span(sample.timestamp.mono.elapsed()))
                     .unwrap_or_else(|| ABSENT.to_owned()),
             ])
             .style(target_style(idx))
@@ -1194,7 +1241,7 @@ fn render_graph_area(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .x_axis(
                 Axis::default()
                     .bounds(viewport_x_bounds(viewport))
-                    .labels(viewport_x_axis_labels(viewport))
+                    .labels(viewport_x_axis_labels(state, viewport, area.width))
                     .style(Style::default().fg(Color::Gray)),
             )
             .y_axis(
@@ -1229,7 +1276,9 @@ fn target_metric_series(
     let data = target
         .graph_history
         .iter()
-        .filter(|sample| sample.timestamp >= viewport.start && sample.timestamp <= viewport.end)
+        .filter(|sample| {
+            sample.timestamp.mono >= viewport.start && sample.timestamp.mono <= viewport.end
+        })
         .filter_map(|sample| {
             metric
                 .value_ns(sample)
@@ -1246,6 +1295,7 @@ fn target_metric_series(
 fn sample_x(sample: &GraphSample, viewport: GraphViewportRange) -> f64 {
     sample
         .timestamp
+        .mono
         .saturating_duration_since(viewport.start)
         .as_secs_f64()
 }
@@ -1348,11 +1398,95 @@ fn viewport_x_bounds(viewport: GraphViewportRange) -> [f64; 2] {
     [0.0, viewport.window.as_secs_f64().max(1.0)]
 }
 
-fn viewport_x_axis_labels(viewport: GraphViewportRange) -> Vec<Span<'static>> {
-    vec![
-        Span::raw(format!("-{}", format_span(viewport.window))),
-        Span::raw(if viewport.is_live { "live" } else { "end" }),
-    ]
+// Use a sample near the viewport end, including when viewing retained history.
+// Wall-clock jumps affect labels only; the viewport and series remain monotonic.
+fn graph_timestamp_anchor(state: &TuiState, end: Instant) -> Option<ClientTimestamp> {
+    state
+        .targets
+        .iter()
+        .filter_map(|target| {
+            target
+                .graph_history
+                .iter()
+                .rev()
+                .find(|sample| sample.timestamp.mono <= end)
+                .or_else(|| target.graph_history.front())
+        })
+        .map(|sample| sample.timestamp)
+        .min_by_key(|timestamp| {
+            if timestamp.mono <= end {
+                end.duration_since(timestamp.mono)
+            } else {
+                timestamp.mono.duration_since(end)
+            }
+        })
+}
+
+fn graph_wall_time(anchor: ClientTimestamp, tick: Instant) -> Option<SystemTime> {
+    if tick >= anchor.mono {
+        anchor.wall.checked_add(tick.duration_since(anchor.mono))
+    } else {
+        anchor.wall.checked_sub(anchor.mono.duration_since(tick))
+    }
+}
+
+fn graph_local_time(wall: SystemTime) -> Option<DateTime<chrono::FixedOffset>> {
+    let nanos = match wall.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(duration) => duration.as_nanos() as i128,
+        Err(error) => -(error.duration().as_nanos() as i128),
+    };
+    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).ok()?;
+    let subsecond = nanos.rem_euclid(1_000_000_000) as u32;
+    let utc = DateTime::<Utc>::from_timestamp(seconds, subsecond)?;
+    // Chrono also falls back to UTC when the system timezone cannot be found.
+    Some(
+        Local
+            .timestamp_opt(seconds, subsecond)
+            .single()
+            .map(|local| local.fixed_offset())
+            .unwrap_or_else(|| utc.fixed_offset()),
+    )
+}
+
+fn viewport_x_axis_labels(
+    state: &TuiState,
+    viewport: GraphViewportRange,
+    width: u16,
+) -> Vec<Span<'static>> {
+    let Some(anchor) = graph_timestamp_anchor(state, viewport.end) else {
+        return vec![Span::raw(ABSENT), Span::raw(ABSENT)];
+    };
+    let local_at = |tick| graph_wall_time(anchor, tick).and_then(graph_local_time);
+    let date_boundary = local_at(viewport.start)
+        .zip(local_at(viewport.end))
+        .is_some_and(|(start, end)| start.date_naive() != end.date_naive());
+    // Reserve space for the borders/y axis and a gap between labels. Use the
+    // longest possible label for this window so narrow charts remain readable.
+    let fractional = viewport.window < Duration::from_secs(8);
+    let label_width = 8 + if fractional { 2 } else { 0 } + if date_boundary { 6 } else { 0 };
+    let count = (usize::from(width.saturating_sub(14)) / (label_width + 3)).clamp(2, 5);
+    let step = viewport.window / (count - 1) as u32;
+    let fractional = step < Duration::from_secs(2);
+    (0..count)
+        .map(|idx| {
+            let tick = if idx == count - 1 {
+                Some(viewport.end)
+            } else {
+                viewport.start.checked_add(step * idx as u32)
+            };
+            let label = tick.and_then(local_at).map(|local| {
+                let mut label = local.format("%H:%M:%S").to_string();
+                if fractional {
+                    label.push_str(&format!(".{}", local.timestamp_subsec_millis() / 100));
+                }
+                if date_boundary && (idx == 0 || idx == count - 1) {
+                    label = format!("{} {label}", local.format("%m-%d"));
+                }
+                label
+            });
+            Span::raw(label.unwrap_or_else(|| ABSENT.to_owned()))
+        })
+        .collect()
 }
 
 fn y_axis_label_count(height: u16) -> usize {
@@ -1479,15 +1613,39 @@ fn format_span(value: Duration) -> String {
     if value.is_zero() {
         return "0s".to_owned();
     }
+
     let nanos = value.as_nanos();
     if nanos < 1_000_000_000 {
         return format_duration(value);
     }
+
     let secs = value.as_secs();
-    if nanos < 60_000_000_000 {
-        format!("{:.1}s", nanos as f64 / 1_000_000_000.0)
+
+    if secs < 60 {
+        return format!("{:.1}s", nanos as f64 / 1_000_000_000.0);
+    }
+
+    let seconds = secs % 60;
+    let minutes = (secs / 60) % 60;
+    let hours = (secs / 3600) % 24;
+    let days = secs / 86_400;
+
+    if days != 0 {
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d{hours:02}h")
+        }
+    } else if hours != 0 {
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h{minutes:02}m")
+        }
+    } else if seconds == 0 {
+        format!("{minutes}m")
     } else {
-        format!("{}m{:02}s", secs / 60, secs % 60)
+        format!("{minutes}m{seconds:02}s")
     }
 }
 

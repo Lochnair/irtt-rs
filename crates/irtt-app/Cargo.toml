@@ -44,9 +44,10 @@ doc = false
 default = ["client", "server", "tui"]
 client = ["dep:tokio", "dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats"]
 server = ["dep:irtt-server", "dep:tokio"]
-tui =["dep:tokio", "dep:futures-core", "dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats", "dep:ratatui", "dep:crossterm"]
+tui =["dep:tokio", "dep:futures-core", "dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats", "dep:ratatui", "dep:crossterm", "dep:chrono"]
 
 [dependencies]
+chrono = { version = "0.4.45", default-features = false, features = ["clock"], optional = true }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
 futures-core = { version = "0.3.34", default-features = false, optional = true }
