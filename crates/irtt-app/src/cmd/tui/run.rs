@@ -1,13 +1,10 @@
-use std::{collections::HashSet, future::poll_fn, io, time::Duration};
+use std::{future::poll_fn, io, time::Duration};
 
 use super::ui::{TuiConfig, TuiState, TuiStatus, TuiTerminal};
 use crate::{
     cmd::tui::args::TuiArgs,
     shared::client::{
-        session::{
-            drain_final_events, peer_close_run_error, request_managed_stop_for_peer_close,
-            request_managed_stop_once,
-        },
+        session::{drain_final_events, request_managed_stop_once},
         worker::ManagedWorker,
     },
 };
@@ -17,7 +14,10 @@ use crossterm::{
 };
 use futures_core::Stream;
 use irtt_client::{
-    managed::{ManagedClient, ManagedEndReason, ManagedEvent, TargetInstance},
+    managed::{
+        ManagedClient, ManagedCommandApplyError, ManagedCommandError, ManagedCompletionPolicy,
+        ManagedEndReason, ManagedEvent, ManagedTargetEndReason, ManagedTargetLifecycle,
+    },
     ClientEvent,
 };
 use ratatui::layout::Rect;
@@ -25,6 +25,8 @@ use tokio::{
     sync::{broadcast::error::RecvError, watch},
     time::{sleep, Instant},
 };
+
+const RETRY_DELAY: Duration = Duration::from_millis(1500);
 
 const RENDER_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -46,8 +48,12 @@ pub async fn run_tui(
     );
     state.set_status(TuiStatus::Opening);
     terminal.draw(&state)?;
-    let (task, handle) = match ManagedClient::task(setup.managed_config(), setup.managed_targets())
-    {
+    let desired_targets = setup.managed_targets();
+    let mut config = setup.managed_config();
+    if continuous {
+        config.completion = ManagedCompletionPolicy::ExplicitStop;
+    }
+    let (task, handle) = match ManagedClient::task(config, desired_targets.clone()) {
         Ok(value) => value,
         Err(error) => {
             state.set_error(error.to_string());
@@ -75,7 +81,10 @@ pub async fn run_tui(
     tokio::pin!(render);
     let mut interrupted = false;
     let mut stop_requested = false;
-    let mut terminal_targets = HashSet::new();
+    let retry = sleep(RETRY_DELAY);
+    tokio::pin!(retry);
+    let mut retry_armed = false;
+    let mut update_receipt = None;
     let mut dropped_events = 0_u64;
     let mut events_closed = false;
     let mut status_closed = false;
@@ -92,18 +101,12 @@ pub async fn run_tui(
             }
             changed = status.changed(), if !status_closed => {
                 status_closed = changed.is_err();
-                let snapshot = status.borrow_and_update().clone();
-                if request_managed_stop_for_peer_close(
-                    continuous, interrupted, snapshot.peer_closed_target_outcomes,
-                    &mut stop_requested,
-                ) {
-                    drop(handle.stop());
-                }
+                state.process_managed_status(&status.borrow_and_update());
                 force_render = true;
             }
             event = events.recv(), if !events_closed => match event {
                 Ok(event) => force_render = process_tui_event(
-                    event, &mut state, &mut terminal_targets,
+                    event, &mut state,
                 ),
                 Err(RecvError::Lagged(count)) => {
                     dropped_events = dropped_events.saturating_add(count);
@@ -138,10 +141,54 @@ pub async fn run_tui(
                     _ => {}
                 }
             }
+            _ = &mut retry, if retry_armed && !interrupted && !*shutdown.borrow() => {
+                state.process_managed_status(&status.borrow());
+                retry_armed = false;
+                update_receipt = match handle.update_targets(desired_targets.clone()) {
+                    Ok(receipt) => Some(receipt),
+                    Err(ManagedCommandError::Stopping | ManagedCommandError::DriverClosed)
+                        if stop_requested || *shutdown.borrow() => None,
+                    Err(error) => return Err(format!("reconnect update failed: {error}").into()),
+                };
+            }
+            result = async { update_receipt.as_mut().unwrap().await },
+                if update_receipt.is_some() => {
+                update_receipt = None;
+                match result {
+                    Ok(ack) => {
+                        state.process_managed_status(&ack.status);
+                        force_render = true;
+                    }
+                    Err(ManagedCommandApplyError::Stopping
+                        | ManagedCommandApplyError::AcknowledgementDisconnected)
+                        if stop_requested || *shutdown.borrow() => {}
+                    Err(error) => return Err(format!("reconnect update failed: {error}").into()),
+                }
+            }
             _ = &mut render, if !state.paused => force_render = true,
         }
         if interrupted && request_managed_stop_once(&mut stop_requested) {
             drop(handle.stop());
+        }
+        if continuous
+            && !interrupted
+            && !stop_requested
+            && !retry_armed
+            && update_receipt.is_none()
+            && status.borrow().targets.iter().any(|target| {
+                target.desired
+                    && target.outcome.as_ref().is_some_and(|outcome| {
+                        matches!(
+                            outcome.end_reason,
+                            ManagedTargetEndReason::Failed(_)
+                                | ManagedTargetEndReason::PeerClosed
+                                | ManagedTargetEndReason::TestComplete
+                        )
+                    })
+            })
+        {
+            retry.as_mut().reset(Instant::now() + RETRY_DELAY);
+            retry_armed = true;
         }
         if force_render {
             terminal.draw(&state)?;
@@ -160,37 +207,32 @@ pub async fn run_tui(
         }
     };
     drain_final_events(&mut events, &mut dropped_events, |event| {
-        process_tui_event(event, &mut state, &mut terminal_targets);
+        process_tui_event(event, &mut state);
         Ok::<(), std::convert::Infallible>(())
     })?;
     state.mark_dropped_managed_events(dropped_events);
-    if outcome.discarded_target_outcomes != 0 {
+    if !continuous && outcome.discarded_target_outcomes != 0 {
         state.set_run_error(format!(
             "{} final target outcomes were discarded",
             outcome.discarded_target_outcomes
         ));
     }
     for target in outcome.recent_target_outcomes.iter() {
-        if terminal_targets.insert(target.target.clone()) {
-            state.process_target_outcome(target);
-        }
+        state.process_target_outcome(target);
     }
     interrupted |= *shutdown.borrow();
     let error = match &outcome.end_reason {
         ManagedEndReason::DriverFailed(failure) => {
             Some(format!("managed driver failed: {failure}"))
         }
-        _ => peer_close_run_error(continuous, interrupted, outcome.peer_closed_target_outcomes)
-            .or_else(|| {
-                (!interrupted
-                    && outcome.successful_target_outcomes == 0
-                    && outcome.failed_target_outcomes > 0)
-                    .then(|| {
-                        format!(
-                            "no managed target completed successfully ({} failed)",
-                            outcome.failed_target_outcomes
-                        )
-                    })
+        _ => (!interrupted
+            && outcome.successful_target_outcomes == 0
+            && outcome.failed_target_outcomes > 0)
+            .then(|| {
+                format!(
+                    "no managed target completed successfully ({} failed)",
+                    outcome.failed_target_outcomes
+                )
             }),
     };
     if let Some(error) = error {
@@ -203,11 +245,7 @@ pub async fn run_tui(
     Ok(())
 }
 
-fn process_tui_event(
-    event: ManagedEvent,
-    state: &mut TuiState,
-    terminal_targets: &mut HashSet<TargetInstance>,
-) -> bool {
+fn process_tui_event(event: ManagedEvent, state: &mut TuiState) -> bool {
     match event {
         ManagedEvent::Client { target, event } => {
             let force_render = matches!(
@@ -221,8 +259,17 @@ fn process_tui_event(
             force_render
         }
         ManagedEvent::TargetFinished { outcome } => {
-            terminal_targets.insert(outcome.target.clone());
             state.process_target_outcome(&outcome);
+            true
+        }
+        ManagedEvent::TargetStateChanged {
+            target,
+            lifecycle:
+                ManagedTargetLifecycle::Pending
+                | ManagedTargetLifecycle::Connecting
+                | ManagedTargetLifecycle::Opening,
+        } => {
+            state.process_target_opening(&target);
             true
         }
         _ => false,
