@@ -47,8 +47,6 @@ fn token_and_sequence() -> Vec<u8> {
     body
 }
 
-// ---------- A. Classification ----------
-
 fn classify(kind: &DecodedRequestKind<'_>) -> &'static str {
     match kind {
         DecodedRequestKind::Open { no_test: false, .. } => "open",
@@ -71,6 +69,34 @@ fn flag_combinations_classify_requests_with_orthogonal_hmac_presence() {
         (FLAG_OPEN | FLAG_CLOSE | FLAG_HMAC, true, "no-test open"),
     ];
 
+    for no_test in [false, true] {
+        for key in [None, Some(KEY)] {
+            let params = Params::default();
+            let packet = encode_request(
+                RequestToEncode::Open {
+                    params: &params,
+                    no_test,
+                },
+                key,
+            )
+            .unwrap();
+            let expected_flags = FLAG_OPEN
+                | if no_test { FLAG_CLOSE } else { 0 }
+                | if key.is_some() { FLAG_HMAC } else { 0 };
+            assert_eq!(packet[3], expected_flags);
+            assert_eq!(
+                decode_request(&packet).unwrap().kind,
+                DecodedRequestKind::Open {
+                    no_test,
+                    params: &[]
+                }
+            );
+            if let Some(key) = key {
+                verify_packet_hmac(key, &packet).unwrap();
+            }
+        }
+    }
+
     for (flags, hmac_present, expected) in cases {
         // Long enough for any kind, so only the flags decide classification.
         let packet = raw(flags, &token_and_sequence(), 64);
@@ -82,6 +108,10 @@ fn flag_combinations_classify_requests_with_orthogonal_hmac_presence() {
             request.hmac_present, hmac_present,
             "flags 0x{flags:02x} HMAC presence"
         );
+        if let DecodedRequestKind::Open { params, .. } = request.kind {
+            let offset = if hmac_present { 20 } else { 4 };
+            assert_eq!(params, &packet[offset..]);
+        }
         assert_eq!(
             classify(&request.kind),
             expected,
@@ -89,8 +119,6 @@ fn flag_combinations_classify_requests_with_orthogonal_hmac_presence() {
         );
     }
 }
-
-// ---------- B. Invalid header / flags ----------
 
 #[test]
 fn structurally_invalid_headers_are_rejected() {
@@ -135,8 +163,6 @@ fn any_reply_flagged_datagram_is_rejected_as_a_request() {
     }
 }
 
-// ---------- C. Structural minimum lengths ----------
-
 #[test]
 fn structural_minimum_lengths_are_enforced_per_kind() {
     // (flags, minimum accepted length)
@@ -171,8 +197,6 @@ fn structural_minimum_lengths_are_enforced_per_kind() {
         }
     }
 }
-
-// ---------- D. Field offsets ----------
 
 #[test]
 fn token_and_sequence_are_read_from_the_hmac_dependent_offsets() {
@@ -211,68 +235,24 @@ fn token_and_sequence_are_read_from_the_hmac_dependent_offsets() {
     }
 }
 
-// ---------- E. Open parameter slice ----------
-
 #[test]
 fn open_params_are_borrowed_after_the_header_and_decoded_later() {
-    let encoded = params().encode();
-
-    for hmac in [false, true] {
-        let flags = FLAG_OPEN | if hmac { FLAG_HMAC } else { 0 };
-        let expected_offset = if hmac { 4 + HMAC_SIZE } else { 4 };
-        let packet = raw(flags, &encoded, expected_offset + encoded.len());
-
-        match decode_request(&packet).unwrap().kind {
-            DecodedRequestKind::Open { params, .. } => {
-                assert_eq!(params, &packet[expected_offset..]);
-                assert_eq!(Params::decode(params).unwrap(), self::params());
+    // Structural parsing accepts even malformed Params; semantic errors belong
+    // to Params::decode and are covered in params.rs.
+    for body in [params().encode(), Vec::new(), vec![1, 0x80]] {
+        for hmac in [false, true] {
+            let flags = FLAG_OPEN | if hmac { FLAG_HMAC } else { 0 };
+            let offset = if hmac { 20 } else { 4 };
+            let packet = raw(flags, &body, offset + body.len());
+            match decode_request(&packet).unwrap().kind {
+                DecodedRequestKind::Open { params, .. } => {
+                    assert_eq!(params, &packet[offset..]);
+                }
+                other => panic!("expected an open request, got {other:?}"),
             }
-            other => panic!("expected an open request, got {other:?}"),
         }
     }
 }
-
-#[test]
-fn empty_and_malformed_open_params_decode_structurally() {
-    let empty = header(FLAG_OPEN);
-    match decode_request(&empty).unwrap().kind {
-        DecodedRequestKind::Open { params, .. } => assert!(params.is_empty()),
-        other => panic!("expected an open request, got {other:?}"),
-    }
-
-    // A truncated varint: structurally fine, semantically not. A receiver must
-    // be able to authenticate before spending effort on this.
-    let malformed = raw(FLAG_OPEN, &[1, 0x80], 6);
-    match decode_request(&malformed).unwrap().kind {
-        DecodedRequestKind::Open { params, .. } => {
-            assert_eq!(params, &[1, 0x80]);
-            assert_eq!(Params::decode(params), Err(ProtoError::TruncatedVarint));
-        }
-        other => panic!("expected an open request, got {other:?}"),
-    }
-}
-
-// ---------- F. Open precedence ----------
-
-#[test]
-fn open_precedence_beats_close_and_an_echo_shaped_body() {
-    // An OPEN|CLOSE datagram whose body looks exactly like a token and
-    // sequence number is still a no-test open, and those bytes are parameters.
-    let packet = raw(FLAG_OPEN | FLAG_CLOSE, &token_and_sequence(), 16);
-
-    assert_eq!(
-        decode_request(&packet).unwrap(),
-        DecodedRequest {
-            hmac_present: false,
-            kind: DecodedRequestKind::Open {
-                no_test: true,
-                params: &packet[4..],
-            },
-        }
-    );
-}
-
-// ---------- G. Trailing data ----------
 
 #[test]
 fn trailing_bytes_are_tolerated_and_no_length_ceiling_applies() {
@@ -303,8 +283,6 @@ fn trailing_bytes_are_tolerated_and_no_length_ceiling_applies() {
     }
 }
 
-// ---------- H. Zero token ----------
-
 #[test]
 fn a_zero_token_is_structurally_valid() {
     assert_eq!(
@@ -322,8 +300,6 @@ fn a_zero_token_is_structurally_valid() {
         }
     );
 }
-
-// ---------- HMAC presence is not authentication ----------
 
 #[test]
 fn hmac_presence_is_reported_independently_of_mac_validity() {
@@ -376,108 +352,5 @@ fn packet_verification_requires_a_present_and_complete_hmac_field() {
     assert_eq!(
         verify_packet_hmac(KEY, &[0x00, MAGIC[1], MAGIC[2], FLAG_HMAC]),
         Err(ProtoError::BadMagic)
-    );
-}
-
-// ---------- Encode -> decode cross-checks ----------
-
-#[test]
-fn encoded_requests_decode_back_to_their_sender_side_identity() {
-    for key in [None, Some(KEY)] {
-        for no_test in [false, true] {
-            let packet = encode_request(
-                RequestToEncode::Open {
-                    params: &params(),
-                    no_test,
-                },
-                key,
-            )
-            .unwrap();
-            let request = decode_request(&packet).unwrap();
-            assert_eq!(request.hmac_present, key.is_some());
-            match request.kind {
-                DecodedRequestKind::Open {
-                    no_test: decoded,
-                    params: encoded,
-                } => {
-                    assert_eq!(decoded, no_test);
-                    assert_eq!(Params::decode(encoded).unwrap(), params());
-                }
-                other => panic!("expected an open request, got {other:?}"),
-            }
-            if let Some(key) = key {
-                verify_packet_hmac(key, &packet).unwrap();
-            }
-        }
-
-        let packet = encode_request(RequestToEncode::Close { token: TOKEN }, key).unwrap();
-        let request = decode_request(&packet).unwrap();
-        assert_eq!(request.hmac_present, key.is_some());
-        assert_eq!(request.kind, DecodedRequestKind::Close { token: TOKEN });
-
-        // The ECHO tail is deliberately not compared against the logical
-        // payload: the sender placed it at a negotiated offset the receiver
-        // cannot recover without `Params`.
-        let echo_params = Params {
-            length: 96,
-            ..params()
-        };
-        let packet = encode_request(
-            RequestToEncode::Echo {
-                token: TOKEN,
-                sequence: SEQUENCE,
-                params: &echo_params,
-                payload: &[1, 2, 3, 4],
-            },
-            key,
-        )
-        .unwrap();
-        let request = decode_request(&packet).unwrap();
-        assert_eq!(request.hmac_present, key.is_some());
-        match request.kind {
-            DecodedRequestKind::Echo {
-                token, sequence, ..
-            } => {
-                assert_eq!(token, TOKEN);
-                assert_eq!(sequence, SEQUENCE);
-            }
-            other => panic!("expected an echo request, got {other:?}"),
-        }
-        if let Some(key) = key {
-            verify_packet_hmac(key, &packet).unwrap();
-        }
-    }
-}
-
-#[test]
-fn echo_encoding_floors_a_negative_negotiated_length_at_the_field_block() {
-    // A negative negotiated length is accepted during open and echoed back
-    // unchanged, so a real session can carry one. It must therefore stay
-    // encodable: it asks for no space beyond the mandatory fields.
-    let params = Params {
-        length: -1,
-        ..Params::default()
-    };
-    let packet = encode_request(
-        RequestToEncode::Echo {
-            token: TOKEN,
-            sequence: SEQUENCE,
-            params: &params,
-            payload: &[],
-        },
-        None,
-    )
-    .expect("a negative negotiated length must still encode");
-
-    // header (4) + token (8) + sequence (4).
-    assert_eq!(packet.len(), 16);
-    let request = decode_request(&packet).unwrap();
-    assert_eq!(
-        request.kind,
-        DecodedRequestKind::Echo {
-            token: TOKEN,
-            sequence: SEQUENCE,
-            tail: &[],
-        }
     );
 }

@@ -54,33 +54,41 @@ fn echo_reply(params: &Params, flags: u8) -> EchoReply {
 }
 
 #[test]
-fn authenticated_reply_encoders_set_hmac_from_key() {
+fn reply_encoders_normalize_hmac_flags_from_the_key() {
     let params = params();
-    let open_reply = OpenReply {
-        flags: FLAG_OPEN | FLAG_REPLY,
-        token: TOKEN,
-        params: params.clone(),
-    };
-    let packet = encode_open_reply(&open_reply, Some(KEY)).unwrap();
-    assert_eq!(packet[3], FLAG_OPEN | FLAG_REPLY | FLAG_HMAC);
-    assert_eq!(
-        decode_open_reply(&packet, Some(KEY)),
-        Ok(OpenReply {
-            flags: FLAG_OPEN | FLAG_REPLY | FLAG_HMAC,
-            ..open_reply
-        })
-    );
-
-    let echo_reply = echo_reply(&params, FLAG_REPLY);
-    let packet = encode_echo_reply(&echo_reply, &params, Some(KEY)).unwrap();
-    assert_eq!(packet[3], FLAG_REPLY | FLAG_HMAC);
-    assert_eq!(
-        decode_echo_reply(&packet, &params, Some(KEY)),
-        Ok(EchoReply {
-            flags: FLAG_REPLY | FLAG_HMAC,
-            ..echo_reply
-        })
-    );
+    for key in [None, Some(KEY)] {
+        for supplied_hmac in [0, FLAG_HMAC] {
+            let auth = if key.is_some() { FLAG_HMAC } else { 0 };
+            let open = OpenReply {
+                flags: FLAG_OPEN | FLAG_REPLY | supplied_hmac,
+                token: TOKEN,
+                params: params.clone(),
+            };
+            let packet = encode_open_reply(&open, key).unwrap();
+            assert_eq!(packet[3], FLAG_OPEN | FLAG_REPLY | auth);
+            let offset = if key.is_some() { 20 } else { 4 };
+            assert_eq!(&packet[offset..offset + 8], &TOKEN.to_le_bytes());
+            assert_eq!(
+                decode_open_reply(&packet, key).unwrap(),
+                OpenReply {
+                    flags: packet[3],
+                    ..open
+                }
+            );
+            let echo = echo_reply(&params, FLAG_REPLY | supplied_hmac);
+            let packet = encode_echo_reply(&echo, &params, key).unwrap();
+            assert_eq!(packet[3], FLAG_REPLY | auth);
+            assert_eq!(&packet[offset..offset + 8], &TOKEN.to_le_bytes());
+            assert_eq!(&packet[offset + 8..offset + 12], &u32::MAX.to_le_bytes());
+            assert_eq!(
+                decode_echo_reply(&packet, &params, key).unwrap(),
+                EchoReply {
+                    flags: packet[3],
+                    ..echo
+                }
+            );
+        }
+    }
 }
 
 #[test]
@@ -95,6 +103,12 @@ fn rejected_open_reply_round_trips_and_zero_token_requires_close() {
     };
     let packet = encode_open_reply(&rejected, None).unwrap();
     assert_eq!(decode_open_reply(&packet, None), Ok(rejected.clone()));
+    let mut zero_without_close = packet.clone();
+    zero_without_close[3] &= !FLAG_CLOSE;
+    assert_eq!(
+        decode_open_reply(&zero_without_close, None),
+        Err(ProtoError::ZeroToken)
+    );
 
     assert_eq!(
         encode_open_reply(
@@ -119,63 +133,51 @@ fn peer_close_echo_reply_round_trips_without_a_close_reply_codec() {
 }
 
 #[test]
-fn reply_encoders_supply_their_packet_type_rules() {
+fn reply_codecs_enforce_packet_type_and_reserved_flag_rules() {
     let params = Params::default();
-    assert_eq!(
-        encode_open_reply(
-            &OpenReply {
-                flags: FLAG_REPLY,
-                token: TOKEN,
-                params: params.clone(),
-            },
-            None,
+    for (flags, expected) in [
+        (FLAG_REPLY, ProtoError::MissingFlag(FLAG_OPEN)),
+        (FLAG_OPEN, ProtoError::MissingFlag(FLAG_REPLY)),
+        (
+            FLAG_OPEN | FLAG_REPLY | 0x10,
+            ProtoError::ReservedFlags(0x10),
         ),
-        Err(ProtoError::MissingFlag(FLAG_OPEN))
-    );
-    assert_eq!(
-        encode_echo_reply(
-            &EchoReply {
-                flags: 0,
-                ..echo_reply(&params, FLAG_REPLY)
-            },
-            &params,
-            None,
-        ),
-        Err(ProtoError::MissingFlag(FLAG_REPLY))
-    );
-}
-
-/// Every packet the reply encoders produce must be rejected by the inbound
-/// request decoder: a server never answers a datagram carrying `FLAG_REPLY`.
-#[test]
-fn encoded_replies_are_never_admitted_as_inbound_requests() {
-    let params = Params::default();
-
-    for reply_flags in [FLAG_OPEN | FLAG_REPLY, FLAG_OPEN | FLAG_REPLY | FLAG_CLOSE] {
-        let packet = encode_open_reply(
+    ] {
+        let open = OpenReply {
+            flags,
+            token: TOKEN,
+            params: params.clone(),
+        };
+        assert_eq!(encode_open_reply(&open, None).unwrap_err(), expected);
+        let mut packet = encode_open_reply(
             &OpenReply {
-                flags: reply_flags,
-                token: if reply_flags & FLAG_CLOSE == 0 {
-                    TOKEN
-                } else {
-                    0
-                },
-                params: params.clone(),
+                flags: FLAG_OPEN | FLAG_REPLY,
+                ..open
             },
             None,
         )
         .unwrap();
-        assert_eq!(
-            decode_request(&packet),
-            Err(ProtoError::UnexpectedFlag(FLAG_REPLY))
-        );
+        packet[3] = flags;
+        assert_eq!(decode_open_reply(&packet, None).unwrap_err(), expected);
     }
-
-    for reply_flags in [FLAG_REPLY, FLAG_REPLY | FLAG_CLOSE] {
-        let packet = encode_echo_reply(&echo_reply(&params, reply_flags), &params, None).unwrap();
+    for (flags, expected) in [
+        (0, ProtoError::MissingFlag(FLAG_REPLY)),
+        (
+            FLAG_OPEN | FLAG_REPLY,
+            ProtoError::UnexpectedFlag(FLAG_OPEN),
+        ),
+        (FLAG_REPLY | 0x10, ProtoError::ReservedFlags(0x10)),
+    ] {
         assert_eq!(
-            decode_request(&packet),
-            Err(ProtoError::UnexpectedFlag(FLAG_REPLY))
+            encode_echo_reply(&echo_reply(&params, flags), &params, None).unwrap_err(),
+            expected
+        );
+        let mut packet =
+            encode_echo_reply(&echo_reply(&params, FLAG_REPLY), &params, None).unwrap();
+        packet[3] = flags;
+        assert_eq!(
+            decode_echo_reply(&packet, &params, None).unwrap_err(),
+            expected
         );
     }
 }
@@ -207,7 +209,12 @@ fn echo_layout_combinations_round_trip() {
             StampAt::Both,
             StampAt::Midpoint,
         ] {
-            for clock in [Clock::Wall, Clock::Monotonic, Clock::Both] {
+            for clock in [
+                Clock::Unspecified,
+                Clock::Wall,
+                Clock::Monotonic,
+                Clock::Both,
+            ] {
                 for key in [None, Some(KEY)] {
                     let params = Params {
                         protocol_version: 1,
@@ -265,44 +272,48 @@ fn echo_reply_requires_exact_negotiated_optional_fields() {
 
 #[test]
 fn echo_payload_is_copied_zero_filled_and_bounded_in_both_directions() {
-    let params = Params {
-        length: 20,
-        ..Params::default()
-    };
-
-    let packet = encode_request(echo_request(&params, &[1, 2]), None).unwrap();
-    assert_eq!(&packet[16..], &[1, 2, 0, 0]);
-    assert_eq!(
-        encode_request(echo_request(&params, &[0; 5]), None),
-        Err(ProtoError::PayloadTooLarge {
-            available: 4,
-            provided: 5,
-        })
-    );
-
-    let reply = EchoReply {
-        payload: vec![3, 4],
-        ..echo_reply(&params, FLAG_REPLY)
-    };
-    let packet = encode_echo_reply(&reply, &params, None).unwrap();
-    assert_eq!(&packet[16..], &[3, 4, 0, 0]);
-    let decoded = decode_echo_reply(&packet, &params, None).unwrap();
-    assert_eq!(decoded.payload, vec![3, 4, 0, 0]);
-    assert_eq!(encode_echo_reply(&decoded, &params, None).unwrap(), packet);
-    assert_eq!(
-        encode_echo_reply(
-            &EchoReply {
-                payload: vec![0; 5],
+    for stats in [ReceivedStats::None, ReceivedStats::Both] {
+        for key in [None, Some(KEY)] {
+            let mut params = Params {
+                received_stats: stats,
+                ..Params::default()
+            };
+            let offset = PacketLayout::echo(key.is_some(), &params).header_len();
+            params.length = (offset + 4) as i64;
+            let packet = encode_request(echo_request(&params, &[1, 2]), key).unwrap();
+            assert_eq!(&packet[offset..], &[1, 2, 0, 0]);
+            assert_eq!(
+                encode_request(echo_request(&params, &[0; 5]), key),
+                Err(ProtoError::PayloadTooLarge {
+                    available: 4,
+                    provided: 5
+                })
+            );
+            let reply = EchoReply {
+                payload: vec![3, 4],
                 ..echo_reply(&params, FLAG_REPLY)
-            },
-            &params,
-            None,
-        ),
-        Err(ProtoError::PayloadTooLarge {
-            available: 4,
-            provided: 5,
-        })
-    );
+            };
+            let packet = encode_echo_reply(&reply, &params, key).unwrap();
+            assert_eq!(&packet[offset..], &[3, 4, 0, 0]);
+            let decoded = decode_echo_reply(&packet, &params, key).unwrap();
+            assert_eq!(decoded.payload, vec![3, 4, 0, 0]);
+            assert_eq!(encode_echo_reply(&decoded, &params, key).unwrap(), packet);
+            assert_eq!(
+                encode_echo_reply(
+                    &EchoReply {
+                        payload: vec![0; 5],
+                        ..reply
+                    },
+                    &params,
+                    key
+                ),
+                Err(ProtoError::PayloadTooLarge {
+                    available: 4,
+                    provided: 5
+                })
+            );
+        }
+    }
 }
 
 #[test]
@@ -321,6 +332,14 @@ fn a_negative_negotiated_length_still_encodes_in_both_directions() {
     let request = encode_request(echo_request(&params, &[]), None)
         .expect("a negative negotiated length must still encode a request");
     assert_eq!(request.len(), 16);
+    assert_eq!(
+        decode_request(&request).unwrap().kind,
+        DecodedRequestKind::Echo {
+            token: TOKEN,
+            sequence: 17,
+            tail: &[]
+        }
+    );
 
     let reply = encode_echo_reply(&echo_reply(&params, FLAG_REPLY), &params, None)
         .expect("a negative negotiated length must still encode a reply");
@@ -505,12 +524,14 @@ fn midpoint_dual_field_reply_authenticates_over_full_packet() {
     let reply = decode_echo_reply(&packet, &params, Some(KEY)).unwrap();
     assert_eq!(reply.timestamps.midpoint_wall, Some(555));
 
-    let mut corrupted = packet;
-    corrupted[HMAC_OFFSET] ^= 0xFF;
-    assert_eq!(
-        decode_echo_reply(&corrupted, &params, Some(KEY)),
-        Err(ProtoError::BadHmac)
-    );
+    for offset in [HMAC_OFFSET, PacketLayout::echo(true, &params).header_len()] {
+        let mut corrupted = packet.clone();
+        corrupted[offset] ^= 0xFF;
+        assert_eq!(
+            decode_echo_reply(&corrupted, &params, Some(KEY)),
+            Err(ProtoError::BadHmac)
+        );
+    }
 }
 
 #[test]
@@ -539,61 +560,92 @@ fn only_the_exact_compat_length_is_accepted_as_an_extension() {
 }
 
 #[test]
-fn midpoint_both_clock_reply_has_no_additional_extension() {
-    let params = midpoint_params(Clock::Both, 0);
-    let reply = echo_reply(&params, FLAG_REPLY);
-    let packet = encode_echo_reply(&reply, &params, None).unwrap();
-
-    let mut too_long = packet.clone();
-    too_long.extend_from_slice(&[0; 8]);
-    assert_eq!(
-        decode_echo_reply(&too_long, &params, None),
-        Err(ProtoError::PacketLengthMismatch {
-            expected: packet.len(),
-            actual: too_long.len(),
-        })
-    );
+fn other_layouts_have_no_longer_form_exception() {
+    for (stamp_at, clock) in [
+        (StampAt::Midpoint, Clock::Both),
+        (StampAt::Receive, Clock::Wall),
+    ] {
+        let params = Params {
+            stamp_at,
+            clock,
+            ..Params::default()
+        };
+        let packet = encode_echo_reply(&echo_reply(&params, FLAG_REPLY), &params, None).unwrap();
+        let mut too_long = packet.clone();
+        too_long.extend_from_slice(&[0; 8]);
+        assert_eq!(
+            decode_echo_reply(&too_long, &params, None),
+            Err(ProtoError::PacketLengthMismatch {
+                expected: packet.len(),
+                actual: too_long.len()
+            })
+        );
+    }
 }
 
 #[test]
-fn non_midpoint_stamp_at_has_no_longer_form_exception() {
-    let params = Params {
-        received_stats: ReceivedStats::None,
-        stamp_at: StampAt::Receive,
-        clock: Clock::Wall,
-        ..Params::default()
-    };
-    let reply = echo_reply(&params, FLAG_REPLY);
-    let packet = encode_echo_reply(&reply, &params, None).unwrap();
-
-    let mut too_long = packet.clone();
-    too_long.extend_from_slice(&[0; 8]);
-    assert_eq!(
-        decode_echo_reply(&too_long, &params, None),
-        Err(ProtoError::PacketLengthMismatch {
-            expected: packet.len(),
-            actual: too_long.len(),
-        })
-    );
-}
-
-/// The midpoint compatibility length is a *reply* concept. An inbound ECHO
-/// request of that length is just a longer request, which a receiver accepts
-/// without applying any negotiated length rule.
-#[test]
-fn echo_request_decoding_has_no_compat_length_rule() {
-    let params = midpoint_params(Clock::Wall, 0);
-    let packet = encode_request(echo_request(&params, &[]), None).unwrap();
-
-    let mut too_long = packet.clone();
-    too_long.extend_from_slice(&[0; 8]);
-    let request = decode_request(&too_long).unwrap();
-    assert_eq!(
-        request.kind,
-        DecodedRequestKind::Echo {
-            token: TOKEN,
-            sequence: 17,
-            tail: &too_long[16..],
+fn reply_decoders_enforce_hmac_presence_and_authenticate_the_body() {
+    let params = params();
+    for key in [None, Some(KEY)] {
+        let open = encode_open_reply(
+            &OpenReply {
+                flags: FLAG_OPEN | FLAG_REPLY,
+                token: TOKEN,
+                params: params.clone(),
+            },
+            key,
+        )
+        .unwrap();
+        let echo = encode_echo_reply(&echo_reply(&params, FLAG_REPLY), &params, key).unwrap();
+        let mismatched_key = if key.is_some() { None } else { Some(KEY) };
+        assert_eq!(
+            decode_open_reply(&open, mismatched_key),
+            Err(ProtoError::HmacPresenceMismatch)
+        );
+        assert_eq!(
+            decode_echo_reply(&echo, &params, mismatched_key),
+            Err(ProtoError::HmacPresenceMismatch)
+        );
+        if let Some(key) = key {
+            let mut bad_open = open;
+            let mut bad_echo = echo;
+            *bad_open.last_mut().unwrap() ^= 1;
+            *bad_echo.last_mut().unwrap() ^= 1;
+            assert_eq!(
+                decode_open_reply(&bad_open, Some(key)),
+                Err(ProtoError::BadHmac)
+            );
+            assert_eq!(
+                decode_echo_reply(&bad_echo, &params, Some(key)),
+                Err(ProtoError::BadHmac)
+            );
         }
-    );
+    }
+}
+
+#[test]
+fn echo_reply_length_errors_precede_hmac_verification() {
+    for key in [None, Some(KEY)] {
+        let mut params = Params::default();
+        let header = PacketLayout::echo(key.is_some(), &params).header_len();
+        params.length = (header + 4) as i64;
+        let packet = encode_echo_reply(&echo_reply(&params, FLAG_REPLY), &params, key).unwrap();
+        for actual in [header - 1, header, packet.len() - 1, packet.len() + 1] {
+            let mut malformed = packet.clone();
+            malformed.resize(actual, 0);
+            // Truncating or extending the signed packet also invalidates its MAC.
+            let expected = if actual < header {
+                ProtoError::PacketTooShort {
+                    needed: header,
+                    actual,
+                }
+            } else {
+                ProtoError::PacketLengthMismatch {
+                    expected: packet.len(),
+                    actual,
+                }
+            };
+            assert_eq!(decode_echo_reply(&malformed, &params, key), Err(expected));
+        }
+    }
 }
