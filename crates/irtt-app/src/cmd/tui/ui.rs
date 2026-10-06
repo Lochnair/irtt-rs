@@ -1032,7 +1032,7 @@ fn target_table(state: &TuiState, area: Rect) -> Table<'static> {
                 },
                 target
                     .last_sample
-                    .map(|sample| format_span(sample.timestamp.mono.elapsed()))
+                    .map(|sample| format_age(sample.timestamp.mono.elapsed()))
                     .unwrap_or_else(|| ABSENT.to_owned()),
             ])
             .style(target_style(idx))
@@ -1629,6 +1629,14 @@ fn format_negotiated(negotiated: &NegotiationResult) -> String {
         params.received_stats,
         changes
     )
+}
+
+fn format_age(age: Duration) -> String {
+    match age.as_secs() {
+        0 => "<1s".to_owned(),
+        seconds @ 1..=59 => format!("{seconds}s"),
+        seconds => format!("{}m", seconds / 60),
+    }
 }
 
 /// Format a wall-clock span shown in the TUI's headers, config lines, and
