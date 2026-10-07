@@ -59,8 +59,16 @@ Configuration is grouped by ownership:
   probe tracking policy.
 
 Clone one config to connect to multiple endpoints. Managed targets retain their
-own ID, endpoint, and authentication inheritance/override; shared
+own ID, endpoint, address-family override, and authentication inheritance/override; shared
 `ManagedClientConfig.client` is reusable without endpoint mutation.
+
+`ManagedTargetConfig.address_family` defaults to `None`, inheriting the shared
+family policy. `Some(AddressFamily::Ipv4)`, `Some(AddressFamily::Ipv6)`, or
+`Some(AddressFamily::Any)` overrides it for that target. Every new generation
+resolves the original endpoint again; callers can constrain a hostname without
+replacing it with a resolved IP. Changing the family specification replaces
+that target's generation, including switching between inheritance and an equal
+explicit override. Hostname expansion and discovery are frontend policies.
 
 Blocking receive policy belongs to `Client`:
 `client.set_recv_timeout(Some(duration))?` sets it before or after opening,

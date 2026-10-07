@@ -2,7 +2,7 @@ use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
 
 use thiserror::Error;
 
-use crate::{Authentication, ClientConfig, ClientError, ClientEvent};
+use crate::{AddressFamily, Authentication, ClientConfig, ClientError, ClientEvent};
 
 use super::TargetId;
 
@@ -48,11 +48,16 @@ impl TargetAuth {
     }
 }
 
-/// Endpoint and authentication specification for one managed target.
+/// Endpoint, address-family and authentication specification for one managed target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedTargetConfig {
     pub id: TargetId,
     pub server_addr: String,
+    /// Override the shared address-family policy. `None` inherits it.
+    ///
+    /// The endpoint remains a hostname when supplied as one, so every new
+    /// generation resolves it again using the effective family policy.
+    pub address_family: Option<AddressFamily>,
     pub auth: TargetAuth,
 }
 
@@ -61,6 +66,7 @@ impl ManagedTargetConfig {
         Self {
             id: id.into(),
             server_addr: server_addr.into(),
+            address_family: None,
             auth: TargetAuth::Inherit,
         }
     }
@@ -86,7 +92,7 @@ pub enum ManagedCompletionPolicy {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedClientConfig {
     /// Reusable session/socket configuration shared across target generations.
-    /// Each target supplies its endpoint and resolves its authentication policy.
+    /// Each target supplies its endpoint and resolves its family and authentication policies.
     pub client: ClientConfig,
     pub pacing: ManagedPacing,
     pub completion: ManagedCompletionPolicy,

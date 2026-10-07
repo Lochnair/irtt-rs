@@ -92,7 +92,7 @@ impl ClientArgs {
     ///
     /// Targets are only required here. `--list-columns` returns before this is
     /// called, so listing columns still needs no target.
-    pub fn prepare(&self) -> Result<ManagedRunSetup, String> {
+    pub async fn prepare(&self) -> Result<ManagedRunSetup, String> {
         if self.targets_stdin && !self.is_continuous() {
             return Err("--targets-stdin requires --duration 0".to_owned());
         }
@@ -105,6 +105,7 @@ impl ClientArgs {
                 stdin_controlled: self.targets_stdin,
             },
         )
+        .await
     }
 
     pub fn is_continuous(&self) -> bool {

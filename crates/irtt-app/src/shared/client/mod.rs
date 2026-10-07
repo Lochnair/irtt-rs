@@ -15,6 +15,6 @@ pub use prepare::{
     STDIN_MAX_DESIRED_TARGETS, STDIN_MAX_LIVE_TARGET_GENERATIONS, STDIN_OUTCOME_HISTORY_LIMIT,
 };
 pub use targets::{
-    parse_stdin_target_set, parse_target, prepare_managed_targets, target_specs, GroupPacingArg,
-    PreparedTarget, TargetArg, TargetSpec,
+    parse_stdin_target_set, parse_target, target_specs, GroupPacingArg, PreparedTarget, TargetArg,
+    TargetPreparation, TargetSpec,
 };

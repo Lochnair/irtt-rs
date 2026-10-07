@@ -1,9 +1,13 @@
-use std::{collections::HashSet, fmt};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt, io,
+    net::{IpAddr, SocketAddr},
+};
 
 use clap::ValueEnum;
 use irtt_client::{
     managed::{ManagedPacing, ManagedTargetConfig, TargetAuth, TargetId},
-    Authentication, HmacKey,
+    AddressFamily, Authentication, HmacKey,
 };
 
 /// One raw positional target captured by Clap.
@@ -63,6 +67,7 @@ impl fmt::Debug for PreparedTarget {
         f.debug_struct("PreparedTarget")
             .field("label", &self.label)
             .field("server_addr", &self.managed.server_addr)
+            .field("address_family", &self.managed.address_family)
             .field("auth", &self.managed.auth)
             .finish()
     }
@@ -257,17 +262,146 @@ pub fn target_specs(targets: &[TargetArg]) -> Result<Vec<TargetSpec>, String> {
     target_specs_with_empty(targets, false)
 }
 
-pub fn prepare_managed_targets(specs: Vec<TargetSpec>) -> Result<Vec<PreparedTarget>, String> {
-    let mut targets = Vec::with_capacity(specs.len());
-    for spec in specs {
-        let mut managed = ManagedTargetConfig::new(TargetId::from(spec.label.clone()), spec.addr);
-        managed.auth = spec.auth;
-        targets.push(PreparedTarget {
-            label: spec.label,
-            managed,
-        });
+/// Family selections for the current desired declarations, never resolved IPs.
+/// Unchanged stdin declarations retain their selections; removed declarations
+/// are forgotten, so adding them again performs fresh discovery.
+#[derive(Debug, Clone)]
+pub struct TargetPreparation {
+    family: AddressFamily,
+    dual_stack: bool,
+    discovered: HashMap<String, (String, [bool; 2])>,
+}
+
+impl TargetPreparation {
+    pub fn new(family: AddressFamily, dual_stack: bool) -> Self {
+        Self {
+            family,
+            dual_stack,
+            discovered: HashMap::new(),
+        }
     }
-    Ok(targets)
+
+    pub async fn prepare(
+        mut self,
+        specs: Vec<TargetSpec>,
+        maximum_targets: Option<usize>,
+    ) -> Result<(Vec<PreparedTarget>, Self), String> {
+        let mut targets = Vec::with_capacity(specs.len());
+        let mut discovered = HashMap::new();
+        let mut labels = HashSet::new();
+        for (index, spec) in specs.into_iter().enumerate() {
+            let families = if let Some(ip) = literal_ip(&spec.addr) {
+                match (self.family, ip) {
+                    (AddressFamily::Ipv4, IpAddr::V6(_)) => {
+                        return Err(format!(
+                            "target {}: IPv6 literal conflicts with --ipv4",
+                            index + 1
+                        ))
+                    }
+                    (AddressFamily::Ipv6, IpAddr::V4(_)) => {
+                        return Err(format!(
+                            "target {}: IPv4 literal conflicts with --ipv6",
+                            index + 1
+                        ))
+                    }
+                    _ => None,
+                }
+            } else if self.dual_stack {
+                let families = match self.discovered.get(&spec.label) {
+                    Some((addr, families)) if *addr == spec.addr => *families,
+                    _ => {
+                        let endpoint = discovery_endpoint(&spec.addr)
+                            .map_err(|error| format!("target {}: {error}", index + 1))?;
+                        discovery_families(tokio::net::lookup_host(endpoint).await)
+                            .map_err(|error| format!("target {}: {error}", index + 1))?
+                    }
+                };
+                discovered.insert(spec.label.clone(), (spec.addr.clone(), families));
+                Some(families)
+            } else {
+                None
+            };
+            for target in expand_target(spec, families) {
+                if !labels.insert(target.label.clone()) {
+                    return Err("duplicate target label after address-family expansion".to_owned());
+                }
+                targets.push(target);
+            }
+            if let Some(maximum) = maximum_targets.filter(|maximum| targets.len() > *maximum) {
+                return Err(format!(
+                    "target set exceeds the {maximum}-target limit after address-family expansion"
+                ));
+            }
+        }
+        self.discovered = discovered;
+        Ok((targets, self))
+    }
+}
+
+fn literal_ip(endpoint: &str) -> Option<IpAddr> {
+    endpoint
+        .parse::<SocketAddr>()
+        .map(|addr| addr.ip())
+        .ok()
+        .or_else(|| endpoint.parse().ok())
+        .or_else(|| {
+            if endpoint.starts_with('[') && endpoint.ends_with(']') {
+                format!("{endpoint}:2112")
+                    .parse::<SocketAddr>()
+                    .ok()
+                    .map(|addr| addr.ip())
+            } else {
+                None
+            }
+        })
+}
+
+fn discovery_endpoint(endpoint: &str) -> Result<(&str, u16), String> {
+    match endpoint.rsplit_once(':') {
+        Some((host, port)) => {
+            let port = port.parse().map_err(|_| "invalid server port".to_owned())?;
+            if host.is_empty() || host.contains(':') || host.starts_with('[') {
+                return Err("invalid server endpoint".to_owned());
+            }
+            Ok((host, port))
+        }
+        None => Ok((endpoint, 2112)),
+    }
+}
+
+fn discovery_families(
+    result: io::Result<impl Iterator<Item = SocketAddr>>,
+) -> Result<[bool; 2], String> {
+    let mut families = [false; 2];
+    for addr in result.map_err(|_| "DNS lookup failed".to_owned())? {
+        families[usize::from(addr.is_ipv6())] = true;
+    }
+    if families == [false; 2] {
+        return Err("DNS lookup returned no usable addresses".to_owned());
+    }
+    Ok(families)
+}
+
+fn expand_target(spec: TargetSpec, families: Option<[bool; 2]>) -> Vec<PreparedTarget> {
+    let selections = match families {
+        None => vec![(spec.label, None)],
+        Some(families) => [("v4", AddressFamily::Ipv4), ("v6", AddressFamily::Ipv6)]
+            .into_iter()
+            .zip(families)
+            .filter(|(_, exists)| *exists)
+            .map(|((suffix, family), _)| (format!("{}/{suffix}", spec.label), Some(family)))
+            .collect(),
+    };
+    selections
+        .into_iter()
+        .map(|(label, family)| {
+            let mut managed =
+                ManagedTargetConfig::new(TargetId::from(label.clone()), spec.addr.clone());
+            managed.address_family = family;
+            managed.auth = spec.auth.clone();
+            PreparedTarget { label, managed }
+        })
+        .collect()
 }
 
 /// Parse one complete stdin target set after its line terminator was removed.
@@ -277,7 +411,7 @@ pub fn prepare_managed_targets(specs: Vec<TargetSpec>) -> Result<Vec<PreparedTar
 pub fn parse_stdin_target_set(
     record: &str,
     maximum_targets: usize,
-) -> Result<Vec<PreparedTarget>, String> {
+) -> Result<Vec<TargetSpec>, String> {
     if record == "[]" {
         return Ok(Vec::new());
     }
@@ -288,5 +422,5 @@ pub fn parse_stdin_target_set(
         ));
     }
     let args = elements.into_iter().map(TargetArg::new).collect::<Vec<_>>();
-    prepare_managed_targets(target_specs_with_empty(&args, true)?)
+    target_specs_with_empty(&args, true)
 }

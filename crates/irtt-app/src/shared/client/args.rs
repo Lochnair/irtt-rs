@@ -6,6 +6,18 @@ use irtt_proto::{Clock, ReceivedStats, StampAt};
 
 #[derive(Clone, clap::Args)]
 pub struct CommonClientArgs {
+    /// Use IPv4 only.
+    #[arg(short = '4', long, conflicts_with_all = ["ipv6", "dual_stack"])]
+    pub ipv4: bool,
+
+    /// Use IPv6 only.
+    #[arg(short = '6', long, conflicts_with_all = ["ipv4", "dual_stack"])]
+    pub ipv6: bool,
+
+    /// Probe available IPv4 and IPv6 paths separately for each hostname.
+    #[arg(long, conflicts_with_all = ["ipv4", "ipv6"], long_help = "Probe available IPv4 and IPv6 paths separately for each hostname. Labels gain /v4 or /v6; IP literals remain single targets. Families are discovered when a target is added; reconnects resolve the original hostname again within the chosen family.")]
+    pub dual_stack: bool,
+
     /// Probe interval.
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     pub interval: Duration,
@@ -66,6 +78,9 @@ pub struct CommonClientArgs {
 impl fmt::Debug for CommonClientArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CommonClientArgs")
+            .field("ipv4", &self.ipv4)
+            .field("ipv6", &self.ipv6)
+            .field("dual_stack", &self.dual_stack)
             .field("interval", &self.interval)
             .field("length", &self.length)
             .field("hmac", &self.hmac.as_ref().map(|_| "[REDACTED]"))

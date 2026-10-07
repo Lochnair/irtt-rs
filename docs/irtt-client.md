@@ -58,6 +58,41 @@ once per interval instead. Final per-target summaries print in the order
 targets were supplied on the command line, not the order in which they
 finish or their labels sort alphabetically.
 
+## ADDRESS FAMILY
+
+By default, each target uses the first address returned by the system resolver,
+whether IPv4 or IPv6. Use `-4` / `--ipv4` to select IPv4 only, or
+`-6` / `--ipv6` to select IPv6 only. Hostnames are resolved when each session
+connects; these flags do not perform an extra discovery lookup. An explicit
+IP literal from the other family is rejected during preparation.
+
+Use `--dual-stack` to compare IPv4 and IPv6 paths as separate measurements:
+
+```sh
+irtt-client -6 host.example
+irtt-client --dual-stack cov=uk-cov1.irtt.lochnair.net
+```
+
+For each hostname, the client discovers which address families the system
+resolver currently returns. IPv4 results create `cov/v4`, IPv6 results create
+`cov/v6`, and both create both targets, in that order. Without an alias,
+`host.example` becomes `host.example/v4` and/or `host.example/v6`. Multiple
+addresses within one family still produce only one target. Explicit IP literals
+keep their original label and remain single targets.
+
+Each target has its own session, statistics, and failures. Its original hostname
+is retained: every new session resolves it again and selects the first address
+matching its family. Families are discovered only when a declaration is added,
+so a newly appearing family does not create another target automatically.
+Discovery failure or a successful lookup returning no addresses rejects the
+whole target set. A missing family is normal and simply creates no target for
+that family. Final labels must be unique, including generated `/v4` and `/v6`
+labels; choose another alias if one collides with an explicit label.
+
+`-4`, `-6`, and `--dual-stack` are mutually exclusive. Expanded targets use
+ordinary multi-target pacing and each sends its own probes, so dual-stack can
+double the number of probes per interval compared with one target per hostname.
+
 ## DYNAMIC TARGET SETS FROM STANDARD INPUT
 
 `--targets-stdin` is available only with continuous mode (`--duration 0`).
@@ -74,6 +109,13 @@ than a delta. A later record replaces an earlier set: targets absent from it
 are retired, unchanged target configurations retain their generation, and a
 changed address or HMAC setting creates a fresh generation. Under transient
 live-generation backpressure, only the latest unapplied desired set is kept.
+
+The same address-family preparation applies to initial and stdin targets.
+With `--dual-stack`, unchanged labels and endpoints retain their discovered
+families across records, including HMAC-only changes. Removing a declaration
+and later adding it again performs fresh discovery. New declarations are
+prepared asynchronously while existing measurements continue. A preparation
+error stops the stream gracefully without applying a partial set.
 
 Commas frame targets in stdin records; escape a literal comma within one
 target as `\,`. Target parsing inside each element is otherwise the same as
@@ -107,7 +149,8 @@ revision to become applicable.
 
 The maximum stdin record payload is 64 KiB. Stdin-controlled mode bounds each
 desired set to 128 targets and retains at most 256 live target generations
-while replacements drain.
+while replacements drain. The 128-target limit applies after dual-stack
+expansion: a hostname producing both families consumes two target slots.
 
 ## FINITE VERSUS CONTINUOUS OPERATION
 
