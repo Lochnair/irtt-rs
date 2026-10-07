@@ -34,6 +34,37 @@ release. The format is loosely based on
 
 ## irtt-client
 
+### 0.6.0
+
+#### Added
+
+- Added `ManagedClientHandle::subscribe_status()` and `ManagedStatusSubscription` for observing durable lifecycle and completion state independently of the lossy event stream. The current snapshot is immediately readable, change notifications track subsequent updates, and terminal target status includes its completed outcome.
+- Managed targets can override the shared address-family policy while retaining the original hostname for resolution on each new generation.
+
+#### Changed
+
+- `ClientConfig` is now reusable across endpoints: `Client::connect` and `AsyncClient::connect` take the endpoint separately, with configuration grouped into `socket`, `request` (`SessionRequest`), and `open` (`OpenPolicy`). `AddressFamily` replaces the separate socket family flags, and blocking receive timeouts are configured through `Client::set_recv_timeout`.
+- Explicit `Authentication`, `HmacKey`, and managed `TargetAuth` replace `ClientConfig.hmac_key` and `ClientAuthConfig`. Key bytes are shared across clones and redacted from debug output. Switching between inherited and explicit authentication or address-family settings starts a new target generation, even when the effective settings are equal.
+- `NegotiationResult` replaces `NegotiatedParams`, separating typed `AcceptedSessionParameters` from exact peer-returned wire parameters and accepted `NegotiationChange` records (formerly `NegotiationRestriction`). Open outcomes and lifecycle events now use tuple variants carrying `SessionStarted` or `NoTestCompleted` payloads.
+- Low-level clients now leave probe cadence and run duration entirely to the caller. `next_send_deadline` and `is_run_complete` were removed; managed clients continue to provide scheduling and finite-run completion. Low-level callers can inspect `negotiation()`, `has_pending_probes()`, and `next_probe_timeout_deadline()` to drive their own event loop.
+- Probe sends now return `Result<SendReceipt, SendProbeError>`, distinguishing failures before socket acceptance from failures after a probe was committed. Receipts convert to `ClientEvent::EchoSent`; its `scheduled_at` and `timer_error` fields are now optional and absent for low-level sends.
+- Stop receipts resolve when the stop request is durably observed or the task becomes terminal; callers must still await task completion to observe finished cleanup.
+
+#### Fixed
+
+- Finite managed runs now reach their negotiated end under socket backpressure, even when no pending probe timeout remains to wake the driver. Staggered pacing no longer repeatedly wakes idle or draining targets that have no send deadline.
+- Blocking receive operations now return lifecycle errors immediately when no session is open, instead of blocking for a datagram or returning empty success after a timeout.
+
+#### Performance
+
+- Managed drain-deadline lookup no longer scans retained timed-out probes, keeping lookup work bounded as retained probe state grows.
+
+#### Compatibility
+
+- The configuration, authentication, negotiation, lifecycle-event, and send APIs above are breaking changes without compatibility aliases. Low-level callers must enforce their own cadence and duration or use a managed client.
+- `AcceptedSessionParameters::dscp` is a six-bit codepoint; `NegotiationResult::peer_params.dscp` remains the raw traffic-class byte. Accepted durations and intervals use Rust duration types rather than wire nanosecond integers.
+- Tokio remains optional, and the default client build remains runtime-free. These API changes do not introduce a wire-protocol migration.
+
 ### 0.5.3
 
 #### Added
@@ -119,6 +150,29 @@ release. The format is loosely based on
 
 ## irtt-stats
 
+### 0.5.2
+
+#### Changed
+
+- `TimeStats` is now re-exported from `measurement-stats`, retaining the existing `irtt_stats::TimeStats` import path, fields, and methods.
+- Timer-error statistics now omit sends without scheduling metadata instead of recording an artificial measurement.
+
+#### Fixed
+
+- Time-based rolling windows now expire backdated events correctly, including expired events inside retained arrival history. Older timestamps cannot move the expiry anchor backwards or restore expired history.
+- Rolling upstream and downstream loss now use the server receive-count increase over the retained packet-event interval instead of comparing window counts against a cumulative server count.
+- Rolling directional-loss estimates are unavailable when counter observations are missing, stale, discontinuous, or separated by an interior gap in the time window, rather than reporting misleading values.
+
+#### Performance
+
+- Indexed rolling-window expiry avoids full-window scans on insertion and reclaims expired entries without accumulating tombstones.
+
+#### Compatibility
+
+- This release consumes `irtt-client` 0.6 events; applications using both crates must upgrade them together.
+- Unavailable rolling directional-loss packet estimates are `None`; their percentage fields remain `0.0`. Valid signed estimates remain possible, and raw server receive counts retain their cumulative meaning.
+- Time-based rolling windows expire when new events arrive, retain events exactly at the cutoff, and have no event-count cap. Use `rolling_count` when event storage needs a fixed bound.
+
 ### 0.5.1
 
 #### Added
@@ -137,6 +191,44 @@ release. The format is loosely based on
 - `StatsConfig::estimated_retained_bytes(probe_count)` gives callers an API to estimate the memory a stats configuration will retain for a given probe count, ahead of actually running a session (used by `irtt-cli`'s multi-target memory-usage warning, see below).
 
 ## irtt-rs
+
+### 0.8.0
+
+#### Added
+
+- Added mutually exclusive `-4` / `--ipv4`, `-6` / `--ipv6`, and `--dual-stack` options to the client and TUI. Dual-stack hostnames expand into independent `/v4` and `/v6` targets with separate sessions, statistics, and failures; explicit IP literals remain single targets.
+- Continuous TUI runs now reconnect independently after target failures, peer closure, or server-limited session completion while healthy targets continue uninterrupted. The TUI remains running even when every target fails.
+- Added target selection and a scrollable details sheet showing negotiation, counters, timing statistics, warnings, and recent events.
+- Graph axes now display local wall-clock timestamps, including fractional seconds or dates where appropriate.
+
+#### Changed
+
+- Replaced separate Graph and Dashboard views with one dashboard comparing all targets. Target rows show effective RTT, cumulative loss, jitter, and the age of the last primary reply. `Tab` / `Shift-Tab` selects a target; `d` opens details, with `g` retained as an alias.
+- Reconnecting targets retain their logical row and graph history, reset session statistics for each new generation, and leave gaps between generations.
+- Increased graph retention from 100,000 to 500,000 samples per target and extended the maximum graph window from one hour to 24 hours.
+- Clearing graph history now clears all targets and returns to live view while preserving latest samples and statistics.
+- Client and TUI frontends now react asynchronously to measurements, status changes, input, and shutdown, removing periodic polling delays.
+- The application library's `run_stream`, `run_tui`, and `prepare_managed_run` entry points are now asynchronous.
+
+#### Performance
+
+- Graph rendering selects samples within the visible viewport instead of scanning the full retained history, with interpolation at viewport boundaries.
+- Reduced graph-history memory usage per sample substantially, allowing retention to increase from 100,000 to 500,000 samples per target without proportional memory growth.
+- Increased regular TUI refresh frequency to 100 ms for smoother updates.
+
+#### Compatibility
+
+- Automatic reconnect applies to continuous TUI runs, not ordinary `irtt-client` runs or finite TUI runs. Explicit stops and no-test completion do not trigger retries.
+- Dual-stack expansion changes target labels and can double probe traffic per hostname. The stdin limit of 128 desired targets applies after expansion; generated labels must remain unique.
+- Address families are discovered when a declaration is added. Each new session resolves the original hostname within its assigned family; newly appearing families are not added automatically. Unchanged stdin declarations retain their discovered families, while removal and re-addition performs fresh discovery.
+- New stdin declarations are prepared asynchronously while existing measurements continue. Preparation errors stop the stream gracefully without applying a partial target set.
+- The larger graph cap permits higher eventual memory use: approximately 42 MiB per target for retained graph samples at the cap on 64-bit macOS, excluding statistics and rendering buffers.
+- Application-library callers must await client/TUI run and preparation functions and supply the new shutdown argument to the run functions.
+- `ClientArgs::prepare` and `TuiArgs::prepare` are also asynchronous; `TargetPreparation::prepare` replaces `prepare_managed_targets`, and `parse_stdin_target_set` now returns `TargetSpec` values for preparation.
+- The application's former `TargetAuth` type was replaced by `irtt_client::managed::TargetAuth`.
+- The public output wrappers `EventRenderStats` and `IpdvPair` were removed in favor of `irtt_stats::EventStatsUpdate` and `IpdvPairUpdate`.
+- `DEFAULT_RECV_TIMEOUT`, `is_shutdown_requested`, and `TuiArgs::timestamp_mode` were removed. `install_signal_handler` is now available only with the `server` feature; client/TUI embedding uses `install_async_signal_handler`.
+- MSRV remains Rust 1.88. Existing output column names and formats are preserved.
 
 ### 0.7.1
 
