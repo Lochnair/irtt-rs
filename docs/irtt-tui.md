@@ -108,11 +108,20 @@ controls appropriate to the currently open graph or details sheet.
 The TUI keeps its own bounded presentation state on top of the statistics
 retention described in `irtt-client(1)`:
 
-- Up to 100,000 graph samples per target.
+- Up to 500,000 graph samples per target.
 - Up to 80 recent status/log messages.
 
+At 500,000 replies per target, retention is approximately 13h53m20s at
+100ms intervals, 27h46m40s at 200ms, or 5d18h53m20s at 1s. Retained graph
+samples store both clocks, six graph-ready values, and a session-boundary
+flag; latest details keep the full typed timing values and sequence number.
+On 64-bit macOS, an 88-byte retained sample gives about 42 MiB per target
+at the cap, excluding statistics and temporary rendering buffers. Histories
+grow on demand and reserve exactly to the cap on their final growth step;
+they do not preallocate the full history for every target at startup.
+
 `r` clears graph history for all targets and returns the viewport to
-live; it does not change the 100,000-sample cap itself. These are
+live; it does not change the 500,000-sample cap itself. These are
 presentation bounds on top of the client's own statistics retention (see
 `irtt-client(1)` MEASUREMENTS AND MEMORY) — a long continuous TUI session's
 total memory is dominated by whichever of the two is larger for your target
