@@ -49,7 +49,7 @@ impl TuiArgs {
     ///
     /// The TUI always requires a target: the parser rejects an empty target
     /// list, and this rejects a target set that cannot be labelled uniquely.
-    pub fn prepare(&self) -> Result<ManagedRunSetup, String> {
+    pub async fn prepare(&self) -> Result<ManagedRunSetup, String> {
         prepare_managed_run(
             &self.common,
             self.duration,
@@ -59,6 +59,7 @@ impl TuiArgs {
                 stdin_controlled: false,
             },
         )
+        .await
     }
 
     pub fn is_continuous(&self) -> bool {

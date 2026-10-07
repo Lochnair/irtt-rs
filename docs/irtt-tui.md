@@ -21,6 +21,21 @@ Target syntax, multiple targets, and pacing are identical to
 `--sfill`, `--dscp`, `--ttl`, `--loose`) is shared with `irtt-client` as
 well; consult that manual for their meaning.
 
+Address-family controls are shared too: `-4` / `--ipv4` uses IPv4 only,
+`-6` / `--ipv6` uses IPv6 only, and `--dual-stack` gives each available family
+of a hostname its own measurement row and graph series. These switches are
+mutually exclusive. Explicit IP literals remain single targets; a literal
+conflicting with `-4` or `-6` is rejected before the dashboard starts.
+
+```sh
+irtt-tui -4 uk-cov1.irtt.lochnair.net
+irtt-tui --dual-stack cov=uk-cov1.irtt.lochnair.net
+```
+
+The second command creates `cov/v4` and/or `cov/v6` according to the system
+resolver's initial results, letting you compare the two paths directly.
+See the client manual's address-family section for discovery errors and labels.
+
 ## CONTINUOUS DEFAULT
 
 Unlike `irtt-client`, **the TUI defaults to continuous mode**
@@ -37,6 +52,11 @@ session completing because the server restricted its duration. After a
 sessions continue undisturbed. Even if every target fails, the TUI stays alive
 until you quit. Explicit stops, removed or replaced targets, and no-test
 completion do not trigger retries. Quitting cancels pending retry work.
+
+With `--dual-stack`, a failed family reconnects independently while its healthy
+sibling continues. Reconnect resolves the original hostname again within the
+target's family. It does not discover additional families or pin the address
+returned by initial discovery.
 
 Each reconnect keeps the same logical target row. Statistics reset when a new
 session generation is accepted, including attempts that fail before opening.

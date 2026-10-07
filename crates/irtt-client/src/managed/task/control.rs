@@ -397,6 +397,9 @@ fn build_task(
             .checked_add(1)
             .ok_or(ManagedConfigError::GenerationExhausted)?;
         let mut client_config = config.client.clone();
+        client_config.address_family = target
+            .address_family
+            .unwrap_or(config.client.address_family);
         client_config.auth = target.auth.resolve(&config.client.auth);
         validate_target_config(&client_config).map_err(|source| {
             ManagedConfigError::InvalidTarget {

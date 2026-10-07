@@ -34,9 +34,10 @@ pub async fn run_tui(
     args: TuiArgs,
     mut shutdown: watch::Receiver<bool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let setup = args
-        .prepare()
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let setup = tokio::select! {
+        result = args.prepare() => result.map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+        _ = shutdown.wait_for(|requested| *requested) => return Ok(()),
+    };
     let continuous = args.is_continuous();
     if *shutdown.borrow() {
         return Ok(());

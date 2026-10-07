@@ -16,7 +16,7 @@ use irtt_client::{
 
 use super::{
     args::CommonClientArgs,
-    targets::{prepare_managed_targets, target_specs, GroupPacingArg, TargetArg},
+    targets::{target_specs, GroupPacingArg, TargetArg, TargetPreparation},
     PreparedTarget,
 };
 
@@ -52,6 +52,8 @@ pub struct ManagedRunSetup {
     pub pacing: ManagedPacing,
     /// Whether this stream may replace its desired set from stdin.
     pub stdin_controlled: bool,
+    /// Preparation policy and family selections for later stdin declarations.
+    pub preparation: TargetPreparation,
 }
 
 impl ManagedRunSetup {
@@ -98,7 +100,7 @@ impl ManagedRunSetup {
 ///
 /// Targets are validated before any configuration is built, so a bad target set
 /// fails before the caller can act on a half-prepared run.
-pub fn prepare_managed_run(
+pub async fn prepare_managed_run(
     common: &CommonClientArgs,
     duration: Duration,
     selection: TargetSelection<'_>,
@@ -113,11 +115,19 @@ pub fn prepare_managed_run(
     } else {
         target_specs(selection.targets)?
     };
-    let targets = prepare_managed_targets(specs)?;
+    let (targets, preparation) = TargetPreparation::new(common.address_family(), common.dual_stack)
+        .prepare(
+            specs,
+            selection
+                .stdin_controlled
+                .then_some(STDIN_MAX_DESIRED_TARGETS),
+        )
+        .await?;
     Ok(ManagedRunSetup {
         targets,
         client: common.to_client_config(duration),
         pacing: selection.pacing.into(),
         stdin_controlled: selection.stdin_controlled,
+        preparation,
     })
 }

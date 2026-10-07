@@ -1,18 +1,29 @@
 use std::time::Duration;
 
 use irtt_client::{
-    Authentication, ClientConfig, HmacKey, NegotiationPolicy, OpenPolicy, SessionRequest,
-    SocketConfig,
+    AddressFamily, Authentication, ClientConfig, HmacKey, NegotiationPolicy, OpenPolicy,
+    SessionRequest, SocketConfig,
 };
 
 use super::args::CommonClientArgs;
 
 impl CommonClientArgs {
+    pub fn address_family(&self) -> AddressFamily {
+        if self.ipv4 {
+            AddressFamily::Ipv4
+        } else if self.ipv6 {
+            AddressFamily::Ipv6
+        } else {
+            AddressFamily::Any
+        }
+    }
+
     /// Build the shared client configuration template for a managed run.
     ///
     /// The config is endpoint-independent; managed targets own their addresses.
     pub fn to_client_config(&self, duration: Duration) -> ClientConfig {
         ClientConfig {
+            address_family: self.address_family(),
             open: OpenPolicy {
                 negotiation: if self.loose {
                     NegotiationPolicy::Loose

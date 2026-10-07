@@ -191,6 +191,9 @@ impl ManagedClientTask {
                 return Err(ManagedCommandApplyError::DuplicateTargetId { id: target.id });
             }
             let mut client_config = self.config.client.clone();
+            client_config.address_family = target
+                .address_family
+                .unwrap_or(self.config.client.address_family);
             client_config.auth = target.auth.resolve(&self.config.client.auth);
             validate_target_config(&client_config).map_err(|source| {
                 ManagedCommandApplyError::InvalidTarget {

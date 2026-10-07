@@ -8,7 +8,7 @@ use std::{
 use irtt_client::{
     managed::{
         ManagedClient, ManagedCommandApplyError, ManagedEndReason, ManagedEvent, ManagedStatus,
-        ManagedTargetConfig, ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
+        ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
     },
     ClientEvent,
 };
@@ -22,7 +22,7 @@ use crate::shared::client::{
         request_managed_stop_once, should_print_final_summary,
     },
     worker::ManagedWorker,
-    ManagedRunSetup, STDIN_MAX_DESIRED_TARGETS, STDIN_OUTCOME_HISTORY_LIMIT,
+    ManagedRunSetup, TargetSpec, STDIN_MAX_DESIRED_TARGETS, STDIN_OUTCOME_HISTORY_LIMIT,
 };
 
 use irtt_stats::{EventStatsUpdate, StatsCollector, StatsConfig};
@@ -46,9 +46,10 @@ pub async fn run_stream(
         print!("{}", OutputConfig::list_columns());
         return Ok(());
     }
-    let setup = args
-        .prepare()
-        .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    let setup = tokio::select! {
+        result = args.prepare() => result.map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+        _ = shutdown.wait_for(|requested| *requested) => return Ok(()),
+    };
     let multi_target = setup.is_multi_target();
     let output_config = OutputConfig::new(
         args.format,
@@ -191,7 +192,7 @@ pub async fn run_stream(
 
 #[derive(Clone)]
 enum StdinUpdate {
-    Targets(Vec<ManagedTargetConfig>),
+    Targets(Vec<TargetSpec>),
     Stop(StdinStop),
 }
 
@@ -286,9 +287,7 @@ fn read_stdin_target_sets<R: BufRead>(
                 }
                 match parse_stdin_target_set(&record, STDIN_MAX_DESIRED_TARGETS) {
                     Ok(targets) => {
-                        updates.send_replace(StdinUpdate::Targets(
-                            targets.into_iter().map(|target| target.managed).collect(),
-                        ));
+                        updates.send_replace(StdinUpdate::Targets(targets));
                     }
                     Err(error) => {
                         updates.send_replace(StdinUpdate::Stop(StdinStop::Fatal(format!(
@@ -449,6 +448,9 @@ async fn run_stdin_stream(
     let mut stats = BTreeMap::new();
     let mut terminal_targets = BoundedTargetSet::new(STDIN_OUTCOME_HISTORY_LIMIT);
     let mut stdin_changed = false;
+    let mut preparation = setup.preparation.clone();
+    let mut desired_specs = None;
+    let mut preparing = None;
     let mut desired = None;
     let mut pending = None;
     let mut submitted = Vec::new();
@@ -465,11 +467,23 @@ async fn run_stdin_stream(
             } else if stdin_changed || stdin.has_changed().unwrap_or(true) {
                 stdin_changed = false;
                 match stdin.borrow_and_update().clone() {
-                    StdinUpdate::Targets(targets) => {
-                        desired = Some(targets);
+                    StdinUpdate::Targets(specs) => {
+                        desired_specs = Some(specs);
+                        desired = None;
                         retry_after = None;
                     }
                     StdinUpdate::Stop(reason) => stop = Some(reason),
+                }
+            }
+            if stop.is_none() && preparing.is_none() {
+                if let Some(specs) = desired_specs.take() {
+                    // Only one preparation runs at a time. Newer records supersede
+                    // its result without piling up uncancellable system DNS jobs.
+                    preparing = Some(Box::pin(
+                        preparation
+                            .clone()
+                            .prepare(specs, Some(STDIN_MAX_DESIRED_TARGETS)),
+                    ));
                 }
             }
             if stop.is_none()
@@ -494,6 +508,7 @@ async fn run_stdin_stream(
                 }
             }
             if stop.is_some() {
+                preparing = None;
                 summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &snapshot));
                 if request_managed_stop_once(&mut stop_requested) {
                     drop(handle.stop());
@@ -508,6 +523,25 @@ async fn run_stdin_stream(
             _ = shutdown.changed(), if stop.is_none() => {}
             _ = stdin.changed(), if stop.is_none() => { stdin_changed = true; }
             changed = status.changed() => { if changed.is_err() { break; } }
+            result = async { preparing.as_mut().expect("guarded target preparation").await }, if preparing.is_some() && stop.is_none() => {
+                preparing = None;
+                // Let the next loop consume any newer record, including EOF,
+                // before considering this prepared revision for submission.
+                if desired_specs.is_none() && !stdin.has_changed().unwrap_or(true) {
+                    match result {
+                        Ok((targets, next_preparation)) => {
+                            preparation = next_preparation;
+                            desired = Some(targets.into_iter().map(|target| target.managed).collect());
+                            retry_after = None;
+                        }
+                        Err(error) => {
+                            stop = Some(StdinStop::Fatal(format!("invalid --targets-stdin target set: {error}")));
+                            summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow()));
+                            if request_managed_stop_once(&mut stop_requested) { drop(handle.stop()); }
+                        }
+                    }
+                }
+            }
             result = async { pending.as_mut().expect("guarded pending receipt").await }, if pending.is_some() && stop.is_none() => {
                 pending = None;
                 match result {
@@ -515,7 +549,7 @@ async fn run_stdin_stream(
                     Err(ManagedCommandApplyError::LiveGenerationLimitExceeded { .. }) => {
                         // A newer desired set supersedes this rejected set. Otherwise,
                         // retry only after the driver's status advances from submission.
-                        if desired.is_none() {
+                        if desired.is_none() && desired_specs.is_none() && preparing.is_none() {
                             desired = Some(std::mem::take(&mut submitted));
                         } else {
                             retry_after = None;
