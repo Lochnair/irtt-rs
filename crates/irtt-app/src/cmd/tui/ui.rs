@@ -43,7 +43,7 @@ use crate::{
     shared::client::{expected_probe_count, GroupPacingArg, ManagedRunSetup},
 };
 
-const HISTORY_LIMIT: usize = 100_000;
+const HISTORY_LIMIT: usize = 500_000;
 const RECENT_EVENT_LIMIT: usize = 80;
 const MIN_WIDTH: u16 = 56;
 const MIN_HEIGHT: u16 = 18;
@@ -405,7 +405,7 @@ impl TuiState {
                     server_timing,
                     ..
                 } => {
-                    target.push_graph_sample(GraphSample {
+                    target.push_graph_sample(LatestSample {
                         generation: target.generation.expect("client event has a generation"),
                         timestamp: *received_at,
                         seq: *seq,
@@ -615,7 +615,7 @@ struct TuiTargetState {
     status: TargetStatus,
     negotiated: Option<NegotiationResult>,
     graph_history: VecDeque<GraphSample>,
-    last_sample: Option<GraphSample>,
+    last_sample: Option<LatestSample>,
     last_warning: Option<String>,
     stats: StatsCollector,
 }
@@ -656,9 +656,20 @@ impl TuiTargetState {
         }
     }
 
-    fn push_graph_sample(&mut self, sample: GraphSample) {
+    fn push_graph_sample(&mut self, sample: LatestSample) {
+        let history = GraphSample {
+            timestamp: sample.timestamp,
+            values_ms: GraphMetric::ALL.map(|metric| {
+                metric
+                    .value_ns(&sample)
+                    .map_or(f64::NAN, |ns| ns as f64 / 1_000_000.0)
+            }),
+            break_before: self
+                .last_sample
+                .is_none_or(|last| last.generation != sample.generation),
+        };
         self.last_sample = Some(sample);
-        push_bounded(&mut self.graph_history, sample, HISTORY_LIMIT);
+        push_bounded(&mut self.graph_history, history, HISTORY_LIMIT);
     }
 }
 
@@ -926,7 +937,8 @@ enum GraphMetric {
 }
 
 impl GraphMetric {
-    const ALL: &[Self] = &[
+    // Enum order also indexes the retained graph values.
+    const ALL: [Self; 6] = [
         Self::EffectiveRtt,
         Self::RawRtt,
         Self::AdjustedRtt,
@@ -966,7 +978,7 @@ impl GraphMetric {
         }
     }
 
-    fn value_ns(self, sample: &GraphSample) -> Option<i128> {
+    fn value_ns(self, sample: &LatestSample) -> Option<i128> {
         match self {
             Self::EffectiveRtt => Some(sample.rtt.effective.as_nanos()),
             Self::RawRtt => Some(SignedDuration::from(sample.rtt.raw).as_nanos()),
@@ -996,8 +1008,25 @@ impl GraphMetric {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// Retained values use the same nanoseconds-to-f64 milliseconds conversion as
+// the chart. NaN means absent and never reaches the canvas as a finite point.
+// Keep both clocks: geometry is monotonic, while labels use local wall time.
+#[derive(Debug, Clone, Copy)]
 struct GraphSample {
+    timestamp: ClientTimestamp,
+    values_ms: [f64; 6],
+    break_before: bool,
+}
+
+impl GraphSample {
+    fn value_ms(&self, metric: GraphMetric) -> Option<f64> {
+        let value = self.values_ms[metric as usize];
+        value.is_finite().then_some(value)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LatestSample {
     generation: u64,
     timestamp: ClientTimestamp,
     seq: u32,
@@ -1426,40 +1455,31 @@ fn target_metric_series(
     let first = target
         .graph_history
         .partition_point(|sample| sample.timestamp.mono < viewport.start);
-    let predecessor_generation = target
-        .graph_history
-        .get(first.saturating_sub(1))
-        .map(|sample| sample.generation);
-    let mut previous = target
-        .graph_history
-        .range(..first)
-        .rev()
-        .take_while(|sample| Some(sample.generation) == predecessor_generation)
-        .find_map(|sample| {
-            metric.value_ns(sample).map(|ns| {
-                (
-                    sample.generation,
-                    (sample.timestamp.mono, ns as f64 / 1_000_000.0),
-                )
-            })
-        });
-    let points = target.graph_history.range(first..).filter_map(|sample| {
-        metric.value_ns(sample).map(|ns| {
-            (
-                sample.generation,
-                (sample.timestamp.mono, ns as f64 / 1_000_000.0),
-            )
-        })
-    });
+    let mut previous = None;
+    for sample in target.graph_history.range(..first).rev() {
+        if let Some(value) = sample.value_ms(metric) {
+            previous = Some((sample.timestamp.mono, value));
+            break;
+        }
+        if sample.break_before {
+            break;
+        }
+    }
     let mut data = Vec::new();
-    for (generation, point) in points {
-        if previous.is_some_and(|(before_generation, _)| before_generation != generation) {
-            if !data.is_empty() {
+    for sample in target.graph_history.range(first..) {
+        // Consume boundaries even when this metric is absent in the first
+        // replies of a new session; filtering them out would bridge an outage.
+        if sample.break_before {
+            if !data.is_empty() && data.last().is_some_and(|(x, _): &(f64, f64)| x.is_finite()) {
                 data.push((f64::NAN, f64::NAN));
             }
             previous = None;
         }
-        if let Some((_, before)) = previous {
+        let Some(value) = sample.value_ms(metric) else {
+            continue;
+        };
+        let point = (sample.timestamp.mono, value);
+        if let Some(before) = previous {
             // Only genuine crossing segments contribute boundary points. In
             // particular, never extend the latest sample to the live edge.
             if before.0 < viewport.start && point.0 > viewport.start {
@@ -1481,7 +1501,7 @@ fn target_metric_series(
                 point.1,
             ));
         }
-        previous = Some((generation, point));
+        previous = Some(point);
     }
     // A boundary beyond the viewport needs no trailing break.
     if data.last().is_some_and(|(x, _)| !x.is_finite()) {
@@ -2032,7 +2052,7 @@ mod tests {
         let mut target = TuiTargetState::new("monitor".into(), stats_config(true));
         for (generation, seconds) in [(0, 0), (0, 2), (1, 6), (1, 8)] {
             let raw = Duration::from_millis(seconds + 1);
-            target.push_graph_sample(GraphSample {
+            target.push_graph_sample(LatestSample {
                 generation,
                 timestamp: ClientTimestamp {
                     mono: start + Duration::from_secs(seconds),
@@ -2041,7 +2061,8 @@ mod tests {
                 seq: 0,
                 rtt: RttSample {
                     raw,
-                    adjusted: None,
+                    adjusted: (seconds != 6)
+                        .then_some(SignedDuration::from_nanos(-(raw.as_nanos() as i128))),
                     effective: SignedDuration::from_nanos(raw.as_nanos() as i128),
                 },
                 one_way: None,
@@ -2110,10 +2131,35 @@ mod tests {
         );
         assert!(series(3, 5).is_none(), "no interpolation across sessions");
         assert!(series(9, 10).is_none(), "no extrapolation to the live edge");
-        let template = target.graph_history[0];
+        let adjusted = |left, right| {
+            target_metric_series(
+                &target,
+                0,
+                GraphViewportRange {
+                    start: start + Duration::from_secs(left),
+                    end: start + Duration::from_secs(right),
+                    window: Duration::from_secs(right - left),
+                },
+                GraphMetric::AdjustedRtt,
+            )
+        };
+        let missing = adjusted(1, 9).unwrap();
+        assert_eq!(&missing.data[..2], [(0.0, -2.0), (1.0, -3.0)]);
+        assert!(missing.data[2].0.is_nan());
+        assert_eq!(&missing.data[3..], [(7.0, -9.0)]);
+        assert!(
+            adjusted(3, 7).is_none(),
+            "absent metric cannot bridge sessions"
+        );
+        assert_eq!(
+            adjusted(7, 9).unwrap().data,
+            [(1.0, -9.0)],
+            "predecessor search stops at an absent boundary metric"
+        );
+        let template = target.last_sample.unwrap();
         target.graph_history.clear();
         for generation in 0..10_000 {
-            target.push_graph_sample(GraphSample {
+            target.push_graph_sample(LatestSample {
                 generation,
                 timestamp: ClientTimestamp {
                     mono: start + Duration::from_secs(generation),
