@@ -19,4 +19,4 @@ irtt-client.workspace = true
 name = "finite_vs_continuous"
 
 [dev-dependencies]
-proptest = "1.11.0"
+proptest = "1.12.0"
