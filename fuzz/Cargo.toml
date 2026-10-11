@@ -8,7 +8,7 @@ edition = "2021"
 cargo-fuzz = true
 
 [dependencies]
-arbitrary = "1.4.2"
+arbitrary = "1.5.0"
 libfuzzer-sys = "0.4.13"
 
 [dependencies.irtt-proto]
