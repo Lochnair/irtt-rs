@@ -1,4 +1,4 @@
-use std::{fmt, time::Duration};
+use std::{fmt, net::IpAddr, net::SocketAddr, time::Duration};
 
 use clap::ValueEnum;
 use irtt_client::{MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH};
@@ -70,6 +70,38 @@ pub struct CommonClientArgs {
     #[arg(long, value_name = "1..=255", value_parser = parse_ttl)]
     pub ttl: Option<u32>,
 
+    #[arg(
+        long = "bind-addr",
+        value_name = "IP[:PORT]",
+        value_parser = parse_bind_addr,
+        long_help = "Local IP address and optional UDP port to bind. \
+                     If no port is specified, the operating system selects \
+                     an ephemeral port. IPv6 addresses with an explicit \
+                     port must use [ADDR]:PORT syntax."
+    )]
+    pub bind_addr: Option<SocketAddr>,
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[arg(
+        long = "bind-device",
+        value_name = "DEVICE",
+        help = "Bind the socket to a network device"
+    )]
+    pub bind_to_device: Option<String>,
+
+    #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+    #[arg(
+        long,
+        value_name = "MARK",
+        value_parser = clap_num::maybe_hex::<u32>,
+        help = "Set the outgoing socket firewall mark"
+    )]
+    pub mark: Option<u32>,
+
+    #[cfg(target_os = "freebsd")]
+    #[arg(long, value_name = "FIB", help = "Set the socket routing table (FIB)")]
+    pub fib: Option<u32>,
+
     /// Accept safe server restrictions during negotiation.
     #[arg(long)]
     pub loose: bool,
@@ -77,7 +109,8 @@ pub struct CommonClientArgs {
 
 impl fmt::Debug for CommonClientArgs {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("CommonClientArgs")
+        let mut debug = f.debug_struct("CommonClientArgs");
+        debug
             .field("ipv4", &self.ipv4)
             .field("ipv6", &self.ipv6)
             .field("dual_stack", &self.dual_stack)
@@ -90,8 +123,14 @@ impl fmt::Debug for CommonClientArgs {
             .field("server_fill", &self.server_fill)
             .field("dscp", &self.dscp)
             .field("ttl", &self.ttl)
-            .field("loose", &self.loose)
-            .finish()
+            .field("bind_addr", &self.bind_addr);
+        #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+        debug
+            .field("bind_to_device", &self.bind_to_device)
+            .field("mark", &self.mark);
+        #[cfg(target_os = "freebsd")]
+        debug.field("fib", &self.fib);
+        debug.field("loose", &self.loose).finish()
     }
 }
 
@@ -150,6 +189,13 @@ impl From<ReceivedStatsArg> for ReceivedStats {
             ReceivedStatsArg::Both => Self::Both,
         }
     }
+}
+
+fn parse_bind_addr(input: &str) -> Result<SocketAddr, String> {
+    input
+        .parse::<SocketAddr>()
+        .or_else(|_| input.parse::<IpAddr>().map(|ip| SocketAddr::new(ip, 0)))
+        .map_err(|_| "expected an IP address, optionally with a port".to_owned())
 }
 
 pub fn parse_duration(input: &str) -> Result<Duration, String> {

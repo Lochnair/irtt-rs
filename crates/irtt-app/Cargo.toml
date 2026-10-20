@@ -49,6 +49,7 @@ tui =["dep:tokio", "dep:futures-core", "dep:irtt-client", "irtt-client/ancillary
 [dependencies]
 chrono = { version = "0.4.45", default-features = false, features = ["clock"], optional = true }
 clap = { version = "4.6.7", features = ["derive", "env"] }
+clap-num = "=1.2.0"
 crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
 futures-core = { version = "0.3.34", default-features = false, optional = true }
 ctrlc = { version = "3.5.2", features = ["termination"] }

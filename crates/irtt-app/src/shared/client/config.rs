@@ -50,6 +50,13 @@ impl CommonClientArgs {
                     Authentication::Hmac(HmacKey::new(key.as_bytes()))
                 }),
             socket: SocketConfig {
+                bind_addr: self.bind_addr,
+                #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+                bind_to_device: self.bind_to_device.clone(),
+                #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
+                mark: self.mark,
+                #[cfg(target_os = "freebsd")]
+                fib: self.fib,
                 ttl: self.ttl,
                 ..SocketConfig::default()
             },

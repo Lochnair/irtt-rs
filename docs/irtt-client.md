@@ -93,6 +93,25 @@ labels; choose another alias if one collides with an explicit label.
 ordinary multi-target pacing and each sends its own probes, so dual-stack can
 double the number of probes per interval compared with one target per hostname.
 
+## LOCAL SOCKET CONFIGURATION
+
+The client supports configuring its local UDP sockets using the following options:
+
+- `--bind-addr IP[:PORT]` binds sockets to the specified local IP address and optional port. If no port is specified, or the port is `0`, the operating system assigns an ephemeral port. IPv6 addresses with an explicit port must use `[ADDR]:PORT` syntax. The address family must match the target's resolved address family.
+- `--bind-device DEVICE` (Linux, Android, Fuchsia) binds sockets to a network interface using `SO_BINDTODEVICE`.
+- `--mark MARK` (Linux, Android, Fuchsia) sets the socket's firewall mark using `SO_MARK`, allowing traffic to be selected by policy routing or firewall rules. Accepts a decimal or 0x-prefixed hexadecimal unsigned 32-bit integer.
+- `--fib FIB` (FreeBSD) selects a routing table using `SO_SETFIB`. The FIB is specified as a decimal unsigned 32-bit integer.
+
+For example, bind IPv4 probes to a specific source address and interface, with a firewall mark:
+
+```sh
+irtt-client -4 --bind-addr 192.0.2.10 --bind-device wan0 --mark 1234 host.example
+```
+
+Setting a firewall mark or binding to a network device may require elevated privileges or appropriate capabilities. If the operating system rejects a socket option, socket setup fails.
+
+A fixed local port may cause binding conflicts when multiple target sockets are created. Use an ephemeral port unless a specific source port is required. A family-specific bind address is also incompatible with targets using the other address family.
+
 ## DYNAMIC TARGET SETS FROM STANDARD INPUT
 
 `--targets-stdin` is available only with continuous mode (`--duration 0`).
