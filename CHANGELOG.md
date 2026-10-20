@@ -192,6 +192,24 @@ release. The format is loosely based on
 
 ## irtt-rs
 
+### 0.9.0
+
+#### Added
+
+- Client and TUI `--bind-addr IP[:PORT]` selects a local source address and optional UDP port. Omitted ports and port `0` use an ephemeral port; IPv6 addresses with an explicit port use `[ADDR]:PORT`. The bind address must match the target's address family, and fixed ports can conflict across multiple target sockets.
+- Client and TUI `--bind-device DEVICE` binds sockets to a network interface on Linux, Android, and Fuchsia.
+- Client and TUI `--mark MARK` sets a socket firewall mark for policy routing or firewall rules on Linux, Android, and Fuchsia. It accepts decimal and `0x`-prefixed hexadecimal unsigned 32-bit values.
+- Client and TUI `--fib FIB` selects a routing table on FreeBSD, accepting a decimal unsigned 32-bit value.
+
+#### Fixed
+
+- Restored CLI compatibility with upstream IRTT for hexadecimal HMAC keys: client, TUI, and server `--hmac`, server `IRTT_SERVER_HMAC`, and client/TUI per-target `@hmac=KEY` accept a lowercase `0x` prefix followed by hexadecimal bytes, with either case allowed for digits. Literal UTF-8 keys remain supported; the HMAC-MD5 algorithm is unchanged.
+- Server argument debug output now redacts HMAC keys, matching the client and TUI. Server help hides the `IRTT_SERVER_HMAC` value, and invalid global HMAC keys are rejected during configuration preparation without echoing key material.
+
+#### Compatibility
+
+- Keys beginning with literal `0x` are now interpreted as hexadecimal. Empty keys, empty hexadecimal keys, odd-length hexadecimal strings, and invalid hexadecimal digits are rejected. Per-target `@hmac=` continues to disable authentication explicitly.
+
 ### 0.8.0
 
 #### Added
