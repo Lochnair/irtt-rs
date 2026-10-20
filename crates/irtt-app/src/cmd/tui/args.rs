@@ -18,7 +18,7 @@ pub struct TuiArgs {
         num_args = 1..,
         required = true,
         value_parser = parse_target,
-        long_help = "Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode.\n\nExplicit labels are used in the legend and status table. A target without @hmac= inherits --hmac; @hmac= disables it for that target.\n\nExamples:\n  irtt-tui host.example\n  irtt-tui eu=host.example\n  irtt-tui eu=host-a.example@hmac=secret us=host-b.example"
+        long_help = "Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode. Keys use literal UTF-8 or lowercase 0x followed by hexadecimal bytes.\n\nExplicit labels are used in the legend and status table. A target without @hmac= inherits --hmac; @hmac= disables it for that target.\n\nExamples:\n  irtt-tui host.example\n  irtt-tui eu=host.example\n  irtt-tui eu=host-a.example@hmac=secret us=host-b.example"
     )]
     pub targets: Vec<TargetArg>,
 

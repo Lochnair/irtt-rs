@@ -37,12 +37,13 @@ overrides it for that target, and `@hmac=` explicitly disables HMAC for that
 target. The modifier uses `@`, not a shell command separator; quote an argument
 if its key needs shell quoting.
 
+Global `--hmac KEY` and per-target `@hmac=KEY` accept plain-text keys or hexadecimal keys prefixed with `0x`. For example, `secret` and `0x736563726574` are equivalent.
+
 Target syntax supports these backslash escapes in labels, addresses, and HMAC
 values: `\\` for a literal backslash, `\@` for a literal `@`, `\=` for a
 literal `=`, and `\;` for a literal semicolon. Escaping `@` is necessary in a
 label or address when it would otherwise begin `@hmac=`; escaping the first
-`=` is how an unlabeled target or a label can contain that character. An `=` in
-an HMAC value, including Base64 padding, does not need escaping. Positional
+`=` is how an unlabeled target or a label can contain that character. An `=` in an HMAC value does not need escaping. Positional
 target arguments may contain a raw comma; stdin target sets have the additional
 `\,` escape described below.
 

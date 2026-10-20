@@ -88,12 +88,13 @@ impl From<GroupPacingArg> for ManagedPacing {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TargetParseError {
     EmptyLabel,
     EmptyAddress,
     InvalidEscape,
     EmptyTarget,
+    InvalidHmac(String),
 }
 
 impl fmt::Display for TargetParseError {
@@ -103,6 +104,7 @@ impl fmt::Display for TargetParseError {
             Self::EmptyAddress => "target address must not be empty",
             Self::InvalidEscape => "invalid target escape sequence",
             Self::EmptyTarget => "target must not be empty",
+            Self::InvalidHmac(message) => message,
         };
         f.write_str(message)
     }
@@ -197,7 +199,10 @@ fn parse_target_syntax(
             let auth = if value.is_empty() {
                 TargetAuth::Override(Authentication::Unauthenticated)
             } else {
-                TargetAuth::Override(Authentication::Hmac(HmacKey::new(value.into_bytes())))
+                TargetAuth::Override(Authentication::Hmac(HmacKey::new(
+                    crate::shared::decode_hmac_key(&value)
+                        .map_err(TargetParseError::InvalidHmac)?,
+                )))
             };
             (&input[..index], auth)
         }

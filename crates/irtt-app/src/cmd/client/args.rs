@@ -16,7 +16,7 @@ pub struct ClientArgs {
         value_name = "TARGET",
         num_args = 0..,
         value_parser = parse_target,
-        long_help = "Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode.\n\nExamples:\n  irtt-client host-a:2112 host-b:2112\n  irtt-client eu=host-a:2112 us=host-b:2112\n  irtt-client ams=host-a:2112@hmac=secret public=host-b:2112@hmac=\n\nA target without @hmac= inherits --hmac. @hmac= explicitly disables it for that target."
+        long_help = "Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode. Keys use literal UTF-8 or lowercase 0x followed by hexadecimal bytes.\n\nExamples:\n  irtt-client host-a:2112 host-b:2112\n  irtt-client eu=host-a:2112 us=host-b:2112\n  irtt-client ams=host-a:2112@hmac=secret public=host-b:2112@hmac=\n\nA target without @hmac= inherits --hmac. @hmac= explicitly disables it for that target."
     )]
     pub targets: Vec<TargetArg>,
 

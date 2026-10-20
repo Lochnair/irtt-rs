@@ -36,7 +36,7 @@ async fn serve(
     args: ServerArgs,
     shutdown_requested: &AtomicBool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = args.server_config();
+    let config = args.server_config()?;
     let binds = args.resolve_binds();
     let is_implicit_default = args.bind.is_empty();
     let set = match ServerSet::bind(binds.clone(), config.clone()).await {

@@ -74,8 +74,9 @@ IPv6 listener.
 
 ### `--hmac KEY`
 
-HMAC key, taken as the UTF-8 bytes of this argument. With a key configured,
-every request must carry a valid MAC and every reply is authenticated;
+Accepts a plain-text key or a hexadecimal key prefixed with `0x`. For example, `secret` and `0x736563726574` are equivalent. The `IRTT_SERVER_HMAC` environment variable uses the same syntax.
+
+With a key configured, every request must carry a valid MAC and every reply is authenticated;
 without one, authenticated requests are dropped. The key is visible in the
 process arguments.
 

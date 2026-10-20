@@ -832,6 +832,7 @@ dependencies = [
  "crossterm",
  "ctrlc",
  "futures-core",
+ "hex",
  "irtt-client",
  "irtt-proto",
  "irtt-server",

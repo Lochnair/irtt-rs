@@ -125,7 +125,7 @@ pub async fn prepare_managed_run(
         .await?;
     Ok(ManagedRunSetup {
         targets,
-        client: common.to_client_config(duration),
+        client: common.to_client_config(duration)?,
         pacing: selection.pacing.into(),
         stdin_controlled: selection.stdin_controlled,
         preparation,

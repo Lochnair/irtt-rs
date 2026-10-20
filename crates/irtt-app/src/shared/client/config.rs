@@ -21,8 +21,8 @@ impl CommonClientArgs {
     /// Build the shared client configuration template for a managed run.
     ///
     /// The config is endpoint-independent; managed targets own their addresses.
-    pub fn to_client_config(&self, duration: Duration) -> ClientConfig {
-        ClientConfig {
+    pub fn to_client_config(&self, duration: Duration) -> Result<ClientConfig, String> {
+        Ok(ClientConfig {
             address_family: self.address_family(),
             open: OpenPolicy {
                 negotiation: if self.loose {
@@ -45,9 +45,11 @@ impl CommonClientArgs {
             },
             auth: self
                 .hmac
-                .as_ref()
+                .as_deref()
+                .map(crate::shared::decode_hmac_key)
+                .transpose()?
                 .map_or(Authentication::Unauthenticated, |key| {
-                    Authentication::Hmac(HmacKey::new(key.as_bytes()))
+                    Authentication::Hmac(HmacKey::new(key))
                 }),
             socket: SocketConfig {
                 bind_addr: self.bind_addr,
@@ -61,7 +63,7 @@ impl CommonClientArgs {
                 ..SocketConfig::default()
             },
             ..ClientConfig::default()
-        }
+        })
     }
 }
 

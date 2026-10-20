@@ -12,7 +12,7 @@ const DEFAULT_PORT: u16 = 2112;
 // Every policy option is optional. An omitted option leaves the corresponding
 // `ServerConfig` default in place rather than restating it here, so library and
 // CLI defaults cannot drift apart.
-#[derive(Debug, Clone, Parser)]
+#[derive(Clone, Parser)]
 #[command(
     name = "irtt-server",
     about = "Minimal IRTT-compatible UDP server",
@@ -28,13 +28,14 @@ pub struct ServerArgs {
     )]
     pub bind: Vec<SocketAddr>,
 
+    // Decode during configuration preparation so Clap cannot echo rejected keys.
     /// HMAC key; every request must then carry a valid MAC.
     #[arg(
         long,
         value_name = "KEY",
-        value_parser = parse_hmac_key,
         env = "IRTT_SERVER_HMAC",
-        long_help = "HMAC key, taken as the UTF-8 bytes of this argument.\n\nAuthentication is global: with a key configured, every request must carry a valid MAC and every reply is authenticated. Without one, authenticated requests are dropped. The key is visible in the process arguments, or in the environment as IRTT_SERVER_HMAC."
+        hide_env_values = true,
+        long_help = "HMAC key: literal UTF-8 or lowercase 0x followed by hexadecimal bytes (digits may use either case). Empty keys and invalid hex are rejected.\n\nAuthentication is global: with a key configured, every request must carry a valid MAC and every reply is authenticated. Without one, authenticated requests are dropped. The key is visible in the process arguments, or in the environment as IRTT_SERVER_HMAC."
     )]
     pub hmac: Option<String>,
 
@@ -126,6 +127,23 @@ pub struct ServerArgs {
     pub no_dscp: bool,
 }
 
+impl std::fmt::Debug for ServerArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerArgs")
+            .field("hmac", &self.hmac.as_ref().map(|_| "[REDACTED]"))
+            .field("bind", &self.bind)
+            .field("max_sessions", &self.max_sessions)
+            .field("max_packet_length", &self.max_packet_length)
+            .field("min_interval", &self.min_interval)
+            .field("burst", &self.burst)
+            .field("idle_timeout", &self.idle_timeout)
+            .field("max_duration", &self.max_duration)
+            .field("timestamp_allowance", &self.timestamp_allowance)
+            .field("no_dscp", &self.no_dscp)
+            .finish()
+    }
+}
+
 /// The command-line spelling of [`TimestampAllowance`].
 ///
 /// A CLI-local enum rather than a `clap` derive on the library type: `irtt-server`
@@ -166,11 +184,10 @@ impl ServerArgs {
     }
 
     /// Builds the server configuration this invocation asks for.
-    #[must_use]
-    pub fn server_config(&self) -> ServerConfig {
+    pub fn server_config(&self) -> Result<ServerConfig, String> {
         let mut config = ServerConfig::default();
         if let Some(key) = self.hmac.as_ref() {
-            config = config.with_hmac_key(key.as_bytes());
+            config = config.with_hmac_key(crate::shared::decode_hmac_key(key)?);
         }
         if let Some(value) = self.max_sessions {
             config = config.with_max_sessions(value);
@@ -198,17 +215,8 @@ impl ServerArgs {
         if self.no_dscp {
             config = config.with_dscp_allowed(false);
         }
-        config
+        Ok(config)
     }
-}
-
-/// Rejects an empty HMAC key so a blank shell expansion cannot silently
-/// enable authentication with predictable, empty key material.
-fn parse_hmac_key(input: &str) -> Result<String, String> {
-    if input.is_empty() {
-        return Err("HMAC key must not be empty".to_owned());
-    }
-    Ok(input.to_owned())
 }
 
 /// Parses a duration whose zero is meaningful server policy.
