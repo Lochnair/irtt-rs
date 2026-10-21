@@ -93,8 +93,6 @@ pub(crate) struct AsyncOpenState {
     deadline: Option<Instant>,
     deadline_timer: Option<Pin<Box<time::Sleep>>>,
     request_submitted: bool,
-    stop_after_current_attempt: bool,
-    stopped_after_current_attempt: bool,
     buffer: [u8; MAX_OPEN_PACKET_SIZE],
     cleanup: Option<AsyncOpenCleanup>,
 }
@@ -106,8 +104,6 @@ impl AsyncOpenState {
             deadline: None,
             deadline_timer: None,
             request_submitted: false,
-            stop_after_current_attempt: false,
-            stopped_after_current_attempt: false,
             buffer: [0_u8; MAX_OPEN_PACKET_SIZE],
             cleanup: None,
         }
@@ -128,19 +124,10 @@ impl AsyncOpenState {
         self.deadline = None;
         self.deadline_timer = None;
         self.request_submitted = false;
-        self.stopped_after_current_attempt = self.stop_after_current_attempt;
     }
 
     pub(crate) fn has_in_flight_work(&self) -> bool {
         self.request_submitted || self.cleanup.is_some()
-    }
-
-    pub(crate) fn request_stop_after_current_attempt(&mut self) {
-        self.stop_after_current_attempt = true;
-    }
-
-    pub(crate) fn stopped_after_current_attempt(&self) -> bool {
-        self.stopped_after_current_attempt
     }
 
     fn deadline(&self) -> Instant {
@@ -324,10 +311,6 @@ impl AsyncClient {
             if state.attempt >= attempt_count {
                 return Poll::Ready(Err(ClientError::OpenTimeout));
             }
-            if state.stop_after_current_attempt && state.deadline.is_none() {
-                state.stopped_after_current_attempt = true;
-                return Poll::Ready(Err(ClientError::OpenTimeout));
-            }
             if state.deadline.is_none() {
                 let timeout = self.machine.config().open.timeouts[state.attempt];
                 if let Err(error) = state.start_attempt(timeout) {
@@ -368,9 +351,6 @@ impl AsyncClient {
                 Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
                 Poll::Ready(Ok(false)) => {
                     state.finish_attempt();
-                    if state.stopped_after_current_attempt() {
-                        return Poll::Ready(Err(ClientError::OpenTimeout));
-                    }
                     continue;
                 }
                 Poll::Ready(Ok(true)) => {}
@@ -396,9 +376,6 @@ impl AsyncClient {
             };
             if datagram.received_at.mono > state.deadline() {
                 state.finish_attempt();
-                if state.stopped_after_current_attempt() {
-                    return Poll::Ready(Err(ClientError::OpenTimeout));
-                }
                 continue;
             }
 
@@ -776,6 +753,16 @@ impl AsyncClient {
             machine.record_kernel_tx_timestamp(id, timestamp);
         })
         .map_err(ClientError::Socket)
+    }
+
+    /// Cancel opening without waiting for a reply or socket writability.
+    /// Retained post-token cleanup gets one best-effort nonblocking send.
+    pub(crate) fn cancel_open(&self, state: &mut AsyncOpenState) -> Option<ClientError> {
+        let cleanup = state.cleanup.take()?;
+        if let Some(packet) = cleanup.packet() {
+            let _ = self.socket.try_send(packet);
+        }
+        Some(cleanup.into_primary())
     }
 
     fn poll_open_cleanup(

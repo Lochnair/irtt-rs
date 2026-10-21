@@ -409,12 +409,12 @@ impl ManagedClientTask {
                     let retirement = retirement
                         .clone()
                         .unwrap_or(ManagedTargetEndReason::Stopped);
-                    if !open.has_in_flight_work() {
-                        self.targets[index].sync_live_packets_sent();
-                        self.finish_target(index, retirement, None);
-                        return false;
-                    }
-                    open.request_stop_after_current_attempt();
+                    let cleanup_failure = client.cancel_open(open).map(|error| {
+                        classify_client_error(ManagedTargetFailurePhase::Opening, &error)
+                    });
+                    self.targets[index].sync_live_packets_sent();
+                    self.finish_target(index, retirement, cleanup_failure);
+                    return false;
                 }
                 match client.poll_open(open, cx) {
                     Poll::Pending => false,
@@ -438,64 +438,25 @@ impl ManagedClientTask {
                             index,
                             vec![ClientEvent::SessionStarted(started)],
                         );
-                        if stopping {
-                            self.targets[index].sync_live_packets_sent();
-                            self.begin_drain(
-                                index,
-                                retirement
-                                    .clone()
-                                    .unwrap_or(ManagedTargetEndReason::Stopped),
-                                now,
-                            )
-                        } else {
-                            let previous = self.targets[index].take_phase();
-                            self.targets[index].restore_phase(TargetPhase::Active {
-                                client: previous.into_client(),
-                                schedule,
-                                send_waiting: false,
-                            });
-                            self.publish_target_phase(index, ManagedTargetLifecycle::Opening);
-                            true
-                        }
+                        let previous = self.targets[index].take_phase();
+                        self.targets[index].restore_phase(TargetPhase::Active {
+                            client: previous.into_client(),
+                            schedule,
+                            send_waiting: false,
+                        });
+                        self.publish_target_phase(index, ManagedTargetLifecycle::Opening);
+                        true
                     }
                     Poll::Ready(Ok(OpenOutcome::NoTestCompleted(completed))) => {
                         self.publish_client_events(
                             index,
                             vec![ClientEvent::NoTestCompleted(completed)],
                         );
-                        let end_reason = if stopping {
-                            retirement
-                                .clone()
-                                .unwrap_or(ManagedTargetEndReason::Stopped)
-                        } else {
-                            ManagedTargetEndReason::NoTestComplete
-                        };
-                        self.finish_target(index, end_reason, None);
+                        self.finish_target(index, ManagedTargetEndReason::NoTestComplete, None);
                         false
                     }
                     Poll::Ready(Err(error)) => {
-                        if stopping {
-                            let TargetPhase::Opening { open, .. } = self.targets[index].phase()
-                            else {
-                                unreachable!()
-                            };
-                            let cleanup_failure =
-                                (!open.stopped_after_current_attempt()).then(|| {
-                                    classify_client_error(
-                                        ManagedTargetFailurePhase::Opening,
-                                        &error,
-                                    )
-                                });
-                            self.finish_target(
-                                index,
-                                retirement
-                                    .clone()
-                                    .unwrap_or(ManagedTargetEndReason::Stopped),
-                                cleanup_failure,
-                            );
-                        } else {
-                            self.fail_target(index, ManagedTargetFailurePhase::Opening, error);
-                        }
+                        self.fail_target(index, ManagedTargetFailurePhase::Opening, error);
                         false
                     }
                 }
