@@ -65,7 +65,6 @@ impl CommonClientArgs {
                 #[cfg(target_os = "freebsd")]
                 fib: self.fib,
                 ttl: self.ttl,
-                ..SocketConfig::default()
             },
             ..ClientConfig::default()
         })
