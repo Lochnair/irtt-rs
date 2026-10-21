@@ -167,7 +167,8 @@ pub async fn run_stream(
                     })
             }),
     };
-    stream_output.print_final_summary = should_print_final_summary(continuous, interrupted);
+    stream_output.print_final_summary =
+        !args.no_test && should_print_final_summary(continuous, interrupted);
     stream_output.show_running_only_summary_note =
         continuous && interrupted && stream_output.print_final_summary;
     for target in &setup.targets {
@@ -733,7 +734,7 @@ fn stats_config(continuous: bool) -> StatsConfig {
     }
 }
 fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option<String> {
-    if args.is_continuous() || args.duration.is_zero() {
+    if args.no_test || args.is_continuous() || args.duration.is_zero() {
         return None;
     }
     let target_count = u64::try_from(target_count).unwrap_or(u64::MAX);

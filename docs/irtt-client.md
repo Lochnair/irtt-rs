@@ -172,6 +172,25 @@ desired set to 128 targets and retains at most 256 live target generations
 while replacements drain. The 128-target limit applies after dual-stack
 expansion: a hostname producing both families consumes two target slots.
 
+## NEGOTIATION ONLY
+
+`-n` / `--no-test` connects to each target, negotiates the requested parameters,
+and exits without sending measurement probes. For example:
+
+```sh
+irtt-client --no-test host.example:2112 --duration 30s --interval 100ms
+```
+
+The `no_test_completed` event reports successful negotiation, including the
+negotiated duration, interval, and packet length. Output format and column
+selection work as usual; no measurement summary or statistics-memory warning
+is printed. Negotiation failures use the normal target diagnostics and exit
+policy: an uninterrupted run exits nonzero if no target succeeds.
+
+Duration options still specify the duration to negotiate; even with
+`--continuous` or `--duration 0`, the client exits after negotiation.
+`--no-test` cannot be combined with `--targets-stdin`.
+
 ## FINITE VERSUS CONTINUOUS OPERATION
 
 `--duration` and `--interval` accept fractional and composite durations, such as

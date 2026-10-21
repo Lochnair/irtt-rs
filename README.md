@@ -104,6 +104,9 @@ Probe a server:
 
 ```sh
 irtt-client netperf-eu.bufferbloat.net:2112 --duration 30s --interval 100ms
+
+# Negotiate parameters without sending measurement probes
+irtt-client --no-test netperf-eu.bufferbloat.net:2112
 ```
 
 Probe continuously until interrupted (`Ctrl-C`):

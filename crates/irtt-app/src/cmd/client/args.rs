@@ -31,6 +31,15 @@ pub struct ClientArgs {
     )]
     pub targets_stdin: bool,
 
+    /// Negotiate parameters and exit without sending measurement probes.
+    #[arg(
+        short = 'n',
+        long,
+        conflicts_with = "targets_stdin",
+        long_help = "Negotiate parameters with each target and exit without sending measurement probes. Duration options still set the requested duration, but do not keep this mode running. Reports negotiated parameters using the selected output format, without a measurement summary."
+    )]
+    pub no_test: bool,
+
     /// Managed group pacing for multi-target mode.
     #[arg(
         long,
@@ -106,7 +115,7 @@ impl ClientArgs {
         if self.targets_stdin && !self.is_continuous() {
             return Err("--targets-stdin requires --continuous or --duration 0".to_owned());
         }
-        prepare_managed_run(
+        let mut setup = prepare_managed_run(
             &self.common,
             if self.continuous {
                 Duration::ZERO
@@ -119,7 +128,11 @@ impl ClientArgs {
                 stdin_controlled: self.targets_stdin,
             },
         )
-        .await
+        .await?;
+        if self.no_test {
+            setup.client.request.run_mode = irtt_client::RunMode::NoTest;
+        }
+        Ok(setup)
     }
 
     pub fn is_continuous(&self) -> bool {
