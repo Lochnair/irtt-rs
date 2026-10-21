@@ -175,29 +175,31 @@ impl CoreStats {
         let mut updates = Vec::new();
 
         for pair in self.ipdv_tracker.insert(sample) {
-            let Some(rtt_ipdv) = duration_from_non_negative_i128_ns(pair.rtt_ipdv_ns) else {
+            let rtt_magnitude_ns = pair.rtt_ipdv_ns.saturating_abs();
+            let send_magnitude_ns = pair.send_ipdv_ns.map(i128::saturating_abs);
+            let receive_magnitude_ns = pair.receive_ipdv_ns.map(i128::saturating_abs);
+            let Some(rtt_ipdv) = duration_from_non_negative_i128_ns(rtt_magnitude_ns) else {
                 continue;
             };
-            let send_ipdv = pair
-                .send_ipdv_ns
-                .and_then(duration_from_non_negative_i128_ns);
-            let receive_ipdv = pair
-                .receive_ipdv_ns
-                .and_then(duration_from_non_negative_i128_ns);
+            let send_ipdv = send_magnitude_ns.and_then(duration_from_non_negative_i128_ns);
+            let receive_ipdv = receive_magnitude_ns.and_then(duration_from_non_negative_i128_ns);
 
-            self.ipdv_round_trip.push_ns(pair.rtt_ipdv_ns);
+            self.ipdv_round_trip.push_ns(rtt_magnitude_ns);
 
-            if let Some(value) = pair.send_ipdv_ns {
+            if let Some(value) = send_magnitude_ns {
                 self.ipdv_send.push_ns(value);
             }
 
-            if let Some(value) = pair.receive_ipdv_ns {
+            if let Some(value) = receive_magnitude_ns {
                 self.ipdv_receive.push_ns(value);
             }
 
             updates.push(IpdvPairUpdate {
                 previous_seq: pair.previous_seq,
                 current_seq: pair.current_seq,
+                rtt_ipdv_ns: pair.rtt_ipdv_ns,
+                send_ipdv_ns: pair.send_ipdv_ns,
+                receive_ipdv_ns: pair.receive_ipdv_ns,
                 rtt_ipdv,
                 send_ipdv,
                 receive_ipdv,

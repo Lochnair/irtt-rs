@@ -541,7 +541,7 @@ columns! {
     SendDelay("sd", ["send_delay"], 9, right, "human-readable client-to-server delay");
     SendDelayUs("sd_us", ["send_delay_us"], 10, right, "client-to-server delay in signed microseconds");
     Ipdv("ipdv", [], 9, right, "human-readable round-trip IPDV for adjacent samples");
-    IpdvUs("ipdv_us", [], 10, right, "round-trip IPDV in microseconds");
+    IpdvUs("ipdv_us", [], 10, right, "round-trip IPDV in signed microseconds");
     ServerProcessing("proc", ["server_processing"], 9, right, "human-readable server processing time");
     ServerProcessingUs("server_processing_us", [], 20, right, "server processing time in microseconds");
     Bytes("bytes", [], 10, right, "packet bytes for packet events");
@@ -820,11 +820,15 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
         Column::Ipdv => row
             .seq()
             .and_then(|seq| ipdv_pair(context.stats, seq))
-            .map(|pair| CellValue::text(format_duration(pair.rtt_ipdv))),
+            .map(|pair| {
+                CellValue::text(format_signed_duration(SignedDuration::from_nanos(
+                    pair.rtt_ipdv_ns,
+                )))
+            }),
         Column::IpdvUs => row
             .seq()
             .and_then(|seq| ipdv_pair(context.stats, seq))
-            .map(|pair| CellValue::Unsigned(duration_us(pair.rtt_ipdv))),
+            .map(|pair| CellValue::Integer(pair.rtt_ipdv_ns / 1_000)),
         Column::ServerProcessing => row
             .reply()
             .and_then(|reply| reply.server_timing.and_then(|timing| timing.processing))

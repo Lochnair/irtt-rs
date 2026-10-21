@@ -89,9 +89,9 @@ impl IpdvTracker {
         Some(CompletedIpdvPair {
             previous_seq,
             current_seq,
-            rtt_ipdv_ns: abs_i128_ns(current.rtt_primary_ns - previous.rtt_primary_ns),
-            send_ipdv_ns: send_ipdv_ns(previous, current).map(abs_i128_ns),
-            receive_ipdv_ns: receive_ipdv_ns(previous, current).map(abs_i128_ns),
+            rtt_ipdv_ns: current.rtt_primary_ns - previous.rtt_primary_ns,
+            send_ipdv_ns: send_ipdv_ns(previous, current),
+            receive_ipdv_ns: receive_ipdv_ns(previous, current),
         })
     }
 }
@@ -159,10 +159,6 @@ fn instant_diff_ns(current: Instant, previous: Instant) -> i128 {
 
 fn duration_ns_i128(duration: Duration) -> i128 {
     i128::try_from(duration.as_nanos()).unwrap_or(i128::MAX)
-}
-
-fn abs_i128_ns(value: i128) -> i128 {
-    value.saturating_abs()
 }
 
 #[cfg(test)]

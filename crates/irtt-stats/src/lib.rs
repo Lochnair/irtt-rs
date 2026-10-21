@@ -520,6 +520,12 @@ pub struct IpdvPairUpdate {
     pub previous_seq: u32,
     /// Sequence number of the later reply in the adjacent pair.
     pub current_seq: u32,
+    /// Signed round-trip delay change (current minus previous) in nanoseconds.
+    pub rtt_ipdv_ns: i128,
+    /// Signed send-side delay change in nanoseconds, when available for both replies.
+    pub send_ipdv_ns: Option<i128>,
+    /// Signed receive-side delay change in nanoseconds, when available for both replies.
+    pub receive_ipdv_ns: Option<i128>,
     /// Absolute round-trip IPDV between the adjacent replies.
     pub rtt_ipdv: Duration,
     /// Absolute send-side IPDV when send one-way delay is available for both replies.
