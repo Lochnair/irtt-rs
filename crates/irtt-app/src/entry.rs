@@ -89,11 +89,10 @@ fn with_shutdown_flag(
 
 #[cfg(feature = "client")]
 fn run_client_applet(argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
-    use clap::Parser;
-
     let shutdown = crate::signal::install_async_signal_handler()
         .map_err(|err| format!("failed to install signal handler: {err}"))?;
-    let args = crate::cmd::client::ClientArgs::parse_from(argv);
+    let args =
+        crate::version::parse::<crate::cmd::client::ClientArgs>(argv, crate::version::client);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?
@@ -107,10 +106,9 @@ fn run_client_applet(_argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Err
 
 #[cfg(feature = "server")]
 fn run_server_applet(argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
-    use clap::Parser;
-
     with_shutdown_flag(|shutdown_requested| {
-        let args = crate::cmd::server::ServerArgs::parse_from(argv);
+        let args =
+            crate::version::parse::<crate::cmd::server::ServerArgs>(argv, crate::version::server);
         crate::cmd::server::run_server(args, shutdown_requested)
     })
 }
@@ -122,11 +120,9 @@ fn run_server_applet(_argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Err
 
 #[cfg(feature = "tui")]
 fn run_tui_applet(argv: Vec<OsString>) -> Result<(), Box<dyn std::error::Error>> {
-    use clap::Parser;
-
     let shutdown = crate::signal::install_async_signal_handler()
         .map_err(|err| format!("failed to install signal handler: {err}"))?;
-    let args = crate::cmd::tui::TuiArgs::parse_from(argv);
+    let args = crate::version::parse::<crate::cmd::tui::TuiArgs>(argv, crate::version::client);
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?

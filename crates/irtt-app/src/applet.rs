@@ -55,10 +55,7 @@ pub fn dispatch_from_argv(argv: Vec<OsString>) -> Result<AppletDispatch, String>
     };
 
     match command {
-        "-V" | "--version" => Ok(AppletDispatch::Help(format!(
-            "irtt-rs {}",
-            env!("CARGO_PKG_VERSION")
-        ))),
+        "-V" | "--version" => Ok(AppletDispatch::Help(crate::version::app())),
         "-h" | "--help" => Ok(AppletDispatch::Help(dispatcher_help())),
         "client" => Ok(AppletDispatch::Run {
             applet: RequestedApplet::Client,

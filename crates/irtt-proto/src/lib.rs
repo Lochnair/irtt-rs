@@ -77,6 +77,9 @@
 //!
 #![forbid(unsafe_code)]
 
+/// Cargo package version of this compiled library.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub mod echo;
 mod envelope;
 pub mod error;

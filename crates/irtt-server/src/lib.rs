@@ -108,6 +108,9 @@
 //! payload bytes never reach a reply under any mode.
 #![forbid(unsafe_code)]
 
+/// Cargo package version of this compiled library.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 mod clock;
 mod config;
 mod core;

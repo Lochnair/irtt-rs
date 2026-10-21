@@ -43,7 +43,7 @@ doc = false
 [features]
 default = ["client", "server", "tui"]
 client = ["dep:humantime", "dep:tokio", "dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats"]
-server = ["dep:irtt-server", "dep:tokio"]
+server = ["dep:irtt-server", "dep:irtt-proto", "dep:tokio"]
 tui =["dep:humantime", "dep:tokio", "dep:futures-core", "dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "dep:irtt-stats", "dep:ratatui", "dep:crossterm", "dep:chrono"]
 
 [dependencies]

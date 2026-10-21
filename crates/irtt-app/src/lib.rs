@@ -6,3 +6,5 @@ pub mod cmd;
 pub mod entry;
 pub mod shared;
 pub mod signal;
+
+mod version;

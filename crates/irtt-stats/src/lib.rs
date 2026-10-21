@@ -25,6 +25,9 @@
 #![warn(missing_docs)]
 #![warn(rustdoc::missing_crate_level_docs)]
 
+/// Cargo package version of this compiled library.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
 use std::time::Duration;
 
 use irtt_client::ClientEvent;
