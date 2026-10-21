@@ -9,7 +9,11 @@ use clap::{Parser, ValueEnum};
 pub const DEFAULT_CLIENT_DURATION: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "irtt-client", about = "Minimal IRTT-compatible stream client")]
+#[command(
+    name = "irtt-client",
+    version,
+    about = "Minimal IRTT-compatible stream client"
+)]
 pub struct ClientArgs {
     /// Server address/host, optionally prefixed with LABEL= and suffixed with @hmac=KEY. Repeat for multi-target mode.
     #[arg(
@@ -38,12 +42,17 @@ pub struct ClientArgs {
 
     #[arg(
         long,
+        short = 'd',
         default_value = "10s",
         value_parser = parse_test_duration,
-        help = "Test duration (e.g. 2.5s, 1m30s, 1h); use 0 for continuous mode",
-        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
+        help = "Test duration (e.g. 2.5s, 1m30s, 1h); use --continuous for continuous mode (0 is also accepted)",
+        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use --continuous for continuous mode (0 is also accepted).\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
     )]
     pub duration: Duration,
+
+    /// Run continuously until interrupted (equivalent to --duration 0).
+    #[arg(long, conflicts_with = "duration")]
+    pub continuous: bool,
 
     #[command(flatten)]
     pub common: CommonClientArgs,
@@ -52,6 +61,7 @@ pub struct ClientArgs {
     #[arg(
         long,
         value_enum,
+        short = 'f',
         default_value_t = OutputFormat::Table,
         long_help = "Event row output format.\n\nTable is the default interactive format. CSV, TSV, and JSON Lines default to all columns for structured export."
     )]
@@ -83,7 +93,7 @@ pub struct ClientArgs {
     pub header: HeaderMode,
 
     /// Include extra fields in table output and final summaries.
-    #[arg(long)]
+    #[arg(short = 'v', long)]
     pub verbose: bool,
 }
 
@@ -94,11 +104,15 @@ impl ClientArgs {
     /// called, so listing columns still needs no target.
     pub async fn prepare(&self) -> Result<ManagedRunSetup, String> {
         if self.targets_stdin && !self.is_continuous() {
-            return Err("--targets-stdin requires --duration 0".to_owned());
+            return Err("--targets-stdin requires --continuous or --duration 0".to_owned());
         }
         prepare_managed_run(
             &self.common,
-            self.duration,
+            if self.continuous {
+                Duration::ZERO
+            } else {
+                self.duration
+            },
             TargetSelection {
                 targets: &self.targets,
                 pacing: self.pacing,
@@ -109,7 +123,7 @@ impl ClientArgs {
     }
 
     pub fn is_continuous(&self) -> bool {
-        self.duration == Duration::ZERO
+        self.continuous || self.duration == Duration::ZERO
     }
 
     pub fn timestamp_mode(&self) -> TimestampArg {

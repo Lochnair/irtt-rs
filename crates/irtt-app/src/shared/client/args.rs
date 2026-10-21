@@ -19,11 +19,11 @@ pub struct CommonClientArgs {
     pub dual_stack: bool,
 
     /// Positive probe interval (e.g. 2.5s, 1m30s, 500us, 100ns, 1h).
-    #[arg(long, default_value = "1s", value_parser = parse_duration)]
+    #[arg(short = 'i', long, default_value = "1s", value_parser = parse_duration)]
     pub interval: Duration,
 
     /// UDP payload length.
-    #[arg(long, default_value_t = 0, value_parser = parse_length)]
+    #[arg(short = 'l', long, default_value_t = 0, value_parser = parse_length)]
     pub length: u32,
 
     // Decode during configuration preparation so Clap cannot echo rejected keys.

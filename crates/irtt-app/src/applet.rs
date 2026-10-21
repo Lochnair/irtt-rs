@@ -55,6 +55,10 @@ pub fn dispatch_from_argv(argv: Vec<OsString>) -> Result<AppletDispatch, String>
     };
 
     match command {
+        "-V" | "--version" => Ok(AppletDispatch::Help(format!(
+            "irtt-rs {}",
+            env!("CARGO_PKG_VERSION")
+        ))),
         "-h" | "--help" => Ok(AppletDispatch::Help(dispatcher_help())),
         "client" => Ok(AppletDispatch::Run {
             applet: RequestedApplet::Client,
@@ -78,6 +82,7 @@ pub fn dispatch_from_argv(argv: Vec<OsString>) -> Result<AppletDispatch, String>
 
 pub fn dispatcher_help() -> String {
     let mut command = Command::new("irtt-rs")
+        .version(env!("CARGO_PKG_VERSION"))
         .about("IRTT-compatible multi-applet dispatcher")
         .subcommand(Command::new("client").about(client_applet_about()))
         .subcommand(Command::new("tui").about(tui_applet_about()))

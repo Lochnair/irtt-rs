@@ -15,6 +15,7 @@ const DEFAULT_PORT: u16 = 2112;
 #[derive(Clone, Parser)]
 #[command(
     name = "irtt-server",
+    version,
     about = "Minimal IRTT-compatible UDP server",
     after_help = "With no --bind, the server listens on the wildcard IRTT port for both address families ([::]:2112 and 0.0.0.0:2112) where the platform supports wildcard reply-source selection.\nRepeat --bind to serve multiple addresses in one process; any explicit --bind replaces the default pair entirely. All listeners use the same policy but keep independent session namespaces."
 )]
