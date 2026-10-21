@@ -191,10 +191,15 @@ impl ReplySample {
                 client_receive_mono: received_at.mono,
                 client_send_wall_ns: system_time_ns(sent_at.wall),
                 client_receive_wall_ns: system_time_ns(received_at.wall),
-                server_receive_mono_ns: server_timing.and_then(|timing| timing.receive_mono_ns),
-                server_send_mono_ns: server_timing.and_then(|timing| timing.send_mono_ns),
-                server_receive_wall_ns: server_timing.and_then(|timing| timing.receive_wall_ns),
-                server_send_wall_ns: server_timing.and_then(|timing| timing.send_wall_ns),
+                // Midpoint timestamps serve as both directional endpoints.
+                server_receive_mono_ns: server_timing
+                    .and_then(|timing| timing.receive_mono_ns.or(timing.midpoint_mono_ns)),
+                server_send_mono_ns: server_timing
+                    .and_then(|timing| timing.send_mono_ns.or(timing.midpoint_mono_ns)),
+                server_receive_wall_ns: server_timing
+                    .and_then(|timing| timing.receive_wall_ns.or(timing.midpoint_wall_ns)),
+                server_send_wall_ns: server_timing
+                    .and_then(|timing| timing.send_wall_ns.or(timing.midpoint_wall_ns)),
             },
         }
     }
