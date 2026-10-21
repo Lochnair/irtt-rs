@@ -35,8 +35,8 @@ pub struct TuiArgs {
         long,
         default_value = "0",
         value_parser = parse_test_duration,
-        help = "Test duration; use 0 for continuous mode",
-        long_help = "Test duration; use 0 for continuous mode. The TUI defaults to continuous mode."
+        help = "Test duration (e.g. 2.5s, 1m30s, 1h); use 0 for continuous mode",
+        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use 0 for continuous mode. The TUI defaults to continuous mode."
     )]
     pub duration: Duration,
 

@@ -18,7 +18,7 @@ pub struct CommonClientArgs {
     #[arg(long, conflicts_with_all = ["ipv4", "ipv6"], long_help = "Probe available IPv4 and IPv6 paths separately for each hostname. Labels gain /v4 or /v6; IP literals remain single targets. Families are discovered when a target is added; reconnects resolve the original hostname again within the chosen family.")]
     pub dual_stack: bool,
 
-    /// Probe interval.
+    /// Positive probe interval (e.g. 2.5s, 1m30s, 500us, 100ns, 1h).
     #[arg(long, default_value = "1s", value_parser = parse_duration)]
     pub interval: Duration,
 
@@ -200,62 +200,18 @@ fn parse_bind_addr(input: &str) -> Result<SocketAddr, String> {
 }
 
 pub fn parse_duration(input: &str) -> Result<Duration, String> {
-    let (number, unit) = split_duration(input)?;
-    let value: u64 = number
-        .parse()
-        .map_err(|_| format!("invalid duration value {input:?}"))?;
-    if value == 0 {
+    let duration = parse_test_duration(input)?;
+    if duration.is_zero() {
         return Err("duration must be greater than zero".to_owned());
     }
-    match unit {
-        "ms" => Ok(Duration::from_millis(value)),
-        "s" => Ok(Duration::from_secs(value)),
-        "m" => value
-            .checked_mul(60)
-            .map(Duration::from_secs)
-            .ok_or_else(|| "duration is too large".to_owned()),
-        _ => Err(format!(
-            "unsupported duration unit {unit:?}; use ms, s, or m"
-        )),
-    }
+    Ok(duration)
 }
 
 pub fn parse_test_duration(input: &str) -> Result<Duration, String> {
     if input == "0" {
         return Ok(Duration::ZERO);
     }
-    let (number, unit) = split_duration(input)?;
-    let value: u64 = number
-        .parse()
-        .map_err(|_| format!("invalid duration value {input:?}"))?;
-    if value == 0 {
-        return Ok(Duration::ZERO);
-    }
-    match unit {
-        "ms" => Ok(Duration::from_millis(value)),
-        "s" => Ok(Duration::from_secs(value)),
-        "m" => value
-            .checked_mul(60)
-            .map(Duration::from_secs)
-            .ok_or_else(|| "duration is too large".to_owned()),
-        _ => Err(format!(
-            "unsupported duration unit {unit:?}; use ms, s, or m"
-        )),
-    }
-}
-
-fn split_duration(input: &str) -> Result<(&str, &str), String> {
-    let split = input
-        .find(|ch: char| !ch.is_ascii_digit())
-        .ok_or_else(|| "duration must include a unit: ms, s, or m".to_owned())?;
-    let (number, unit) = input.split_at(split);
-    if number.is_empty() || unit.is_empty() {
-        return Err("duration must include a positive value and unit".to_owned());
-    }
-    if number.starts_with('-') {
-        return Err("duration must be greater than zero".to_owned());
-    }
-    Ok((number, unit))
+    humantime::parse_duration(input).map_err(|error| error.to_string())
 }
 
 pub fn parse_length(input: &str) -> Result<u32, String> {

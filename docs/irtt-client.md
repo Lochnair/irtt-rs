@@ -174,6 +174,12 @@ expansion: a hostname producing both families consumes two target slots.
 
 ## FINITE VERSUS CONTINUOUS OPERATION
 
+`--duration` and `--interval` accept fractional and composite durations, such as
+`2.5s`, `1m30s`, and `1h`, as well as `ms`, `us` (or `µs`), and `ns` units
+(e.g. `500us` or `100ns`). A nonzero value requires a unit. The interval must
+be greater than zero; a zero test duration, including `0s`, selects continuous
+mode.
+
 `--duration` controls the run length:
 
 - Any nonzero duration (default `10s`) is a **finite** run: probing stops

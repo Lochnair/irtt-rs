@@ -40,7 +40,10 @@ See the client manual's address-family section for discovery errors and labels.
 
 Unlike `irtt-client`, **the TUI defaults to continuous mode**
 (`--duration 0`): it runs until you quit. Pass an explicit `--duration` for
-a finite run:
+a finite run. Both `--duration` and `--interval` use the
+[client duration syntax](irtt-client.md#finite-versus-continuous-operation),
+including fractional values (`2.5s`), composite values (`1m30s`), and units
+from nanoseconds (`ns`) through hours (`h`):
 
 ```sh
 irtt-tui <server> --duration 30s

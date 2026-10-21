@@ -40,8 +40,8 @@ pub struct ClientArgs {
         long,
         default_value = "10s",
         value_parser = parse_test_duration,
-        help = "Test duration; use 0 for continuous mode",
-        long_help = "Test duration; use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
+        help = "Test duration (e.g. 2.5s, 1m30s, 1h); use 0 for continuous mode",
+        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use 0 for continuous mode.\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
     )]
     pub duration: Duration,
 
