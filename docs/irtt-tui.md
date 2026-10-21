@@ -16,9 +16,9 @@ At least one target is required.
 
 Target syntax, multiple targets, and pacing are identical to
 `irtt-client(1)` — see that manual for `[LABEL=]TARGET` syntax and the
-`--pacing staggered|burst` option. The full set of negotiation flags
-(`--interval`, `--length`, `--hmac`, `--clock`, `--tstamp`, `--stats`,
-`--sfill`, `--dscp`, `--ttl`, `--loose`) is shared with `irtt-client` as
+`--pacing staggered|burst` option. The client configuration flags
+(`--interval`, `--timeouts`, `--length`, `--hmac`, `--clock`, `--tstamp`,
+`--stats`, `--sfill`, `--dscp`, `--ttl`, `--loose`) are shared with `irtt-client` as
 well; consult that manual for their meaning.
 
 Address-family controls are shared too: `-4` / `--ipv4` uses IPv4 only,

@@ -22,16 +22,21 @@ impl CommonClientArgs {
     ///
     /// The config is endpoint-independent; managed targets own their addresses.
     pub fn to_client_config(&self, duration: Duration) -> Result<ClientConfig, String> {
+        let mut open = OpenPolicy {
+            negotiation: if self.loose {
+                NegotiationPolicy::Loose
+            } else {
+                NegotiationPolicy::Strict
+            },
+            ..Default::default()
+        };
+        if !self.timeouts.is_empty() {
+            open.timeouts.clone_from(&self.timeouts);
+        }
+
         Ok(ClientConfig {
             address_family: self.address_family(),
-            open: OpenPolicy {
-                negotiation: if self.loose {
-                    NegotiationPolicy::Loose
-                } else {
-                    NegotiationPolicy::Strict
-                },
-                ..Default::default()
-            },
+            open,
             request: SessionRequest {
                 duration: (!duration.is_zero()).then_some(duration),
                 interval: self.interval,

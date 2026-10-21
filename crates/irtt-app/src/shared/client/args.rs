@@ -22,6 +22,10 @@ pub struct CommonClientArgs {
     #[arg(short = 'i', long, default_value = "1s", value_parser = parse_duration)]
     pub interval: Duration,
 
+    /// Comma-separated session-opening timeouts, one per attempt (each >= 200ms).
+    #[arg(long, value_name = "DURATIONS", value_delimiter = ',', value_parser = parse_duration, long_help = "Comma-separated session-opening receive timeouts, one per attempt (each at least 200ms), e.g. 1s,2s,4s,8s. Omit to use the library default retry schedule.")]
+    pub timeouts: Vec<Duration>,
+
     /// UDP payload length.
     #[arg(short = 'l', long, default_value_t = 0, value_parser = parse_length)]
     pub length: u32,
@@ -116,6 +120,7 @@ impl fmt::Debug for CommonClientArgs {
             .field("ipv6", &self.ipv6)
             .field("dual_stack", &self.dual_stack)
             .field("interval", &self.interval)
+            .field("timeouts", &self.timeouts)
             .field("length", &self.length)
             .field("hmac", &self.hmac.as_ref().map(|_| "[REDACTED]"))
             .field("clock", &self.clock)

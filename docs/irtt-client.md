@@ -180,6 +180,12 @@ expansion: a hostname producing both families consumes two target slots.
 be greater than zero; a zero test duration, including `0s`, selects continuous
 mode.
 
+`--timeouts 1s,2s,4s,8s` sets the session-opening retry schedule. Each
+comma-separated duration is the receive timeout for one open attempt; attempts
+stop when a valid open reply arrives. The list must be nonempty, with each
+value at least `200ms`, and uses the same duration syntax as `--interval`.
+Omitting the option preserves the library default schedule.
+
 `--duration` controls the run length:
 
 - Any nonzero duration (default `10s`) is a **finite** run: probing stops
