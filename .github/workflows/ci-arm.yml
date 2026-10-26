@@ -53,7 +53,7 @@ jobs:
         if: matrix.musl
         run: |
           sudo apt-get update
-          sudo apt-get install --no-install-recommends musl-tools
+          sudo apt-get install -y --no-install-recommends musl-tools
 
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
