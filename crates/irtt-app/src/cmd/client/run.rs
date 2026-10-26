@@ -58,8 +58,11 @@ pub async fn run_stream(
         args.verbose,
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    if let Some(warning) = reconnect_stats_warning(&args) {
+        eprintln!("{warning}");
+    }
     if setup.stdin_controlled {
-        return run_stdin_stream(setup, output_config, shutdown).await;
+        return run_stdin_stream(setup, output_config, shutdown, &args).await;
     }
     let continuous = args.is_continuous();
     let target_count = setup.target_count();
@@ -70,12 +73,21 @@ pub async fn run_stream(
     if *shutdown.borrow() {
         return Ok(());
     }
-    let (task, handle) = ManagedClient::task(setup.managed_config(), setup.managed_targets())?;
+    let (task, handle) = ManagedClient::task(
+        {
+            let mut config = setup.managed_config();
+            config.reconnect_timeout = args.reconnect.then_some(args.reconnect_timeout);
+            config
+        },
+        setup.managed_targets(),
+    )?;
     let mut events = handle.subscribe()?;
     let mut status = handle.subscribe_status();
     let owner = ManagedWorker::start(task, handle.clone())?;
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     let mut stream_output = StreamOutput {
+        continuous: args.is_continuous(),
+        collect_stats: !args.no_stats,
         config: output_config,
         header_printed: false,
         print_final_summary: false,
@@ -86,6 +98,7 @@ pub async fn run_stream(
     let mut stats = setup
         .targets
         .iter()
+        .filter(|_| !args.no_stats)
         .map(|target| {
             (
                 target.label.clone(),
@@ -168,13 +181,13 @@ pub async fn run_stream(
             }),
     };
     stream_output.print_final_summary =
-        !args.no_test && should_print_final_summary(continuous, interrupted);
+        !args.no_stats && !args.no_test && should_print_final_summary(continuous, interrupted);
     stream_output.show_running_only_summary_note =
         continuous && interrupted && stream_output.print_final_summary;
     for target in &setup.targets {
-        let target_stats = stats.get(&target.label).expect(
-            "every prepared target must have a stats collector inserted before the run begins",
-        );
+        let Some(target_stats) = stats.get(&target.label) else {
+            continue;
+        };
         if multi_target
             && stream_output.print_final_summary
             && stream_output.config.prints_summary()
@@ -361,17 +374,22 @@ fn process_stdin_event<W: Write>(
     terminal_targets: &mut BoundedTargetSet,
 ) -> io::Result<()> {
     match event {
-        ManagedEvent::TargetStateChanged { target, .. } => {
+        ManagedEvent::TargetStateChanged { target, .. } if stream_output.collect_stats => {
             stats
                 .entry(target)
                 .or_insert_with(|| StatsCollector::new(stats_config(true)));
         }
         ManagedEvent::Client { target, event } => {
-            let collector = stats
-                .entry(target.clone())
-                .or_insert_with(|| StatsCollector::new(stats_config(true)));
-            let update = collector.process(&event);
-            stream_output.print_event(&event, Some(target.id.as_str()), &update)?;
+            let update = stream_output.collect_stats.then(|| {
+                let collector = stats
+                    .entry(target.clone())
+                    .or_insert_with(|| StatsCollector::new(stats_config(true)));
+                if matches!(event, ClientEvent::SessionStarted(_)) {
+                    *collector = StatsCollector::new(stats_config(true));
+                }
+                collector.process(&event)
+            });
+            stream_output.print_event(&event, Some(target.id.as_str()), update.as_ref())?;
         }
         ManagedEvent::TargetFinished { outcome }
             if terminal_targets.insert(outcome.target.clone()) =>
@@ -402,7 +420,11 @@ fn reconcile_stdin_stats(
 fn snapshot_stdin_summary_targets(
     stats: &mut BTreeMap<TargetInstance, StatsCollector>,
     status: &ManagedStatus,
+    enabled: bool,
 ) -> BTreeSet<TargetInstance> {
+    if !enabled {
+        return BTreeSet::new();
+    }
     let targets = status
         .targets
         .iter()
@@ -427,11 +449,19 @@ async fn run_stdin_stream(
     setup: ManagedRunSetup,
     output_config: OutputConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
+    args: &ClientArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if *shutdown.borrow() {
         return Ok(());
     }
-    let (task, handle) = ManagedClient::task(setup.managed_config(), setup.managed_targets())?;
+    let (task, handle) = ManagedClient::task(
+        {
+            let mut config = setup.managed_config();
+            config.reconnect_timeout = args.reconnect.then_some(args.reconnect_timeout);
+            config
+        },
+        setup.managed_targets(),
+    )?;
     let mut events = handle.subscribe()?;
     let mut status = handle.subscribe_status();
     let owner = ManagedWorker::start(task, handle.clone())?;
@@ -440,6 +470,8 @@ async fn run_stdin_stream(
 
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     let mut stream_output = StreamOutput {
+        continuous: args.is_continuous(),
+        collect_stats: !args.no_stats,
         config: output_config,
         header_printed: false,
         print_final_summary: false,
@@ -510,7 +542,11 @@ async fn run_stdin_stream(
             }
             if stop.is_some() {
                 preparing = None;
-                summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &snapshot));
+                summary_targets = Some(snapshot_stdin_summary_targets(
+                    &mut stats,
+                    &snapshot,
+                    !args.no_stats,
+                ));
                 if request_managed_stop_once(&mut stop_requested) {
                     drop(handle.stop());
                 }
@@ -537,7 +573,7 @@ async fn run_stdin_stream(
                         }
                         Err(error) => {
                             stop = Some(StdinStop::Fatal(format!("invalid --targets-stdin target set: {error}")));
-                            summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow()));
+                            summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow(), !args.no_stats));
                             if request_managed_stop_once(&mut stop_requested) { drop(handle.stop()); }
                         }
                     }
@@ -558,7 +594,7 @@ async fn run_stdin_stream(
                     }
                     Err(_) => {
                         stop = Some(StdinStop::Fatal("--targets-stdin update was rejected".to_owned()));
-                        summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow()));
+                        summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow(), !args.no_stats));
                         if request_managed_stop_once(&mut stop_requested) { drop(handle.stop()); }
                     }
                 }
@@ -595,7 +631,8 @@ async fn run_stdin_stream(
         );
     }
 
-    let print_summary = matches!(stop, Some(StdinStop::Interrupted | StdinStop::Eof));
+    let print_summary =
+        !args.no_stats && matches!(stop, Some(StdinStop::Interrupted | StdinStop::Eof));
     stream_output.print_final_summary = print_summary;
     stream_output.show_running_only_summary_note = print_summary;
     if let Some(summary_targets) = summary_targets {
@@ -636,11 +673,17 @@ fn process_event<W: Write>(
 ) -> io::Result<()> {
     match event {
         ManagedEvent::Client { target, event } => {
-            let collector = stats
-                .entry(target.id.as_str().to_owned())
-                .or_insert_with(|| StatsCollector::new(stats_config(false)));
-            let update = collector.process(&event);
-            stream_output.print_event(&event, Some(target.id.as_str()), &update)?;
+            let update = stream_output.collect_stats.then(|| {
+                let collector = stats
+                    .get_mut(target.id.as_str())
+                    .expect("prepared target has a statistics collector");
+                if matches!(event, ClientEvent::SessionStarted(_)) {
+                    let config = stats_config(stream_output.continuous);
+                    *collector = StatsCollector::new(config);
+                }
+                collector.process(&event)
+            });
+            stream_output.print_event(&event, Some(target.id.as_str()), update.as_ref())?;
         }
         ManagedEvent::TargetFinished { outcome } => {
             terminal_targets.insert(outcome.target.clone());
@@ -678,6 +721,8 @@ fn dropped_event_warning(dropped_events: u64) -> Option<String> {
 }
 
 struct StreamOutput<'a, W: Write> {
+    continuous: bool,
+    collect_stats: bool,
     config: OutputConfig,
     header_printed: bool,
     print_final_summary: bool,
@@ -689,10 +734,10 @@ impl<W: Write> StreamOutput<'_, W> {
         &mut self,
         event: &ClientEvent,
         target: Option<&str>,
-        update: &EventStatsUpdate,
+        update: Option<&EventStatsUpdate>,
     ) -> io::Result<()> {
         self.print_header()?;
-        if let Some(line) = self.config.render_event(event, target, Some(update)) {
+        if let Some(line) = self.config.render_event(event, target, update) {
             writeln!(self.out, "{line}")?;
         }
         Ok(())
@@ -734,7 +779,7 @@ fn stats_config(continuous: bool) -> StatsConfig {
     }
 }
 fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option<String> {
-    if args.no_test || args.is_continuous() || args.duration.is_zero() {
+    if args.no_stats || args.no_test || args.is_continuous() || args.duration.is_zero() {
         return None;
     }
     let target_count = u64::try_from(target_count).unwrap_or(u64::MAX);
@@ -761,3 +806,8 @@ fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option
     };
     Some(format!("irtt-rs: warning: finite exact statistics may retain about {formatted} for this run; {guidance}"))
 }
+
+fn reconnect_stats_warning(args: &ClientArgs) -> Option<&'static str> {
+    (args.reconnect && !args.no_stats).then_some("irtt-rs: warning: statistics spanning multiple sessions may not accurately represent one uninterrupted measurement run; use --no-stats for measurement events only. Session statistics reset on reconnect.")
+}
+

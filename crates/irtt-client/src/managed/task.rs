@@ -327,7 +327,14 @@ impl ManagedClientTask {
         let mut non_send_deadline = None;
         let mut send_deadline = None;
         for target in &self.targets {
+            non_send_deadline = non_send_deadline
+                .into_iter()
+                .chain(target.silence_deadline(self.config.reconnect_timeout))
+                .min();
             match target.phase() {
+                TargetPhase::Retrying { deadline } => {
+                    non_send_deadline = non_send_deadline.into_iter().chain(Some(*deadline)).min();
+                }
                 TargetPhase::Active {
                     client,
                     schedule,

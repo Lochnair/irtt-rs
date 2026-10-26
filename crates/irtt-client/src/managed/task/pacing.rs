@@ -206,6 +206,12 @@ impl ManagedClientTask {
         };
         self.targets[index].sync_packets_sent(&client);
         send_waiting = result.is_pending();
+        if send_waiting {
+            // A blocked sender is not evidence of an unresponsive peer. Arm
+            // a fresh silence period only after transmission resumes.
+            self.targets[index].silence_since = None;
+            self.targets[index].last_reply_at = None;
+        }
         self.targets[index].restore_phase(TargetPhase::Active {
             client,
             schedule,

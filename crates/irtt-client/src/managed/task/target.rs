@@ -5,7 +5,7 @@ use std::{
     pin::Pin,
     sync::Arc,
     task::{Context, Poll},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -27,6 +27,9 @@ type ConnectFuture =
     Pin<Box<dyn Future<Output = Result<AsyncClient, ClientError>> + Send + 'static>>;
 
 pub(super) enum TargetPhase {
+    Retrying {
+        deadline: Instant,
+    },
     Pending {
         client_config: ClientConfig,
     },
@@ -65,6 +68,7 @@ pub(super) enum TargetPhase {
 impl TargetPhase {
     pub(super) fn lifecycle(&self) -> ManagedTargetLifecycle {
         match self {
+            Self::Retrying { .. } => ManagedTargetLifecycle::Pending,
             Self::Pending { .. } => ManagedTargetLifecycle::Pending,
             Self::Connecting { .. } => ManagedTargetLifecycle::Connecting,
             Self::Opening { .. } => ManagedTargetLifecycle::Opening,
@@ -182,11 +186,30 @@ pub(super) struct TargetRuntime {
     pub(super) server_addr: Arc<str>,
     pub(super) remote: Option<std::net::SocketAddr>,
     pub(super) counters: TargetCounters,
+    pub(super) sent_before_session: u64,
+    pub(super) retry_delay: Duration,
+    pub(super) silence_since: Option<Instant>,
+    pub(super) last_reply_at: Option<Instant>,
     // None only while a synchronous operation owns the phase locally.
     pub(super) phase: Option<TargetPhase>,
 }
 
 impl TargetRuntime {
+    pub(super) fn silence_deadline(&self, timeout: Option<Duration>) -> Option<Instant> {
+        let TargetPhase::Active {
+            schedule,
+            send_waiting,
+            ..
+        } = self.phase()
+        else {
+            return None;
+        };
+        if *send_waiting || schedule.is_finished() {
+            return None;
+        }
+        self.silence_since?.checked_add(timeout?)
+    }
+
     pub(super) fn phase(&self) -> &TargetPhase {
         self.phase
             .as_ref()
@@ -218,16 +241,18 @@ impl TargetRuntime {
         self.membership.is_desired() && matches!(phase, TargetPhase::Active { .. })
     }
 
-    /// Adopt the underlying client's authoritative sent count.
-    ///
-    /// The client owns `packets_sent`; this runtime only mirrors it so a
-    /// terminal outcome can report it after the client is gone.
+    /// Combine the current client's authoritative sent count with retired
+    /// sessions, so one target generation keeps durable accounting on retries.
     pub(super) fn sync_packets_sent(&mut self, client: &AsyncClient) {
-        self.counters.packets_sent = client.packets_sent();
+        self.counters.packets_sent = self
+            .sent_before_session
+            .saturating_add(client.packets_sent());
     }
 
     pub(super) fn sync_live_packets_sent(&mut self) {
-        self.counters.packets_sent = self.phase().client().packets_sent();
+        self.counters.packets_sent = self
+            .sent_before_session
+            .saturating_add(self.phase().client().packets_sent());
     }
 
     /// Build this target's durable outcome.
@@ -284,6 +309,30 @@ impl ManagedClientTask {
 
     pub(super) fn publish_client_events(&mut self, index: usize, events: Vec<ClientEvent>) {
         for event in events {
+            match &event {
+                ClientEvent::EchoSent { sent_at, .. } => {
+                    let target = &mut self.targets[index];
+                    let anchor = target
+                        .last_reply_at
+                        .filter(|reply| {
+                            self.config.reconnect_timeout.is_some_and(|timeout| {
+                                sent_at.mono.duration_since(*reply) < timeout
+                            })
+                        })
+                        .unwrap_or(sent_at.mono);
+                    target.silence_since.get_or_insert(anchor);
+                }
+                ClientEvent::EchoReply { received_at, .. }
+                | ClientEvent::LateReply { received_at, .. }
+                | ClientEvent::DuplicateReply { received_at, .. } => {
+                    // A reply disarms silence until another probe is committed.
+                    // A healthy sender with a long interval can remain idle.
+                    self.targets[index].silence_since = None;
+                    self.targets[index].last_reply_at = Some(received_at.mono);
+                    self.targets[index].retry_delay = Duration::from_millis(250);
+                }
+                _ => {}
+            }
             self.targets[index].counters.observe(&event);
             self.publish_event(ManagedEvent::Client {
                 target: self.targets[index].instance.clone(),
@@ -298,6 +347,23 @@ impl ManagedClientTask {
         end_reason: ManagedTargetEndReason,
         cleanup_failure: Option<ManagedTargetFailure>,
     ) {
+        if self.can_reconnect(index)
+            && matches!(
+                end_reason,
+                ManagedTargetEndReason::Failed(_)
+                    | ManagedTargetEndReason::PeerClosed
+                    | ManagedTargetEndReason::TestComplete
+            )
+        {
+            let target = &mut self.targets[index];
+            target.sent_before_session = target.counters.packets_sent;
+            target.silence_since = None;
+            target.last_reply_at = None;
+            let deadline = Instant::now() + target.retry_delay;
+            target.retry_delay = (target.retry_delay * 2).min(Duration::from_secs(10));
+            self.install_target_phase(index, TargetPhase::Retrying { deadline });
+            return;
+        }
         let outcome = Arc::new(self.targets[index].outcome(end_reason, cleanup_failure));
         // Finalize history before the phase publisher installs Terminal, updates
         // pacing and publishes one complete status followed by the lifecycle event.
@@ -309,6 +375,12 @@ impl ManagedClientTask {
             },
         );
         self.publish_event(ManagedEvent::TargetFinished { outcome });
+    }
+
+    fn can_reconnect(&self, index: usize) -> bool {
+        self.config.reconnect_timeout.is_some()
+            && !self.phase.is_stopping()
+            && self.targets[index].membership.is_desired()
     }
 
     fn fail_target(&mut self, index: usize, phase: ManagedTargetFailurePhase, error: ClientError) {
@@ -332,6 +404,9 @@ impl ManagedClientTask {
         };
         client.discard_prepared_probe();
         self.targets[index].sync_live_packets_sent();
+        if self.can_reconnect(index) {
+            return self.begin_close(index, primary_end, None, now);
+        }
         match cleanup {
             OpenSessionFailureCleanup::Drain => self.begin_drain(index, primary_end, now),
             OpenSessionFailureCleanup::Close => self.begin_close(index, primary_end, None, now),
@@ -359,6 +434,27 @@ impl ManagedClientTask {
         let retirement = self.effective_retirement(index);
         let stopping = self.phase.is_stopping() || retirement.is_some();
         match self.targets[index].phase_mut() {
+            TargetPhase::Retrying { deadline } => {
+                if stopping {
+                    self.finish_target(
+                        index,
+                        retirement.unwrap_or(ManagedTargetEndReason::Stopped),
+                        None,
+                    );
+                    false
+                } else if now >= *deadline {
+                    let target = &self.targets[index].config;
+                    let mut client_config = self.config.client.clone();
+                    client_config.address_family = target
+                        .address_family
+                        .unwrap_or(client_config.address_family);
+                    client_config.auth = target.auth.resolve(&client_config.auth);
+                    self.install_target_phase(index, TargetPhase::Pending { client_config });
+                    true
+                } else {
+                    false
+                }
+            }
             TargetPhase::Pending { .. } => {
                 if stopping {
                     self.finish_target(
@@ -465,6 +561,16 @@ impl ManagedClientTask {
                 if stopping {
                     client.discard_prepared_probe();
                     self.targets[index].sync_live_packets_sent();
+                    if self.config.reconnect_timeout.is_some() {
+                        return self.begin_close(
+                            index,
+                            retirement
+                                .clone()
+                                .unwrap_or(ManagedTargetEndReason::Stopped),
+                            None,
+                            now,
+                        );
+                    }
                     return self.begin_drain(
                         index,
                         retirement
@@ -499,6 +605,22 @@ impl ManagedClientTask {
                     self.targets[index].sync_live_packets_sent();
                     self.finish_target(index, ManagedTargetEndReason::PeerClosed, None);
                     return false;
+                }
+                if self.targets[index]
+                    .silence_deadline(self.config.reconnect_timeout)
+                    .is_some_and(|deadline| deadline <= now)
+                {
+                    self.targets[index].sync_live_packets_sent();
+                    return self.begin_close(
+                        index,
+                        ManagedTargetEndReason::Failed(ManagedTargetFailure {
+                            phase: ManagedTargetFailurePhase::Receiving,
+                            kind: ManagedTargetFailureKind::Timeout,
+                            message: Arc::from("session silent while sending probes"),
+                        }),
+                        None,
+                        now,
+                    );
                 }
                 let TargetPhase::Active {
                     client, schedule, ..

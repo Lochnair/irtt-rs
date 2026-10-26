@@ -45,7 +45,8 @@ struct UpdatePlan {
 
 fn synchronously_retireable(phase: &TargetPhase) -> bool {
     match phase {
-        TargetPhase::Pending { .. }
+        TargetPhase::Retrying { .. }
+        | TargetPhase::Pending { .. }
         | TargetPhase::Connecting { .. }
         | TargetPhase::Terminal { .. } => true,
         TargetPhase::Opening { open, .. } => !open.has_in_flight_work(),
@@ -140,6 +141,10 @@ impl ManagedClientTask {
                 membership: TargetMembership::Desired,
                 remote: None,
                 counters: TargetCounters::default(),
+                sent_before_session: 0,
+                retry_delay: std::time::Duration::from_millis(250),
+                silence_since: None,
+                last_reply_at: None,
                 phase: Some(TargetPhase::Pending {
                     client_config: planned.client_config,
                 }),

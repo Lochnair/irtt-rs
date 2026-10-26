@@ -101,6 +101,9 @@ pub struct ManagedClientConfig {
     pub outcome_history_limit: usize,
     pub max_live_target_generations: usize,
     pub final_drain: Duration,
+    /// Retry failed/closed sessions and detect silence while sending. Only valid
+    /// for continuous measurement runs. None (the default) disables reconnection.
+    pub reconnect_timeout: Option<Duration>,
 }
 
 impl Default for ManagedClientConfig {
@@ -114,6 +117,7 @@ impl Default for ManagedClientConfig {
             outcome_history_limit: DEFAULT_MANAGED_OUTCOME_HISTORY_LIMIT,
             max_live_target_generations: DEFAULT_MANAGED_MAX_LIVE_TARGET_GENERATIONS,
             final_drain: DEFAULT_MANAGED_FINAL_DRAIN,
+            reconnect_timeout: None,
         }
     }
 }
@@ -364,6 +368,8 @@ pub struct ManagedTargetFailure {
 /// Configuration failure detected before any runtime work begins.
 #[derive(Debug, Error)]
 pub enum ManagedConfigError {
+    #[error("reconnection requires continuous measurement mode and a positive, schedulable silence timeout")]
+    InvalidReconnectPolicy,
     #[error("FinishWhenQuiescent requires at least one initial target")]
     EmptyInitialTargets,
     #[error("duplicate managed target id {id}")]

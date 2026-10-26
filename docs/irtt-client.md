@@ -220,6 +220,25 @@ See [MEASUREMENTS AND MEMORY](#measurements-and-memory) below for why this
 distinction also determines what statistics can be computed and how much
 memory a long run retains.
 
+### Optional recovery and event-only runs
+
+`--no-stats` disables statistics collection and final summaries while preserving individual measurement output. Statistics-dependent columns (such as IPDV) are unavailable. This does not remove the `irtt-stats` dependency.
+
+`--reconnect` enables automatic recovery for individual targets in continuous mode (`--continuous` or `--duration 0`). Failed connections, closed sessions, and unresponsive servers are retried without interrupting other targets. Retries use exponential backoff from 250 ms up to 10 seconds.
+
+`--reconnect-timeout DURATION` controls how long a session can go without valid replies before reconnection is attempted (default: `10s`). The timeout applies only while actively sending probes and should account for the probe interval and expected packet loss.
+
+**Statistics reset on reconnection**, so final summaries only reflect the latest session per target. A warning is emitted when reconnection is enabled with statistics collection. Use `--no-stats` to disable collection and suppress the warning.
+
+Example for continuous, multi-target CSV output without statistics:
+
+```sh
+irtt-client --continuous --reconnect --no-stats \
+  --format csv --header never \
+  --columns client_receive_wall_ns,target,seq,rd_us,sd_us \
+  reflector1 reflector2
+```
+
 ## OUTPUT
 
 ### `--format FORMAT`
@@ -355,7 +374,7 @@ approaches a fixed multiple of `targets` regardless of how long it runs.
 ## PEER CLOSE AND EXIT BEHAVIOR
 
 A peer closing a finite run is accepted as a terminal, successful outcome.
-In continuous mode, an uninterrupted peer closure is treated as an error —
+Without `--reconnect`, in continuous mode, an uninterrupted peer closure is treated as an error —
 the client exits nonzero — so a process supervisor can restart it; an
 interrupted run (`Ctrl-C`) never reports peer closure as an error, whichever
 mode it was in.

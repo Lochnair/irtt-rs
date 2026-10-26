@@ -55,13 +55,29 @@ pub struct ClientArgs {
         default_value = "10s",
         value_parser = parse_test_duration,
         help = "Test duration (e.g. 2.5s, 1m30s, 1h); use --continuous for continuous mode (0 is also accepted)",
-        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use --continuous for continuous mode (0 is also accepted).\n\nFinite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
+        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use --continuous for continuous mode (0 is also accepted).\n\nUnless --no-stats is selected, finite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
     )]
     pub duration: Duration,
 
     /// Run continuously until interrupted (equivalent to --duration 0).
     #[arg(long, conflicts_with = "duration")]
     pub continuous: bool,
+
+    /// Disable statistics collection and final summaries; retain measurement event output.
+    #[arg(long)]
+    pub no_stats: bool,
+
+    /// Retry failed, closed, or silent sessions (requires continuous mode).
+    #[arg(
+        long,
+        conflicts_with = "no_test",
+        long_help = "Retry failed initial opens and closed, failed, or silent sessions independently per target. Requires --continuous or --duration 0. Unsuccessful connections back off from 250ms to 10s. Use --reconnect-timeout to configure silence detection and --no-stats when only measurement events are needed."
+    )]
+    pub reconnect: bool,
+
+    /// Reconnect after this long without valid replies while sending probes.
+    #[arg(long, default_value = "10s", value_parser = crate::shared::client::parse_duration, requires = "reconnect")]
+    pub reconnect_timeout: Duration,
 
     #[command(flatten)]
     pub common: CommonClientArgs,
@@ -112,6 +128,9 @@ impl ClientArgs {
     /// Targets are only required here. `--list-columns` returns before this is
     /// called, so listing columns still needs no target.
     pub async fn prepare(&self) -> Result<ManagedRunSetup, String> {
+        if self.reconnect && !self.is_continuous() {
+            return Err("--reconnect requires --continuous or --duration 0".to_owned());
+        }
         if self.targets_stdin && !self.is_continuous() {
             return Err("--targets-stdin requires --continuous or --duration 0".to_owned());
         }
