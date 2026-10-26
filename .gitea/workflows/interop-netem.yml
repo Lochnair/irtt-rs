@@ -34,12 +34,33 @@ jobs:
         with:
           cache: false
 
+      - name: Install Go toolchain
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: '1.27.3'
+          cache: false
+
+      - name: Install netem dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends iproute2 python3
+
       - name: Check host tools and network administration access
         run: |
           ip -V
           tc -V
           go version
-          sudo -n true
+          # Exercise the namespace, veth, and qdisc operations the harness needs.
+          # sudo/NET_ADMIN alone do not establish mount/namespace permissions.
+          sudo -n bash -euo pipefail <<'SH'
+          probe_ns="irtt-preflight-$$"
+          ip netns add "$probe_ns"
+          trap 'ip netns delete "$probe_ns"' EXIT
+          ip netns exec "$probe_ns" sh -ec '
+            ip link add probe0 type veth peer name probe1
+            tc qdisc add dev probe0 root netem delay 1ms
+          '
+          SH
 
       - name: Install upstream irtt
         run: |
