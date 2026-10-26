@@ -237,7 +237,9 @@ warnings are disabled, and IPDV columns retain their names with absent values
 (`-` in tables, empty CSV/TSV fields, and JSON `null`). Measurement events and
 protocol-level received statistics remain available.
 
-`--reconnect` enables automatic recovery for individual targets in continuous mode (`--continuous` or `--duration 0`). Failed connections, closed sessions, and unresponsive servers are retried without interrupting other targets. Retries use exponential backoff from 250 ms up to 10 seconds.
+`--reconnect` enables automatic recovery for individual targets in continuous mode (`--continuous` or `--duration 0`). Failed connections, closed sessions, and unresponsive servers are retried without interrupting other targets. Retries double the delay after each failed attempt, from 250 ms up to 10 seconds by default. A valid reply resets the delay to the initial value; each target backs off independently.
+
+`--reconnect-initial-delay DURATION` (default: `250ms`) and `--reconnect-max-delay DURATION` (default: `10s`) configure these delays. Both require `--reconnect`, must be positive and schedulable, and the maximum must be at least twice the initial delay. For example, `--reconnect-initial-delay 1s --reconnect-max-delay 5s` retries after `1s`, `2s`, `4s`, `5s`, then `5s` thereafter.
 
 `--reconnect-timeout DURATION` controls how long a session can go without valid replies before reconnection is attempted (default: `10s`). The timeout applies only while actively sending probes and should account for the probe interval and expected packet loss.
 

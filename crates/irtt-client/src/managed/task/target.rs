@@ -329,7 +329,7 @@ impl ManagedClientTask {
                     // A healthy sender with a long interval can remain idle.
                     self.targets[index].silence_since = None;
                     self.targets[index].last_reply_at = Some(received_at.mono);
-                    self.targets[index].retry_delay = Duration::from_millis(250);
+                    self.targets[index].retry_delay = self.config.reconnect_initial_delay;
                 }
                 _ => {}
             }
@@ -344,7 +344,7 @@ impl ManagedClientTask {
     fn finish_target(
         &mut self,
         index: usize,
-        end_reason: ManagedTargetEndReason,
+        mut end_reason: ManagedTargetEndReason,
         cleanup_failure: Option<ManagedTargetFailure>,
     ) {
         if self.can_reconnect(index)
@@ -359,10 +359,17 @@ impl ManagedClientTask {
             target.sent_before_session = target.counters.packets_sent;
             target.silence_since = None;
             target.last_reply_at = None;
-            let deadline = Instant::now() + target.retry_delay;
-            target.retry_delay = (target.retry_delay * 2).min(Duration::from_secs(10));
-            self.install_target_phase(index, TargetPhase::Retrying { deadline });
-            return;
+            if let Some(deadline) = Instant::now().checked_add(target.retry_delay) {
+                target.retry_delay = target
+                    .retry_delay
+                    .checked_mul(2)
+                    .unwrap_or(self.config.reconnect_max_delay)
+                    .min(self.config.reconnect_max_delay);
+                self.install_target_phase(index, TargetPhase::Retrying { deadline });
+                return;
+            }
+            // A delay validated at construction may no longer fit after a long run.
+            end_reason = ManagedTargetEndReason::Failed(duration_overflow_failure());
         }
         let outcome = Arc::new(self.targets[index].outcome(end_reason, cleanup_failure));
         // Finalize history before the phase publisher installs Terminal, updates

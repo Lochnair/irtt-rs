@@ -104,6 +104,12 @@ pub struct ManagedClientConfig {
     /// Retry failed/closed sessions and detect silence while sending. Only valid
     /// for continuous measurement runs. None (the default) disables reconnection.
     pub reconnect_timeout: Option<Duration>,
+    /// First retry delay, also restored after a valid reply (default: 250 ms).
+    /// Must be positive and at most half of `reconnect_max_delay`.
+    pub reconnect_initial_delay: Duration,
+    /// Cap for per-target exponential backoff with a fixed multiplier of two
+    /// (default: 10 seconds). Must be schedulable from the current instant.
+    pub reconnect_max_delay: Duration,
 }
 
 impl Default for ManagedClientConfig {
@@ -118,6 +124,8 @@ impl Default for ManagedClientConfig {
             max_live_target_generations: DEFAULT_MANAGED_MAX_LIVE_TARGET_GENERATIONS,
             final_drain: DEFAULT_MANAGED_FINAL_DRAIN,
             reconnect_timeout: None,
+            reconnect_initial_delay: Duration::from_millis(250),
+            reconnect_max_delay: Duration::from_secs(10),
         }
     }
 }
@@ -370,6 +378,11 @@ pub struct ManagedTargetFailure {
 pub enum ManagedConfigError {
     #[error("reconnection requires continuous measurement mode and a positive, schedulable silence timeout")]
     InvalidReconnectPolicy,
+    #[error("reconnection delays must be positive and schedulable, with maximum delay at least twice the initial delay (initial: {initial:?}, maximum: {maximum:?})")]
+    InvalidReconnectDelays {
+        initial: Duration,
+        maximum: Duration,
+    },
     #[error("FinishWhenQuiescent requires at least one initial target")]
     EmptyInitialTargets,
     #[error("duplicate managed target id {id}")]

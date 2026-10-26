@@ -142,7 +142,7 @@ impl ManagedClientTask {
                 remote: None,
                 counters: TargetCounters::default(),
                 sent_before_session: 0,
-                retry_delay: std::time::Duration::from_millis(250),
+                retry_delay: self.config.reconnect_initial_delay,
                 silence_since: None,
                 last_reply_at: None,
                 phase: Some(TargetPhase::Pending {

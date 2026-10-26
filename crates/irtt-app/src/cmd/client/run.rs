@@ -78,6 +78,8 @@ pub async fn run_stream(
         {
             let mut config = setup.managed_config();
             config.reconnect_timeout = args.reconnect.then_some(args.reconnect_timeout);
+            config.reconnect_initial_delay = args.reconnect_initial_delay;
+            config.reconnect_max_delay = args.reconnect_max_delay;
             config
         },
         setup.managed_targets(),
@@ -482,6 +484,8 @@ async fn run_stdin_stream(
         {
             let mut config = setup.managed_config();
             config.reconnect_timeout = args.reconnect.then_some(args.reconnect_timeout);
+            config.reconnect_initial_delay = args.reconnect_initial_delay;
+            config.reconnect_max_delay = args.reconnect_max_delay;
             config
         },
         setup.managed_targets(),

@@ -367,6 +367,26 @@ fn build_task(
             maximum: tokio::sync::Semaphore::MAX_PERMITS,
         });
     }
+    if config.reconnect_initial_delay.is_zero()
+        || config.reconnect_max_delay.is_zero()
+        || config
+            .reconnect_initial_delay
+            .checked_mul(2)
+            .is_none_or(|minimum| config.reconnect_max_delay < minimum)
+        // Tokio represents timer deadlines in u64 milliseconds, reserving the
+        // top two values for state. Leave room for its millisecond rounding.
+        || config.reconnect_max_delay.as_millis() >= u128::from(u64::MAX - 2)
+        || config
+            .reconnect_max_delay
+            .checked_add(std::time::Duration::from_millis(1))
+            .and_then(|delay| Instant::now().checked_add(delay))
+            .is_none()
+    {
+        return Err(ManagedConfigError::InvalidReconnectDelays {
+            initial: config.reconnect_initial_delay,
+            maximum: config.reconnect_max_delay,
+        });
+    }
     if let Some(timeout) = config.reconnect_timeout {
         if timeout.is_zero()
             || Instant::now().checked_add(timeout).is_none()
@@ -427,7 +447,7 @@ fn build_task(
             remote: None,
             counters: TargetCounters::default(),
             sent_before_session: 0,
-            retry_delay: std::time::Duration::from_millis(250),
+            retry_delay: config.reconnect_initial_delay,
             silence_since: None,
             last_reply_at: None,
             phase: Some(TargetPhase::Pending { client_config }),

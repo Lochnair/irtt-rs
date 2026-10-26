@@ -72,13 +72,21 @@ pub struct ClientArgs {
     #[arg(
         long,
         conflicts_with = "no_test",
-        long_help = "Retry failed initial opens and closed, failed, or silent sessions independently per target. Requires --continuous or --duration 0. Unsuccessful connections back off from 250ms to 10s. Use --reconnect-timeout to configure silence detection and --no-stats when only measurement events are needed."
+        long_help = "Retry failed initial opens and closed, failed, or silent sessions independently per target. Requires --continuous or --duration 0. Unsuccessful connections use exponential backoff (defaults: 250ms initial, 10s maximum), configurable with --reconnect-initial-delay and --reconnect-max-delay. Use --reconnect-timeout to configure silence detection and --no-stats when only measurement events are needed."
     )]
     pub reconnect: bool,
 
     /// Reconnect after this long without valid replies while sending probes.
     #[arg(long, default_value = "10s", value_parser = crate::shared::client::parse_duration, requires = "reconnect")]
     pub reconnect_timeout: Duration,
+
+    /// Initial retry delay, restored after a valid reply.
+    #[arg(long, default_value = "250ms", value_parser = crate::shared::client::parse_duration, requires = "reconnect")]
+    pub reconnect_initial_delay: Duration,
+
+    /// Maximum retry delay (must be at least twice the initial delay).
+    #[arg(long, default_value = "10s", value_parser = crate::shared::client::parse_duration, requires = "reconnect")]
+    pub reconnect_max_delay: Duration,
 
     #[command(flatten)]
     pub common: CommonClientArgs,
@@ -131,6 +139,15 @@ impl ClientArgs {
     pub async fn prepare(&self) -> Result<ManagedRunSetup, String> {
         if self.reconnect && !self.is_continuous() {
             return Err("--reconnect requires --continuous or --duration 0".to_owned());
+        }
+        if self
+            .reconnect_initial_delay
+            .checked_mul(2)
+            .is_none_or(|minimum| self.reconnect_max_delay < minimum)
+        {
+            return Err(
+                "--reconnect-max-delay must be at least twice --reconnect-initial-delay".to_owned(),
+            );
         }
         if self.targets_stdin && !self.is_continuous() {
             return Err("--targets-stdin requires --continuous or --duration 0".to_owned());
