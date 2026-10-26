@@ -1,0 +1,32 @@
+
+[build]
+# MIPS musl std expects libunwind; cross GCC provides libgcc_eh.
+pre-build = [
+    '''
+    for cc in /usr/local/bin/mips*-gcc; do
+        [ -x "$cc" ] || continue
+        archive=$("$cc" -print-file-name=libgcc_eh.a)
+        test -f "$archive" || exit 1
+        ln -sf libgcc_eh.a "$(dirname "$archive")/libunwind.a"
+    done
+    ''',
+]
+
+[target.riscv64gc-unknown-linux-musl]
+image = "ghcr.io/cross-rs/riscv64gc-unknown-linux-musl:main"
+
+[target.mips-unknown-linux-musl]
+image = "ghcr.io/cross-rs/mips-unknown-linux-musl:main"
+build-std = ["std", "panic_abort"]
+
+[target.mipsel-unknown-linux-musl]
+image = "ghcr.io/cross-rs/mipsel-unknown-linux-musl:main"
+build-std = ["std", "panic_abort"]
+
+[target.mips64-unknown-linux-muslabi64]
+image = "ghcr.io/cross-rs/mips64-unknown-linux-muslabi64:main"
+build-std = ["std", "panic_abort"]
+
+[target.mips64el-unknown-linux-muslabi64]
+image = "ghcr.io/cross-rs/mips64el-unknown-linux-muslabi64:main"
+build-std = ["std", "panic_abort"]

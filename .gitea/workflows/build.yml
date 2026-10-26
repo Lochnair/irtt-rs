@@ -1,0 +1,191 @@
+
+name: Build binaries
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Measure before stripping; strip packaged copies ourselves.
+  CARGO_PROFILE_RELEASE_STRIP: none
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ matrix.target }}
+    defaults:
+      run:
+        shell: bash
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        target:
+          - x86_64-musl
+          - i686-musl
+          - arm-musleabi
+          - arm-musleabihf
+          - armv7-musleabi
+          - armv7-musleabihf
+          - aarch64-musl
+          - mips-musl
+          - mipsel-musl
+          - mips64-muslabi64
+          - mips64el-muslabi64
+          - riscv64gc-musl
+
+    steps:
+      - name: Checkout
+        uses: builtin:checkout
+
+      - name: Configure Rust directories
+        run: |
+          echo "CARGO_HOME=$RUNNER_TEMP/cargo" >> "$GITHUB_ENV"
+          echo "RUSTUP_HOME=$RUNNER_TEMP/rustup" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
+        with:
+          toolchain: ${{ startsWith(matrix.target, 'mips') && 'nightly' || 'stable' }}
+          cache: false
+          build-warnings: warn
+
+      - name: Install cross and binary tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils llvm
+          cargo install --git https://github.com/cross-rs/cross --locked cross
+          echo "RUST_TARGET=${TARGET%-*}-unknown-linux-${TARGET#*-}" >> "$GITHUB_ENV"
+
+      - name: Detect statistics feature
+        run: |
+          if grep -Eq '^[[:space:]]*stats[[:space:]]*=' crates/irtt-app/Cargo.toml; then
+            echo "HAS_STATS_FEATURE=true" >> "$GITHUB_ENV"
+          else
+            echo "HAS_STATS_FEATURE=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Build, verify, package, and compare
+        env:
+          RUSTFLAGS: ${{ startsWith(matrix.target, 'mips') && '-C target-feature=+crt-static -C link-self-contained=no' || '-C target-feature=+crt-static' }}
+          CROSS_REMOTE: "true"
+          CROSS_REMOTE_COPY_FULL_TARGET_DIR: ${{ startsWith(matrix.target, 'mips') && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          declare -A raw_size
+          declare -A stripped_size
+          declare -A compressed_size
+
+          mkdir -p dist
+
+          build_variant() {
+            local variant="$1"
+            local features="$2"
+            local binary="target/${RUST_TARGET}/release/irtt-client"
+            local directory="dist/${variant}"
+            local artifact="dist/irtt-client-${TARGET}-${variant}.tar.gz"
+
+            echo "::group::Build ${variant} (${features})"
+
+            cross build \
+              --release \
+              --locked \
+              --target "$RUST_TARGET" \
+              -p irtt-rs \
+              --bin irtt-client \
+              --no-default-features \
+              --features "$features"
+
+            # Reject dynamically linked executables.
+            if readelf --program-headers "$binary" | grep -q INTERP ||
+               readelf --dynamic "$binary" | grep -q NEEDED; then
+              echo "Binary is not statically linked: ${variant}" >&2
+              exit 1
+            fi
+
+            mkdir -p "$directory"
+            cp "$binary" "$directory/irtt-client"
+
+            raw_size[$variant]=$(stat -c %s "$binary")
+
+            llvm-strip --strip-all "$directory/irtt-client"
+            stripped_size[$variant]=$(stat -c %s "$directory/irtt-client")
+
+            # Each archive contains an executable named irtt-client.
+            tar -czf "$artifact" -C "$directory" irtt-client
+            compressed_size[$variant]=$(stat -c %s "$artifact")
+
+            echo "::endgroup::"
+          }
+
+          human() {
+            numfmt --to=iec-i --suffix=B --format='%.1f' "$1"
+          }
+
+          reduction() {
+            awk -v full="$1" -v minimal="$2" 'BEGIN {
+              if (full == 0) {
+                printf "N/A"
+              } else {
+                printf "%.1f%%", 100 * (full - minimal) / full
+              }
+            }'
+          }
+
+          # Before feature gating, client already includes statistics.
+          if [[ "$HAS_STATS_FEATURE" == "true" ]]; then
+            build_variant full "client,stats"
+            build_variant minimal "client"
+          else
+            build_variant full "client"
+          fi
+
+          {
+            echo "### irtt-client: ${TARGET}"
+            echo
+            echo '| Variant | Unstripped | Stripped | Compressed |'
+            echo '|:--|--:|--:|--:|'
+
+            printf '| Full | %s | %s | %s |\n' \
+              "$(human "${raw_size[full]}")" \
+              "$(human "${stripped_size[full]}")" \
+              "$(human "${compressed_size[full]}")"
+
+            if [[ "$HAS_STATS_FEATURE" == "true" ]]; then
+              printf '| Minimal | %s | %s | %s |\n' \
+                "$(human "${raw_size[minimal]}")" \
+                "$(human "${stripped_size[minimal]}")" \
+                "$(human "${compressed_size[minimal]}")"
+
+              printf '| **Reduction** | **%s** | **%s** | **%s** |\n' \
+                "$(reduction "${raw_size[full]}" "${raw_size[minimal]}")" \
+                "$(reduction "${stripped_size[full]}" "${stripped_size[minimal]}")" \
+                "$(reduction "${compressed_size[full]}" "${compressed_size[minimal]}")"
+
+              echo
+              echo "Full: client,stats | Minimal: client"
+            else
+              echo
+              echo "Baseline only: the stats Cargo feature is not yet available."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload binaries
+        # Gitea's v3 artifact protocol.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: irtt-client-${{ matrix.target }}
+          path: dist/irtt-client-${{ matrix.target }}-*.tar.gz
+          if-no-files-found: error
