@@ -7,20 +7,29 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      build_mode:
+        description: "Build configuration"
+        type: choice
+        required: true
+        default: standard
+        options:
+          - standard
+          - nightly-experiments
 
 permissions:
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
-  # Measure before stripping; strip packaged copies ourselves.
   CARGO_PROFILE_RELEASE_STRIP: none
+  BUILD_MODE: ${{ inputs.build_mode || 'standard' }}
 
 jobs:
   build:
     name: Build (${{ matrix.target }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 120
     env:
       TARGET: ${{ matrix.target }}
     defaults:
@@ -57,9 +66,13 @@ jobs:
       - name: Install Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@ecabd13d1c56bd1345c230e542e9144811ad706f # v2
         with:
-          toolchain: ${{ startsWith(matrix.target, 'mips') && 'nightly' || 'stable' }}
+          toolchain: ${{ (inputs.build_mode == 'nightly-experiments' || startsWith(matrix.target, 'mips')) && 'nightly' || 'stable' }}
           cache: false
           build-warnings: warn
+
+      - name: Install nightly standard library sources
+        if: inputs.build_mode == 'nightly-experiments'
+        run: rustup component add rust-src --toolchain nightly
 
       - name: Install cross and binary tools
         run: |
@@ -78,6 +91,7 @@ jobs:
 
       - name: Build, verify, package, and compare
         env:
+          # MIPS std needs CRT objects from the cross GCC toolchain.
           RUSTFLAGS: ${{ startsWith(matrix.target, 'mips') && '-C target-feature=+crt-static -C link-self-contained=no' || '-C target-feature=+crt-static' }}
           CROSS_REMOTE: "true"
           CROSS_REMOTE_COPY_FULL_TARGET_DIR: ${{ startsWith(matrix.target, 'mips') && 'true' || 'false' }}
@@ -87,30 +101,45 @@ jobs:
           declare -A raw_size
           declare -A stripped_size
           declare -A compressed_size
+          declare -a variants
 
           mkdir -p dist
+
+          cross_cmd=(cross)
+          if [[ "$BUILD_MODE" == "nightly-experiments" ]]; then
+            cross_cmd+=(+nightly)
+          fi
 
           build_variant() {
             local variant="$1"
             local features="$2"
+            shift 2
+
             local binary="target/${RUST_TARGET}/release/irtt-client"
             local directory="dist/${variant}"
             local artifact="dist/irtt-client-${TARGET}-${variant}.tar.gz"
 
             echo "::group::Build ${variant} (${features})"
 
-            cross build \
+            # Additional arguments allow individual variants to
+            # customize build-std, std features and panic behavior.
+            "${cross_cmd[@]}" build \
               --release \
               --locked \
               --target "$RUST_TARGET" \
               -p irtt-rs \
               --bin irtt-client \
               --no-default-features \
-              --features "$features"
+              --features "$features" \
+              "$@"
 
-            # Reject dynamically linked executables.
-            if readelf --program-headers "$binary" | grep -q INTERP ||
-               readelf --dynamic "$binary" | grep -q NEEDED; then
+            # Check dynamic linking without relying on pipeline
+            # behavior under pipefail.
+            readelf --program-headers "$binary" > /tmp/program-headers.txt
+            readelf --dynamic "$binary" > /tmp/dynamic-section.txt
+
+            if grep -q INTERP /tmp/program-headers.txt ||
+               grep -q NEEDED /tmp/dynamic-section.txt; then
               echo "Binary is not statically linked: ${variant}" >&2
               exit 1
             fi
@@ -121,17 +150,31 @@ jobs:
             raw_size[$variant]=$(stat -c %s "$binary")
 
             llvm-strip --strip-all "$directory/irtt-client"
-            stripped_size[$variant]=$(stat -c %s "$directory/irtt-client")
+            stripped_size[$variant]=$(
+              stat -c %s "$directory/irtt-client"
+            )
 
-            # Each archive contains an executable named irtt-client.
             tar -czf "$artifact" -C "$directory" irtt-client
             compressed_size[$variant]=$(stat -c %s "$artifact")
+
+            variants+=("$variant")
 
             echo "::endgroup::"
           }
 
           human() {
             numfmt --to=iec-i --suffix=B --format='%.1f' "$1"
+          }
+
+          # Positive means larger than baseline; negative means smaller.
+          delta() {
+            awk -v base="$1" -v current="$2" 'BEGIN {
+              if (base == 0) {
+                printf "N/A"
+              } else {
+                printf "%+.1f%%", 100 * (current - base) / base
+              }
+            }'
           }
 
           reduction() {
@@ -144,41 +187,95 @@ jobs:
             }'
           }
 
-          # Before feature gating, client already includes statistics.
+          # Standard builds preserve the existing toolchain policy:
+          # stable everywhere except MIPS, which requires nightly.
+          #
+          # Experimental mode uses nightly for every variant so
+          # compiler-version differences don't affect comparisons.
+
           if [[ "$HAS_STATS_FEATURE" == "true" ]]; then
             build_variant full "client,stats"
             build_variant minimal "client"
+            baseline="minimal"
           else
+            # Compatibility with main before stats feature gating.
             build_variant full "client"
+            baseline="full"
+          fi
+
+          if [[ "$BUILD_MODE" == "nightly-experiments" ]]; then
+            # Existing Cross.toml already rebuilds std on MIPS.
+            # On other targets, the normal builds use prebuilt std.
+
+            build_variant rebuilt-std "client" \
+              -Z build-std
+
+            # Rebuild std without backtrace support, retaining
+            # normal panic unwinding.
+            build_variant no-backtrace "client" \
+              -Z build-std \
+              -Z build-std-features=panic-unwind
+
+            # Most aggressive experiment: no unwinding, panic
+            # reporting, or std backtrace support.
+            build_variant immediate-abort "client" \
+              -Z panic-immediate-abort \
+              -Z build-std \
+              -Z build-std-features= \
+              --config 'profile.release.panic="immediate-abort"'
           fi
 
           {
             echo "### irtt-client: ${TARGET}"
             echo
-            echo '| Variant | Unstripped | Stripped | Compressed |'
-            echo '|:--|--:|--:|--:|'
+            echo "Build mode: \`${BUILD_MODE}\`"
+            echo
+            echo '| Variant | Unstripped | Stripped | Compressed | Compressed vs baseline |'
+            echo '|:--|--:|--:|--:|--:|'
 
-            printf '| Full | %s | %s | %s |\n' \
-              "$(human "${raw_size[full]}")" \
-              "$(human "${stripped_size[full]}")" \
-              "$(human "${compressed_size[full]}")"
+            for variant in "${variants[@]}"; do
+              if [[ "$variant" == "$baseline" ]]; then
+                comparison="Baseline"
+              else
+                comparison=$(delta \
+                  "${compressed_size[$baseline]}" \
+                  "${compressed_size[$variant]}")
+              fi
+
+              printf '| %s | %s | %s | %s | %s |\n' \
+                "$variant" \
+                "$(human "${raw_size[$variant]}")" \
+                "$(human "${stripped_size[$variant]}")" \
+                "$(human "${compressed_size[$variant]}")" \
+                "$comparison"
+            done
 
             if [[ "$HAS_STATS_FEATURE" == "true" ]]; then
-              printf '| Minimal | %s | %s | %s |\n' \
-                "$(human "${raw_size[minimal]}")" \
-                "$(human "${stripped_size[minimal]}")" \
-                "$(human "${compressed_size[minimal]}")"
+              echo
+              echo '#### Full vs minimal'
+              echo
+              echo '| Unstripped reduction | Stripped reduction | Compressed reduction |'
+              echo '|--:|--:|--:|'
 
-              printf '| **Reduction** | **%s** | **%s** | **%s** |\n' \
+              printf '| %s | %s | %s |\n' \
                 "$(reduction "${raw_size[full]}" "${raw_size[minimal]}")" \
                 "$(reduction "${stripped_size[full]}" "${stripped_size[minimal]}")" \
                 "$(reduction "${compressed_size[full]}" "${compressed_size[minimal]}")"
-
-              echo
-              echo "Full: client,stats | Minimal: client"
             else
               echo
-              echo "Baseline only: the stats Cargo feature is not yet available."
+              echo "The stats feature is not available; client includes statistics."
+            fi
+
+            if [[ "$BUILD_MODE" == "nightly-experiments" ]]; then
+              echo
+              echo '#### Experiment details'
+              echo
+              echo '- `rebuilt-std`: nightly `-Z build-std`, default std features'
+              echo '- `no-backtrace`: rebuilt std with `panic-unwind` only'
+              echo '- `immediate-abort`: rebuilt std with immediate panic termination'
+              echo
+              echo 'MIPS already uses build-std through Cross.toml.'
+              echo 'All measurements use the same target and nightly toolchain.'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
