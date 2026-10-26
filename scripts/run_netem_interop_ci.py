@@ -215,7 +215,7 @@ def select_scenarios(args: argparse.Namespace) -> list[Scenario]:
 def preflight(args: argparse.Namespace) -> None:
     if platform.system() != "Linux":
         raise RuntimeError("netem interop requires Linux network namespaces and tc netem")
-    for binary in ["ip", "tc"]:
+    for binary in ["ip", "tc", "nsenter"]:
         if shutil.which(binary) is None:
             raise RuntimeError(f"required command not found in PATH: {binary}")
     if args.sudo and shutil.which(args.sudo) is None:
@@ -256,7 +256,7 @@ def sudo_prefix(args: argparse.Namespace) -> list[str]:
 
 
 def netns(args: argparse.Namespace, namespace: str, command: list[str]) -> list[str]:
-    return [*sudo_prefix(args), "ip", "netns", "exec", namespace, *command]
+    return [*sudo_prefix(args), "nsenter", f"--net=/run/netns/{namespace}", "--", *command]
 
 
 def run_checked(
@@ -300,12 +300,12 @@ def setup_namespaces(args: argparse.Namespace, run_dir: Path) -> None:
         [*sudo_prefix(args), "ip", "link", "add", CLIENT_VETH, "type", "veth", "peer", "name", SERVER_VETH],
         [*sudo_prefix(args), "ip", "link", "set", CLIENT_VETH, "netns", CLIENT_NS],
         [*sudo_prefix(args), "ip", "link", "set", SERVER_VETH, "netns", SERVER_NS],
-        [*sudo_prefix(args), "ip", "-n", CLIENT_NS, "addr", "add", CLIENT_ADDR, "dev", CLIENT_VETH],
-        [*sudo_prefix(args), "ip", "-n", SERVER_NS, "addr", "add", SERVER_ADDR, "dev", SERVER_VETH],
-        [*sudo_prefix(args), "ip", "-n", CLIENT_NS, "link", "set", "lo", "up"],
-        [*sudo_prefix(args), "ip", "-n", SERVER_NS, "link", "set", "lo", "up"],
-        [*sudo_prefix(args), "ip", "-n", CLIENT_NS, "link", "set", CLIENT_VETH, "up"],
-        [*sudo_prefix(args), "ip", "-n", SERVER_NS, "link", "set", SERVER_VETH, "up"],
+        netns(args, CLIENT_NS, ["ip", "addr", "add", CLIENT_ADDR, "dev", CLIENT_VETH]),
+        netns(args, SERVER_NS, ["ip", "addr", "add", SERVER_ADDR, "dev", SERVER_VETH]),
+        netns(args, CLIENT_NS, ["ip", "link", "set", "lo", "up"]),
+        netns(args, SERVER_NS, ["ip", "link", "set", "lo", "up"]),
+        netns(args, CLIENT_NS, ["ip", "link", "set", CLIENT_VETH, "up"]),
+        netns(args, SERVER_NS, ["ip", "link", "set", SERVER_VETH, "up"]),
     ]
     for index, command in enumerate(commands):
         run_checked(command, run_dir / "setup" / f"{index:02d}")
@@ -409,12 +409,7 @@ def apply_netem(args: argparse.Namespace, scenario: Scenario, scenario_dir: Path
     for namespace, dev, setting in commands:
         if not setting:
             continue
-        command = [
-            *sudo_prefix(args),
-            "ip",
-            "netns",
-            "exec",
-            namespace,
+        command = netns(args, namespace, [
             "tc",
             "qdisc",
             "replace",
@@ -423,25 +418,20 @@ def apply_netem(args: argparse.Namespace, scenario: Scenario, scenario_dir: Path
             "root",
             "netem",
             *shlex.split(setting),
-        ]
+        ])
         run_checked(command, scenario_dir / "netem" / f"{namespace}-{dev}")
 
 
 def delete_qdiscs(args: argparse.Namespace, log_dir: Path) -> None:
     for namespace, dev in [(CLIENT_NS, CLIENT_VETH), (SERVER_NS, SERVER_VETH)]:
-        command = [
-            *sudo_prefix(args),
-            "ip",
-            "netns",
-            "exec",
-            namespace,
+        command = netns(args, namespace, [
             "tc",
             "qdisc",
             "del",
             "dev",
             dev,
             "root",
-        ]
+        ])
         run_checked(
             command,
             log_dir / "qdisc-cleanup" / f"{namespace}-{dev}",
@@ -698,12 +688,19 @@ def cleanup(args: argparse.Namespace, quiet: bool) -> None:
         return
     if args.sudo and shutil.which(args.sudo) is None:
         return
-    commands = [
-        [*sudo_prefix(args), "ip", "netns", "exec", CLIENT_NS, "tc", "qdisc", "del", "dev", CLIENT_VETH, "root"],
-        [*sudo_prefix(args), "ip", "netns", "exec", SERVER_NS, "tc", "qdisc", "del", "dev", SERVER_VETH, "root"],
+    commands = []
+    if shutil.which("nsenter") is not None:
+        commands.extend([
+            netns(args, CLIENT_NS, ["tc", "qdisc", "del", "dev", CLIENT_VETH, "root"]),
+            netns(args, SERVER_NS, ["tc", "qdisc", "del", "dev", SERVER_VETH, "root"]),
+        ])
+    commands.extend([
         [*sudo_prefix(args), "ip", "netns", "delete", CLIENT_NS],
         [*sudo_prefix(args), "ip", "netns", "delete", SERVER_NS],
-    ]
+        # A setup failure can leave either end of the pair in the host namespace.
+        [*sudo_prefix(args), "ip", "link", "delete", CLIENT_VETH],
+        [*sudo_prefix(args), "ip", "link", "delete", SERVER_VETH],
+    ])
     for command in commands:
         completed = subprocess.run(
             command,

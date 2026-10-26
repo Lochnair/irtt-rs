@@ -43,12 +43,13 @@ jobs:
       - name: Install netem dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends iproute2 python3
+          sudo apt-get install -y --no-install-recommends iproute2 python3 util-linux
 
       - name: Check host tools and network administration access
         run: |
           ip -V
           tc -V
+          nsenter --version
           go version
           # Exercise the namespace, veth, and qdisc operations the harness needs.
           # sudo/NET_ADMIN alone do not establish mount/namespace permissions.
@@ -56,9 +57,10 @@ jobs:
           probe_ns="irtt-preflight-$$"
           ip netns add "$probe_ns"
           trap 'ip netns delete "$probe_ns"' EXIT
-          ip netns exec "$probe_ns" sh -ec '
+          nsenter --net="/run/netns/$probe_ns" -- sh -ec '
             ip link add probe0 type veth peer name probe1
             tc qdisc add dev probe0 root netem delay 1ms
+            tc qdisc show dev probe0
           '
           SH
 
