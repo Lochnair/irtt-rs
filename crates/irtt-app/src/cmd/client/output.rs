@@ -9,6 +9,7 @@ use irtt_client::{
     ServerTiming, SignedDuration, WarningKind,
 };
 
+#[cfg(feature = "stats")]
 use irtt_stats::{EventStatsUpdate, IpdvPairUpdate};
 
 use super::args::{HeaderMode, OutputFormat};
@@ -48,10 +49,12 @@ impl OutputConfig {
         })
     }
 
+    #[cfg(feature = "stats")]
     pub(super) fn prints_summary(&self) -> bool {
         self.format.prints_summary()
     }
 
+    #[cfg(feature = "stats")]
     pub(super) fn summary_verbose(&self) -> bool {
         self.verbose
     }
@@ -96,15 +99,22 @@ impl OutputConfig {
         &self,
         event: &ClientEvent,
         target: Option<&str>,
-        stats: Option<&EventStatsUpdate>,
+        #[cfg(feature = "stats")] stats: Option<&EventStatsUpdate>,
     ) -> Option<String> {
         let row = OutputRow::from_event(event);
         if self.default_table_rows && row.is_default_table_hidden() {
             return None;
         }
 
+        #[cfg(feature = "stats")]
+        let ipdv_ns = row
+            .seq()
+            .and_then(|seq| ipdv_pair(stats, seq))
+            .map(|pair| pair.rtt_ipdv_ns);
+        #[cfg(not(feature = "stats"))]
+        let ipdv_ns = None;
         let context = RenderContext {
-            stats,
+            ipdv_ns,
             target,
             verbose: self.verbose,
         };
@@ -155,7 +165,7 @@ impl OutputConfig {
 
 #[derive(Debug, Clone, Copy)]
 struct RenderContext<'a> {
-    stats: Option<&'a EventStatsUpdate>,
+    ipdv_ns: Option<i128>,
     target: Option<&'a str>,
     verbose: bool,
 }
@@ -817,18 +827,12 @@ fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Opti
             .reply()
             .and_then(|reply| reply.one_way.and_then(|one_way| one_way.client_to_server))
             .map(|value| CellValue::Integer(signed_duration_us(value))),
-        Column::Ipdv => row
-            .seq()
-            .and_then(|seq| ipdv_pair(context.stats, seq))
-            .map(|pair| {
-                CellValue::text(format_signed_duration(SignedDuration::from_nanos(
-                    pair.rtt_ipdv_ns,
-                )))
-            }),
-        Column::IpdvUs => row
-            .seq()
-            .and_then(|seq| ipdv_pair(context.stats, seq))
-            .map(|pair| CellValue::Integer(pair.rtt_ipdv_ns / 1_000)),
+        Column::Ipdv => context.ipdv_ns.map(|value| {
+            CellValue::text(format_signed_duration(SignedDuration::from_nanos(value)))
+        }),
+        Column::IpdvUs => context
+            .ipdv_ns
+            .map(|value| CellValue::Integer(value / 1_000)),
         Column::ServerProcessing => row
             .reply()
             .and_then(|reply| reply.server_timing.and_then(|timing| timing.processing))
@@ -935,6 +939,7 @@ fn server_timing_i64(
         .map(|value| CellValue::Integer(i128::from(value)))
 }
 
+#[cfg(feature = "stats")]
 fn ipdv_pair(stats: Option<&EventStatsUpdate>, seq: u32) -> Option<&IpdvPairUpdate> {
     let stats = stats?;
     stats

@@ -84,11 +84,14 @@ cargo install irtt-rs --locked
 This installs the `irtt-rs` dispatcher plus dedicated `irtt-client`,
 `irtt-tui`, and `irtt-server` binaries. Each applet can also be built in
 isolation with `--no-default-features` plus the applet's own feature, for
-example a lightweight client-only install:
+example a lightweight client-only install without statistics:
 
 ```sh
 cargo install irtt-rs --locked --no-default-features --features client
 ```
+
+Add `stats` (`--features client,stats`) to retain statistics in a client-only
+build. Statistics are enabled by default; the TUI always enables them.
 
 For development, or to install directly from a checkout:
 
@@ -165,6 +168,7 @@ when to use it instead of `irtt-client`/`irtt-server` directly.
 | --- | --- |
 | `--no-default-features` | `irtt-rs` |
 | `--no-default-features --features client` | `irtt-rs`, `irtt-client` |
+| `--no-default-features --features client,stats` | `irtt-rs`, `irtt-client` (with statistics) |
 | `--no-default-features --features server` | `irtt-rs`, `irtt-server` |
 | `--no-default-features --features tui` | `irtt-rs`, `irtt-tui` |
 | Default features (or `--all-features`) | `irtt-rs`, `irtt-client`, `irtt-tui`, `irtt-server` |

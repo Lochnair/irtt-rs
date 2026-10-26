@@ -49,8 +49,11 @@ reports which feature to rebuild with, and `irtt-rs --help` lists which
 applets the current build actually contains.
 
 ```sh
-cargo install irtt-rs --locked --no-default-features --features client
+cargo install irtt-rs --locked --no-default-features --features client,stats
 ```
+
+Use `--features client` to omit statistics. The default build includes the
+`stats` feature, and `tui` always enables it.
 
 ## RELATIONSHIP TO irtt-client, irtt-tui, irtt-server
 
