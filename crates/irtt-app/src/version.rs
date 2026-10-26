@@ -22,10 +22,14 @@ pub(crate) fn parse<T: clap::Parser>(argv: Vec<OsString>, report: fn() -> String
 
 #[cfg(any(feature = "client", feature = "tui"))]
 pub(crate) fn client() -> String {
+    #[cfg(feature = "stats")]
+    let stats = format!("  stats:  {}\n", irtt_stats::VERSION);
+    #[cfg(not(feature = "stats"))]
+    let stats = "  stats: disabled\n";
     format!(
-        "  client: {}\n  stats:  {}\n  proto:  {}\n",
+        "  client: {}\n{}  proto:  {}\n",
         irtt_client::VERSION,
-        irtt_stats::VERSION,
+        stats,
         irtt_proto::VERSION,
     )
 }

@@ -222,7 +222,20 @@ memory a long run retains.
 
 ### Optional recovery and event-only runs
 
-`--no-stats` disables statistics collection and final summaries while preserving individual measurement output. Statistics-dependent columns (such as IPDV) are unavailable. This does not remove the `irtt-stats` dependency.
+`--no-stats` disables statistics collection and final summaries while preserving individual measurement output. Statistics-dependent columns (such as IPDV) are unavailable. This runtime option does not remove the `irtt-stats` dependency.
+
+To omit statistics at compile time, build with:
+
+```sh
+cargo build --release -p irtt-rs --bin irtt-client --no-default-features --features client
+```
+
+Use `--features client,stats` to include statistics in a client-only build.
+Default builds include statistics, and `tui` always enables them. Without
+compiled statistics, `--no-stats` remains accepted, summaries and statistics
+warnings are disabled, and IPDV columns retain their names with absent values
+(`-` in tables, empty CSV/TSV fields, and JSON `null`). Measurement events and
+protocol-level received statistics remain available.
 
 `--reconnect` enables automatic recovery for individual targets in continuous mode (`--continuous` or `--duration 0`). Failed connections, closed sessions, and unresponsive servers are retried without interrupting other targets. Retries use exponential backoff from 250 ms up to 10 seconds.
 

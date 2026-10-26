@@ -55,7 +55,7 @@ pub struct ClientArgs {
         default_value = "10s",
         value_parser = parse_test_duration,
         help = "Test duration (e.g. 2.5s, 1m30s, 1h); use --continuous for continuous mode (0 is also accepted)",
-        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use --continuous for continuous mode (0 is also accepted).\n\nUnless --no-stats is selected, finite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
+        long_help = "Test duration (e.g. 2.5s, 1m30s, 500us, 100ns, 1h); use --continuous for continuous mode (0 is also accepted).\n\nWhen statistics support is compiled in and --no-stats is not selected, finite runs retain exact statistics for final summaries. Continuous mode uses bounded-memory running statistics and prints a final summary when interrupted; --targets-stdin also prints the final retained summary on EOF."
     )]
     pub duration: Duration,
 
@@ -64,6 +64,7 @@ pub struct ClientArgs {
     pub continuous: bool,
 
     /// Disable statistics collection and final summaries; retain measurement event output.
+    /// Accepted even when statistics support is not compiled in.
     #[arg(long)]
     pub no_stats: bool,
 

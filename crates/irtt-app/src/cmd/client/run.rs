@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     io::{self, BufRead, Write},
     sync::Arc,
     thread,
@@ -7,7 +7,7 @@ use std::{
 
 use irtt_client::{
     managed::{
-        ManagedClient, ManagedCommandApplyError, ManagedEndReason, ManagedEvent, ManagedStatus,
+        ManagedClient, ManagedCommandApplyError, ManagedEndReason, ManagedEvent,
         ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
     },
     ClientEvent,
@@ -16,26 +16,25 @@ use irtt_client::{
 use super::{args::ClientArgs, output::OutputConfig};
 
 use crate::shared::client::{
-    expected_probe_count, parse_stdin_target_set,
+    parse_stdin_target_set,
     session::{
         drain_final_events, peer_close_run_error, request_managed_stop_for_peer_close,
-        request_managed_stop_once, should_print_final_summary,
+        request_managed_stop_once,
     },
     worker::ManagedWorker,
     ManagedRunSetup, TargetSpec, STDIN_MAX_DESIRED_TARGETS, STDIN_OUTCOME_HISTORY_LIMIT,
 };
 
+#[cfg(feature = "stats")]
 use irtt_stats::{EventStatsUpdate, StatsCollector, StatsConfig};
 
-const MIB: u64 = 1024 * 1024;
+#[cfg(feature = "stats")]
+use crate::shared::client::{expected_probe_count, session::should_print_final_summary};
+#[cfg(feature = "stats")]
+use irtt_client::managed::ManagedStatus;
+#[cfg(feature = "stats")]
+use std::collections::{BTreeMap, BTreeSet};
 
-const GIB: u64 = 1024 * MIB;
-
-const FINITE_STATS_MEMORY_WARNING_BYTES: u64 = 128 * MIB;
-
-const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
-
-const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
 const MAX_STDIN_RECORD_BYTES: usize = 64 * 1024;
 
 pub async fn run_stream(
@@ -50,6 +49,7 @@ pub async fn run_stream(
         result = args.prepare() => result.map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
         _ = shutdown.wait_for(|requested| *requested) => return Ok(()),
     };
+    #[cfg(feature = "stats")]
     let multi_target = setup.is_multi_target();
     let output_config = OutputConfig::new(
         args.format,
@@ -58,6 +58,7 @@ pub async fn run_stream(
         args.verbose,
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
+    #[cfg(feature = "stats")]
     if let Some(warning) = reconnect_stats_warning(&args) {
         eprintln!("{warning}");
     }
@@ -65,9 +66,9 @@ pub async fn run_stream(
         return run_stdin_stream(setup, output_config, shutdown, &args).await;
     }
     let continuous = args.is_continuous();
-    let target_count = setup.target_count();
 
-    if let Some(warning) = finite_stats_memory_warning(&args, target_count) {
+    #[cfg(feature = "stats")]
+    if let Some(warning) = finite_stats_memory_warning(&args, setup.target_count()) {
         eprintln!("{warning}");
     }
     if *shutdown.borrow() {
@@ -86,15 +87,20 @@ pub async fn run_stream(
     let owner = ManagedWorker::start(task, handle.clone())?;
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     let mut stream_output = StreamOutput {
+        #[cfg(feature = "stats")]
         continuous: args.is_continuous(),
+        #[cfg(feature = "stats")]
         collect_stats: !args.no_stats,
         config: output_config,
         header_printed: false,
+        #[cfg(feature = "stats")]
         print_final_summary: false,
+        #[cfg(feature = "stats")]
         show_running_only_summary_note: false,
         out: &mut stdout,
     };
 
+    #[cfg(feature = "stats")]
     let mut stats = setup
         .targets
         .iter()
@@ -133,7 +139,7 @@ pub async fn run_stream(
             _ = shutdown.changed(), if !interrupted => {}
             changed = status.changed() => { if changed.is_err() { break; } }
             event = events.recv() => match event {
-                Ok(event) => process_event(event, &mut stream_output, &mut stats, &mut terminal_targets)?,
+                Ok(event) => process_event(event, &mut stream_output, #[cfg(feature = "stats")] &mut stats, &mut terminal_targets)?,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     dropped_events = dropped_events.saturating_add(count);
                 }
@@ -146,7 +152,13 @@ pub async fn run_stream(
     }
     let outcome = owner.join().await?;
     drain_final_events(&mut events, &mut dropped_events, |event| {
-        process_event(event, &mut stream_output, &mut stats, &mut terminal_targets)
+        process_event(
+            event,
+            &mut stream_output,
+            #[cfg(feature = "stats")]
+            &mut stats,
+            &mut terminal_targets,
+        )
     })?;
     if let Some(warning) = dropped_event_warning(dropped_events) {
         eprintln!("{warning}");
@@ -180,22 +192,25 @@ pub async fn run_stream(
                     })
             }),
     };
-    stream_output.print_final_summary =
-        !args.no_stats && !args.no_test && should_print_final_summary(continuous, interrupted);
-    stream_output.show_running_only_summary_note =
-        continuous && interrupted && stream_output.print_final_summary;
-    for target in &setup.targets {
-        let Some(target_stats) = stats.get(&target.label) else {
-            continue;
-        };
-        if multi_target
-            && stream_output.print_final_summary
-            && stream_output.config.prints_summary()
-        {
-            writeln!(stream_output.out)?;
-            writeln!(stream_output.out, "target: {}", target.label)?;
+    #[cfg(feature = "stats")]
+    {
+        stream_output.print_final_summary =
+            !args.no_stats && !args.no_test && should_print_final_summary(continuous, interrupted);
+        stream_output.show_running_only_summary_note =
+            continuous && interrupted && stream_output.print_final_summary;
+        for target in &setup.targets {
+            let Some(target_stats) = stats.get(&target.label) else {
+                continue;
+            };
+            if multi_target
+                && stream_output.print_final_summary
+                && stream_output.config.prints_summary()
+            {
+                writeln!(stream_output.out)?;
+                writeln!(stream_output.out, "target: {}", target.label)?;
+            }
+            stream_output.print_summary(target_stats)?;
         }
-        stream_output.print_summary(target_stats)?;
     }
     stream_output.out.flush()?;
     if let Some(error) = terminal_error {
@@ -370,16 +385,18 @@ impl BoundedTargetSet {
 fn process_stdin_event<W: Write>(
     event: ManagedEvent,
     stream_output: &mut StreamOutput<'_, W>,
-    stats: &mut BTreeMap<TargetInstance, StatsCollector>,
+    #[cfg(feature = "stats")] stats: &mut BTreeMap<TargetInstance, StatsCollector>,
     terminal_targets: &mut BoundedTargetSet,
 ) -> io::Result<()> {
     match event {
+        #[cfg(feature = "stats")]
         ManagedEvent::TargetStateChanged { target, .. } if stream_output.collect_stats => {
             stats
                 .entry(target)
                 .or_insert_with(|| StatsCollector::new(stats_config(true)));
         }
         ManagedEvent::Client { target, event } => {
+            #[cfg(feature = "stats")]
             let update = stream_output.collect_stats.then(|| {
                 let collector = stats
                     .entry(target.clone())
@@ -389,7 +406,12 @@ fn process_stdin_event<W: Write>(
                 }
                 collector.process(&event)
             });
-            stream_output.print_event(&event, Some(target.id.as_str()), update.as_ref())?;
+            stream_output.print_event(
+                &event,
+                Some(target.id.as_str()),
+                #[cfg(feature = "stats")]
+                update.as_ref(),
+            )?;
         }
         ManagedEvent::TargetFinished { outcome }
             if terminal_targets.insert(outcome.target.clone()) =>
@@ -401,6 +423,7 @@ fn process_stdin_event<W: Write>(
     Ok(())
 }
 
+#[cfg(feature = "stats")]
 fn reconcile_stdin_stats(
     stats: &mut BTreeMap<TargetInstance, StatsCollector>,
     status: &ManagedStatus,
@@ -417,6 +440,7 @@ fn reconcile_stdin_stats(
     });
 }
 
+#[cfg(feature = "stats")]
 fn snapshot_stdin_summary_targets(
     stats: &mut BTreeMap<TargetInstance, StatsCollector>,
     status: &ManagedStatus,
@@ -470,14 +494,19 @@ async fn run_stdin_stream(
 
     let mut stdout = io::LineWriter::new(io::stdout().lock());
     let mut stream_output = StreamOutput {
+        #[cfg(feature = "stats")]
         continuous: args.is_continuous(),
+        #[cfg(feature = "stats")]
         collect_stats: !args.no_stats,
         config: output_config,
         header_printed: false,
+        #[cfg(feature = "stats")]
         print_final_summary: false,
+        #[cfg(feature = "stats")]
         show_running_only_summary_note: false,
         out: &mut stdout,
     };
+    #[cfg(feature = "stats")]
     let mut stats = BTreeMap::new();
     let mut terminal_targets = BoundedTargetSet::new(STDIN_OUTCOME_HISTORY_LIMIT);
     let mut stdin_changed = false;
@@ -491,6 +520,7 @@ async fn run_stdin_stream(
     let mut dropped_events = 0_u64;
     let mut stop_requested = false;
     let mut stop = None;
+    #[cfg(feature = "stats")]
     let mut summary_targets = None;
     loop {
         let snapshot = status.borrow_and_update().clone();
@@ -542,16 +572,20 @@ async fn run_stdin_stream(
             }
             if stop.is_some() {
                 preparing = None;
-                summary_targets = Some(snapshot_stdin_summary_targets(
-                    &mut stats,
-                    &snapshot,
-                    !args.no_stats,
-                ));
+                #[cfg(feature = "stats")]
+                {
+                    summary_targets = Some(snapshot_stdin_summary_targets(
+                        &mut stats,
+                        &snapshot,
+                        !args.no_stats,
+                    ));
+                }
                 if request_managed_stop_once(&mut stop_requested) {
                     drop(handle.stop());
                 }
             }
         }
+        #[cfg(feature = "stats")]
         reconcile_stdin_stats(&mut stats, &snapshot, summary_targets.as_ref());
         if snapshot.final_outcome.is_some() {
             break;
@@ -573,7 +607,10 @@ async fn run_stdin_stream(
                         }
                         Err(error) => {
                             stop = Some(StdinStop::Fatal(format!("invalid --targets-stdin target set: {error}")));
-                            summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow(), !args.no_stats));
+                            #[cfg(feature = "stats")]
+                            {
+                                summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow(), !args.no_stats));
+                            }
                             if request_managed_stop_once(&mut stop_requested) { drop(handle.stop()); }
                         }
                     }
@@ -594,14 +631,18 @@ async fn run_stdin_stream(
                     }
                     Err(_) => {
                         stop = Some(StdinStop::Fatal("--targets-stdin update was rejected".to_owned()));
-                        summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow(), !args.no_stats));
+                        #[cfg(feature = "stats")]
+                        {
+                            summary_targets = Some(snapshot_stdin_summary_targets(&mut stats, &status.borrow(), !args.no_stats));
+                        }
                         if request_managed_stop_once(&mut stop_requested) { drop(handle.stop()); }
                     }
                 }
             }
             event = events.recv() => match event {
                 Ok(event) => {
-                    process_stdin_event(event, &mut stream_output, &mut stats, &mut terminal_targets)?;
+                    process_stdin_event(event, &mut stream_output, #[cfg(feature = "stats")] &mut stats, &mut terminal_targets)?;
+                    #[cfg(feature = "stats")]
                     reconcile_stdin_stats(&mut stats, &status.borrow(), summary_targets.as_ref());
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
@@ -614,7 +655,13 @@ async fn run_stdin_stream(
 
     let outcome = owner.join().await?;
     drain_final_events(&mut events, &mut dropped_events, |event| {
-        process_stdin_event(event, &mut stream_output, &mut stats, &mut terminal_targets)
+        process_stdin_event(
+            event,
+            &mut stream_output,
+            #[cfg(feature = "stats")]
+            &mut stats,
+            &mut terminal_targets,
+        )
     })?;
     if let Some(warning) = dropped_event_warning(dropped_events) {
         eprintln!("{warning}");
@@ -631,25 +678,28 @@ async fn run_stdin_stream(
         );
     }
 
-    let print_summary =
-        !args.no_stats && matches!(stop, Some(StdinStop::Interrupted | StdinStop::Eof));
-    stream_output.print_final_summary = print_summary;
-    stream_output.show_running_only_summary_note = print_summary;
-    if let Some(summary_targets) = summary_targets {
-        let multi_target = summary_targets.len() > 1;
-        for target in summary_targets {
-            let stats = stats
-                .get(&target)
-                .expect("summary snapshot retains every selected target collector");
-            if multi_target && stream_output.config.prints_summary() {
-                writeln!(stream_output.out)?;
-                writeln!(
-                    stream_output.out,
-                    "target: {} (generation {})",
-                    target.id, target.generation
-                )?;
+    #[cfg(feature = "stats")]
+    {
+        let print_summary =
+            !args.no_stats && matches!(stop, Some(StdinStop::Interrupted | StdinStop::Eof));
+        stream_output.print_final_summary = print_summary;
+        stream_output.show_running_only_summary_note = print_summary;
+        if let Some(summary_targets) = summary_targets {
+            let multi_target = summary_targets.len() > 1;
+            for target in summary_targets {
+                let stats = stats
+                    .get(&target)
+                    .expect("summary snapshot retains every selected target collector");
+                if multi_target && stream_output.config.prints_summary() {
+                    writeln!(stream_output.out)?;
+                    writeln!(
+                        stream_output.out,
+                        "target: {} (generation {})",
+                        target.id, target.generation
+                    )?;
+                }
+                stream_output.print_summary(stats)?;
             }
-            stream_output.print_summary(stats)?;
         }
     }
     stream_output.out.flush()?;
@@ -668,11 +718,12 @@ async fn run_stdin_stream(
 fn process_event<W: Write>(
     event: ManagedEvent,
     stream_output: &mut StreamOutput<'_, W>,
-    stats: &mut BTreeMap<String, StatsCollector>,
+    #[cfg(feature = "stats")] stats: &mut BTreeMap<String, StatsCollector>,
     terminal_targets: &mut HashSet<TargetInstance>,
 ) -> io::Result<()> {
     match event {
         ManagedEvent::Client { target, event } => {
+            #[cfg(feature = "stats")]
             let update = stream_output.collect_stats.then(|| {
                 let collector = stats
                     .get_mut(target.id.as_str())
@@ -683,7 +734,12 @@ fn process_event<W: Write>(
                 }
                 collector.process(&event)
             });
-            stream_output.print_event(&event, Some(target.id.as_str()), update.as_ref())?;
+            stream_output.print_event(
+                &event,
+                Some(target.id.as_str()),
+                #[cfg(feature = "stats")]
+                update.as_ref(),
+            )?;
         }
         ManagedEvent::TargetFinished { outcome } => {
             terminal_targets.insert(outcome.target.clone());
@@ -717,15 +773,24 @@ fn target_failure_messages(target: &ManagedTargetOutcome) -> Vec<String> {
     messages
 }
 fn dropped_event_warning(dropped_events: u64) -> Option<String> {
-    (dropped_events > 0).then(|| format!("irtt-rs: warning: dropped {dropped_events} managed run event{}; output and statistics may be incomplete", if dropped_events == 1 { "" } else { "s" }))
+    let affected = if cfg!(feature = "stats") {
+        "output and statistics"
+    } else {
+        "output"
+    };
+    (dropped_events > 0).then(|| format!("irtt-rs: warning: dropped {dropped_events} managed run event{}; {affected} may be incomplete", if dropped_events == 1 { "" } else { "s" }))
 }
 
 struct StreamOutput<'a, W: Write> {
+    #[cfg(feature = "stats")]
     continuous: bool,
+    #[cfg(feature = "stats")]
     collect_stats: bool,
     config: OutputConfig,
     header_printed: bool,
+    #[cfg(feature = "stats")]
     print_final_summary: bool,
+    #[cfg(feature = "stats")]
     show_running_only_summary_note: bool,
     out: &'a mut W,
 }
@@ -734,10 +799,15 @@ impl<W: Write> StreamOutput<'_, W> {
         &mut self,
         event: &ClientEvent,
         target: Option<&str>,
-        update: Option<&EventStatsUpdate>,
+        #[cfg(feature = "stats")] update: Option<&EventStatsUpdate>,
     ) -> io::Result<()> {
         self.print_header()?;
-        if let Some(line) = self.config.render_event(event, target, update) {
+        if let Some(line) = self.config.render_event(
+            event,
+            target,
+            #[cfg(feature = "stats")]
+            update,
+        ) {
             writeln!(self.out, "{line}")?;
         }
         Ok(())
@@ -753,6 +823,7 @@ impl<W: Write> StreamOutput<'_, W> {
         Ok(())
     }
 
+    #[cfg(feature = "stats")]
     fn print_summary(&mut self, stats: &StatsCollector) -> io::Result<()> {
         if self.print_final_summary && self.config.prints_summary() {
             write!(
@@ -771,6 +842,7 @@ impl<W: Write> StreamOutput<'_, W> {
     }
 }
 
+#[cfg(feature = "stats")]
 fn stats_config(continuous: bool) -> StatsConfig {
     if continuous {
         StatsConfig::continuous()
@@ -778,7 +850,17 @@ fn stats_config(continuous: bool) -> StatsConfig {
         StatsConfig::finite()
     }
 }
+#[cfg(feature = "stats")]
 fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option<String> {
+    const MIB: u64 = 1024 * 1024;
+
+    const GIB: u64 = 1024 * MIB;
+
+    const FINITE_STATS_MEMORY_WARNING_BYTES: u64 = 128 * MIB;
+
+    const FINITE_STATS_MEMORY_STRONG_WARNING_BYTES: u64 = 512 * MIB;
+
+    const FINITE_STATS_MEMORY_VERY_STRONG_WARNING_BYTES: u64 = GIB;
     if args.no_stats || args.no_test || args.is_continuous() || args.duration.is_zero() {
         return None;
     }
@@ -807,7 +889,7 @@ fn finite_stats_memory_warning(args: &ClientArgs, target_count: usize) -> Option
     Some(format!("irtt-rs: warning: finite exact statistics may retain about {formatted} for this run; {guidance}"))
 }
 
+#[cfg(feature = "stats")]
 fn reconnect_stats_warning(args: &ClientArgs) -> Option<&'static str> {
     (args.reconnect && !args.no_stats).then_some("irtt-rs: warning: statistics spanning multiple sessions may not accurately represent one uninterrupted measurement run; use --no-stats for measurement events only. Session statistics reset on reconnect.")
 }
-

@@ -11,8 +11,13 @@ Installing this crate builds:
 - `irtt-tui` — the interactive terminal UI (feature `tui`).
 - `irtt-server` — the dedicated server binary (feature `server`).
 
-All three features are enabled by default, so a plain `cargo install irtt-rs`
-installs everything.
+The `client`, `server`, `tui`, and `stats` features are enabled by default, so a
+plain `cargo install irtt-rs` installs everything. The TUI requires statistics
+and enables `stats` automatically.
+
+For a client without statistics, use
+`cargo install irtt-rs --locked --no-default-features --features client --bin irtt-client`.
+Use `--features client,stats` for a client-only build with statistics.
 
 ## This is an application, not a library
 

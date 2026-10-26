@@ -57,12 +57,13 @@ pub(crate) fn format_ns_i128(value: i128) -> String {
 }
 
 /// Format an optional nanosecond scalar, rendering `None` as [`ABSENT`].
+#[cfg(any(all(feature = "client", feature = "stats"), feature = "tui"))]
 pub(crate) fn format_optional_ns_i128(value: Option<i128>) -> String {
     value.map(format_ns_i128).unwrap_or_else(absent)
 }
 
 /// Format an optional nanosecond scalar, rendering `None` as [`ABSENT`].
-#[cfg(feature = "client")]
+#[cfg(all(feature = "client", feature = "stats"))]
 pub(crate) fn format_optional_ns_f64(value: Option<f64>) -> String {
     value.map(format_ns_f64).unwrap_or_else(absent)
 }
@@ -80,6 +81,7 @@ pub(crate) fn format_signed_duration(value: SignedDuration) -> String {
 
 /// Format a percentage with two decimals; non-finite values render as
 /// [`ABSENT`].
+#[cfg(any(all(feature = "client", feature = "stats"), feature = "tui"))]
 pub(crate) fn format_percent(value: f64) -> String {
     if value.is_finite() {
         format!("{value:.2}%")
@@ -112,6 +114,7 @@ pub(crate) fn format_optional_count(value: Option<u64>) -> String {
     value.map(format_count).unwrap_or_else(absent)
 }
 
+#[cfg(any(all(feature = "client", feature = "stats"), feature = "tui"))]
 fn absent() -> String {
     ABSENT.to_owned()
 }
