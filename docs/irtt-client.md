@@ -115,7 +115,8 @@ A fixed local port may cause binding conflicts when multiple target sockets are 
 
 ## DYNAMIC TARGET SETS FROM STANDARD INPUT
 
-`--targets-stdin` is available only with continuous mode (`--duration 0`).
+`--targets-stdin` is available only with continuous mode (`--continuous` or
+`--duration 0`).
 Positional targets remain an initial desired set, and may be omitted to
 start empty:
 
@@ -208,12 +209,14 @@ Omitting the option preserves the library default schedule.
 `--duration` controls the run length:
 
 - Any nonzero duration (default `10s`) is a **finite** run: probing stops
-  after that long, and a final summary is always printed for table output
-  (see [OUTPUT](#output) below — CSV, TSV, and JSON Lines never print one).
-- `--duration 0` is **continuous**: the client runs until interrupted
-  (`Ctrl-C`). For table output, a final summary is printed only if the run
-  was interrupted. Stdin-controlled mode is the exception: EOF also requests
-  a graceful stop and prints the final retained summary. An uninterrupted
+  after that long, and a final summary is printed for table output when
+  statistics are enabled (see [OUTPUT](#output) below — CSV, TSV, and
+  JSON Lines never print one).
+- `--continuous` (or `--duration 0`) is **continuous**: the client runs until
+  interrupted (`Ctrl-C`). With statistics enabled and table output, a final
+  summary is printed only if the run was interrupted. Stdin-controlled mode
+  is the exception: EOF also requests a graceful stop and prints the final
+  retained summary. An uninterrupted
   continuous run that exits for another reason does not get one.
 
 See [MEASUREMENTS AND MEMORY](#measurements-and-memory) below for why this
@@ -249,6 +252,8 @@ Example for continuous, multi-target CSV output without statistics:
 
 ```sh
 irtt-client --continuous --reconnect --no-stats \
+  --reconnect-timeout 10s \
+  --reconnect-initial-delay 250ms --reconnect-max-delay 10s \
   --format csv --header never \
   --columns client_receive_wall_ns,target,seq,rd_us,sd_us \
   reflector1 reflector2
@@ -344,6 +349,10 @@ processing time is derived from the same server receive endpoint.
 
 ## MEASUREMENTS AND MEMORY
 
+The statistics retention below applies only when the `stats` feature is compiled
+in and `--no-stats` is absent. Disabling collection keeps the client
+classification bounds but allocates no statistics collectors.
+
 Finite and continuous modes make a different tradeoff between exact
 statistics and bounded memory.
 
@@ -394,9 +403,10 @@ the client exits nonzero — so a process supervisor can restart it; an
 interrupted run (`Ctrl-C`) never reports peer closure as an error, whichever
 mode it was in.
 
-With `--targets-stdin`, peer closure is target-local: other desired targets
-and the stdin controller continue running. Including that target in a later
-complete set starts a fresh generation.
+With `--reconnect`, a desired target reopens automatically after peer closure.
+Without recovery, `--targets-stdin` makes peer closure target-local: other
+desired targets and the stdin controller continue running. Including that
+target in a later complete set starts a fresh generation.
 
 ## EXIT STATUS
 

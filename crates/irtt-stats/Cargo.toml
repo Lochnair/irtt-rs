@@ -1,6 +1,6 @@
 [package]
 name = "irtt-stats"
-version = "0.5.2"
+version = "0.6.0"
 description = "Statistics aggregation for irtt-client events"
 edition.workspace = true
 license.workspace = true

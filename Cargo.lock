@@ -857,7 +857,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-client"
-version = "0.6.0"
+version = "0.7.0"
 dependencies = [
  "irtt-proto",
  "irtt-server",
@@ -879,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-proto"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "hmac",
  "md-5",
@@ -890,7 +890,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-rs"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "chrono",
  "clap",
@@ -911,7 +911,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-server"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "getrandom 0.4.3",
  "irtt-proto",
@@ -923,7 +923,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-stats"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "irtt-client",
  "measurement-stats",

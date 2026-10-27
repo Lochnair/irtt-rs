@@ -16,10 +16,16 @@ re-export. Event interpretation, IPDV pairing, loss, and snapshot reconstruction
 remain here.
 
 A `StatsCollector` has one sequence/IPDV namespace and one packet count, both
-scoped to a single target. A managed session covering multiple targets needs
-one collector per target — as the `irtt-rs` CLI does — since a target's
+scoped to a single target session. A managed session covering multiple targets
+needs one collector per target — as the `irtt-rs` CLI does — since a target's
 sequence numbers start over at zero and feeding two targets into one
-collector would pair up unrelated probes.
+collector would pair up unrelated probes. Reset or replace the collector when a
+target reconnects, since the new session restarts its sequence numbers.
+
+Version 0.6 consumes `irtt-client` 0.7 events. Applications using both crates
+must upgrade them together to avoid incompatible `ClientEvent` types.
+`IpdvPairUpdate` exposes signed nanosecond changes alongside the existing
+absolute `Duration` values; aggregate IPDV statistics remain absolute magnitudes.
 
 ## Retention modes
 

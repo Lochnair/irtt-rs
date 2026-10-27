@@ -132,7 +132,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-proto"
-version = "0.5.1"
+version = "0.5.2"
 dependencies = [
  "hmac",
  "md-5",
@@ -152,7 +152,7 @@ dependencies = [
 
 [[package]]
 name = "irtt-server"
-version = "0.5.3"
+version = "0.5.4"
 dependencies = [
  "getrandom",
  "irtt-proto",

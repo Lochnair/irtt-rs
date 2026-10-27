@@ -35,6 +35,21 @@ Use `ClientEvent::from(receipt)` for an `EchoSent` event with `scheduled_at` and
 `timer_error` absent; the managed driver supplies those schedule measurements
 and publishes committed sends even when post-send processing fails.
 
+Managed continuous measurement runs can opt into automatic recovery with
+`ManagedClientConfig.reconnect_timeout: Some(timeout)`. Initial connection
+failures, closed/failed sessions, server-limited completion, and reply silence
+while sending trigger independent per-target retries. `reconnect_initial_delay`
+(default 250 ms) doubles to `reconnect_max_delay` (default 10 s); a valid reply
+resets the delay. Both delays must be positive and schedulable, with the maximum
+at least twice the initial delay. Explicit stop and target removal cancel retries.
+Recovery is disabled by default and is invalid for finite or negotiation-only runs.
+
+In 0.7, complete `ManagedClientConfig` literals must include the three recovery
+fields (or use `..Default::default()`), and exhaustive `ManagedConfigError`
+matches must handle the new recovery-policy variants. A target can emit repeated
+session-start events within one instance; reset session-bound state, including
+statistics, for each reopened session. Use `irtt-stats` 0.6 with client 0.7 events.
+
 Tokio stays optional: the default build has no runtime and no Tokio
 dependency at all.
 

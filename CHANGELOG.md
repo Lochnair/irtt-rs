@@ -10,6 +10,12 @@ release. The format is loosely based on
 
 ## irtt-proto
 
+### 0.5.2
+
+#### Added
+
+- Exported `VERSION`, the compiled crate's Cargo package version, for applications reporting their component versions. Wire behavior is unchanged.
+
 ### 0.5.1
 
 #### Added
@@ -33,6 +39,25 @@ release. The format is loosely based on
 - The echo-reply length codec now accepts upstream `irtt`'s longer midpoint-echo compatibility length instead of rejecting it, fixing an interop gap against real upstream servers/clients that send that length.
 
 ## irtt-client
+
+### 0.7.0
+
+#### Added
+
+- Opt-in automatic session reconnection in the Tokio managed driver and `BlockingManagedClient`. Continuous measurement runs can retry initial connection failures, failed or peer-closed sessions, and server-limited session completion. Silence detection reconnects a session that stops replying while probes are being sent.
+- Each desired target retries independently, leaving healthy targets running. Exponential backoff doubles from `reconnect_initial_delay` (default 250 ms) to `reconnect_max_delay` (default 10 s); a valid reply restores the initial delay. Reopening resolves the original endpoint again. Target removal and explicit shutdown cancel recovery.
+- Exported `VERSION` for compiled component-version reporting.
+
+#### Fixed
+
+- Stopping or replacing a target during session opening cancels the pending open immediately, instead of waiting for its retry schedule to finish.
+
+#### Compatibility
+
+- `ManagedClientConfig` gains `reconnect_timeout`, `reconnect_initial_delay`, and `reconnect_max_delay`; update complete struct literals or use `..Default::default()`. Reconnection is disabled by default (`reconnect_timeout: None`) and is valid only for continuous normal measurement mode, with a positive schedulable silence timeout. Retry delays must be positive and schedulable, and the maximum must be at least twice the initial delay.
+- `ManagedConfigError` gains `InvalidReconnectPolicy` and `InvalidReconnectDelays`; downstream exhaustive matches must handle them. Delay validation applies even when recovery is disabled.
+- A reconnecting target returns to pending/opening status rather than producing a terminal outcome for each retry. Consumers must handle repeated session-start events for the same target instance and reset session-bound statistics and sequence tracking on each new session.
+- Use `irtt-stats` 0.6 with this client version when exchanging `ClientEvent` values. Tokio remains optional; the default low-level client remains runtime-free. No wire-protocol migration is required.
 
 ### 0.6.0
 
@@ -105,6 +130,12 @@ release. The format is loosely based on
 
 ## irtt-server
 
+### 0.5.4
+
+#### Added
+
+- Exported `VERSION`, the compiled crate's Cargo package version, for applications reporting their component versions. Server policy and wire behavior are unchanged.
+
 ### 0.5.3
 
 #### Added
@@ -150,6 +181,23 @@ release. The format is loosely based on
 
 ## irtt-stats
 
+### 0.6.0
+
+#### Changed
+
+- Updated the public `irtt-client` dependency to 0.7. Applications passing `ClientEvent` values into this crate must upgrade both dependencies together; client 0.6 and 0.7 event types come from different crate versions and cannot be mixed.
+- Added signed nanosecond changes to `IpdvPairUpdate`: `rtt_ipdv_ns`, `send_ipdv_ns`, and `receive_ipdv_ns`. Existing `Duration` fields and aggregate IPDV statistics remain absolute magnitudes. Update complete struct literals to include the new fields.
+- Exported `VERSION` for compiled component-version reporting.
+
+#### Fixed
+
+- Directional IPDV is available with midpoint timestamps, using the midpoint for both server endpoints.
+- Per-packet IPDV preserves the sign of the delay change instead of reporting only its magnitude.
+
+#### Compatibility
+
+- Collectors remain scoped to one target session. Reset or replace a collector when the managed client reconnects; this release does not aggregate across session sequence resets.
+
 ### 0.5.2
 
 #### Changed
@@ -191,6 +239,30 @@ release. The format is loosely based on
 - `StatsConfig::estimated_retained_bytes(probe_count)` gives callers an API to estimate the memory a stats configuration will retain for a given probe count, ahead of actually running a session (used by `irtt-cli`'s multi-target memory-usage warning, see below).
 
 ## irtt-rs
+
+### 0.10.0
+
+#### Added
+
+- Continuous CLI recovery with `--continuous --reconnect` (or `--duration 0 --reconnect`). Failed initial opens, failed or closed sessions, server-limited completion, and reply silence trigger independent per-target retries. Healthy targets keep running, including in multi-target and `--targets-stdin` runs; removing a desired target cancels its retries.
+- `--reconnect-timeout` configures reply-silence detection while sending (default 10 s). `--reconnect-initial-delay` and `--reconnect-max-delay` configure per-target exponential backoff (defaults 250 ms and 10 s); the maximum must be at least twice the initial delay. Valid replies reset the backoff. Explicit stops do not retry.
+- `--no-stats` disables client statistics collection, retention warnings, and final summaries while retaining measurement events and structured output columns. Statistics-dependent fields have absent values.
+- Optional `stats` Cargo feature, enabled by default and required by `tui`. Build a lightweight client without statistics using `cargo build --release -p irtt-rs --bin irtt-client --no-default-features --features client`; use `--features client,stats` for a client-only build with statistics.
+- `--continuous` as an explicit alias for zero duration, `-d` for duration, `-i` for interval, `-l` for packet length, client `-f` for output format, and `-v` for verbose output. Client/TUI durations accept fractional and composite values such as `2.5s` and `1m30s`.
+- Client/TUI `--timeouts` configures the session-opening attempt schedule independently of session reconnection.
+- Client `-n` / `--no-test` negotiates parameters and exits without measurement probes, using the selected output format.
+- `--version` on the dispatcher and applets; applets also report their compiled library versions and whether client statistics are disabled.
+
+#### Fixed
+
+- Signed per-packet IPDV is preserved in output; directional IPDV is available with midpoint timestamps.
+
+#### Compatibility
+
+- Reconnection is opt-in for the CLI and requires continuous measurement mode; it cannot be combined with `--no-test`. Statistics reset on every reopened session, so summaries describe only the latest session per target, not the whole continuous run. A warning explains this when recovery and statistics are both enabled. Continuous TUI recovery remains enabled as before.
+- Statistics are no longer implied by the `client` feature. Existing custom builds using `--no-default-features --features client` must add `stats` to retain collection and summaries. `--no-stats` is accepted in builds without statistics; output schemas are preserved, with absent IPDV values.
+- Nonzero duration values require units; zero (including `0s`) still selects continuous mode. `--continuous` and an explicit `--duration` are mutually exclusive.
+- Application-library users must account for the added client argument/configuration fields and optional statistics feature. Dependencies are now client 0.7 and stats 0.6, with proto >=0.5.2 and server >=0.5.4 for component-version reporting. MSRV remains Rust 1.88.
 
 ### 0.9.0
 
@@ -330,10 +402,15 @@ Starting with this release, crates are versioned and tagged independently
 rather than in lockstep. Each crate's release is tagged as `<crate>/vX.Y.Z`
 (e.g. `irtt-proto/v0.5.0`), pointing at the commit its version was released
 from. `irtt-proto`, `irtt-client`, `irtt-server`, and `irtt-stats` are
-libraries published to [crates.io](https://crates.io); their tags exist to
+libraries published to [crates.io](https://crates.io); publication is a separate
+manual Cargo step. Their tags exist to
 identify the exact source for a given crates.io release and do not produce a
 GitHub Release. The application package (`irtt-cli` through 0.5.0, `irtt-rs`
 from 0.6.0 onward) is the only package with prebuilt binary artifacts: pushing
 an `irtt-rs/vX.Y.Z` tag triggers [cargo-dist](https://opensource.axo.dev/cargo-dist/)
-to build and publish a GitHub Release with platform binaries. The historical
+to build and publish a GitHub Release with platform binaries. On Gitea, the
+same application tag triggers the server Docker image workflow, publishing
+`X.Y.Z` and `latest` to Gitea and GHCR. Library tags
+trigger the Gitea Semver workflow, but neither binary nor image publication.
+The application tag also triggers that Semver check. The historical
 `irtt-cli/v0.5.0` tag remains as released; it is not rewritten or replaced.

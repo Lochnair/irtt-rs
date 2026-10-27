@@ -45,8 +45,8 @@ this project's interop harness.
 | --- | --- | --- |
 | Wire protocol | Protocol version 1, verified against upstream v0.9.1 | Protocol version 1 (unchanged in v0.9.2) |
 | Finite probing | Supported, default 10s | Supported, default 1m |
-| Continuous/indefinite operation | Supported (`--duration 0`); still computes running statistics (see below) | Supported via streaming mode (`-s`, added in v0.9.2); computes no statistics at all in that mode |
-| Statistics in continuous mode | Running count/min/max/mean/variance per target; exact medians unavailable; bounded IPDV tracking | None in streaming mode — raw/event output only, by design, to avoid unbounded memory |
+| Continuous/indefinite operation | Supported (`--continuous` or `--duration 0`), with optional per-target reconnection | Supported via streaming mode (`-s`, added in v0.9.2); computes no statistics at all in that mode |
+| Statistics in continuous mode | Optional running count/min/max/mean/variance per session; no exact medians; bounded IPDV tracking. Use `--no-stats` or omit the `stats` feature to disable collection | None in streaming mode — raw/event output only, by design, to avoid unbounded memory |
 | Multi-target probing (one invocation) | Supported, with labels and staggered/burst pacing | Not supported — one remote address per invocation |
 | Terminal UI | `irtt-tui`, a live graph/dashboard applet | Not present |
 | Output formats | table, csv, tsv, jsonl, with selectable columns | Text summary, JSON (optionally gzip to file), and a fixed-field raw mode; no CSV/TSV and no column selection |
@@ -115,8 +115,15 @@ irtt-client --no-test netperf-eu.bufferbloat.net:2112
 Probe continuously until interrupted (`Ctrl-C`):
 
 ```sh
-irtt-client netperf-eu.bufferbloat.net:2112 --duration 0
+irtt-client netperf-eu.bufferbloat.net:2112 --continuous
+
+# Recover failed, closed, or silent sessions independently per target
+irtt-client netperf-eu.bufferbloat.net:2112 --continuous --reconnect \
+  --reconnect-timeout 10s --reconnect-initial-delay 250ms --reconnect-max-delay 10s
 ```
+
+Reconnection resets statistics for that target; summaries cover its latest
+session. Add `--no-stats` for measurement events without statistics collection.
 
 Watch the same session live in the terminal UI:
 
