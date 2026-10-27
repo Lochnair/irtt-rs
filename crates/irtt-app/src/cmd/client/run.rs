@@ -8,7 +8,7 @@ use std::{
 use irtt_client::{
     managed::{
         ManagedClient, ManagedCommandApplyError, ManagedEndReason, ManagedEvent,
-        ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
+        ManagedEventTryRecvError, ManagedTargetEndReason, ManagedTargetOutcome, TargetInstance,
     },
     ClientEvent,
 };
@@ -18,8 +18,7 @@ use super::{args::ClientArgs, output::OutputConfig};
 use crate::shared::client::{
     parse_stdin_target_set,
     session::{
-        drain_final_events, peer_close_run_error, request_managed_stop_for_peer_close,
-        request_managed_stop_once,
+        peer_close_run_error, request_managed_stop_for_peer_close, request_managed_stop_once,
     },
     worker::ManagedWorker,
     ManagedRunSetup, TargetSpec, STDIN_MAX_DESIRED_TARGETS, STDIN_OUTCOME_HISTORY_LIMIT,
@@ -37,6 +36,28 @@ use std::collections::{BTreeMap, BTreeSet};
 
 const MAX_STDIN_RECORD_BYTES: usize = 64 * 1024;
 
+// The frontend only renders into memory. This thread is the sole stdout owner;
+// dropping its JoinHandle deliberately detaches a writer blocked in a pipe.
+struct StdoutWriter {
+    sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+}
+
+impl StdoutWriter {
+    async fn send(&self, buffer: &mut Vec<u8>) -> io::Result<()> {
+        if !buffer.is_empty() {
+            // Reserve before taking the buffer: cancellation never discards an
+            // already accepted chunk, and normal operation preserves ordering.
+            let permit = self
+                .sender
+                .reserve()
+                .await
+                .map_err(|_| io::Error::other("stdout writer stopped accepting output"))?;
+            permit.send(std::mem::take(buffer));
+        }
+        Ok(())
+    }
+}
+
 pub async fn run_stream(
     args: ClientArgs,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
@@ -45,6 +66,53 @@ pub async fn run_stream(
         print!("{}", OutputConfig::list_columns());
         return Ok(());
     }
+    let (sender, mut receiver) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let (completed, mut completion) = tokio::sync::oneshot::channel();
+    let writer = thread::Builder::new()
+        .name("irtt-stdout".to_owned())
+        .spawn(move || {
+            let result = (|| {
+                let mut stdout = io::LineWriter::new(io::stdout().lock());
+                while let Some(chunk) = receiver.blocking_recv() {
+                    stdout.write_all(&chunk)?;
+                }
+                stdout.flush()
+            })();
+            let _ = completed.send(result);
+        })?;
+    let output = StdoutWriter { sender };
+    let run_shutdown = shutdown.clone();
+    let result = tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|requested| *requested) => return Ok(()),
+        result = &mut completion => {
+            // Dropping the run future stops and joins its ManagedWorker first.
+            writer.join().map_err(|_| io::Error::other("stdout writer thread panicked"))?;
+            result.map_err(|_| io::Error::other("stdout writer completed without a result"))??;
+            return Err(io::Error::other("stdout writer stopped unexpectedly").into());
+        }
+        result = run_stream_output(args, run_shutdown, &output) => result,
+    };
+    drop(output);
+    // The same cancellation guard applies after the managed worker has ended,
+    // while queued events and summaries are still being written.
+    let written = tokio::select! {
+        biased;
+        _ = shutdown.wait_for(|requested| *requested) => return result,
+        result = &mut completion => result,
+    };
+    writer
+        .join()
+        .map_err(|_| io::Error::other("stdout writer thread panicked"))?;
+    written.map_err(|_| io::Error::other("stdout writer completed without a result"))??;
+    result
+}
+
+async fn run_stream_output(
+    args: ClientArgs,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+    output: &StdoutWriter,
+) -> Result<(), Box<dyn std::error::Error>> {
     let setup = tokio::select! {
         result = args.prepare() => result.map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
         _ = shutdown.wait_for(|requested| *requested) => return Ok(()),
@@ -63,7 +131,7 @@ pub async fn run_stream(
         eprintln!("{warning}");
     }
     if setup.stdin_controlled {
-        return run_stdin_stream(setup, output_config, shutdown, &args).await;
+        return run_stdin_stream(setup, output_config, shutdown, &args, output).await;
     }
     let continuous = args.is_continuous();
 
@@ -87,7 +155,7 @@ pub async fn run_stream(
     let mut events = handle.subscribe()?;
     let mut status = handle.subscribe_status();
     let owner = ManagedWorker::start(task, handle.clone())?;
-    let mut stdout = io::LineWriter::new(io::stdout().lock());
+    let mut stdout = Vec::new();
     let mut stream_output = StreamOutput {
         #[cfg(feature = "stats")]
         continuous: args.is_continuous(),
@@ -141,7 +209,10 @@ pub async fn run_stream(
             _ = shutdown.changed(), if !interrupted => {}
             changed = status.changed() => { if changed.is_err() { break; } }
             event = events.recv() => match event {
-                Ok(event) => process_event(event, &mut stream_output, #[cfg(feature = "stats")] &mut stats, &mut terminal_targets)?,
+                Ok(event) => {
+                    process_event(event, &mut stream_output, #[cfg(feature = "stats")] &mut stats, &mut terminal_targets)?;
+                    output.send(stream_output.out).await?;
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(count)) => {
                     dropped_events = dropped_events.saturating_add(count);
                 }
@@ -153,15 +224,24 @@ pub async fn run_stream(
         eprintln!("interrupted, closing managed run...");
     }
     let outcome = owner.join().await?;
-    drain_final_events(&mut events, &mut dropped_events, |event| {
-        process_event(
-            event,
-            &mut stream_output,
-            #[cfg(feature = "stats")]
-            &mut stats,
-            &mut terminal_targets,
-        )
-    })?;
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                process_event(
+                    event,
+                    &mut stream_output,
+                    #[cfg(feature = "stats")]
+                    &mut stats,
+                    &mut terminal_targets,
+                )?;
+                output.send(stream_output.out).await?;
+            }
+            Err(ManagedEventTryRecvError::Lagged(count)) => {
+                dropped_events = dropped_events.saturating_add(count);
+            }
+            Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
+        }
+    }
     if let Some(warning) = dropped_event_warning(dropped_events) {
         eprintln!("{warning}");
     }
@@ -212,9 +292,10 @@ pub async fn run_stream(
                 writeln!(stream_output.out, "target: {}", target.label)?;
             }
             stream_output.print_summary(target_stats)?;
+            output.send(stream_output.out).await?;
         }
     }
-    stream_output.out.flush()?;
+    output.send(stream_output.out).await?;
     if let Some(error) = terminal_error {
         return Err(error.into());
     }
@@ -476,6 +557,7 @@ async fn run_stdin_stream(
     output_config: OutputConfig,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     args: &ClientArgs,
+    output: &StdoutWriter,
 ) -> Result<(), Box<dyn std::error::Error>> {
     if *shutdown.borrow() {
         return Ok(());
@@ -496,7 +578,7 @@ async fn run_stdin_stream(
     let (updates, mut stdin) = tokio::sync::watch::channel(StdinUpdate::Targets(Vec::new()));
     spawn_stdin_target_reader(updates)?;
 
-    let mut stdout = io::LineWriter::new(io::stdout().lock());
+    let mut stdout = Vec::new();
     let mut stream_output = StreamOutput {
         #[cfg(feature = "stats")]
         continuous: args.is_continuous(),
@@ -646,6 +728,7 @@ async fn run_stdin_stream(
             event = events.recv() => match event {
                 Ok(event) => {
                     process_stdin_event(event, &mut stream_output, #[cfg(feature = "stats")] &mut stats, &mut terminal_targets)?;
+                    output.send(stream_output.out).await?;
                     #[cfg(feature = "stats")]
                     reconcile_stdin_stats(&mut stats, &status.borrow(), summary_targets.as_ref());
                 }
@@ -658,15 +741,24 @@ async fn run_stdin_stream(
     }
 
     let outcome = owner.join().await?;
-    drain_final_events(&mut events, &mut dropped_events, |event| {
-        process_stdin_event(
-            event,
-            &mut stream_output,
-            #[cfg(feature = "stats")]
-            &mut stats,
-            &mut terminal_targets,
-        )
-    })?;
+    loop {
+        match events.try_recv() {
+            Ok(event) => {
+                process_stdin_event(
+                    event,
+                    &mut stream_output,
+                    #[cfg(feature = "stats")]
+                    &mut stats,
+                    &mut terminal_targets,
+                )?;
+                output.send(stream_output.out).await?;
+            }
+            Err(ManagedEventTryRecvError::Lagged(count)) => {
+                dropped_events = dropped_events.saturating_add(count);
+            }
+            Err(ManagedEventTryRecvError::Empty | ManagedEventTryRecvError::Closed) => break,
+        }
+    }
     if let Some(warning) = dropped_event_warning(dropped_events) {
         eprintln!("{warning}");
     }
@@ -703,10 +795,11 @@ async fn run_stdin_stream(
                     )?;
                 }
                 stream_output.print_summary(stats)?;
+                output.send(stream_output.out).await?;
             }
         }
     }
-    stream_output.out.flush()?;
+    output.send(stream_output.out).await?;
 
     match stop {
         Some(StdinStop::Fatal(error)) => Err(error.into()),
