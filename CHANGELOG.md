@@ -240,6 +240,13 @@ release. The format is loosely based on
 
 ## irtt-rs
 
+### 0.10.1
+
+#### Fixed
+
+- The client now responds to SIGINT and SIGTERM while stdout is blocked, so a stalled output reader no longer prevents shutdown.
+- Interrupted measurements preserve partial statistics summaries when output can be written. A shared 250 ms grace period bounds output flushing during shutdown.
+
 ### 0.10.0
 
 #### Added
