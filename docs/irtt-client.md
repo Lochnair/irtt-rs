@@ -1,29 +1,31 @@
 # irtt-client
 
-## NAME
+## Name
 
 irtt-client - IRTT-compatible stream client
 
-## SYNOPSIS
+## Synopsis
 
 `irtt-client` [*OPTIONS*] [*[LABEL=]TARGET[@hmac=KEY]*]...
 
 `irtt-client` `--list-columns`
 
-## DESCRIPTION
+## Description
 
-`irtt-client` probes one or more IRTT-compatible servers over UDP and prints
-per-probe measurement events as they arrive, plus a final summary for
-eligible runs.
+Use `irtt-client` to probe one or more IRTT-compatible servers over UDP.
+It prints measurement events as they arrive, and a final summary when the
+run qualifies for one.
 
-## TARGETS
+## Targets
 
-Every target argument accepts `[LABEL=]TARGET[@hmac=KEY]`. An optional
-`LABEL=` prefix assigns the logical target name used in output; without it,
-the target string itself is used as the label. Labeled and unlabeled targets
-can be freely mixed in one argument list. Prefer explicit labels for
-long-running dynamic target sets: the label is the stable target identity
-across replacements.
+Write targets as `[LABEL=]TARGET[@hmac=KEY]`. You can add a `LABEL=` prefix
+to choose the name shown in output. If you leave it out, the client uses
+the target string as its label. You can mix labeled and unlabeled targets
+in the same command.
+
+If you're changing targets during a long run, give them explicit labels.
+The label identifies the same logical target when you replace its
+configuration.
 
 ```sh
 irtt-client host-a:2112
@@ -37,29 +39,31 @@ overrides it for that target, and `@hmac=` explicitly disables HMAC for that
 target. The modifier uses `@`, not a shell command separator; quote an argument
 if its key needs shell quoting.
 
-Global `--hmac KEY` and per-target `@hmac=KEY` accept plain-text keys or hexadecimal keys prefixed with `0x`. For example, `secret` and `0x736563726574` are equivalent.
+Both the global `--hmac KEY` and per-target `@hmac=KEY` accept plain-text
+keys or hexadecimal keys prefixed with `0x`. For example, `secret` and
+`0x736563726574` are equivalent.
 
 Target syntax supports these backslash escapes in labels, addresses, and HMAC
 values: `\\` for a literal backslash, `\@` for a literal `@`, `\=` for a
 literal `=`, and `\;` for a literal semicolon. Escaping `@` is necessary in a
 label or address when it would otherwise begin `@hmac=`; escaping the first
-`=` is how an unlabeled target or a label can contain that character. An `=` in an HMAC value does not need escaping. Positional
-target arguments may contain a raw comma; stdin target sets have the additional
-`\,` escape described below.
+`=` lets an unlabeled target or a label contain that character. An `=` in
+an HMAC value does not need escaping. Positional target arguments may
+contain a raw comma; stdin target sets have the additional `\,` escape
+described below.
 
 Shells process unquoted backslashes and characters such as semicolons before
 the client sees them. Single-quote a target when it contains parser escapes,
 for example `'west\=edge=host\@hmac=literal@hmac=a\;b\\c'`, so the
 backslashes reach `irtt-client` unchanged.
 
-Multiple targets are probed concurrently. By default, a multi-target session
-uses **staggered** pacing, spacing active targets across the probe interval;
-pass `--pacing burst` to send one probe to every active target back-to-back
-once per interval instead. Final per-target summaries print in the order
-targets were supplied on the command line, not the order in which they
-finish or their labels sort alphabetically.
+The client probes multiple targets concurrently. By default it staggers
+them across the probe interval. If you want to send one probe to every
+active target back-to-back once per interval, use `--pacing burst`.
+Final summaries follow the command-line target order, regardless of which
+target finished first or how their labels sort.
 
-## ADDRESS FAMILY
+## Address family
 
 By default, each target uses the first address returned by the system resolver,
 whether IPv4 or IPv6. Use `-4` / `--ipv4` to select IPv4 only, or
@@ -94,42 +98,58 @@ labels; choose another alias if one collides with an explicit label.
 ordinary multi-target pacing and each sends its own probes, so dual-stack can
 double the number of probes per interval compared with one target per hostname.
 
-## LOCAL SOCKET CONFIGURATION
+## Local socket configuration
 
-The client supports configuring its local UDP sockets using the following options:
+If you need to control where probes leave the machine, use these socket
+options:
 
-- `--bind-addr IP[:PORT]` binds sockets to the specified local IP address and optional port. If no port is specified, or the port is `0`, the operating system assigns an ephemeral port. IPv6 addresses with an explicit port must use `[ADDR]:PORT` syntax. The address family must match the target's resolved address family.
-- `--bind-device DEVICE` (Linux, Android, Fuchsia) binds sockets to a network interface using `SO_BINDTODEVICE`.
-- `--mark MARK` (Linux, Android, Fuchsia) sets the socket's firewall mark using `SO_MARK`, allowing traffic to be selected by policy routing or firewall rules. Accepts a decimal or 0x-prefixed hexadecimal unsigned 32-bit integer.
-- `--fib FIB` (FreeBSD) selects a routing table using `SO_SETFIB`. The FIB is specified as a decimal unsigned 32-bit integer.
+- `--bind-addr IP[:PORT]` binds sockets to a local IP address and optional
+  port. Leave out the port or use `0` to let the OS assign an ephemeral port.
+  IPv6 addresses with a port need `[ADDR]:PORT` syntax. The address family
+  must match the target's resolved address family.
+- `--bind-device DEVICE` (Linux, Android, Fuchsia) binds sockets to a
+  network interface using `SO_BINDTODEVICE`.
+- `--mark MARK` (Linux, Android, Fuchsia) sets the socket's firewall mark
+  using `SO_MARK`, so policy routing or firewall rules can select the
+  traffic. It accepts a decimal or 0x-prefixed hexadecimal unsigned 32-bit
+  integer.
+- `--fib FIB` (FreeBSD) selects a routing table using `SO_SETFIB`. Supply
+  the FIB as a decimal unsigned 32-bit integer.
 
-For example, bind IPv4 probes to a specific source address and interface, with a firewall mark:
+For example, to bind IPv4 probes to a specific source address and interface
+with a firewall mark:
 
 ```sh
 irtt-client -4 --bind-addr 192.0.2.10 --bind-device wan0 --mark 1234 host.example
 ```
 
-Setting a firewall mark or binding to a network device may require elevated privileges or appropriate capabilities. If the operating system rejects a socket option, socket setup fails.
+Setting a firewall mark or binding to a network device may require elevated
+privileges or appropriate capabilities. If the OS rejects a socket option,
+socket setup fails.
 
-A fixed local port may cause binding conflicts when multiple target sockets are created. Use an ephemeral port unless a specific source port is required. A family-specific bind address is also incompatible with targets using the other address family.
+A fixed local port can cause bind conflicts when the client creates sockets
+for multiple targets. Unless you need a particular source port, let the OS
+assign one. A bind address for one family also cannot be used with targets
+in the other family.
 
-## DYNAMIC TARGET SETS FROM STANDARD INPUT
+## Dynamic target sets from standard input
 
-`--targets-stdin` is available only with continuous mode (`--continuous` or
-`--duration 0`).
-Positional targets remain an initial desired set, and may be omitted to
-start empty:
+`--targets-stdin` only works in continuous mode (`--continuous` or
+`--duration 0`). Use it to change targets while the client is running.
+Positional targets form the initial set. You can leave them out to start
+with none:
 
 ~~~sh
 irtt-client --duration 0 --targets-stdin
 irtt-client --duration 0 --targets-stdin ams=ams.example:2112
 ~~~
 
-Each non-empty stdin record declares the complete desired target set, rather
-than a delta. A later record replaces an earlier set: targets absent from it
-are retired, unchanged target configurations retain their generation, and a
-changed address or HMAC setting creates a fresh generation. Under transient
-live-generation backpressure, only the latest unapplied desired set is kept.
+Each non-empty stdin record gives the complete set of targets you want.
+A new record replaces the previous set: the client retires targets you leave
+out, keeps the generation for unchanged configurations, and starts a fresh
+generation when an address or HMAC setting changes. If live-generation
+capacity temporarily prevents an update, only the latest unapplied set is
+kept.
 
 The same address-family preparation applies to initial and stdin targets.
 With `--dual-stack`, unchanged labels and endpoints retain their discovered
@@ -138,11 +158,12 @@ and later adding it again performs fresh discovery. New declarations are
 prepared asynchronously while existing measurements continue. A preparation
 error stops the stream gracefully without applying a partial set.
 
-Commas frame targets in stdin records; escape a literal comma within one
-target as `\,`. Target parsing inside each element is otherwise the same as
-for positional arguments, including the other escapes above, `@hmac=KEY`, and
-`@hmac=`. Use a persistent producer or keep a pipe/FIFO writer open while the
-client is being controlled. For example, in one terminal:
+Separate targets in stdin records with commas, and escape a comma inside a
+target as `\,`. Each target otherwise uses the same syntax as positional
+arguments, including the escapes above, `@hmac=KEY`, and `@hmac=`.
+
+Keep the producer or pipe/FIFO writer open while controlling the client.
+For example, run this in one terminal:
 
 ~~~sh
 mkfifo /tmp/irtt-targets
@@ -150,8 +171,8 @@ irtt-client --duration 0 --targets-stdin --hmac default-secret \
   < /tmp/irtt-targets
 ~~~
 
-Then open the FIFO once from another terminal and keep that descriptor open
-while publishing complete desired sets:
+Then, in another terminal, open the FIFO once and keep that descriptor open
+while sending complete target sets:
 
 ~~~sh
 exec 3> /tmp/irtt-targets
@@ -161,19 +182,21 @@ printf '%s\n' 'sg=sg.example:2112@hmac=sg-secret,nyc=nyc.example:2112' >&3
 exec 3>&-
 ~~~
 
-The exact record `[]` selects an empty desired set. Empty records are
-ignored; whitespace is otherwise payload, not trimming. EOF is immediate loss
-or closure of the control plane and requests a graceful stop. A desired-state
-revision that was read but has not yet been acknowledged as applied may be
-discarded when EOF is observed; EOF does not wait for a capacity-rejected
-revision to become applicable.
+Send exactly `[]` to select an empty target set. The client ignores empty
+records, but otherwise treats whitespace as part of the input without
+trimming it.
+
+Closing stdin sends EOF and asks the client to stop gracefully. An update
+that has been read but not yet acknowledged as applied may be discarded
+at that point. EOF does not wait for an update blocked by capacity to
+become applicable.
 
 The maximum stdin record payload is 64 KiB. Stdin-controlled mode bounds each
 desired set to 128 targets and retains at most 256 live target generations
 while replacements drain. The 128-target limit applies after dual-stack
 expansion: a hostname producing both families consumes two target slots.
 
-## NEGOTIATION ONLY
+## Negotiation only
 
 `-n` / `--no-test` connects to each target, negotiates the requested parameters,
 and exits without sending measurement probes. For example:
@@ -182,17 +205,18 @@ and exits without sending measurement probes. For example:
 irtt-client --no-test host.example:2112 --duration 30s --interval 100ms
 ```
 
-The `no_test_completed` event reports successful negotiation, including the
+On successful negotiation, the `no_test_completed` event includes the
 negotiated duration, interval, and packet length. Output format and column
-selection work as usual; no measurement summary or statistics-memory warning
-is printed. Negotiation failures use the normal target diagnostics and exit
-policy: an uninterrupted run exits nonzero if no target succeeds.
+selection work as usual. The client prints no measurement summary or
+statistics-memory warning. Negotiation failures use the normal target
+diagnostics and exit policy: an uninterrupted run exits nonzero if no
+target succeeds.
 
 Duration options still specify the duration to negotiate; even with
 `--continuous` or `--duration 0`, the client exits after negotiation.
 `--no-test` cannot be combined with `--targets-stdin`.
 
-## FINITE VERSUS CONTINUOUS OPERATION
+## Finite versus continuous operation
 
 `--duration` and `--interval` accept fractional and composite durations, such as
 `2.5s`, `1m30s`, and `1h`, as well as `ms`, `us` (or `µs`), and `ns` units
@@ -208,24 +232,25 @@ Omitting the option preserves the library default schedule.
 
 `--duration` controls the run length:
 
-- Any nonzero duration (default `10s`) is a **finite** run: probing stops
-  after that long, and a final summary is printed for table output when
-  statistics are enabled (see [OUTPUT](#output) below — CSV, TSV, and
-  JSON Lines never print one).
-- `--continuous` (or `--duration 0`) is **continuous**: the client runs until
-  interrupted (`Ctrl-C`). With statistics enabled and table output, a final
-  summary is printed only if the run was interrupted. Stdin-controlled mode
-  is the exception: EOF also requests a graceful stop and prints the final
-  retained summary. An uninterrupted
-  continuous run that exits for another reason does not get one.
+- A nonzero duration (default `10s`) gives you a finite run. Probing stops
+  after that long. If statistics are enabled and you're using table
+  [output](#output), the client prints a final summary. CSV, TSV, and
+  JSON Lines never include a summary.
+- With `--continuous` (or `--duration 0`), the client runs until interrupted
+  (`Ctrl-C`). With statistics and table output enabled, interrupting the run
+  prints a final summary. In stdin-controlled mode, EOF also stops the run
+  gracefully and prints the retained summary. A continuous run that exits
+  for another reason without being interrupted does not print one.
 
-See [MEASUREMENTS AND MEMORY](#measurements-and-memory) below for why this
-distinction also determines what statistics can be computed and how much
-memory a long run retains.
+The choice also affects which statistics are available and how much memory
+a long run retains. See [Measurements and memory](#measurements-and-memory).
 
 ### Optional recovery and event-only runs
 
-`--no-stats` disables statistics collection and final summaries while preserving individual measurement output. Statistics-dependent columns (such as IPDV) are unavailable. This runtime option does not remove the `irtt-stats` dependency.
+If you only need individual measurements, use `--no-stats` to disable
+statistics collection and final summaries. Columns that need statistics,
+such as IPDV, are unavailable. The runtime flag still leaves the
+`irtt-stats` dependency in the build.
 
 To omit statistics at compile time, build with:
 
@@ -240,15 +265,31 @@ warnings are disabled, and IPDV columns retain their names with absent values
 (`-` in tables, empty CSV/TSV fields, and JSON `null`). Measurement events and
 protocol-level received statistics remain available.
 
-`--reconnect` enables automatic recovery for individual targets in continuous mode (`--continuous` or `--duration 0`). Failed connections, closed sessions, and unresponsive servers are retried without interrupting other targets. Retries double the delay after each failed attempt, from 250 ms up to 10 seconds by default. A valid reply resets the delay to the initial value; each target backs off independently.
+Use `--reconnect` to recover individual targets in continuous mode
+(`--continuous` or `--duration 0`). The client retries failed connections,
+closed sessions, and unresponsive servers while the other targets keep
+running. By default, the delay doubles after each failed attempt, from
+250 ms up to 10 seconds. A valid reply resets it to the initial delay.
+Each target backs off independently.
 
-`--reconnect-initial-delay DURATION` (default: `250ms`) and `--reconnect-max-delay DURATION` (default: `10s`) configure these delays. Both require `--reconnect`, must be positive and schedulable, and the maximum must be at least twice the initial delay. For example, `--reconnect-initial-delay 1s --reconnect-max-delay 5s` retries after `1s`, `2s`, `4s`, `5s`, then `5s` thereafter.
+You can change the delays with `--reconnect-initial-delay DURATION`
+(default: `250ms`) and `--reconnect-max-delay DURATION` (default: `10s`).
+Both require `--reconnect` and must be positive and schedulable. The maximum
+must be at least twice the initial delay. For example,
+`--reconnect-initial-delay 1s --reconnect-max-delay 5s` retries after `1s`,
+`2s`, `4s`, `5s`, then `5s` from there on.
 
-`--reconnect-timeout DURATION` controls how long a session can go without valid replies before reconnection is attempted (default: `10s`). The timeout applies only while actively sending probes and should account for the probe interval and expected packet loss.
+`--reconnect-timeout DURATION` sets how long a session can go without valid
+replies before the client tries to reconnect (default: `10s`). It only
+applies while actively sending probes, so allow for your probe interval and
+expected packet loss.
 
-**Statistics reset on reconnection**, so final summaries only reflect the latest session per target. A warning is emitted when reconnection is enabled with statistics collection. Use `--no-stats` to disable collection and suppress the warning.
+Reconnecting resets statistics for that target, so its final summary only
+covers the latest session. The client warns about this when reconnection
+and statistics collection are both enabled. Use `--no-stats` to disable
+collection and suppress the warning.
 
-Example for continuous, multi-target CSV output without statistics:
+For continuous CSV output from multiple targets without statistics:
 
 ```sh
 irtt-client --continuous --reconnect --no-stats \
@@ -259,11 +300,11 @@ irtt-client --continuous --reconnect --no-stats \
   reflector1 reflector2
 ```
 
-## OUTPUT
+## Output
 
 ### `--format FORMAT`
 
-One of four event-row formats, default `table`:
+Choose one of four event-row formats. The default is `table`:
 
 - `table`: human-readable terminal output; the only format that prints a
   final summary.
@@ -271,7 +312,7 @@ One of four event-row formats, default `table`:
 - `tsv`: tab-separated output.
 - `jsonl`: one JSON object per event.
 
-CSV, TSV, and JSON Lines default to **all** columns for structured export;
+CSV, TSV, and JSON Lines include all columns by default for structured export;
 `table` defaults to a compact column set and hides `echo_sent` rows. An
 explicit `--columns` selection other than `default` shows all event rows,
 including `echo_sent`; `--columns default` is equivalent to omitting the
@@ -279,15 +320,15 @@ option and keeps `echo_sent` hidden for table output.
 
 ### `--columns COLUMNS` / `-c COLUMNS`
 
-Comma-separated event row columns, or the special values `default` (the
-format's default set) or `all` (every column). List every available column,
-its meaning, and its aliases with:
+Choose event-row columns with a comma-separated list, or use `default`
+for the format's default set and `all` for every column. To see the
+available columns, their meanings, and aliases, run:
 
 ```sh
 irtt-client --list-columns
 ```
 
-(`--list-columns` does not require a target.)
+You don't need a target for `--list-columns`.
 
 ### `--header auto|always|never`
 
@@ -296,10 +337,9 @@ Lines never prints a header line.
 
 ### `--verbose`
 
-Includes extra fields in table output and final summaries. Has no effect on
-CSV, TSV, or JSON Lines output either way — those formats show their default
-all-column set or an explicit `--columns` selection exactly as given,
-regardless of `--verbose`.
+Include extra fields in table output and final summaries. CSV, TSV, and
+JSON Lines keep their default all-column set or your explicit `--columns`
+selection regardless of `--verbose`.
 
 ### Examples
 
@@ -309,13 +349,13 @@ irtt-client <server> --format jsonl
 irtt-client <server> --format csv --columns event,seq,remote,effective_rtt_us
 ```
 
-A stream containing only effective RTT values in microseconds:
+To print only effective RTT values in microseconds:
 
 ```sh
 irtt-client <server> --format tsv --columns effective_rtt_us --header never
 ```
 
-## MEASUREMENT FIELDS
+## Measurement fields
 
 Useful measurement columns:
 
@@ -336,95 +376,95 @@ Useful measurement columns:
 
 ### Kernel timestamps (Linux)
 
-On Linux, one-way delay estimates prefer a kernel-captured timestamp over
-userspace timing for this client's own send/receive endpoint, where the
-platform and socket support it, reducing the effect of scheduling and
-queuing delay. The peer's reported endpoint gets the same preference when it
-is the `irtt-server` applet running on Linux; against another
-IRTT-compatible server, whatever wall-clock value it reports is used as-is.
-This is best-effort: an unsupported or implausible kernel timestamp falls
-back to userspace timing. `raw_rtt_us` is unaffected either way;
-`adjusted_rtt_us`/`effective_rtt_us` can still shift slightly, since server
-processing time is derived from the same server receive endpoint.
+On Linux, the client prefers kernel timestamps for its own send/receive
+endpoint when calculating one-way delays, where the platform and socket
+support them. This reduces the effect of scheduling and queuing delay.
+The `irtt-server` applet makes the same choice for its endpoint on Linux.
+With another IRTT-compatible server, the client uses the wall-clock value
+that server reports as-is.
 
-## MEASUREMENTS AND MEMORY
+If a kernel timestamp is unsupported or implausible, timing falls back to
+userspace. This leaves `raw_rtt_us` unchanged. The
+`adjusted_rtt_us`/`effective_rtt_us` values can still shift slightly, since
+server processing time uses the same server receive endpoint.
 
-The statistics retention below applies only when the `stats` feature is compiled
-in and `--no-stats` is absent. Disabling collection keeps the client
-classification bounds but allocates no statistics collectors.
+## Measurements and memory
 
-Finite and continuous modes make a different tradeoff between exact
-statistics and bounded memory.
+If the `stats` feature is compiled in and you haven't used `--no-stats`,
+the client collects statistics as described here. Disabling collection
+allocates no statistics collectors, though the client still keeps its
+bounded reply-classification state.
 
-**Finite mode** retains exact timing samples (and adjacent-sequence IPDV
-state) so the final summary can report exact medians. Retained memory
-therefore grows with the number of probes sent, at a small constant cost per
-probe (on the order of a few hundred bytes of retained sample state per
-probe per target, before allocator overhead) — a very long finite run at a
-short interval is the case to plan capacity for. The client warns on stderr
-when its own estimate of this retained state crosses roughly 128 MiB, and
-again more strongly past roughly 512 MiB and 1 GiB; treat those numbers as
-practical guidance, not a promised RSS ceiling, since allocator and OS
-overhead sit outside the estimate.
+In finite mode, the client keeps exact timing samples and adjacent-sequence
+IPDV state so it can report exact medians in the final summary. Memory
+grows with the number of probes sent, at roughly a few hundred bytes per
+probe per target before allocator overhead. So if you're planning a long
+finite run with a short interval, allow for that growth.
 
-**Continuous mode** (`--duration 0`) does not retain a growing sample
-history: running statistics keep count/min/max/mean/variance only, so exact
-medians are unavailable. It still keeps a bounded adjacent-sequence IPDV
-store, capped at 4,096 sequences per target, so nearby replies can still
-form IPDV pairs. Retained statistics state therefore approaches a fixed
-per-target bound rather than growing with elapsed run time.
+The client prints a warning on stderr when its estimate of retained state
+crosses roughly 128 MiB, with stronger warnings past roughly 512 MiB and
+1 GiB. These are useful planning figures, but they don't promise an RSS
+ceiling: allocator and OS overhead are outside the estimate.
 
-Reply classification (independent of the statistics choice above) is also
-bounded per target: each of the pending, timed-out, and completed/duplicate
-sequence stores has its own 4,096-entry limit — not one shared total across
-the three. A full pending store makes the client fail and drain that target
-as resource-exhausted rather than wait for capacity to free. Timed-out and
-completed state evict their oldest entries, so a sufficiently old late reply
-can still be seen and counted, but no longer has retained send state for
-measurements such as RTT.
+In continuous mode (`--duration 0`), running statistics keep only
+count/min/max/mean/variance, so exact medians are unavailable. The client
+still keeps up to 4,096 sequences per target for adjacent-sequence IPDV
+pairs. Statistics memory approaches a fixed limit per target as the run
+continues.
 
-Overall, retained state scales with the **number of configured targets**
-and these fixed per-target limits, not with total probes sent in continuous
-mode. Output is written as events arrive rather than accumulated; the
-managed event stream feeding it is itself bounded and lossy (16,384 events),
-so a sufficiently slow consumer can miss events, in which case the client
-reports that resulting output/statistics may be incomplete.
+Reply classification has its own bounds, regardless of whether you collect
+statistics. Each target has separate pending, timed-out, and
+completed/duplicate sequence stores, each with a 4,096-entry limit. If the
+pending store fills, the client fails and drains that target as
+resource-exhausted. It does not wait for space to free up.
+
+The timed-out and completed stores evict their oldest entries. A very late
+reply can still be seen and counted after eviction, but without its retained
+send state the client cannot calculate measurements such as RTT.
+
+In continuous mode, retained state scales with the number of configured
+targets and these fixed limits per target. The client writes output as
+events arrive. The managed event stream has a 16,384-event capacity and can
+drop events if the consumer falls behind. If that happens, the client
+reports that output and statistics may be incomplete.
 
 For capacity planning on constrained devices (for example an OpenWrt
 router): a finite run's statistics memory is roughly proportional to
 `targets × probes_sent`, while a continuous run's statistics memory
 approaches a fixed multiple of `targets` regardless of how long it runs.
 
-## PEER CLOSE AND EXIT BEHAVIOR
+## Peer close and exit behavior
 
-A peer closing a finite run is accepted as a terminal, successful outcome.
-Without `--reconnect`, in continuous mode, an uninterrupted peer closure is treated as an error —
-the client exits nonzero — so a process supervisor can restart it; an
-interrupted run (`Ctrl-C`) never reports peer closure as an error, whichever
-mode it was in.
+If a peer closes a finite run, the client treats that as successful
+completion. In continuous mode without `--reconnect`, a peer closure ends
+an uninterrupted run with a nonzero exit status so a process supervisor
+can restart it. If you interrupted the run (`Ctrl-C`), peer closure is
+never reported as an error in either mode.
 
 With `--reconnect`, a desired target reopens automatically after peer closure.
 Without recovery, `--targets-stdin` makes peer closure target-local: other
 desired targets and the stdin controller continue running. Including that
 target in a later complete set starts a fresh generation.
 
-## EXIT STATUS
+## Exit status
 
-`0` on success (including a finite run's ordinary completion, and an
-interrupted run of either mode). Nonzero if the managed driver failed, if an
-uninterrupted continuous run ended by peer closure, or if the run was not
-interrupted and no target completed successfully. An interrupted run never
-fails on the last of these conditions — for example, interrupting a
-continuous run whose only target never opened still exits `0`.
+The client exits `0` on success, including normal finite completion and
+interrupted runs in either mode. It exits nonzero if the managed driver
+fails, an uninterrupted continuous run ends by peer closure, or no target
+completes successfully in an uninterrupted run.
 
-## SERVER FILL REQUEST
+Interrupting the run prevents the last condition from counting as a failure.
+For example, if you interrupt a continuous run whose only target never
+opened, it still exits `0`.
+
+## Server fill request
 
 `--sfill DESCRIPTOR` requests the server's echo-reply payload fill: `none`
 (zero-filled), `rand` (random bytes), or `pattern:HEX` (a repeating
-hexadecimal pattern). See `irtt-server(1)` SERVER FILL for what the server
-does with an unset or unparseable request.
+hexadecimal pattern). See the Server fill section in `irtt-server(1)` for
+what the server does with an unset or unparseable request.
 
-## EXAMPLES
+## Examples
 
 ```sh
 irtt-client netperf-eu.bufferbloat.net:2112
@@ -433,7 +473,7 @@ irtt-client netperf-eu.bufferbloat.net:2112 --duration 0
 irtt-client host-a:2112 host-b:2112 --pacing burst
 ```
 
-## SEE ALSO
+## See also
 
 `irtt-tui(1)`, `irtt-server(1)`, `irtt-rs(1)`, and `irtt-client --help` for
 the full option list, including HMAC, clock/timestamp negotiation, DSCP, and

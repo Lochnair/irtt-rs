@@ -1,25 +1,24 @@
 # irtt-tui
 
-## NAME
+## Name
 
 irtt-tui - IRTT-compatible terminal UI client
 
-## SYNOPSIS
+## Synopsis
 
 `irtt-tui` [*OPTIONS*] *[LABEL=]TARGET*...
 
-## DESCRIPTION
+## Description
 
-`irtt-tui` is a live dashboard over the same probing engine as
-`irtt-client(1)`: a graph and status view instead of a printed event stream.
-At least one target is required.
+`irtt-tui` gives you a live graph and status dashboard using the same probing
+engine as `irtt-client(1)`. You need at least one target to start it.
 
-Target syntax, multiple targets, and pacing are identical to
-`irtt-client(1)` — see that manual for `[LABEL=]TARGET` syntax and the
-`--pacing staggered|burst` option. The client configuration flags
+Targets and pacing work the same as in `irtt-client(1)`. See that manual
+for `[LABEL=]TARGET` syntax, multiple targets, and the
+`--pacing staggered|burst` option. The configuration flags
 (`--interval`, `--timeouts`, `--length`, `--hmac`, `--clock`, `--tstamp`,
-`--stats`, `--sfill`, `--dscp`, `--ttl`, `--loose`) are shared with `irtt-client` as
-well; consult that manual for their meaning.
+`--stats`, `--sfill`, `--dscp`, `--ttl`, `--loose`) are also shared with
+`irtt-client`, so the same descriptions apply.
 
 Address-family controls are shared too: `-4` / `--ipv4` uses IPv4 only,
 `-6` / `--ipv6` uses IPv6 only, and `--dual-stack` gives each available family
@@ -36,11 +35,12 @@ The second command creates `cov/v4` and/or `cov/v6` according to the system
 resolver's initial results, letting you compare the two paths directly.
 See the client manual's address-family section for discovery errors and labels.
 
-## CONTINUOUS DEFAULT
+## Continuous default
 
-Unlike `irtt-client`, **the TUI defaults to continuous mode**
-(`--duration 0`): it runs until you quit. Pass an explicit `--duration` for
-a finite run. Both `--duration` and `--interval` use the
+The TUI defaults to continuous mode (`--duration 0`) and runs until you
+quit. If you're used to `irtt-client`, which defaults to a finite run,
+keep that difference in mind. To set a finite run, pass an explicit
+`--duration`. Both `--duration` and `--interval` use the
 [client duration syntax](irtt-client.md#finite-versus-continuous-operation),
 including fractional values (`2.5s`), composite values (`1m30s`), and units
 from nanoseconds (`ns`) through hours (`h`):
@@ -49,26 +49,29 @@ from nanoseconds (`ns`) through hours (`h`):
 irtt-tui <server> --duration 30s
 ```
 
-Continuous runs reconnect after target-local failures, peer closure, or a
-session completing because the server restricted its duration. After a
-1.5-second delay, one coalesced retry reopens completed targets while healthy
-sessions continue undisturbed. Even if every target fails, the TUI stays alive
-until you quit. Explicit stops, removed or replaced targets, and no-test
-completion do not trigger retries. Quitting cancels pending retry work.
+In continuous mode, the TUI reconnects after a target fails, the peer closes
+the session, or the session ends because the server limited its duration.
+After a 1.5-second delay, it groups completed targets into one retry while
+healthy sessions keep running. Even if every target fails, the TUI stays
+open until you quit.
+
+Explicit stops, removed or replaced targets, and no-test completion do not
+trigger retries. Quitting cancels any pending retry work.
 
 With `--dual-stack`, a failed family reconnects independently while its healthy
 sibling continues. Reconnect resolves the original hostname again within the
 target's family. It does not discover additional families or pin the address
 returned by initial discovery.
 
-Each reconnect keeps the same logical target row. Statistics reset when a new
+Reconnecting keeps the target in the same row. Statistics reset when a new
 session generation is accepted, including attempts that fail before opening.
-Retained graph history and the age of the last actual reply remain; the graph
-leaves a gap between generations instead of connecting their samples.
+The TUI keeps graph history and the age of the last actual reply, with a
+gap in the graph between generations.
 
-## DASHBOARD
+## Dashboard
 
-One dashboard is used for every target count and terminal size. It shows:
+The dashboard uses the same layout for any target count and terminal size.
+It shows:
 
 - Run status, elapsed time, and finite duration or continuous mode.
 - The selected target's label and remote address, plus latest signed
@@ -78,30 +81,32 @@ One dashboard is used for every target count and terminal size. It shows:
 - A graph overlaying all targets, with matching target colors and a visible
   live/history indicator and window size.
 
-An active session with no primary replies shows `waiting`. Reply age makes a
-stale RTT distinguishable from a fresh measurement. Loss follows the shared
-statistics collector: outstanding sends can temporarily contribute to the
-cumulative loss estimate. Jitter is `-` until an IPDV pair is available.
+An active session shows `waiting` until it gets a primary reply. Check the
+reply age to see how fresh the displayed RTT is. The loss estimate comes
+from the shared statistics collector, so outstanding sends can temporarily
+count towards cumulative loss. Jitter stays `-` until an IPDV pair is
+available.
 
-`Tab` / `Shift-Tab` selects a target, bringing its row into view when necessary.
-Up to six target rows are shown; smaller terminals show fewer. Selecting a target
-changes the identification, one-way summary and details; the graph continues to
-compare every target.
+Use `Tab` / `Shift-Tab` to select a target and bring its row into view.
+The dashboard shows up to six target rows, with fewer on smaller terminals.
+Selecting a target changes the identification, one-way summary, and details.
+The graph still compares every target.
 
-`d` opens a details sheet in the graph's space. It contains the selected target's
-session and negotiation, packet counters, progress, latest timing sample, full
-timing statistics, warnings, and recent events from all targets. Scroll it with
-the arrows or page keys. Long lines and timing columns can be read with horizontal
-scrolling, including full labels and remote addresses that do not fit in the
-header. `d` or `Esc` returns to the graph, preserving its metric and viewport.
-The former large/compact Dashboard screens have been replaced by this sheet;
-`g` remains an alias for `d`.
+Press `d` to open details in the graph's space. You'll find the selected
+target's session and negotiation, packet counters, progress, latest timing
+sample, full timing statistics, and warnings, along with recent events
+from all targets.
 
-The minimum terminal size is 56 columns by 18 rows. Below that size the UI asks
-for a resize and continues acquiring measurements. Resize and important status
-redraws still work while the display is paused.
+Scroll with the arrows or page keys. You can scroll horizontally to read
+long lines and timing columns, including labels and remote addresses that
+don't fit in the header. Press `d` or `Esc` to return to the graph with its
+metric and viewport preserved. You can also use `g` as an alias for `d`.
 
-## CONTROLS
+You need a terminal at least 56 columns wide and 18 rows tall. Below that
+size, the TUI asks you to resize while continuing to collect measurements.
+Resizing and important status redraws still work when the display is paused.
+
+## Controls
 
 | Key | Action |
 | --- | --- |
@@ -126,50 +131,52 @@ Signed effective/adjusted RTT and one-way values are preserved. Graph windows
 range from 5 seconds to 24 hours and default to one minute. The footer shows
 controls appropriate to the currently open graph or details sheet.
 
-## RETAINED HISTORY
+## Retained history
 
-The TUI keeps its own bounded presentation state on top of the statistics
-retention described in `irtt-client(1)`:
+Along with the statistics described in `irtt-client(1)`, the TUI keeps
+some history for the display:
 
 - Up to 500,000 graph samples per target.
 - Up to 80 recent status/log messages.
 
-At 500,000 replies per target, retention is approximately 13h53m20s at
-100ms intervals, 27h46m40s at 200ms, or 5d18h53m20s at 1s. Retained graph
-samples store both clocks, six graph-ready values, and a session-boundary
-flag; latest details keep the full typed timing values and sequence number.
-On 64-bit macOS, an 88-byte retained sample gives about 42 MiB per target
-at the cap, excluding statistics and temporary rendering buffers. Histories
-grow on demand and reserve exactly to the cap on their final growth step;
-they do not preallocate the full history for every target at startup.
+At 500,000 replies per target, you get approximately 13h53m20s of history
+with 100ms intervals, 27h46m40s at 200ms, or 5d18h53m20s at 1s. Each graph
+sample stores both clocks, six values ready for graphing, and a flag marking
+session boundaries. The latest details keep the full typed timing values
+and sequence number.
 
-`r` clears graph history for all targets and returns the viewport to
-live; it does not change the 500,000-sample cap itself. These are
-presentation bounds on top of the client's own statistics retention (see
-`irtt-client(1)` MEASUREMENTS AND MEMORY) — a long continuous TUI session's
-total memory is dominated by whichever of the two is larger for your target
-count.
+On 64-bit macOS, each retained sample takes 88 bytes, giving about 42 MiB
+per target at the cap. Statistics and temporary rendering buffers use
+additional memory. History grows as needed and reserves exactly to the
+cap on its final growth step, so you don't pay for the full history of
+every target at startup.
 
-A **finite** `--duration` TUI run retains exact statistics samples exactly as
-`irtt-client(1)` does in finite mode, so its retained state grows with the
-probe count rather than approaching a bound. Unlike `irtt-client`, the TUI
-prints **no** memory warning when that estimate gets large: it owns the
-alternate screen, and a stderr warning there would be invisible or would
-corrupt the display. Size a long finite TUI run from the figures in
-`irtt-client(1)` MEASUREMENTS AND MEMORY, or use the continuous default.
+Press `r` to clear graph history for all targets and return to the live
+view. This leaves the 500,000-sample cap unchanged. Display history is kept
+in addition to the client's statistics (see Measurements and memory in
+`irtt-client(1)`). During a long continuous TUI session, whichever uses more
+memory for your target count will dominate the total.
 
-## EXIT BEHAVIOR
+If you set a finite `--duration`, the TUI retains exact statistics samples
+just as `irtt-client(1)` does in finite mode. Memory then grows with the
+probe count. The TUI does not print the memory warnings you get from
+`irtt-client`, since a stderr warning on the alternate screen could be
+invisible or corrupt the display. For a long finite run, plan memory using
+the figures in `irtt-client(1)` under Measurements and memory, or use the
+continuous default.
 
-Quitting with `q` or `Ctrl-C` is an interrupted, successful exit. In continuous
-mode, peer closure and target failures trigger reconnect rather than ending the
-run. A managed driver failure or an unexpected reconnect-update failure still
-ends the TUI with an error.
+## Exit behavior
+
+Quitting with `q` or `Ctrl-C` counts as an interrupted, successful exit.
+In continuous mode, the TUI reconnects after peer closure and target failures.
+A managed driver failure or an unexpected reconnect-update failure still
+ends the run with an error.
 
 Finite runs do not reconnect. They complete after their target sessions end;
 a peer closure is a normal session ending, while a run whose targets all fail
 exits with an error.
 
-## EXAMPLES
+## Examples
 
 ```sh
 irtt-tui host.example
@@ -178,7 +185,7 @@ irtt-tui eu=host-a.example us=host-b.example --pacing burst
 irtt-tui host.example --duration 30s
 ```
 
-## SEE ALSO
+## See also
 
 `irtt-client(1)` for target syntax, pacing, negotiation flags, and
 finite/continuous memory behavior; `irtt-server(1)`; `irtt-rs(1)`.

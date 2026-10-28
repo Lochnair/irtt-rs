@@ -1,10 +1,10 @@
 # irtt-rs
 
-## NAME
+## Name
 
 irtt-rs - IRTT-compatible multi-applet dispatcher
 
-## SYNOPSIS
+## Synopsis
 
 `irtt-rs` `client` [*OPTIONS*] [*[LABEL=]TARGET*]...
 
@@ -12,41 +12,40 @@ irtt-rs - IRTT-compatible multi-applet dispatcher
 
 `irtt-rs` `server` [*OPTIONS*]
 
-## DESCRIPTION
+## Description
 
-`irtt-rs` is a multicall dispatcher: one binary that runs the client, TUI,
-or server applet depending on the subcommand given, or on the name it was
-invoked/copied as. It exists for router-friendly single-binary deployment;
-it does not add behavior beyond what `irtt-client(1)`, `irtt-tui(1)`, and
-`irtt-server(1)` already provide.
+`irtt-rs` lets you run the client, TUI, or server from one binary. You choose
+the applet with a subcommand, or by the name you invoke or copy the binary
+as. This is useful on a router where you want a single binary to deploy.
+The applets behave the same as `irtt-client(1)`, `irtt-tui(1)`, and
+`irtt-server(1)`.
 
-Each subcommand behaves exactly like its dedicated binary — `irtt-rs client
-...` is equivalent to running `irtt-client ...` directly. See those manuals
-for target syntax, options, output, and exit behavior.
+For example, `irtt-rs client ...` does the same thing as running `irtt-client ...` directly. See the
+individual manuals for target syntax, options, output, and exit behavior.
 
-## APPLET BINARY NAMES
+## Applet binary names
 
-The build also produces dedicated binaries: `irtt-client`, `irtt-tui`, and
-`irtt-server`. A dedicated binary always runs its own role, regardless of
-what it is invoked or copied as — it does not consult argv0 dispatch logic.
+The build also produces dedicated `irtt-client`, `irtt-tui`, and
+`irtt-server` binaries. These always run their own applet, even if you copy
+or invoke them under a different name. They do not use argv0 to choose an
+applet.
 
-`irtt-rs` itself inspects argv0 first: if invoked (or symlinked/copied) under
-one of the recognized applet names — `irtt-client`, `irtt-tui`, or
-`irtt-server` — it runs that applet directly, without needing a subcommand.
-Any other name starting with `irtt-` (other than `irtt-rs` itself) is
-rejected as an unknown applet name before subcommand parsing is even
-attempted — `irtt-custom server` is a hard error, not a fallthrough. Only
-`irtt-rs` itself, or a name that doesn't start with `irtt-` at all, falls
-through to ordinary `client`/`tui`/`server` subcommand parsing.
+The `irtt-rs` dispatcher checks argv0 first. If you invoke it through a
+symlink or copy named `irtt-client`, `irtt-tui`, or `irtt-server`, it runs
+that applet without a subcommand.
 
-## FEATURE-DEPENDENT APPLET AVAILABILITY
+Other names starting with `irtt-`, except `irtt-rs` itself, are rejected
+before subcommands are parsed. So `irtt-custom server` fails with an unknown
+applet error. If the name is `irtt-rs`, or doesn't start with `irtt-`, the
+dispatcher parses the usual `client`/`tui`/`server` subcommands.
 
-Each applet is gated by a Cargo feature on the `irtt-rs` package: `client`,
-`tui`, `server`. All three are in the default feature set. A build with a
-feature disabled still produces the `irtt-rs` binary, but that applet is
-unavailable at runtime — running it (by subcommand or by binary name)
-reports which feature to rebuild with, and `irtt-rs --help` lists which
-applets the current build actually contains.
+## Feature-dependent applet availability
+
+Each applet has a Cargo feature on the `irtt-rs` package: `client`,
+`tui`, `server`. All three are enabled by default. If you disable one, the
+build still produces `irtt-rs`, but you cannot run that applet. Trying it
+through either a subcommand or a binary name tells you which feature to
+rebuild with. Use `irtt-rs --help` to see which applets your build includes.
 
 ```sh
 cargo install irtt-rs --locked --no-default-features --features client,stats
@@ -55,13 +54,12 @@ cargo install irtt-rs --locked --no-default-features --features client,stats
 Use `--features client` to omit statistics. The default build includes the
 `stats` feature, and `tui` always enables it.
 
-## RELATIONSHIP TO irtt-client, irtt-tui, irtt-server
+## Relationship to irtt-client, irtt-tui, irtt-server
 
-`irtt-rs` is packaging and dispatch only. All probing, display, and server
-behavior lives in `irtt-client(1)`, `irtt-tui(1)`, and `irtt-server(1)` —
-consult those manuals for anything observable about running a probe or
-serving one.
+The `irtt-rs` dispatcher handles packaging and applet selection. For how to run
+probes, use the dashboard, or serve requests, see `irtt-client(1)`,
+`irtt-tui(1)`, and `irtt-server(1)`.
 
-## SEE ALSO
+## See also
 
 `irtt-client(1)`, `irtt-tui(1)`, `irtt-server(1)`.
