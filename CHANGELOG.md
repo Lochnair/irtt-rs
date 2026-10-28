@@ -240,6 +240,13 @@ release. The format is loosely based on
 
 ## irtt-rs
 
+### 0.10.2
+
+#### Added
+
+- Client `--events` filters output by event type, using comma-separated names or repeated options. For example, `--events echo_reply` prints only echo replies. Omitting the option preserves normal output behavior.
+- Explicitly selecting `echo_sent` with `--events` shows those events even with default table columns.
+
 ### 0.10.1
 
 #### Fixed
