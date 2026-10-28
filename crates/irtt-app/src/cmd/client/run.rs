@@ -171,6 +171,7 @@ async fn run_stream_output(
         args.columns.as_deref(),
         args.header,
         args.verbose,
+        args.events.clone(),
     )
     .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     #[cfg(feature = "stats")]

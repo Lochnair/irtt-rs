@@ -12,12 +12,13 @@ use irtt_client::{
 #[cfg(feature = "stats")]
 use irtt_stats::{EventStatsUpdate, IpdvPairUpdate};
 
-use super::args::{HeaderMode, OutputFormat};
+use super::args::{EventKind, HeaderMode, OutputFormat};
 use crate::cmd::format::{format_duration, format_signed_duration, ABSENT};
 
 #[derive(Debug, Clone)]
 pub(super) struct OutputConfig {
     format: OutputFormat,
+    events: Vec<EventKind>,
     columns: Vec<Column>,
     header: HeaderMode,
     default_table_rows: bool,
@@ -30,6 +31,7 @@ impl OutputConfig {
         columns: Option<&str>,
         header: HeaderMode,
         verbose: bool,
+        events: Vec<EventKind>,
     ) -> Result<Self, String> {
         let uses_default_columns = columns
             .map(|columns| columns.trim() == "default")
@@ -42,6 +44,7 @@ impl OutputConfig {
 
         Ok(Self {
             format,
+            events,
             columns,
             header,
             default_table_rows,
@@ -102,7 +105,10 @@ impl OutputConfig {
         #[cfg(feature = "stats")] stats: Option<&EventStatsUpdate>,
     ) -> Option<String> {
         let row = OutputRow::from_event(event);
-        if self.default_table_rows && row.is_default_table_hidden() {
+        if !self.events.is_empty() && !self.events.contains(&row.event_kind()) {
+            return None;
+        }
+        if self.events.is_empty() && self.default_table_rows && row.is_default_table_hidden() {
             return None;
         }
 
@@ -322,17 +328,17 @@ impl OutputRow {
         }
     }
 
-    fn event_name(&self) -> &'static str {
+    fn event_kind(&self) -> EventKind {
         match self {
-            Self::SessionStarted(_) => "session_started",
-            Self::NoTestCompleted(_) => "no_test_completed",
-            Self::SessionClosed { .. } => "session_closed",
-            Self::EchoSent { .. } => "echo_sent",
-            Self::EchoReply(_) => "echo_reply",
-            Self::Loss { .. } => "loss",
-            Self::Duplicate { .. } => "duplicate",
-            Self::Late { .. } => "late",
-            Self::Warning { .. } => "warning",
+            Self::SessionStarted(_) => EventKind::SessionStarted,
+            Self::NoTestCompleted(_) => EventKind::NoTestCompleted,
+            Self::SessionClosed { .. } => EventKind::SessionClosed,
+            Self::EchoSent { .. } => EventKind::EchoSent,
+            Self::EchoReply(_) => EventKind::EchoReply,
+            Self::Loss { .. } => EventKind::Loss,
+            Self::Duplicate { .. } => EventKind::Duplicate,
+            Self::Late { .. } => EventKind::Late,
+            Self::Warning { .. } => EventKind::Warning,
         }
     }
 
@@ -784,7 +790,7 @@ fn render_jsonl_row(row: &OutputRow, columns: &[Column], context: RenderContext<
 fn cell_for(row: &OutputRow, column: Column, context: RenderContext<'_>) -> Option<CellValue> {
     match column {
         Column::Target => context.target.map(CellValue::text),
-        Column::Event => Some(CellValue::text(row.event_name())),
+        Column::Event => Some(CellValue::text(row.event_kind().name())),
         Column::Seq => row.seq().map(|seq| CellValue::Unsigned(u128::from(seq))),
         Column::Remote => row
             .remote()

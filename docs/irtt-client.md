@@ -313,10 +313,23 @@ Choose one of four event-row formats. The default is `table`:
 - `jsonl`: one JSON object per event.
 
 CSV, TSV, and JSON Lines include all columns by default for structured export;
-`table` defaults to a compact column set and hides `echo_sent` rows. An
-explicit `--columns` selection other than `default` shows all event rows,
-including `echo_sent`; `--columns default` is equivalent to omitting the
-option and keeps `echo_sent` hidden for table output.
+`table` defaults to a compact column set and hides `echo_sent` events.
+You can show those events by explicitly selecting them with `--events`
+or by using custom columns.
+
+### `--events EVENTS`
+
+Choose which events to print with a comma-separated list, or repeat the
+option to select more events. The available names are `session_started`,
+`no_test_completed`, `session_closed`, `echo_sent`, `echo_reply`, `loss`,
+`duplicate`, `late`, and `warning`. Without this option, the client prints
+all events normally shown by the selected format.
+
+For CSV output containing only echo replies:
+
+```sh
+irtt-client <server> --events echo_reply --format csv --header never --no-stats
+```
 
 ### `--columns COLUMNS` / `-c COLUMNS`
 

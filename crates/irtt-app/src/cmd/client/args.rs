@@ -101,12 +101,22 @@ pub struct ClientArgs {
     )]
     pub format: OutputFormat,
 
+    /// Filter output by event type.
+    #[arg(
+        long,
+        value_name = "EVENTS",
+        value_delimiter = ',',
+        value_enum,
+        long_help = "Filter output by event type. Accepts comma-separated names or repeated options. If omitted, the normal output behavior is unchanged."
+    )]
+    pub events: Vec<EventKind>,
+
     /// Comma-separated event row columns, or default/all.
     #[arg(
         short = 'c',
         long,
         value_name = "COLUMNS",
-        long_help = "Comma-separated event row columns, or default/all.\n\nThe default table columns are compact and hide echo_sent rows. Custom table columns include all event rows. Run --list-columns to see valid names."
+        long_help = "Comma-separated event row columns, or default/all.\n\nThe default table columns are compact and hide echo_sent rows unless explicitly selected with --events. Custom table columns include all event rows. Run --list-columns to see valid names."
     )]
     pub columns: Option<String>,
 
@@ -186,6 +196,29 @@ impl std::ops::Deref for ClientArgs {
 
     fn deref(&self) -> &Self::Target {
         &self.common
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "snake_case")]
+pub enum EventKind {
+    SessionStarted,
+    NoTestCompleted,
+    SessionClosed,
+    EchoSent,
+    EchoReply,
+    Loss,
+    Duplicate,
+    Late,
+    Warning,
+}
+
+impl EventKind {
+    pub(super) fn name(self) -> String {
+        self.to_possible_value()
+            .expect("all event kinds have a CLI value")
+            .get_name()
+            .to_owned()
     }
 }
 
