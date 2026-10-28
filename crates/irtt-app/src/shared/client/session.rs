@@ -1,5 +1,7 @@
+#[cfg(feature = "tui")]
 use irtt_client::managed::{ManagedEvent, ManagedEventSubscription, ManagedEventTryRecvError};
 
+#[cfg(feature = "tui")]
 pub(crate) fn drain_final_events<E>(
     events: &mut ManagedEventSubscription,
     dropped_events: &mut u64,
