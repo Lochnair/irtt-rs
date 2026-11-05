@@ -45,7 +45,31 @@ features, version coverage, and black-box interoperability testing.
 Prebuilt binaries for supported platforms are available on the
 [GitHub Releases](https://github.com/Lochnair/irtt-rs/releases) page.
 
-Alternatively, install from crates.io using Rust 1.88 or newer:
+### OpenWrt 25.12 and newer
+
+You can install from [my APK feed](https://openwrt.lochnair.net). Packages
+are built for all OpenWrt architectures except those unsupported by Rust.
+The feed currently publishes builds for OpenWrt 25.12 only. These should
+also work on newer releases, provided there are no incompatible ABI changes.
+
+Run this as root on your router. It reads your package architecture from
+`/etc/openwrt_release`:
+
+```sh
+. /etc/openwrt_release
+wget -O /etc/apk/keys/lochnair-apk.pem https://openwrt.lochnair.net/keys/lochnair-apk.pem
+echo "https://openwrt.lochnair.net/25.12/${DISTRIB_ARCH}/packages.adb" >> /etc/apk/repositories.d/customfeeds.list
+apk update
+apk add irtt-rs
+```
+
+The `irtt-rs` package includes the client with statistics. To install the
+client, server, and terminal UI, use `apk add irtt-rs-full` instead of
+`apk add irtt-rs`.
+
+### Installing with Cargo
+
+Install from crates.io using Rust 1.88 or newer:
 
 ```sh
 cargo install irtt-rs --locked
