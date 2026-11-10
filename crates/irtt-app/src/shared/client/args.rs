@@ -1,7 +1,9 @@
 use std::{fmt, net::IpAddr, net::SocketAddr, time::Duration};
 
 use clap::ValueEnum;
-use irtt_client::{MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH};
+use irtt_client::{
+    TimestampMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
+};
 use irtt_proto::{Clock, ReceivedStats, StampAt};
 
 #[derive(Clone, clap::Args)]
@@ -48,6 +50,14 @@ pub struct CommonClientArgs {
         default_value_t = TimestampArg::Both
     )]
     pub tstamp: TimestampArg,
+
+    /// Local kernel RX timestamping policy.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub kernel_rx_timestamp: KernelTimestampArg,
+
+    /// Local kernel TX timestamping policy.
+    #[arg(long, value_enum, default_value = "auto")]
+    pub kernel_tx_timestamp: KernelTimestampArg,
 
     /// Received-stats mode to request.
     #[arg(
@@ -125,6 +135,8 @@ impl fmt::Debug for CommonClientArgs {
             .field("hmac", &self.hmac.as_ref().map(|_| "[REDACTED]"))
             .field("clock", &self.clock)
             .field("tstamp", &self.tstamp)
+            .field("kernel_rx_timestamp", &self.kernel_rx_timestamp)
+            .field("kernel_tx_timestamp", &self.kernel_tx_timestamp)
             .field("stats", &self.stats)
             .field("server_fill", &self.server_fill)
             .field("dscp", &self.dscp)
@@ -137,6 +149,26 @@ impl fmt::Debug for CommonClientArgs {
         #[cfg(target_os = "freebsd")]
         debug.field("fib", &self.fib);
         debug.field("loose", &self.loose).finish()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum KernelTimestampArg {
+    /// Try kernel timestamping and fall back to userspace on initialization failure.
+    Auto,
+    /// Require initialization. Individual packets may still use userspace timestamps.
+    On,
+    /// Use userspace timestamps.
+    Off,
+}
+
+impl From<KernelTimestampArg> for TimestampMode {
+    fn from(value: KernelTimestampArg) -> Self {
+        match value {
+            KernelTimestampArg::Auto => Self::Auto,
+            KernelTimestampArg::On => Self::On,
+            KernelTimestampArg::Off => Self::Off,
+        }
     }
 }
 

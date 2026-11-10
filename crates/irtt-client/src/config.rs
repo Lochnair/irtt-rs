@@ -268,6 +268,10 @@ impl Default for OpenPolicy {
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SocketConfig {
+    /// Local kernel receive timestamp policy.
+    pub kernel_rx_timestamp: TimestampMode,
+    /// Local kernel transmit timestamp policy.
+    pub kernel_tx_timestamp: TimestampMode,
     /// Local address to bind before connecting the UDP socket.
     ///
     /// `None` binds to an unspecified address with an ephemeral port matching
@@ -288,6 +292,21 @@ pub struct SocketConfig {
     /// platform socket option range; [`MAX_TTL`] is the public configuration
     /// bound used by this crate.
     pub ttl: Option<u32>,
+}
+
+/// Local software kernel timestamp initialization policy for one direction.
+///
+/// An initialized socket can still lack a usable timestamp for an individual
+/// packet. Measurements then use the corresponding userspace timestamp.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TimestampMode {
+    /// Try to initialize kernel timestamping and fall back on failure.
+    #[default]
+    Auto,
+    /// Return an error if kernel timestamping cannot be initialized.
+    On,
+    /// Do not request or use kernel timestamps in this direction.
+    Off,
 }
 
 /// How strictly to handle server-side negotiation restrictions.

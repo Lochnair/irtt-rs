@@ -57,6 +57,8 @@ impl CommonClientArgs {
                     Authentication::Hmac(HmacKey::new(key))
                 }),
             socket: SocketConfig {
+                kernel_rx_timestamp: self.kernel_rx_timestamp.into(),
+                kernel_tx_timestamp: self.kernel_tx_timestamp.into(),
                 bind_addr: self.bind_addr,
                 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
                 bind_to_device: self.bind_to_device.clone(),

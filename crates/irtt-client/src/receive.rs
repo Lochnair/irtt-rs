@@ -4,7 +4,7 @@ use std::{
     time::SystemTime,
 };
 
-use crate::{metadata::ReceiveMeta, timing::ClientTimestamp};
+use crate::{metadata::ReceiveMeta, timing::ClientTimestamp, ClientError, TimestampMode};
 
 #[cfg(all(target_os = "linux", feature = "ancillary"))]
 mod linux;
@@ -20,6 +20,7 @@ pub(crate) struct ReceivedDatagram {
 pub(crate) fn recv_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
+    _rx_timestamping: bool,
 ) -> Result<ReceivedDatagram, io::Error> {
     let len = socket.recv(buf)?;
     let received_at = ClientTimestamp::now();
@@ -35,8 +36,9 @@ pub(crate) fn recv_datagram(
 pub(crate) fn recv_datagram(
     socket: &UdpSocket,
     buf: &mut [u8],
+    rx_timestamping: bool,
 ) -> Result<ReceivedDatagram, io::Error> {
-    linux::recv_datagram(socket, buf)
+    linux::recv_datagram(socket, buf, rx_timestamping)
 }
 
 #[cfg(all(
@@ -46,6 +48,7 @@ pub(crate) fn recv_datagram(
 pub(crate) fn try_recv_tokio_datagram(
     socket: &tokio::net::UdpSocket,
     buf: &mut [u8],
+    _rx_timestamping: bool,
 ) -> Result<ReceivedDatagram, io::Error> {
     let len = socket.try_recv(buf)?;
     let received_at = ClientTimestamp::now();
@@ -61,8 +64,9 @@ pub(crate) fn try_recv_tokio_datagram(
 pub(crate) fn try_recv_tokio_datagram(
     socket: &tokio::net::UdpSocket,
     buf: &mut [u8],
+    rx_timestamping: bool,
 ) -> Result<ReceivedDatagram, io::Error> {
-    linux::try_recv_tokio_datagram(socket, buf)
+    linux::try_recv_tokio_datagram(socket, buf, rx_timestamping)
 }
 
 #[cfg(not(all(target_os = "linux", feature = "ancillary")))]
@@ -78,19 +82,68 @@ pub(crate) fn configure_receive_metadata(socket: &UdpSocket, remote: SocketAddr)
     linux::configure_receive_metadata(socket, remote)
 }
 
+pub(crate) fn configure_rx_timestamping(
+    socket: &UdpSocket,
+    remote: SocketAddr,
+    mode: TimestampMode,
+) -> Result<bool, ClientError> {
+    initialize_timestamping(
+        mode,
+        remote,
+        "enable kernel RX timestamping (use --kernel-rx-timestamp=auto to allow fallback)",
+        || set_rx_timestamping(socket),
+    )
+}
+
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+fn set_rx_timestamping(socket: &UdpSocket) -> io::Result<()> {
+    linux::set_rx_timestamping(socket)
+}
+
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+fn set_rx_timestamping(_socket: &UdpSocket) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "kernel timestamping requires Linux and the ancillary feature",
+    ))
+}
+
+pub(crate) fn initialize_timestamping(
+    mode: TimestampMode,
+    remote: SocketAddr,
+    operation: &'static str,
+    initialize: impl FnOnce() -> io::Result<()>,
+) -> Result<bool, ClientError> {
+    if mode == TimestampMode::Off {
+        return Ok(false);
+    }
+    match initialize() {
+        Ok(()) => Ok(true),
+        Err(_) if mode == TimestampMode::Auto => Ok(false),
+        Err(source) => Err(ClientError::SocketOption {
+            operation,
+            remote,
+            source,
+        }),
+    }
+}
+
 /// Best-effort upgrade a socket from RX-only to RX+TX kernel software
 /// timestamping. Returns whether the upgrade succeeded; a caller should
 /// track this to skip later drains entirely rather than perform harmless
 /// no-op ones. Always returns `false` off Linux or without the `ancillary`
 /// feature, so callers never need their own platform `cfg`.
 #[cfg(not(all(target_os = "linux", feature = "ancillary")))]
-pub(crate) fn try_enable_tx_timestamping<S>(_socket: &S) -> bool {
+pub(crate) fn try_enable_tx_timestamping<S>(_socket: &S, _rx_timestamping: bool) -> bool {
     false
 }
 
 #[cfg(all(target_os = "linux", feature = "ancillary"))]
-pub(crate) fn try_enable_tx_timestamping<S: std::os::fd::AsFd>(socket: &S) -> bool {
-    linux::try_enable_tx_timestamping(socket)
+pub(crate) fn try_enable_tx_timestamping<S: std::os::fd::AsFd>(
+    socket: &S,
+    rx_timestamping: bool,
+) -> bool {
+    linux::try_enable_tx_timestamping(socket, rx_timestamping)
 }
 
 /// Bounded, nonblocking drain of `socket`'s `MSG_ERRQUEUE`, reporting each
