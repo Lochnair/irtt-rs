@@ -73,8 +73,8 @@ pub use auth::{Authentication, HmacKey};
 pub use client::Client;
 pub use config::{
     AddressFamily, ClientConfig, NegotiationPolicy, OpenPolicy, RecvBudget, RunMode,
-    SessionRequest, SocketConfig, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES, MAX_TTL,
-    MAX_UDP_PAYLOAD_LENGTH,
+    SessionRequest, SocketConfig, TimestampMode, MAX_DSCP_CODEPOINT, MAX_SERVER_FILL_BYTES,
+    MAX_TTL, MAX_UDP_PAYLOAD_LENGTH,
 };
 pub use error::ClientError;
 pub use event::{

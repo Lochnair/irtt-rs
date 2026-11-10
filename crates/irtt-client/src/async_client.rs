@@ -184,6 +184,7 @@ pub struct AsyncClient {
     /// See `Client::tx_timestamping_enabled` in `client.rs` for the
     /// invariant this tracks; it is the same adapter-owned capability flag.
     tx_timestamping_enabled: bool,
+    rx_timestamping: bool,
 }
 
 impl AsyncClient {
@@ -206,7 +207,8 @@ impl AsyncClient {
         let remote = resolve_remote_tokio(endpoint.as_ref(), config.address_family).await?;
         let machine = SessionMachine::new(config.clone(), remote)?;
         let prepared_open = machine.prepare_open_request()?;
-        let socket = connect_tokio_udp_socket(&config.socket, remote, config.address_family)?;
+        let (socket, rx_timestamping) =
+            connect_tokio_udp_socket(&config.socket, remote, config.address_family)?;
 
         Ok(Self {
             socket,
@@ -217,6 +219,7 @@ impl AsyncClient {
             prepared_open: Some(prepared_open),
             prepared_probe: None,
             tx_timestamping_enabled: false,
+            rx_timestamping,
         })
     }
 
@@ -356,7 +359,11 @@ impl AsyncClient {
                 Poll::Ready(Ok(true)) => {}
             }
 
-            let datagram = match try_recv_tokio_datagram(&self.socket, &mut state.buffer) {
+            let datagram = match try_recv_tokio_datagram(
+                &self.socket,
+                &mut state.buffer,
+                self.rx_timestamping,
+            ) {
                 Ok(datagram) => datagram,
                 // WouldBlock is a readiness false positive; Interrupted
                 // (EINTR) is a transient nonblocking-recvmsg interruption.
@@ -532,7 +539,11 @@ impl AsyncClient {
                 }
             }
 
-            let datagram = match try_recv_tokio_datagram(&self.socket, &mut self.recv_buffer) {
+            let datagram = match try_recv_tokio_datagram(
+                &self.socket,
+                &mut self.recv_buffer,
+                self.rx_timestamping,
+            ) {
                 Ok(datagram) => datagram,
                 // See `RECV_POLL_WORK_BUDGET`: both a readiness false
                 // positive and an interrupted nonblocking recvmsg retry
@@ -738,7 +749,8 @@ impl AsyncClient {
 
         self.applied_traffic_class = prepared.negotiated_traffic_class;
         self.prepared_open = None;
-        self.tx_timestamping_enabled = try_enable_tx_timestamping(&self.socket);
+        self.tx_timestamping_enabled =
+            try_enable_tx_timestamping(&self.socket, self.rx_timestamping);
         outcome
     }
 

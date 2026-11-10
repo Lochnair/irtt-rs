@@ -5,7 +5,7 @@ use socket2::{Domain, Protocol, Socket, Type};
 use crate::{
     config::{AddressFamily, SocketConfig, DEFAULT_PORT},
     error::ClientError,
-    receive::configure_receive_metadata,
+    receive::{configure_receive_metadata, configure_rx_timestamping},
     socket_options::apply_ttl_to_socket,
 };
 
@@ -84,7 +84,7 @@ pub(crate) fn connect_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
     family: AddressFamily,
-) -> Result<UdpSocket, ClientError> {
+) -> Result<(UdpSocket, bool), ClientError> {
     let socket = create_prebind_udp_socket(remote, family)?;
     #[cfg(any(
         target_os = "android",
@@ -112,7 +112,8 @@ pub(crate) fn connect_udp_socket(
     if let Some(ttl) = config.ttl {
         apply_ttl_to_socket(&socket, remote, ttl)?;
     }
-    Ok(socket)
+    let rx_timestamping = configure_rx_timestamping(&socket, remote, config.kernel_rx_timestamp)?;
+    Ok((socket, rx_timestamping))
 }
 
 fn create_prebind_udp_socket(
@@ -137,8 +138,8 @@ pub(crate) fn connect_tokio_udp_socket(
     config: &SocketConfig,
     remote: SocketAddr,
     family: AddressFamily,
-) -> Result<tokio::net::UdpSocket, ClientError> {
-    let socket = connect_udp_socket(config, remote, family)?;
+) -> Result<(tokio::net::UdpSocket, bool), ClientError> {
+    let (socket, rx_timestamping) = connect_udp_socket(config, remote, family)?;
     socket.set_nonblocking(true)?;
-    Ok(tokio::net::UdpSocket::from_std(socket)?)
+    Ok((tokio::net::UdpSocket::from_std(socket)?, rx_timestamping))
 }

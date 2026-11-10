@@ -80,6 +80,7 @@ pub struct Client {
     /// unnecessary error-queue drains are skipped once it is known there is
     /// nothing to drain.
     tx_timestamping_enabled: bool,
+    rx_timestamping: bool,
 }
 
 impl Client {
@@ -96,7 +97,8 @@ impl Client {
         config.open.validate()?;
         let remote = resolve_remote(endpoint.as_ref(), config.address_family)?;
         let runtime = SessionMachine::new(config.clone(), remote)?;
-        let socket = connect_udp_socket(&config.socket, remote, config.address_family)?;
+        let (socket, rx_timestamping) =
+            connect_udp_socket(&config.socket, remote, config.address_family)?;
 
         Ok(Self {
             runtime,
@@ -106,6 +108,7 @@ impl Client {
             recv_timeout: None,
             applied_traffic_class: None,
             tx_timestamping_enabled: false,
+            rx_timestamping,
         })
     }
 
@@ -317,7 +320,7 @@ impl Client {
         let mut timeout_narrowed = false;
 
         let result = loop {
-            match recv_datagram(&self.socket, &mut self.recv_buffer) {
+            match recv_datagram(&self.socket, &mut self.recv_buffer, self.rx_timestamping) {
                 Ok(datagram) => break Ok(Some(datagram)),
                 Err(err)
                     if matches!(
@@ -442,7 +445,7 @@ impl Client {
                 }
                 self.socket.set_read_timeout(Some(remaining))?;
 
-                let datagram = match recv_datagram(&self.socket, &mut buf) {
+                let datagram = match recv_datagram(&self.socket, &mut buf, self.rx_timestamping) {
                     Ok(datagram) => datagram,
                     // WouldBlock/TimedOut mean the attempt's own deadline
                     // elapsed; Interrupted (EINTR) means the syscall was
@@ -572,7 +575,8 @@ impl Client {
             let outcome = self.runtime.commit_open(machine);
 
             self.applied_traffic_class = Some(negotiated_traffic_class);
-            self.tx_timestamping_enabled = try_enable_tx_timestamping(&self.socket);
+            self.tx_timestamping_enabled =
+                try_enable_tx_timestamping(&self.socket, self.rx_timestamping);
             Ok(outcome)
         } else {
             if let Err(source) = self.socket.set_read_timeout(post_open_recv_timeout) {
@@ -581,7 +585,8 @@ impl Client {
             let outcome = self.runtime.commit_open(machine);
 
             self.applied_traffic_class = None;
-            self.tx_timestamping_enabled = try_enable_tx_timestamping(&self.socket);
+            self.tx_timestamping_enabled =
+                try_enable_tx_timestamping(&self.socket, self.rx_timestamping);
             Ok(outcome)
         }
     }

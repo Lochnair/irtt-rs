@@ -24,13 +24,12 @@ use nix::{
 use super::system_time_from_timespec;
 
 /// `SO_TIMESTAMPING` configuration for a TX-timestamped socket. Combines the
-/// module's RX flags with the TX-side flags TX capture needs: `TX_SOFTWARE`
+/// software reporting and the TX-side flags TX capture needs: `TX_SOFTWARE`
 /// to generate a send timestamp, `OPT_ID` for automatic per-datagram
 /// correlation, and `OPT_TSONLY` so the notification does not need to
 /// retain or copy the original payload.
 pub(crate) const TX_TIMESTAMPING_FLAGS: TimestampingFlag =
-    TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
-        .union(TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE)
+    TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE
         .union(TimestampingFlag::SOF_TIMESTAMPING_TX_SOFTWARE)
         .union(TimestampingFlag::SOF_TIMESTAMPING_OPT_ID)
         .union(TimestampingFlag::SOF_TIMESTAMPING_OPT_TSONLY);
