@@ -132,23 +132,35 @@ const PROBES: usize = 3;
 // check that it corresponds to this send, even when replies arrive in reverse.
 fn assert_endpoints(
     event: &ClientEvent,
+    expected_seq: u32,
     anchors: &[SystemTime],
     rx: TimestampMode,
     tx: TimestampMode,
 ) {
-    let ClientEvent::EchoReply {
-        seq,
-        sent_at,
-        received_at,
-        rtt,
-        server_timing: Some(timing),
-        one_way: Some(one_way),
-        packet_meta,
-        ..
-    } = event
-    else {
-        panic!("expected measured reply: {event:?}");
+    let (seq, sent_at, received_at, rtt, timing, one_way, packet_meta) = match event {
+        ClientEvent::EchoReply {
+            seq,
+            sent_at,
+            received_at,
+            rtt,
+            server_timing: Some(timing),
+            one_way: Some(one_way),
+            packet_meta,
+            ..
+        } => (seq, sent_at, received_at, rtt, timing, one_way, packet_meta),
+        ClientEvent::LateReply {
+            seq,
+            sent_at: Some(sent_at),
+            received_at,
+            rtt: Some(rtt),
+            server_timing: Some(timing),
+            one_way: Some(one_way),
+            packet_meta,
+            ..
+        } => (seq, sent_at, received_at, rtt, timing, one_way, packet_meta),
+        _ => panic!("expected measured reply: {event:?}"),
     };
+    assert_eq!(*seq, expected_seq);
     let ns = |wall: SystemTime| {
         i128::try_from(wall.duration_since(UNIX_EPOCH).unwrap().as_nanos()).unwrap()
     };
@@ -229,10 +241,8 @@ fn blocking_timestamp_modes_with_reordered_replies() {
         }
         for seq in (0..PROBES as u32).rev() {
             let events = client.recv_once().unwrap();
-            assert!(
-                matches!(events.as_slice(), [ClientEvent::EchoReply { seq: actual, .. }] if *actual == seq)
-            );
-            assert_endpoints(&events[0], &anchors, rx, tx);
+            assert_eq!(events.len(), 1);
+            assert_endpoints(&events[0], seq, &anchors, rx, tx);
         }
         client.close().unwrap();
         assert_markings(&peer.join().unwrap(), allowed);
@@ -261,8 +271,8 @@ fn async_timestamp_modes_with_reordered_replies() {
                 }
                 for seq in (0..PROBES as u32).rev() {
                     let events = client.recv().await.unwrap();
-                    assert!(matches!(events.as_slice(), [ClientEvent::EchoReply { seq: actual, .. }] if *actual == seq));
-                    assert_endpoints(&events[0], &anchors, rx, tx);
+                    assert_eq!(events.len(), 1);
+                    assert_endpoints(&events[0], seq, &anchors, rx, tx);
                 }
                 client.close().await.unwrap();
             })
