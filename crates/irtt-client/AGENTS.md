@@ -35,68 +35,26 @@ of one operation's commitment.
 
 Tokio retains one prepared probe across cancellation/readiness false positives
 and `WouldBlock`, samples a fresh private anchor on each retry, and clears the
-prepared probe after commitment even when post-send processing fails. Failed
-submissions still invalidate kernel TX ID correlation as documented below.
+prepared probe after commitment even when post-send processing fails. Failed implicit-ID submissions invalidate correlation as documented below.
+Explicit-ID sends consume a distinct attempt ID even on failure.
 
 ## Linux kernel TX timestamp capture
 
-On Linux, with the `ancillary` feature, the client best-effort upgrades its
-socket from RX-only `SO_TIMESTAMPING` to RX+TX immediately after a successful
-Open, before the first Echo probe can be sent:
+RX and TX use separate `TimestampMode` policies. Both default to auto, which
+falls back when initialization fails. On requires initialization and off
+skips that direction. Per-packet timing is optional. Keep IP_TOS/IPV6_TCLASS
+capture separate from both policies. Gate software RX metadata on successful
+RX initialization even if TX software reporting produces an RX cmsg.
 
-```
-socket created
-    -> RX timestamping configured (RX_SOFTWARE | SOFTWARE)
-    -> Open attempts/retries (untimestamped)
-    -> successful Open
-    -> best-effort enable TX timestamping (+ TX_SOFTWARE | OPT_ID | OPT_TSONLY)
-    -> first Echo probe
-```
+Configure software TX with OPT_ID after trusted Open acceptance, before committing the session. Earlier Open traffic has no TX generation. A failed strict activation restores local preparation and attempts a token-bound cleanup Close.
 
-`TX_SOFTWARE` asks the kernel for a software send timestamp; `OPT_ID` asks it
-to tag each notification with an automatically incrementing per-socket ID;
-`OPT_TSONLY` means the notification never needs to carry the original
-payload, so a zero-length receive buffer is enough. The upgrade is entirely
-best-effort: if it fails, the client keeps operating on the original RX-only
-configuration (`try_enable_tx_timestamping` restores it explicitly) and
-timing falls back to userspace `sent_at` as it always has. TX capability
-failure is never a public error and is never logged from the library.
-
-### Best-effort kernel-ID correlation
-
-The client uses the kernel's automatic `OPT_ID` as the probe's wire-sequence
-correlation ID — no separate correlation map. On the normal successful-send
-path, both counters start at zero after Open and advance together. This is
-not a permanent identity: a kernel ID can theoretically be consumed while a
-send is being prepared and then survive a subsequent send failure, leaving
-kernel IDs one or more steps ahead of `next_wire_seq`. Do not restore an
-assumption that failed or nonblocking sends cannot cause that desynchrony.
-
-The effect is confined to the optional timing enhancement. A kernel timestamp
-whose ID cannot be matched to a pending or retained timed-out probe is
-discarded, as is any implausible timestamp; `sent_at` remains the ordinary
-userspace fallback. **After every failed probe submission, disable kernel-ID
-correlation for the rest of that session.** A gap means an otherwise plausible
-later ID can name the wrong probe, so subsequent error-queue timestamps must
-be discarded rather than attached by ID. This is safe because:
-
-- **Normal successful sends track together.** `wire_seq` starts at 0 on every
-  successful Open (`SessionMachine::commit_open` builds a fresh
-  `ActiveSession` with `next_wire_seq: 0`) and advances by exactly 1 only via
-  `commit_probe_sent`, after a confirmed successful socket send. TX
-  timestamping is enabled after that same successful Open and before any probe
-  is sent, so the normal zero points line up.
-- **One socket, one session, no reopen.** `SessionMachine`'s state machine
-  only reaches `Open` from `Connected`, and `commit_open`/`commit_local_close`
-  never route back to `Connected`. A `Client`/`AsyncClient` cannot reopen a
-  second session on the same socket, so there is no second epoch of wire
-  sequence numbers to collide with a stale kernel ID.
-- **The one extra send (Close) is harmless.** `Close` sends one datagram
-  after TX timestamping is already enabled, generating one TX timestamp
-  record with no corresponding `wire_seq` (`Close` does not advance
-  `next_wire_seq`). Because the session is terminal immediately after,
-  nothing will ever look up that ID; `record_kernel_tx_timestamp`'s
-  "unknown ID -> ignore" rule discards it safely.
+Keep `OPT_TSONLY` to avoid queuing the original datagram payload. An
+implicit-ID Echo send error or anomalous accepted length can desynchronize
+kernel IDs and wire sequences. Quarantine later associations. A Close that
+may generate a timestamp and fails to submit also invalidates implicit
+correlation, because the session remains open. Keep already attached
+timestamps, send receipts and pending/retained accounting. Never correlate
+a reused timestamp ID.
 
 ## MSG_ERRQUEUE drains
 
@@ -107,8 +65,8 @@ completion (`TxTimestamp`), a timestamp-origin record that is not a usable
 fatal, since this client only ever requests `TX_SOFTWARE`/`SND`, so anything
 else on that origin is unexpected metadata, not a network error), a genuine
 non-timestamp socket/network error (`SocketError`), or nothing (`Ignored`).
-Origin (`SO_EE_ORIGIN_TIMESTAMPING` or not) is the only thing that decides
-between the last two categories.
+A timestamp origin cannot become a socket error. Truncated or ambiguous
+control records are optional metadata and are discarded.
 
 `receive::linux::drain_tx_timestamps` reads up to
 `MAX_TX_TIMESTAMP_RECORDS_PER_DRAIN` (32) records per call: nonblocking, one
@@ -160,8 +118,9 @@ justify why integration coverage is insufficient.
 alongside the userspace `sent_at`. It survives pending -> timed-out retention
 (`SessionMachine::record_kernel_tx_timestamp` updates whichever of
 `PendingMap`/`TimedOutMap` still holds the probe) and is otherwise bounded by
-the same limits those maps already enforce — no new unbounded state. First
-valid observation wins on duplicates.
+the same limits those maps already enforce — no new unbounded state. The earliest software observation at or after the send anchor is retained
+when duplicate notifications disagree. Check the reply-time upper bound when
+selecting the endpoint.
 
 ### Pre-send anchor vs. post-send `sent_at` (F-04)
 

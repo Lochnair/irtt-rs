@@ -9,20 +9,10 @@
 //! downstream one-way delay only when plausible relative to the userspace
 //! receive sample — are unchanged by any of this module's TX-side additions.
 //!
-//! After a successful Open, the client adapter best-effort upgrades the
-//! socket from [`RX_TIMESTAMPING_FLAGS`] to [`error_queue::TX_TIMESTAMPING_FLAGS`]
-//! via [`set_tx_timestamping`]. When that succeeds, the automatic
-//! `SOF_TIMESTAMPING_OPT_ID` counter normally tracks the probe wire sequence
-//! after successful sends, so it is used as a best-effort correlation ID.
-//! A kernel ID can theoretically be consumed by a send that later fails,
-//! desynchronizing that correlation. [`drain_tx_timestamps`] discards
-//! unmatched or implausible records; the userspace `sent_at` timestamp remains
-//! the fallback. After a probe send failure, correlation is disabled for that
-//! session so later IDs cannot be misattributed. It performs a small bounded,
-//! nonblocking read of
-//! `MSG_ERRQUEUE` so the adapter can opportunistically collect timestamps
-//! without ever waiting for one. A plausible kernel TX wall time is used only
-//! for upstream one-way delay; RTT retains the userspace send instant.
+//! The adapter resolves each TX notification to a probe before passing it
+//! to the session machine. The error queue is drained opportunistically with
+//! a fixed work bound. Plausible software wall timestamps affect upstream
+//! one-way delay. RTT uses the userspace monotonic endpoints.
 
 use std::{
     io::{self, IoSliceMut},

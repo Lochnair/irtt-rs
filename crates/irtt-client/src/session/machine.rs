@@ -426,21 +426,13 @@ impl SessionMachine {
         }
     }
 
-    /// Record an observed Linux kernel TX timestamp for `wire_seq`, the
-    /// automatic `SOF_TIMESTAMPING_OPT_ID` the kernel assigned when the
-    /// datagram was submitted.
-    ///
-    /// `wire_seq` normally matches that correlation ID after successful
-    /// sends. This is best effort rather than an invariant: a kernel ID can
-    /// theoretically be consumed by a send that later fails, leaving the
-    /// counters desynchronized. An unmatched or implausible ID is discarded;
-    /// the probe's userspace `sent_at` remains the fallback.
+    /// Record an observed Linux software TX timestamp after the adapter
+    /// has resolved its kernel ID to a probe wire sequence.
     ///
     /// Updates a still-pending or already-timed-out probe in place. Never
     /// resurrects a completed, evicted, or unknown probe, and never touches
     /// `sent_at`, timeout/loss/reply state, or any counter — this is purely
-    /// dormant metadata attachment. A probe that already has a timestamp
-    /// keeps the earliest observation after the send anchor. A future
+    /// dormant metadata attachment. A probe keeps the earliest observation after the send anchor. A future
     /// duplicate cannot hide a usable timestamp at reply processing.
     pub(crate) fn record_kernel_tx_timestamp(&mut self, wire_seq: u32, timestamp: SystemTime) {
         let MachineState::Open(session) = &mut self.state else {
