@@ -11,7 +11,7 @@
 //!
 //! After a successful Open, the client adapter best-effort upgrades the
 //! socket from [`RX_TIMESTAMPING_FLAGS`] to [`error_queue::TX_TIMESTAMPING_FLAGS`]
-//! via [`try_enable_tx_timestamping`]. When that succeeds, the automatic
+//! via [`set_tx_timestamping`]. When that succeeds, the automatic
 //! `SOF_TIMESTAMPING_OPT_ID` counter normally tracks the probe wire sequence
 //! after successful sends, so it is used as a best-effort correlation ID.
 //! A kernel ID can theoretically be consumed by a send that later fails,
@@ -56,32 +56,19 @@ use error_queue::ErrorQueueRecord;
 /// without any unbounded loop.
 pub(crate) const MAX_TX_TIMESTAMP_RECORDS_PER_DRAIN: usize = 32;
 
-/// Best-effort upgrade from RX-only to RX+TX `SO_TIMESTAMPING` flags.
-///
-/// Returns `true` when the upgrade succeeded and the caller may now expect
-/// `MSG_ERRQUEUE` TX timestamp records for subsequent sends. On failure, the
-/// original [`RX_TIMESTAMPING_FLAGS`] are best-effort restored so a failed
-/// upgrade cannot leave the socket without the RX timestamping this client
-/// already depends on; that restore's own failure is not observable here
-/// (both leave the caller without TX capability, which this return value
-/// already reports).
-pub(crate) fn try_enable_tx_timestamping<S: AsFd>(socket: &S, rx_timestamping: bool) -> bool {
+/// Enable TX generation on top of the initialized RX state. Linux validates
+/// the new flags before replacing the previous configuration.
+pub(crate) fn set_tx_timestamping<S: AsFd>(socket: &S, rx_timestamping: bool) -> io::Result<()> {
     let rx_flags = if rx_timestamping {
         RX_TIMESTAMPING_FLAGS
     } else {
         TimestampingFlag::empty()
     };
-    if setsockopt(
+    Ok(setsockopt(
         socket,
         sockopt::Timestamping,
         &(rx_flags | error_queue::TX_TIMESTAMPING_FLAGS),
-    )
-    .is_ok()
-    {
-        return true;
-    }
-    let _ = setsockopt(socket, sockopt::Timestamping, &rx_flags);
-    false
+    )?)
 }
 
 /// Bounded, nonblocking drain of `fd`'s `MSG_ERRQUEUE`.
@@ -122,7 +109,7 @@ pub(crate) fn drain_tx_timestamps<S: AsRawFd>(
 /// documented fallback quirks, so the client uses `SO_TIMESTAMPING`
 /// exclusively for receive timing. Hardware and TX-side flags are
 /// deliberately excluded here: a fresh socket is receive-only until (and
-/// unless) [`try_enable_tx_timestamping`] later upgrades it.
+/// unless) [`set_tx_timestamping`] later upgrades it.
 const RX_TIMESTAMPING_FLAGS: TimestampingFlag = TimestampingFlag::SOF_TIMESTAMPING_RX_SOFTWARE
     .union(TimestampingFlag::SOF_TIMESTAMPING_SOFTWARE);
 

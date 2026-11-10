@@ -59,7 +59,7 @@ struct ExtendedErrWithAddr {
 /// record (with room for the largest possible offender address) plus one
 /// `SCM_TIMESTAMPING` record.
 const ERROR_QUEUE_CONTROL_LEN: usize =
-    cmsg_space::<ExtendedErrWithAddr>() + cmsg_space::<Timestamps>();
+    cmsg_space::<ExtendedErrWithAddr>() + cmsg_space::<Timestamps>() + cmsg_space::<i32>();
 
 /// A classified record read from a socket's `MSG_ERRQUEUE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,10 +170,13 @@ pub(crate) fn try_recv_error_queue_record(fd: RawFd) -> io::Result<Option<ErrorQ
         MsgFlags::MSG_ERRQUEUE | MsgFlags::MSG_DONTWAIT,
     ) {
         Ok(msg) => {
-            let cmsgs = msg
-                .cmsgs()
-                .map_err(|_| io::Error::from(io::ErrorKind::InvalidData))?;
-            Ok(Some(classify(cmsgs)))
+            // Truncated optional metadata cannot identify a probe or a
+            // socket error reliably. A complete network record is sized
+            // above, including its address and traffic class.
+            Ok(Some(match msg.cmsgs() {
+                Ok(cmsgs) => classify(cmsgs),
+                Err(_) => ErrorQueueRecord::Ignored,
+            }))
         }
         Err(Errno::EWOULDBLOCK) => Ok(None),
         Err(Errno::EINTR) => Ok(Some(ErrorQueueRecord::Ignored)),

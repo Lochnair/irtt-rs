@@ -14,7 +14,7 @@ use crate::{
     config::ClientConfig,
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
-    receive::{drain_tx_timestamps, try_enable_tx_timestamping, try_recv_tokio_datagram},
+    receive::{configure_tx_timestamping, drain_tx_timestamps, try_recv_tokio_datagram},
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
         PreparedProbe, SessionMachine, TimeoutBatch, MAX_OPEN_PACKET_SIZE,
@@ -626,13 +626,17 @@ impl AsyncClient {
             let bytes = match send_result {
                 Ok(bytes) => bytes,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.machine.invalidate_kernel_tx_correlation();
                     if let Err(error) = rollback.restore() {
                         return Poll::Ready(Err(error));
                     }
 
                     continue;
                 }
-                Err(error) => return Poll::Ready(Err(ClientError::Socket(error))),
+                Err(error) => {
+                    self.machine.invalidate_kernel_tx_correlation();
+                    return Poll::Ready(Err(ClientError::Socket(error)));
+                }
             };
 
             let close_sent_at = ClientTimestamp::now();
@@ -700,6 +704,12 @@ impl AsyncClient {
         machine: PreparedOpenAcceptance,
     ) -> Result<PreparedAsyncOpen, Box<PreparedAsyncOpenFailure>> {
         let Some(negotiated) = machine.normal_negotiated() else {
+            self.tx_timestamping_enabled = match self.activate_tx_timestamping() {
+                Ok(enabled) => enabled,
+                Err(primary) => {
+                    return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }))
+                }
+            };
             return Ok(PreparedAsyncOpen {
                 machine,
                 recv_buffer_len: None,
@@ -734,6 +744,14 @@ impl AsyncClient {
             return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }));
         }
 
+        self.tx_timestamping_enabled = match self.activate_tx_timestamping() {
+            Ok(enabled) => enabled,
+            Err(primary) => {
+                self.restore_dscp_best_effort(self.applied_traffic_class);
+                return Err(Box::new(PreparedAsyncOpenFailure { primary, machine }));
+            }
+        };
+
         Ok(PreparedAsyncOpen {
             machine,
             recv_buffer_len: Some(recv_buffer_len),
@@ -749,9 +767,16 @@ impl AsyncClient {
 
         self.applied_traffic_class = prepared.negotiated_traffic_class;
         self.prepared_open = None;
-        self.tx_timestamping_enabled =
-            try_enable_tx_timestamping(&self.socket, self.rx_timestamping);
         outcome
+    }
+
+    fn activate_tx_timestamping(&self) -> Result<bool, ClientError> {
+        configure_tx_timestamping(
+            &self.socket,
+            self.remote,
+            self.machine.config().socket.kernel_tx_timestamp,
+            self.rx_timestamping,
+        )
     }
 
     /// See `Client::drain_tx_timestamps` in `client.rs`: same bounded,

@@ -440,21 +440,29 @@ impl SessionMachine {
     /// resurrects a completed, evicted, or unknown probe, and never touches
     /// `sent_at`, timeout/loss/reply state, or any counter — this is purely
     /// dormant metadata attachment. A probe that already has a timestamp
-    /// keeps it: first usable observation wins, so a later duplicate cannot
-    /// silently overwrite it.
+    /// keeps the earliest observation after the send anchor. A future
+    /// duplicate cannot hide a usable timestamp at reply processing.
     pub(crate) fn record_kernel_tx_timestamp(&mut self, wire_seq: u32, timestamp: SystemTime) {
         let MachineState::Open(session) = &mut self.state else {
             return;
         };
-        if !session.kernel_tx_correlation_valid {
+        // Do not attach any records after reusing an ID. A delayed record
+        // carries no generation and could name a different retained probe.
+        if !session.kernel_tx_correlation_valid || session.packets_sent > u64::from(u32::MAX) + 1 {
             return;
         }
-        if let Some(probe) = session.pending.get_mut(wire_seq) {
-            probe.kernel_tx_timestamp.get_or_insert(timestamp);
-            return;
-        }
-        if let Some(probe) = session.timed_out.get_mut(wire_seq) {
-            probe.kernel_tx_timestamp.get_or_insert(timestamp);
+        let probe = session
+            .pending
+            .get_mut(wire_seq)
+            .or_else(|| session.timed_out.get_mut(wire_seq));
+        if let Some(probe) = probe {
+            if timestamp >= probe.tx_not_before_wall
+                && probe
+                    .kernel_tx_timestamp
+                    .is_none_or(|previous| timestamp < previous)
+            {
+                probe.kernel_tx_timestamp = Some(timestamp);
+            }
         }
     }
 
@@ -1405,6 +1413,8 @@ mod tests {
             let commit = machine.finalize_probe_commit(preflight, anchor).unwrap();
             let sent = machine.commit_probe_sent(commit, sent_at, probe.bytes.len());
             if attach_before_timeout {
+                machine.record_kernel_tx_timestamp(sent.seq, UNIX_EPOCH);
+                machine.record_kernel_tx_timestamp(sent.seq, anchor.wall + Duration::from_secs(30));
                 machine.record_kernel_tx_timestamp(sent.seq, kernel_tx);
             }
             let deadline = machine.next_probe_timeout_deadline().unwrap();
@@ -1413,8 +1423,11 @@ mod tests {
                 ClientEvent::EchoLoss { seq: 0, .. }
             ));
             if !attach_before_timeout {
+                machine.record_kernel_tx_timestamp(sent.seq, UNIX_EPOCH);
+                machine.record_kernel_tx_timestamp(sent.seq, anchor.wall + Duration::from_secs(30));
                 machine.record_kernel_tx_timestamp(sent.seq, kernel_tx);
             }
+            machine.record_kernel_tx_timestamp(sent.seq, kernel_tx + Duration::from_micros(1));
             let events = machine
                 .process_echo_reply(
                     EchoReply {

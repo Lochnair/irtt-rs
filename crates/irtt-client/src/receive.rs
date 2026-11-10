@@ -102,6 +102,11 @@ fn set_rx_timestamping(socket: &UdpSocket) -> io::Result<()> {
 
 #[cfg(not(all(target_os = "linux", feature = "ancillary")))]
 fn set_rx_timestamping(_socket: &UdpSocket) -> io::Result<()> {
+    unsupported_timestamping()
+}
+
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+fn unsupported_timestamping() -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "kernel timestamping requires Linux and the ancillary feature",
@@ -128,22 +133,35 @@ pub(crate) fn initialize_timestamping(
     }
 }
 
-/// Best-effort upgrade a socket from RX-only to RX+TX kernel software
-/// timestamping. Returns whether the upgrade succeeded; a caller should
-/// track this to skip later drains entirely rather than perform harmless
-/// no-op ones. Always returns `false` off Linux or without the `ancillary`
-/// feature, so callers never need their own platform `cfg`.
-#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
-pub(crate) fn try_enable_tx_timestamping<S>(_socket: &S, _rx_timestamping: bool) -> bool {
-    false
+/// Configure TX generation without changing the successfully configured RX policy.
+#[cfg(all(target_os = "linux", feature = "ancillary"))]
+pub(crate) fn configure_tx_timestamping<S: std::os::fd::AsFd>(
+    socket: &S,
+    remote: SocketAddr,
+    mode: TimestampMode,
+    rx_timestamping: bool,
+) -> Result<bool, ClientError> {
+    initialize_timestamping(
+        mode,
+        remote,
+        "enable kernel TX timestamping (use --kernel-tx-timestamp=auto to allow fallback)",
+        || linux::set_tx_timestamping(socket, rx_timestamping),
+    )
 }
 
-#[cfg(all(target_os = "linux", feature = "ancillary"))]
-pub(crate) fn try_enable_tx_timestamping<S: std::os::fd::AsFd>(
-    socket: &S,
-    rx_timestamping: bool,
-) -> bool {
-    linux::try_enable_tx_timestamping(socket, rx_timestamping)
+#[cfg(not(all(target_os = "linux", feature = "ancillary")))]
+pub(crate) fn configure_tx_timestamping<S>(
+    _socket: &S,
+    remote: SocketAddr,
+    mode: TimestampMode,
+    _rx_timestamping: bool,
+) -> Result<bool, ClientError> {
+    initialize_timestamping(
+        mode,
+        remote,
+        "enable kernel TX timestamping (use --kernel-tx-timestamp=auto to allow fallback)",
+        unsupported_timestamping,
+    )
 }
 
 /// Bounded, nonblocking drain of `socket`'s `MSG_ERRQUEUE`, reporting each
