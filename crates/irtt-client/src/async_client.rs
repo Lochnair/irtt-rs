@@ -507,6 +507,7 @@ impl AsyncClient {
                 send_call,
             };
             if let Err(source) = validate_datagram_length(expected_bytes, bytes) {
+                self.machine.invalidate_kernel_tx_correlation();
                 return Poll::Ready(Err(SendProbeError::AfterCommit {
                     receipt,
                     source: Box::new(source),
