@@ -246,12 +246,13 @@ impl Client {
             bytes: sent.bytes,
             send_call,
         };
-        validate_datagram_length(expected_bytes, bytes).map_err(|source| {
-            SendProbeError::AfterCommit {
+        if let Err(source) = validate_datagram_length(expected_bytes, bytes) {
+            runtime.invalidate_kernel_tx_correlation();
+            return Err(SendProbeError::AfterCommit {
                 receipt,
                 source: Box::new(source),
-            }
-        })?;
+            });
+        }
         self.drain_tx_timestamps()
             .map_err(|source| SendProbeError::AfterCommit {
                 receipt,

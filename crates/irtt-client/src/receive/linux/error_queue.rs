@@ -99,14 +99,20 @@ pub(crate) enum ErrorQueueRecord {
 pub(crate) fn classify(cmsgs: impl Iterator<Item = ControlMessageOwned>) -> ErrorQueueRecord {
     let mut extended_error: Option<(u32, u8, u32, u32)> = None;
     let mut timestamp: Option<Timestamps> = None;
+    let mut duplicate_timestamp = false;
 
     for cmsg in cmsgs {
         match cmsg {
             ControlMessageOwned::Ipv4RecvErr(err, _) | ControlMessageOwned::Ipv6RecvErr(err, _) => {
-                extended_error = Some((err.ee_errno, err.ee_origin, err.ee_info, err.ee_data));
+                if extended_error
+                    .replace((err.ee_errno, err.ee_origin, err.ee_info, err.ee_data))
+                    .is_some()
+                {
+                    return ErrorQueueRecord::Ignored;
+                }
             }
             ControlMessageOwned::ScmTimestampsns(observed) => {
-                timestamp = Some(observed);
+                duplicate_timestamp |= timestamp.replace(observed).is_some();
             }
             _ => {}
         }
@@ -117,14 +123,14 @@ pub(crate) fn classify(cmsgs: impl Iterator<Item = ControlMessageOwned>) -> Erro
     };
 
     if origin != nix::libc::SO_EE_ORIGIN_TIMESTAMPING {
-        return ErrorQueueRecord::SocketError {
-            errno: errno as i32,
-            origin,
+        return match i32::try_from(errno) {
+            Ok(errno) if errno > 0 => ErrorQueueRecord::SocketError { errno, origin },
+            _ => ErrorQueueRecord::Ignored,
         };
     }
 
     let is_send_completion = errno == nix::libc::ENOMSG as u32 && info == SCM_TSTAMP_SND;
-    if !is_send_completion {
+    if !is_send_completion || duplicate_timestamp {
         return ErrorQueueRecord::MalformedOrUnsupportedTimestamp;
     }
 
