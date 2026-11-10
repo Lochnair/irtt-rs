@@ -8,7 +8,7 @@ use crate::{
     config::{ClientConfig, RecvBudget},
     error::ClientError,
     event::{ClientEvent, OpenOutcome},
-    receive::{drain_tx_timestamps, recv_datagram, try_enable_tx_timestamping, ReceivedDatagram},
+    receive::{configure_tx_timestamping, drain_tx_timestamps, recv_datagram, ReceivedDatagram},
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, SessionMachine,
         MAX_OPEN_PACKET_SIZE,
@@ -175,6 +175,7 @@ impl Client {
         let bytes = match self.socket.send(prepared.bytes) {
             Ok(bytes) => bytes,
             Err(err) => {
+                self.runtime.invalidate_kernel_tx_correlation();
                 self.restore_dscp_best_effort(previous_traffic_class);
                 return Err(ClientError::Socket(err));
             }
@@ -572,23 +573,35 @@ impl Client {
                 return Err(primary);
             }
 
-            let outcome = self.runtime.commit_open(machine);
+            self.tx_timestamping_enabled = match self.activate_tx_timestamping() {
+                Ok(enabled) => enabled,
+                Err(primary) => {
+                    self.recv_buffer.truncate(previous_len);
+                    self.restore_dscp_best_effort(previous_traffic_class);
+                    self.send_cleanup_close_best_effort(machine.cleanup_close_packet());
+                    return Err(primary);
+                }
+            };
 
             self.applied_traffic_class = Some(negotiated_traffic_class);
-            self.tx_timestamping_enabled =
-                try_enable_tx_timestamping(&self.socket, self.rx_timestamping);
-            Ok(outcome)
+            Ok(self.runtime.commit_open(machine))
         } else {
             if let Err(source) = self.socket.set_read_timeout(post_open_recv_timeout) {
                 return Err(ClientError::ReadTimeoutRestore { source });
             }
-            let outcome = self.runtime.commit_open(machine);
-
+            self.tx_timestamping_enabled = self.activate_tx_timestamping()?;
             self.applied_traffic_class = None;
-            self.tx_timestamping_enabled =
-                try_enable_tx_timestamping(&self.socket, self.rx_timestamping);
-            Ok(outcome)
+            Ok(self.runtime.commit_open(machine))
         }
+    }
+
+    fn activate_tx_timestamping(&self) -> Result<bool, ClientError> {
+        configure_tx_timestamping(
+            &self.socket,
+            self.remote,
+            self.runtime.config().socket.kernel_tx_timestamp,
+            self.rx_timestamping,
+        )
     }
 
     /// Best-effort, bounded, nonblocking drain of the socket's
