@@ -10,7 +10,7 @@ use std::{
 
 use crate::{
     async_client::{AsyncClient, AsyncOpenState},
-    managed::schedule::ProbeSchedule,
+    managed::schedule::{explicit_origin, ProbeSchedule},
     managed::{
         classify_client_error, ManagedEvent, ManagedTargetConfig, ManagedTargetEndReason,
         ManagedTargetFailure, ManagedTargetFailureKind, ManagedTargetFailurePhase,
@@ -522,21 +522,31 @@ impl ManagedClientTask {
                 match client.poll_open(open, cx) {
                     Poll::Pending => false,
                     Poll::Ready(Ok(OpenOutcome::Started(started))) => {
-                        let schedule = match ProbeSchedule::new(
-                            started.at.mono,
-                            &started.negotiation.accepted,
-                        ) {
-                            Ok(schedule) => schedule,
-                            Err(error) => {
-                                return self.begin_open_session_failure(
-                                    index,
-                                    ManagedTargetFailurePhase::Timing,
-                                    error,
-                                    now,
-                                    OpenSessionFailureCleanup::Close,
-                                )
-                            }
-                        };
+                        let schedule =
+                            match explicit_origin(self.config.pacing, &self.targets[index].config)
+                                .and_then(|origin| match origin {
+                                    Some(origin) => ProbeSchedule::explicit(
+                                        started.at.mono,
+                                        &started.negotiation.accepted,
+                                        origin,
+                                        Instant::now(),
+                                    ),
+                                    None => ProbeSchedule::new(
+                                        started.at.mono,
+                                        &started.negotiation.accepted,
+                                    ),
+                                }) {
+                                Ok(schedule) => schedule,
+                                Err(error) => {
+                                    return self.begin_open_session_failure(
+                                        index,
+                                        ManagedTargetFailurePhase::Timing,
+                                        error,
+                                        now,
+                                        OpenSessionFailureCleanup::Close,
+                                    )
+                                }
+                            };
                         self.publish_client_events(
                             index,
                             vec![ClientEvent::SessionStarted(started)],

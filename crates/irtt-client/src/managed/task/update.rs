@@ -9,6 +9,7 @@ use std::{
 
 use crate::{
     managed::{
+        schedule::{explicit_origin, ProbeSchedule},
         ManagedCommandAcknowledgement, ManagedCommandApplyError, ManagedCompletionPolicy,
         ManagedEvent, ManagedTargetConfig, ManagedTargetLifecycle, TargetInstance,
     },
@@ -38,9 +39,16 @@ struct PlannedRetirement {
 struct UpdatePlan {
     retirements: Vec<PlannedRetirement>,
     created: Vec<PlannedTarget>,
+    rephased: Vec<PlannedRephase>,
     next_generation: u64,
     next_command_sequence: u64,
     prospective_live_count: usize,
+}
+
+struct PlannedRephase {
+    index: usize,
+    offset: Option<std::time::Duration>,
+    schedule: Option<ProbeSchedule>,
 }
 
 fn synchronously_retireable(phase: &TargetPhase) -> bool {
@@ -59,7 +67,10 @@ fn synchronously_retireable(phase: &TargetPhase) -> bool {
 fn runtime_satisfies_target(runtime: &TargetRuntime, target: &ManagedTargetConfig) -> bool {
     runtime.membership.is_desired()
         && !matches!(runtime.phase(), TargetPhase::Terminal { .. })
-        && runtime.config == *target
+        && runtime.config.id == target.id
+        && runtime.config.server_addr == target.server_addr
+        && runtime.config.address_family == target.address_family
+        && runtime.config.auth == target.auth
 }
 
 impl ManagedClientTask {
@@ -94,10 +105,28 @@ impl ManagedClientTask {
         &mut self,
         incoming: Vec<ManagedTargetConfig>,
     ) -> Result<ManagedCommandAcknowledgement, ManagedCommandApplyError> {
-        let plan = self.plan_targets(incoming)?;
+        let now = Instant::now();
+        let plan = self.plan_targets(incoming, now)?;
         debug_assert!(plan.prospective_live_count <= self.config.max_live_target_generations);
 
-        let now = Instant::now();
+        // Indices still refer to the original vector. All fallible scheduling
+        // preparation completed before any retirement or in-place change.
+        for rephase in plan.rephased {
+            let target = &mut self.targets[rephase.index];
+            target.config.send_offset = rephase.offset;
+            if let (
+                Some(prepared),
+                TargetPhase::Active {
+                    schedule,
+                    send_waiting,
+                    ..
+                },
+            ) = (rephase.schedule, target.phase_mut())
+            {
+                *schedule = prepared;
+                *send_waiting = false;
+            }
+        }
         let mut synchronous = HashSet::with_capacity(plan.retirements.len());
         let mut finished = Vec::new();
         for retirement in &plan.retirements {
@@ -188,6 +217,7 @@ impl ManagedClientTask {
     fn plan_targets(
         &self,
         incoming: Vec<ManagedTargetConfig>,
+        now: Instant,
     ) -> Result<UpdatePlan, ManagedCommandApplyError> {
         let mut ids = HashSet::with_capacity(incoming.len());
         let mut prepared = Vec::with_capacity(incoming.len());
@@ -200,12 +230,12 @@ impl ManagedClientTask {
                 .address_family
                 .unwrap_or(self.config.client.address_family);
             client_config.auth = target.auth.resolve(&self.config.client.auth);
-            validate_target_config(&client_config).map_err(|source| {
-                ManagedCommandApplyError::InvalidTarget {
+            validate_target_config(&client_config)
+                .and_then(|()| explicit_origin(self.config.pacing, &target).map(|_| ()))
+                .map_err(|source| ManagedCommandApplyError::InvalidTarget {
                     id: target.id.clone(),
                     source,
-                }
-            })?;
+                })?;
             prepared.push((target, client_config));
         }
         let mut retirements = Vec::new();
@@ -234,12 +264,36 @@ impl ManagedClientTask {
 
         let mut next_generation = self.next_generation;
         let mut created = Vec::new();
+        let mut rephased = Vec::new();
         for (target, client_config) in prepared {
-            if self
+            if let Some((index, runtime)) = self
                 .targets
                 .iter()
-                .any(|runtime| runtime_satisfies_target(runtime, &target))
+                .enumerate()
+                .find(|(_, runtime)| runtime_satisfies_target(runtime, &target))
             {
+                if runtime.config.send_offset != target.send_offset {
+                    let schedule = match runtime.phase() {
+                        TargetPhase::Active { schedule, .. } => {
+                            let prepared = explicit_origin(self.config.pacing, &target)
+                                .and_then(|origin| {
+                                    schedule
+                                        .rephased(origin.expect("validated explicit offset"), now)
+                                })
+                                .map_err(|source| ManagedCommandApplyError::InvalidTarget {
+                                    id: target.id.clone(),
+                                    source,
+                                })?;
+                            Some(prepared)
+                        }
+                        _ => None,
+                    };
+                    rephased.push(PlannedRephase {
+                        index,
+                        offset: target.send_offset,
+                        schedule,
+                    });
+                }
                 continue;
             }
             let generation = next_generation;
@@ -277,6 +331,7 @@ impl ManagedClientTask {
         Ok(UpdatePlan {
             retirements,
             created,
+            rephased,
             next_generation,
             next_command_sequence,
             prospective_live_count,

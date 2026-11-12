@@ -17,11 +17,11 @@ use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
 use crate::{
     managed::{
-        ManagedClientConfig, ManagedCommandAcknowledgement, ManagedCommandApplyError,
-        ManagedCommandError, ManagedCompletionPolicy, ManagedConfigError, ManagedEvent,
-        ManagedEventSubscription, ManagedLifecycle, ManagedStatus, ManagedStatusSubscription,
-        ManagedSubscribeError, ManagedTargetConfig, ManagedTargetLifecycle, ManagedTargetStatus,
-        TargetInstance,
+        schedule::explicit_origin, ManagedClientConfig, ManagedCommandAcknowledgement,
+        ManagedCommandApplyError, ManagedCommandError, ManagedCompletionPolicy, ManagedConfigError,
+        ManagedEvent, ManagedEventSubscription, ManagedLifecycle, ManagedStatus,
+        ManagedStatusSubscription, ManagedSubscribeError, ManagedTargetConfig,
+        ManagedTargetLifecycle, ManagedTargetStatus, TargetInstance,
     },
     session::machine::SessionMachine,
     socket_options::validate_ttl,
@@ -215,11 +215,16 @@ impl ManagedClientHandle {
     /// `targets` is stopped and removed. A target that is still present with an
     /// unchanged configuration continues undisturbed — it is not restarted and
     /// does not get a new generation. A target present with a *changed*
-    /// configuration, or whose current generation already reached a terminal
-    /// state (e.g. failed, completed, or was closed by the peer), is treated as
+    /// session-defining configuration, or whose current generation already
+    /// reached a terminal state (e.g. failed, completed, or was closed by the peer), is treated as
     /// a fresh start: it is retired and a new generation is created for it, even
     /// if the configuration is byte-for-byte identical to the one that just
     /// finished.
+    ///
+    /// Changing only `send_offset` rephases an unfinished active session in
+    /// place. Its next slot is no earlier than application and one accepted
+    /// interval after its last committed send. Other live phases retain the
+    /// new offset for activation/recovery; draining and closing are not undone.
     ///
     /// This call enqueues the update without waiting for queue capacity; await
     /// the returned [`ManagedCommandReceipt`] to observe whether — and how — it
@@ -430,12 +435,12 @@ fn build_task(
             .address_family
             .unwrap_or(config.client.address_family);
         client_config.auth = target.auth.resolve(&config.client.auth);
-        validate_target_config(&client_config).map_err(|source| {
-            ManagedConfigError::InvalidTarget {
+        validate_target_config(&client_config)
+            .and_then(|()| explicit_origin(config.pacing, &target).map(|_| ()))
+            .map_err(|source| ManagedConfigError::InvalidTarget {
                 id: target.id.clone(),
                 source,
-            }
-        })?;
+            })?;
         runtimes.push(TargetRuntime {
             instance: TargetInstance {
                 id: target.id.clone(),

@@ -24,7 +24,7 @@
 //! [`SendProbeError`] distinguishes uncommitted failures from post-commit
 //! failures carrying that receipt. Convert a receipt to [`ClientEvent`] for
 //! presentation or statistics. [`managed`] owns
-//! negotiated-interval scheduling, finite runs, and staggered/burst pacing:
+//! negotiated-interval scheduling, finite runs, and staggered/burst/explicit pacing:
 //! `ManagedClientTask` /
 //! `ManagedClientHandle` (`tokio` feature) run and control one or more
 //! targets under a Tokio runtime, and `BlockingManagedClient` (`tokio`

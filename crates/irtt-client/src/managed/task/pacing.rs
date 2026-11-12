@@ -198,6 +198,7 @@ impl ManagedClientTask {
         self.record_stagger_acceptance(send_result, stagger_spacing, Instant::now());
         if accepted {
             schedule.commit(commit);
+            schedule.record_send(receipt.unwrap().sent_at.mono);
         }
         let schedule_error = if accepted {
             schedule.skip_missed_slots_at(Instant::now()).err()

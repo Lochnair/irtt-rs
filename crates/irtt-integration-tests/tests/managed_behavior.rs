@@ -94,6 +94,9 @@ async fn both_pacing_modes_serve_every_target_on_its_negotiated_grid() {
                         // inconclusive; it must not fail an otherwise valid run.
                         observed_pacing = gap < Duration::from_millis(25);
                     }
+                    ManagedPacing::Explicit { .. } => {
+                        unreachable!("only automatic modes are tested here")
+                    }
                 }
                 if observed_pacing {
                     break;

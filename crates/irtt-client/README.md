@@ -25,7 +25,7 @@ binaries are built on.
 `Client` and `AsyncClient` send one probe whenever called. They expose the
 negotiated parameters, pending-probe status, and timeout deadlines; callers
 own cadence and run duration. The managed driver provides fixed cadence,
-missed-slot handling, finite runs, and staggered or burst pacing. Low-level
+missed-slot handling, finite runs, and staggered, burst, or explicit pacing. Low-level
 sends return `Result<SendReceipt, SendProbeError>` instead of event lists.
 A `SendReceipt` carries the committed sequence, remote, post-send timestamp,
 accepted bytes, and send-call duration. `NotCommitted(ClientError)` guarantees
@@ -84,6 +84,43 @@ resolves the original endpoint again; callers can constrain a hostname without
 replacing it with a resolved IP. Changing the family specification replaces
 that target's generation, including switching between inheritance and an equal
 explicit override. Hostname expansion and discovery are frontend policies.
+
+### Explicit managed scheduling
+
+`ManagedPacing::Explicit { epoch: std::time::Instant }` uses one fixed monotonic
+origin shared with the consumer's other measurement engines. Every target must
+set `send_offset: Some(offset)`, including zero. Its intended deadlines are
+`epoch + offset + n * accepted_interval` for nonnegative `n`. Offsets are not
+normalized modulo the interval. `Staggered` and `Burst` reject supplied offsets.
+See the `ManagedPacing::Explicit` rustdoc example for a hybrid 500 ms schedule
+with IRTT slots at 0, 100, and 400 ms.
+
+New and reconnected sessions join the next eligible grid slot. They carry no
+minimum-gap constraint across session boundaries. Changing only `send_offset`
+through `update_targets` rephases a live session in place: it preserves the
+socket, generation, negotiated parameters, sequence state, pending probes, and
+counters. The next slot is at or after application and at least one accepted
+interval after the last committed send. Unchanged targets remain undisturbed.
+Updates are atomic; a rejected desired set changes nothing. Offsets updated
+before activation or during recovery apply when the session opens; draining and
+closing are not reversed, and finished schedules are not revived.
+
+Scheduling never changes negotiation. Each session repeats at its accepted
+interval, so equal accepted intervals are necessary for a repeating common
+hybrid period. Finite duration still begins at Open, and a first eligible
+deadline at or beyond expiry completes without sending. Runtime and socket
+delays can make actual sends late; obsolete slots are skipped without moving
+the grid. `EchoSent.scheduled_at` and `timer_error` expose that distinction.
+
+Offset presence, mode compatibility, and `epoch + offset` representability are
+validated before establishment through `InvalidTarget`. Accepted-interval
+arithmetic is checked after negotiation; failures use the runtime Timing-failure
+and cleanup path. Live-update calculations are preflighted and failures reject
+the command through its receipt before any change is applied.
+
+Complete `ManagedTargetConfig` literals must now include `send_offset` (the
+constructor supplies `None`); exhaustive `ManagedPacing` matches must handle
+`Explicit { .. }`. The shared epoch cannot be updated during a managed run.
 
 Blocking receive policy belongs to `Client`:
 `client.set_recv_timeout(Some(duration))?` sets it before or after opening,

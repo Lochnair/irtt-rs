@@ -1,4 +1,9 @@
-use std::{fmt, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    fmt,
+    net::SocketAddr,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use thiserror::Error;
 
@@ -48,7 +53,8 @@ impl TargetAuth {
     }
 }
 
-/// Endpoint, address-family and authentication specification for one managed target.
+/// Session-defining endpoint/family/authentication and mutable send scheduling
+/// for one managed target.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ManagedTargetConfig {
     pub id: TargetId,
@@ -59,6 +65,15 @@ pub struct ManagedTargetConfig {
     /// generation resolves it again using the effective family policy.
     pub address_family: Option<AddressFamily>,
     pub auth: TargetAuth,
+    /// First grid offset from the shared epoch. Required in explicit pacing;
+    /// forbidden otherwise. Changing only this field rephases a live session
+    /// in place, without changing its generation or negotiated parameters.
+    /// Offsets are not reduced modulo the interval: `epoch + offset` is the
+    /// first possible grid deadline. Missing/incompatible offsets and overflow
+    /// of that sum are rejected before establishment. Later accepted-interval
+    /// arithmetic failures are runtime scheduling failures (or a rejected live
+    /// update), rather than configuration failures during Open.
+    pub send_offset: Option<Duration>,
 }
 
 impl ManagedTargetConfig {
@@ -68,6 +83,7 @@ impl ManagedTargetConfig {
             server_addr: server_addr.into(),
             address_family: None,
             auth: TargetAuth::Inherit,
+            send_offset: None,
         }
     }
 }
@@ -78,6 +94,59 @@ pub enum ManagedPacing {
     #[default]
     Staggered,
     Burst,
+    /// Follow each target's externally assigned grid without a group gate.
+    ///
+    /// Deadlines are `epoch + send_offset + n * accepted_interval`, `n >= 0`.
+    /// New sessions join the next slot, without a minimum gap across sessions.
+    /// Live rephasing also requires one accepted interval since the last
+    /// committed send. The epoch cannot be changed during a managed run.
+    /// Finite duration still starts at Open; a first deadline at or beyond
+    /// expiry finishes without sending. Runtime/socket delays may make sends
+    /// late; obsolete slots are skipped without drifting the grid.
+    ///
+    /// # Example
+    ///
+    /// Reserve the 200 ms and 300 ms slots for another measurement engine
+    /// using the same monotonic epoch:
+    ///
+    /// ```no_run
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// use std::time::{Duration, Instant};
+    /// use irtt_client::{managed::*, ClientConfig, SessionRequest};
+    /// let epoch = Instant::now();
+    /// let config = ManagedClientConfig {
+    ///     client: ClientConfig {
+    ///         request: SessionRequest {
+    ///             duration: None,
+    ///             interval: Duration::from_millis(500),
+    ///             ..Default::default()
+    ///         },
+    ///         ..Default::default()
+    ///     },
+    ///     pacing: ManagedPacing::Explicit { epoch },
+    ///     completion: ManagedCompletionPolicy::ExplicitStop,
+    ///     ..Default::default()
+    /// };
+    /// let mut targets: Vec<_> = [("a", 0), ("b", 100), ("e", 400)]
+    ///     .into_iter()
+    ///     .map(|(id, offset)| {
+    ///         let mut target = ManagedTargetConfig::new(id, "127.0.0.1:2112");
+    ///         target.send_offset = Some(Duration::from_millis(offset));
+    ///         target
+    ///     }).collect();
+    /// let (task, handle) = ManagedClient::task(config, targets.clone())?;
+    /// let driver = tokio::spawn(task);
+    /// // Redistribute a slot without reopening that target's live session.
+    /// targets[1].send_offset = Some(Duration::from_millis(125));
+    /// handle.update_targets(targets)?.await?;
+    /// handle.stop().await;
+    /// driver.await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    Explicit {
+        epoch: Instant,
+    },
 }
 
 /// Policy controlling top-level natural completion.

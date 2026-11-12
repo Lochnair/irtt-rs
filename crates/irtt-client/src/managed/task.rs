@@ -501,7 +501,9 @@ impl Future for ManagedClientTask {
         if this.phase.is_running() {
             immediate |= match this.config.pacing {
                 ManagedPacing::Staggered => this.poll_staggered_send(cx, now),
-                ManagedPacing::Burst => this.poll_burst_sends(cx, now),
+                ManagedPacing::Burst | ManagedPacing::Explicit { .. } => {
+                    this.poll_burst_sends(cx, now)
+                }
             };
         }
 
