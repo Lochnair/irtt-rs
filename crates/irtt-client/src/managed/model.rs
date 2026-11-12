@@ -506,7 +506,9 @@ pub(crate) fn classify_client_error(
         | ClientError::PendingLimitExceeded { .. } => ManagedTargetFailureKind::ResourceExhausted,
         ClientError::DatagramLengthMismatch { .. } => ManagedTargetFailureKind::Socket,
         #[cfg(feature = "tokio")]
-        ClientError::NoTokioRuntime => ManagedTargetFailureKind::InvalidState,
+        ClientError::NoTokioRuntime
+        | ClientError::OpenInProgress
+        | ClientError::InvalidOpenOperation => ManagedTargetFailureKind::InvalidState,
         ClientError::NotOpen
         | ClientError::AlreadyOpen
         | ClientError::AlreadyCompleted

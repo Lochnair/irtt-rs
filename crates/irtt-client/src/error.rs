@@ -12,6 +12,14 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum ClientError {
+    /// Another resumable Open operation still belongs to this client.
+    #[cfg(feature = "tokio")]
+    #[error("an Open operation is already in progress")]
+    OpenInProgress,
+    /// An Open operation belongs to another client or has already finished.
+    #[cfg(feature = "tokio")]
+    #[error("invalid or completed Open operation")]
+    InvalidOpenOperation,
     /// A Tokio-backed client operation was polled without a current runtime.
     #[cfg(feature = "tokio")]
     #[error("Tokio AsyncClient requires a current Tokio runtime")]

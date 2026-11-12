@@ -490,15 +490,16 @@ impl ManagedClientTask {
                 }
                 match future.as_mut().poll(cx) {
                     Poll::Pending => false,
-                    Poll::Ready(Ok(client)) => {
+                    Poll::Ready(Ok(mut client)) => {
+                        let open = match client.begin_open() {
+                            Ok(open) => Box::new(open),
+                            Err(error) => {
+                                self.fail_target(index, ManagedTargetFailurePhase::Opening, error);
+                                return false;
+                            }
+                        };
                         self.targets[index].remote = Some(client.remote_addr());
-                        self.install_target_phase(
-                            index,
-                            TargetPhase::Opening {
-                                client,
-                                open: Box::new(AsyncOpenState::new()),
-                            },
-                        );
+                        self.install_target_phase(index, TargetPhase::Opening { client, open });
                         true
                     }
                     Poll::Ready(Err(error)) => {
@@ -512,7 +513,7 @@ impl ManagedClientTask {
                     let retirement = retirement
                         .clone()
                         .unwrap_or(ManagedTargetEndReason::Stopped);
-                    let cleanup_failure = client.cancel_open(open).map(|error| {
+                    let cleanup_failure = client.cancel_open(open).err().map(|error| {
                         classify_client_error(ManagedTargetFailurePhase::Opening, &error)
                     });
                     self.targets[index].sync_live_packets_sent();

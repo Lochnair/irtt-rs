@@ -122,3 +122,33 @@ Full API documentation is on [docs.rs/irtt-client](https://docs.rs/irtt-client).
 
 Part of [irtt-rs](https://github.com/Lochnair/irtt-rs), an independent Rust
 implementation of an IRTT-compatible protocol stack.
+
+## Externally polled Tokio clients
+
+An owner driving multiple sessions can interleave `AsyncClient::poll_send_probe`,
+`poll_recv`, and `poll_close` without creating competing futures that borrow the
+client. Each poll performs bounded immediate work and registers readiness (or
+self-wakes when yielding known work). Use one owner and one waiter per readiness
+direction; a blocked send does not prevent receive polling.
+
+Create a resumable `AsyncOpenState` with `begin_open`, then retain it across
+`poll_open` calls. Operations belong to their initiating client and cannot be
+reused after completion or cancellation. `cancel_open` makes one best-effort
+attempt at known token cleanup without waiting; it returns any retained primary
+Open failure. Dropping an operation detaches no cleanup and permits another
+exchange on the still-connected client. Unknown remote token allocations may
+remain until server expiry. Retry with a new client when session identity must
+be unambiguous.
+
+Use `next_probe_timeout_deadline` to arm maintenance and
+`poll_timeouts_bounded_at(now, limit)` to process bounded expiry batches. Its
+`more_due` flag requires another pass; this synchronous method registers no
+wake. `discard_prepared_probe` withdraws only uncommitted preparation, never a
+pending transmitted probe. The scheduler must also stop polling the abandoned
+opportunity.
+
+`Pending` commits nothing. Both successful receipts and `AfterCommit` errors
+represent accepted transmissions and must be accounted for before cleanup.
+Scheduling, reconnect policy, application roles, and multi-session fairness
+remain caller responsibilities. See the `tokio_client` example for the polling
+operations; no blocking-client or runtime requirement changes are introduced.

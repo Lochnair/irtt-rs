@@ -68,7 +68,7 @@ mod socket_options;
 mod timing;
 
 #[cfg(feature = "tokio")]
-pub use async_client::AsyncClient;
+pub use async_client::{AsyncClient, AsyncOpenState};
 pub use auth::{Authentication, HmacKey};
 pub use client::Client;
 pub use config::{
@@ -79,7 +79,7 @@ pub use config::{
 pub use error::ClientError;
 pub use event::{
     ClientEvent, NoTestCompleted, OneWayDelaySample, OpenOutcome, PacketMeta, ReceivedStatsSample,
-    RttSample, ServerTiming, SessionStarted, SignedDuration, WarningKind,
+    RttSample, ServerTiming, SessionStarted, SignedDuration, TimeoutBatch, WarningKind,
 };
 pub use send::{SendProbeError, SendReceipt};
 pub use session::{AcceptedSessionParameters, NegotiationChange, NegotiationResult};

@@ -16,19 +16,18 @@
 //! instead of hanging, because the example shortens `open.timeouts` for a
 //! fast demonstration.
 
-use std::time::{Duration, Instant};
+use std::{
+    future::poll_fn,
+    time::{Duration, Instant},
+};
 
 use irtt_client::{
     AsyncClient, ClientConfig, ClientEvent, OpenOutcome, OpenPolicy, SessionRequest,
 };
 
-/// Upper bound on how long the receive wait can go without also calling
-/// `poll_timeouts()`. `AsyncClient` does not expose the earliest pending
-/// probe's own timeout deadline, so this example polls on a short fixed
-/// cadence instead of waiting for the full `probe_timeout()` from whenever
-/// this loop last ran — that would let poll_timeouts() classify a lost
-/// probe (and its dependent statistics/session state) far later than it
-/// actually became lost.
+/// A short maintenance cadence supplements exact pending-probe deadlines.
+/// A multi-session owner can combine those deadlines with its send deadlines
+/// and use bounded timeout batches to retain fair progress across sessions.
 const TIMEOUT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 fn main() {
@@ -65,7 +64,10 @@ async fn run() {
         }
     };
 
-    let negotiated = match client.open().await {
+    let mut opening = client
+        .begin_open()
+        .expect("connected client can begin Open");
+    let negotiated = match poll_fn(|cx| client.poll_open(&mut opening, cx)).await {
         Ok(OpenOutcome::Started(started)) => {
             println!("session opened: {started:?}");
             started.negotiation
@@ -106,7 +108,7 @@ async fn run() {
             .unwrap();
 
         let recv_result = tokio::select! {
-            events = client.recv() => Some(events),
+            events = poll_fn(|cx| client.poll_recv(cx)) => Some(events),
             () = tokio::time::sleep_until(tokio::time::Instant::from_std(wake_at)) => None,
         };
         if let Some(result) = recv_result {
@@ -120,7 +122,7 @@ async fn run() {
         }
 
         if Instant::now() < end && Instant::now() >= next_send {
-            match client.send_probe().await {
+            match poll_fn(|cx| client.poll_send_probe(cx)).await {
                 Ok(receipt) => {
                     print_event(&receipt.into());
                     while next_send <= Instant::now() {
@@ -148,7 +150,7 @@ async fn run() {
     if client.is_peer_closed() {
         return;
     }
-    match client.close().await {
+    match poll_fn(|cx| client.poll_close(cx)).await {
         Ok(events) => events.iter().for_each(print_event),
         Err(err) => eprintln!("close failed: {err}"),
     }

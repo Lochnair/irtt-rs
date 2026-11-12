@@ -3,6 +3,7 @@ use std::{
     io,
     net::SocketAddr,
     pin::Pin,
+    sync::{Arc, Weak},
     task::{Context, Poll},
     time::{Duration, Instant},
 };
@@ -17,12 +18,12 @@ use crate::{
     receive::{configure_tx_timestamping, drain_tx_timestamps, try_recv_tokio_datagram},
     session::machine::{
         recv_buffer_size, OpenDatagramDisposition, PreparedOpenAcceptance, PreparedOpenRequest,
-        PreparedProbe, SessionMachine, TimeoutBatch, MAX_OPEN_PACKET_SIZE,
+        PreparedProbe, SessionMachine, MAX_OPEN_PACKET_SIZE,
     },
     socket::{connect_tokio_udp_socket, resolve_remote_tokio},
     socket_options::{apply_traffic_class_to_tokio_socket, clear_dscp_on_tokio_socket},
     timing::ClientTimestamp,
-    SendProbeError, SendReceipt,
+    SendProbeError, SendReceipt, TimeoutBatch,
 };
 
 /// Maximum amount of immediately available opening work performed by one poll.
@@ -31,6 +32,9 @@ use crate::{
 /// encounter readiness false positives without ever awaiting.  Bound that work
 /// so one managed target cannot retain the current-thread runtime.
 const OPEN_POLL_WORK_BUDGET: usize = 64;
+
+// Bound false readiness/Interrupted retry work in send and close polls.
+const SUBMISSION_POLL_WORK_BUDGET: usize = 64;
 
 /// Maximum immediately available receive work performed by one
 /// [`AsyncClient::poll_recv`] poll.
@@ -86,9 +90,13 @@ impl AsyncOpenCleanup {
 /// Owned state for one asynchronous open transaction.
 ///
 /// This state deliberately contains no reference to [`AsyncClient`], allowing
-/// a managed target to store the client and opening state side by side.
+/// a caller to store the client and opening state side by side. Create it
+/// through [`AsyncClient::begin_open`]; it is bound to that client and is not
+/// reusable after completion/cancellation. Dropping it never detaches cleanup.
 #[derive(Debug)]
-pub(crate) struct AsyncOpenState {
+pub struct AsyncOpenState {
+    owner: Arc<()>,
+    finished: bool,
     attempt: usize,
     deadline: Option<Instant>,
     deadline_timer: Option<Pin<Box<time::Sleep>>>,
@@ -98,8 +106,10 @@ pub(crate) struct AsyncOpenState {
 }
 
 impl AsyncOpenState {
-    pub(crate) fn new() -> Self {
+    fn new(owner: Arc<()>) -> Self {
         Self {
+            owner,
+            finished: false,
             attempt: 0,
             deadline: None,
             deadline_timer: None,
@@ -180,6 +190,7 @@ pub struct AsyncClient {
     recv_buffer: Vec<u8>,
     applied_traffic_class: Option<u8>,
     prepared_open: Option<PreparedOpenRequest>,
+    open_operation: Weak<()>,
     prepared_probe: Option<PreparedProbe>,
     /// See `Client::tx_timestamping_enabled` in `client.rs` for the
     /// invariant this tracks; it is the same adapter-owned capability flag.
@@ -217,6 +228,7 @@ impl AsyncClient {
             recv_buffer: vec![0_u8; recv_buffer_size(false, None)?],
             applied_traffic_class: None,
             prepared_open: Some(prepared_open),
+            open_operation: Weak::new(),
             prepared_probe: None,
             tx_timestamping_enabled: false,
             rx_timestamping,
@@ -235,7 +247,7 @@ impl AsyncClient {
     /// best-effort post-token cleanup, cleanup may remain incomplete because
     /// this low-level client never detaches cleanup work.
     pub async fn open(&mut self) -> Result<OpenOutcome, ClientError> {
-        let mut state = AsyncOpenState::new();
+        let mut state = self.begin_open()?;
         poll_fn(|cx| self.poll_open(&mut state, cx)).await
     }
 
@@ -274,7 +286,10 @@ impl AsyncClient {
         self.machine.poll_timeouts_at(now)
     }
 
-    pub(crate) fn poll_timeouts_bounded_at(
+    /// Process at most `limit` expired probes without waiting. A zero limit
+    /// only reports whether work is due. If `more_due`, arrange another pass
+    /// without starving other sessions; this operation does not register a wake.
+    pub fn poll_timeouts_bounded_at(
         &mut self,
         now: Instant,
         limit: usize,
@@ -293,7 +308,45 @@ impl AsyncClient {
         poll_fn(|cx| self.poll_close(cx)).await
     }
 
-    pub(crate) fn poll_open(
+    /// Begin one resumable Open exchange without performing socket I/O.
+    ///
+    /// Keep the returned operation across polls. Only one unfinished operation
+    /// may exist per client; dropping it permits a new exchange but performs no cleanup.
+    pub fn begin_open(&mut self) -> Result<AsyncOpenState, ClientError> {
+        self.machine.ensure_connected()?;
+        if self.open_operation.upgrade().is_some() {
+            return Err(ClientError::OpenInProgress);
+        }
+        let owner = Arc::new(());
+        self.open_operation = Arc::downgrade(&owner);
+        Ok(AsyncOpenState::new(owner))
+    }
+
+    /// Advance a bounded amount of Open work, registering readiness/timer wakes.
+    ///
+    /// The operation must come from this client's `begin_open`, and must not
+    /// have completed or been cancelled. Pending preserves attempt deadlines.
+    pub fn poll_open(
+        &mut self,
+        state: &mut AsyncOpenState,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<OpenOutcome, ClientError>> {
+        if !self.owns_open(state) {
+            return Poll::Ready(Err(ClientError::InvalidOpenOperation));
+        }
+        let result = self.poll_open_inner(state, cx);
+        if result.is_ready() {
+            state.finished = true;
+            self.open_operation = Weak::new();
+        }
+        result
+    }
+
+    fn owns_open(&self, state: &AsyncOpenState) -> bool {
+        !state.finished && self.open_operation.ptr_eq(&Arc::downgrade(&state.owner))
+    }
+
+    fn poll_open_inner(
         &mut self,
         state: &mut AsyncOpenState,
         cx: &mut Context<'_>,
@@ -423,7 +476,14 @@ impl AsyncClient {
         Poll::Pending
     }
 
-    pub(crate) fn poll_send_probe(
+    /// Attempt one probe without awaiting socket writability.
+    ///
+    /// Pending registers the current write waker and commits nothing. The
+    /// retained preparation may be retried or explicitly discarded. Success
+    /// and AfterCommit both contain an authoritative accepted-send receipt.
+    /// One owner must drive this client; do not install competing write waiters.
+    /// Receive polling may continue between send polls.
+    pub fn poll_send_probe(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<SendReceipt, SendProbeError>> {
@@ -436,7 +496,7 @@ impl AsyncClient {
                 Err(error) => return Poll::Ready(Err(SendProbeError::NotCommitted(error))),
             }
         }
-        loop {
+        for _ in 0..SUBMISSION_POLL_WORK_BUDGET {
             match self.socket.poll_send_ready(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Ok(())) => {}
@@ -521,9 +581,14 @@ impl AsyncClient {
             }
             return Poll::Ready(Ok(receipt));
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
-    pub(crate) fn poll_recv(
+    /// Receive/classify bounded packet work without waiting. Pending registers
+    /// a read wake (or self-wakes after exhausting the immediate-work budget).
+    /// One owner must drive reads; pending sends do not prevent receive polling.
+    pub fn poll_recv(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Vec<ClientEvent>, ClientError>> {
@@ -592,11 +657,14 @@ impl AsyncClient {
         Poll::Pending
     }
 
-    pub(crate) fn poll_close(
+    /// Advance a bounded close submission without blocking. Pending registers
+    /// a write wake and leaves the session open. Stop polling probes while
+    /// closing; cancellation does not detach cleanup or imply remote closure.
+    pub fn poll_close(
         &mut self,
         cx: &mut Context<'_>,
     ) -> Poll<Result<Vec<ClientEvent>, ClientError>> {
-        loop {
+        for _ in 0..SUBMISSION_POLL_WORK_BUDGET {
             let prepared = match self.machine.prepare_close() {
                 Ok(prepared) => prepared,
                 Err(error) => return Poll::Ready(Err(error)),
@@ -655,6 +723,8 @@ impl AsyncClient {
             events.push(event);
             return Poll::Ready(Ok(events));
         }
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 
     /// Return the configured local probe timeout.
@@ -696,7 +766,10 @@ impl AsyncClient {
         self.machine.latest_probe_timeout_deadline()
     }
 
-    pub(crate) fn discard_prepared_probe(&mut self) {
+    /// Withdraw retained preparation for a probe that has not committed.
+    /// This changes no sequence, counter, or pending probe. The caller must
+    /// also stop polling the abandoned send opportunity.
+    pub fn discard_prepared_probe(&mut self) {
         self.prepared_probe = None;
     }
 
@@ -793,14 +866,23 @@ impl AsyncClient {
         .map_err(ClientError::Socket)
     }
 
-    /// Cancel opening without waiting for a reply or socket writability.
-    /// Retained post-token cleanup gets one best-effort nonblocking send.
-    pub(crate) fn cancel_open(&self, state: &mut AsyncOpenState) -> Option<ClientError> {
-        let cleanup = state.cleanup.take()?;
-        if let Some(packet) = cleanup.packet() {
-            let _ = self.socket.try_send(packet);
+    /// Cancel an operation from this client, without waiting for writability.
+    /// Any known token cleanup gets one best-effort send. A retained primary
+    /// opening failure is returned even if cleanup succeeds. Unknown remote
+    /// token allocations cannot be reclaimed locally. No work is detached.
+    pub fn cancel_open(&mut self, state: &mut AsyncOpenState) -> Result<(), ClientError> {
+        if !self.owns_open(state) {
+            return Err(ClientError::InvalidOpenOperation);
         }
-        Some(cleanup.into_primary())
+        state.finished = true;
+        self.open_operation = Weak::new();
+        if let Some(cleanup) = state.cleanup.take() {
+            if let Some(packet) = cleanup.packet() {
+                let _ = self.socket.try_send(packet);
+            }
+            return Err(cleanup.into_primary());
+        }
+        Ok(())
     }
 
     fn poll_open_cleanup(

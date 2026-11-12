@@ -20,6 +20,7 @@ use crate::{
     session::{negotiate_params, NegotiationResult},
     socket_options::dscp_codepoint_to_traffic_class,
     timing::ClientTimestamp,
+    TimeoutBatch,
 };
 
 pub(crate) const MAX_OPEN_PACKET_SIZE: usize = 512;
@@ -152,12 +153,6 @@ pub(crate) struct ProbeCommit {
     tx_not_before_wall: SystemTime,
     next_wire_seq: u32,
     next_packets_sent: u64,
-}
-
-#[derive(Debug)]
-pub(crate) struct TimeoutBatch {
-    pub events: Vec<ClientEvent>,
-    pub more_due: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -834,7 +829,7 @@ impl SessionMachine {
         }
     }
 
-    fn ensure_connected(&self) -> Result<(), ClientError> {
+    pub(crate) fn ensure_connected(&self) -> Result<(), ClientError> {
         match self.state {
             MachineState::Connected => Ok(()),
             MachineState::Open(_) => Err(ClientError::AlreadyOpen),

@@ -411,3 +411,12 @@ pub struct PacketMeta {
     /// timestamp, not a NIC hardware ingress time.
     pub kernel_rx_timestamp: Option<std::time::SystemTime>,
 }
+
+/// Result of bounded local timeout processing.
+#[derive(Debug)]
+pub struct TimeoutBatch {
+    /// Loss events for probes expired during this pass.
+    pub events: Vec<ClientEvent>,
+    /// More probes were already due at the supplied instant.
+    pub more_due: bool,
+}
