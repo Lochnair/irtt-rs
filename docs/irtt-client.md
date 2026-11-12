@@ -396,8 +396,32 @@ The `irtt-server` applet makes the same choice for its endpoint on Linux.
 With another IRTT-compatible server, the client uses the wall-clock value
 that server reports as-is.
 
-If a kernel timestamp is unsupported or implausible, timing falls back to
-userspace. This leaves `raw_rtt_us` unchanged. The
+Configure the local RX and TX directions independently with
+`--kernel-rx-timestamp=auto|on|off` and
+`--kernel-tx-timestamp=auto|on|off`. Both default to `auto`.
+
+- `auto` attempts kernel software timestamp initialization and falls back
+  to userspace if initialization fails.
+- `on` requires successful initialization. RX initialization occurs during
+  socket creation. TX initialization occurs after successful Open negotiation,
+  before committing the session. A strict TX failure attempts to close the
+  allocated server session and returns an actionable error.
+- `off` disables the requested direction.
+
+Kernel timestamp collection requires Linux and the library's `ancillary`
+feature. A strict `on` request returns an error when that support is absent.
+Successful initialization still permits missing or invalid timestamps on
+individual packets. Receiving DSCP/ECN metadata is independent of these modes.
+
+TX uses implicit `OPT_ID` correlation and `OPT_TSONLY`, including on Linux
+6.6 and 6.12. Open requests are sent before TX generation is enabled. After
+a failed Echo send or failed timestamped Close, later TX records are
+discarded for the session because the kernel ID counter may have advanced.
+Already attached timestamps remain usable, and RX collection continues
+according to its own mode. TX correlation also stops before an ID is reused.
+
+If a per-packet kernel timestamp is missing or implausible, timing falls back
+to userspace. This leaves `raw_rtt_us` unchanged. The
 `adjusted_rtt_us`/`effective_rtt_us` values can still shift slightly, since
 server processing time uses the same server receive endpoint.
 

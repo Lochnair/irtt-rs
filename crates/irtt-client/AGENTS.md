@@ -35,8 +35,8 @@ of one operation's commitment.
 
 Tokio retains one prepared probe across cancellation/readiness false positives
 and `WouldBlock`, samples a fresh private anchor on each retry, and clears the
-prepared probe after commitment even when post-send processing fails. Failed implicit-ID submissions invalidate correlation as documented below.
-Explicit-ID sends consume a distinct attempt ID even on failure.
+prepared probe after commitment even when post-send processing fails. Failed
+implicit-ID submissions invalidate correlation as documented below.
 
 ## Linux kernel TX timestamp capture
 
@@ -46,7 +46,10 @@ skips that direction. Per-packet timing is optional. Keep IP_TOS/IPV6_TCLASS
 capture separate from both policies. Gate software RX metadata on successful
 RX initialization even if TX software reporting produces an RX cmsg.
 
-Configure software TX with OPT_ID after trusted Open acceptance, before committing the session. Earlier Open traffic has no TX generation. A failed strict activation restores local preparation and attempts a token-bound cleanup Close.
+Configure software TX with OPT_ID after trusted Open acceptance, before
+committing the session. Earlier Open traffic has no TX generation. A failed
+strict activation restores local preparation and attempts a token-bound
+cleanup Close.
 
 Keep `OPT_TSONLY` to avoid queuing the original datagram payload. An
 implicit-ID Echo send error or anomalous accepted length can desynchronize
@@ -118,7 +121,8 @@ justify why integration coverage is insufficient.
 alongside the userspace `sent_at`. It survives pending -> timed-out retention
 (`SessionMachine::record_kernel_tx_timestamp` updates whichever of
 `PendingMap`/`TimedOutMap` still holds the probe) and is otherwise bounded by
-the same limits those maps already enforce — no new unbounded state. The earliest software observation at or after the send anchor is retained
+the same limits those maps already enforce — no new unbounded state. The
+earliest software observation at or after the send anchor is retained
 when duplicate notifications disagree. Check the reply-time upper bound when
 selecting the endpoint.
 

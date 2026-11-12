@@ -17,7 +17,8 @@ Targets and pacing work the same as in `irtt-client(1)`. See that manual
 for `[LABEL=]TARGET` syntax, multiple targets, and the
 `--pacing staggered|burst` option. The configuration flags
 (`--interval`, `--timeouts`, `--length`, `--hmac`, `--clock`, `--tstamp`,
-`--stats`, `--sfill`, `--dscp`, `--ttl`, `--loose`) are also shared with
+`--kernel-rx-timestamp`, `--kernel-tx-timestamp`, `--stats`, `--sfill`,
+`--dscp`, `--ttl`, `--loose`) are also shared with
 `irtt-client`, so the same descriptions apply.
 
 Address-family controls are shared too: `-4` / `--ipv4` uses IPv4 only,

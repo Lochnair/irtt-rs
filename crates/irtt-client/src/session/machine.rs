@@ -432,8 +432,9 @@ impl SessionMachine {
     /// Updates a still-pending or already-timed-out probe in place. Never
     /// resurrects a completed, evicted, or unknown probe, and never touches
     /// `sent_at`, timeout/loss/reply state, or any counter — this is purely
-    /// dormant metadata attachment. A probe keeps the earliest observation after the send anchor. A future
-    /// duplicate cannot hide a usable timestamp at reply processing.
+    /// dormant metadata attachment. A probe keeps the earliest observation
+    /// after the send anchor. A future duplicate cannot hide a usable
+    /// timestamp at reply processing.
     pub(crate) fn record_kernel_tx_timestamp(&mut self, wire_seq: u32, timestamp: SystemTime) {
         let MachineState::Open(session) = &mut self.state else {
             return;
