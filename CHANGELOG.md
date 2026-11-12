@@ -40,6 +40,25 @@ release. The format is loosely based on
 
 ## irtt-client
 
+### 0.8.0
+
+#### Added
+
+- Public nonblocking `AsyncClient` send, receive, and close polling for caller-owned multi-session drivers. Send and close retries have bounded immediate work; existing async and managed execution share the same operations.
+- Resumable Open operations created by `begin_open`, with client ownership checks, explicit cancellation, and rejection of completed or mismatched operations.
+- Public bounded timeout batches and withdrawal of uncommitted probe preparation. Accepted-send receipts remain authoritative on `AfterCommit` failures.
+- Independent local RX and TX kernel timestamp policies through `TimestampMode::{Auto, On, Off}`. Strict initialization failures are reported before Open commits; per-packet measurements still fall back when usable metadata is absent.
+
+#### Fixed
+
+- Discard ambiguous or truncated TX timestamp records and keep timestamp correlation tied to the pre-send anchor and valid packet bounds.
+
+#### Compatibility
+
+- `SocketConfig` gains `kernel_rx_timestamp` and `kernel_tx_timestamp`; complete struct literals must supply them or use `..Default::default()`. Both default to `Auto`.
+- Client 0.7 and 0.8 event types come from distinct crate versions. Libraries exchanging `ClientEvent` values must use a compatible client dependency; the previously published `irtt-stats` 0.6.0 uses client 0.7.
+- Tokio remains optional and the default client remains runtime-free. Scheduling and reconnect policy remain caller-owned for low-level clients. Wire formats are unchanged.
+
 ### 0.7.0
 
 #### Added

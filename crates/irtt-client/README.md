@@ -50,6 +50,12 @@ matches must handle the new recovery-policy variants. A target can emit repeated
 session-start events within one instance; reset session-bound state, including
 statistics, for each reopened session. Use `irtt-stats` 0.6 with client 0.7 events.
 
+In 0.8, `SocketConfig` also gains independent `kernel_rx_timestamp` and
+`kernel_tx_timestamp` policies; update complete literals or use
+`..Default::default()`. The default `TimestampMode::Auto` preserves best-effort
+initialization. The published `irtt-stats` 0.6.0 depends on client 0.7 and cannot
+consume client 0.8 event values without updating its client dependency.
+
 Tokio stays optional: the default build has no runtime and no Tokio
 dependency at all.
 
