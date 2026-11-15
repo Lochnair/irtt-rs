@@ -67,4 +67,4 @@ irtt-server.workspace = true
 tokio = { version = "1.54.1", default-features = false, features = ["rt", "sync"] }
 
 [target.'cfg(unix)'.dev-dependencies]
-nix = { version = "0.31.3", features = ["term", "poll", "signal", "process"] }
+nix = { version = "0.32.0", features = ["term", "poll", "signal", "process"] }
