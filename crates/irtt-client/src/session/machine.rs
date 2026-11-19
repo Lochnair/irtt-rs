@@ -1122,36 +1122,41 @@ mod tests {
 
     #[test]
     fn timing_arithmetic_preserves_negative_samples() {
+        // Microseconds, not nanoseconds: Windows `SystemTime` only has 100 ns
+        // resolution and would truncate finer wall-clock values.
+        const US: i64 = 1_000;
         let mono = Instant::now();
         let sent = ClientTimestamp {
             mono,
-            wall: UNIX_EPOCH + Duration::from_nanos(100),
+            wall: UNIX_EPOCH + Duration::from_micros(100),
         };
         let received = ClientTimestamp {
-            mono: mono + Duration::from_nanos(10),
-            wall: UNIX_EPOCH + Duration::from_nanos(110),
+            mono: mono + Duration::from_micros(10),
+            wall: UNIX_EPOCH + Duration::from_micros(110),
         };
         // Processing longer than raw RTT must remain negative with either clock.
         for timestamps in [
             TimestampFields {
-                recv_mono: Some(100),
-                send_mono: Some(120),
+                recv_mono: Some(100 * US),
+                send_mono: Some(120 * US),
                 ..TimestampFields::default()
             },
             TimestampFields {
-                recv_wall: Some(100),
-                send_wall: Some(120),
+                recv_wall: Some(100 * US),
+                send_wall: Some(120 * US),
                 ..TimestampFields::default()
             },
         ] {
             let rtt = compute_rtt(&sent, &received, &timestamps);
-            assert_eq!(rtt.raw, Duration::from_nanos(10));
-            assert_eq!(rtt.adjusted.unwrap().as_nanos(), -10);
-            assert_eq!(rtt.effective.as_nanos(), -10);
+            assert_eq!(rtt.raw, Duration::from_micros(10));
+            assert_eq!(rtt.adjusted.unwrap().as_nanos(), i128::from(-10 * US));
+            assert_eq!(rtt.effective.as_nanos(), i128::from(-10 * US));
         }
         // A server clock behind or ahead can make either direction negative.
         for (recv_wall, send_wall, upstream, downstream) in [(90, 95, -10, 15), (115, 120, 15, -10)]
         {
+            let (recv_wall, send_wall) = (recv_wall * US, send_wall * US);
+            let (upstream, downstream) = (i128::from(upstream * US), i128::from(downstream * US));
             let sample = compute_one_way(
                 &sent,
                 sent.wall,
