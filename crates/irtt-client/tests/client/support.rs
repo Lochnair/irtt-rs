@@ -13,6 +13,10 @@ use std::{
 pub(super) const TOKEN: u64 = 0x1234_5678_90ab_cdef;
 pub(super) const HMAC_OFFSET: usize = 4;
 
+/// Large enough for any UDP datagram. A smaller buffer truncates long probes on
+/// Unix, but makes the receive fail outright on Windows (`WSAEMSGSIZE`).
+const REQUEST_BUFFER_LEN: usize = 65_536;
+
 pub(super) struct FakeServer {
     pub(super) addr: SocketAddr,
     pub(super) rx: mpsc::Receiver<Vec<u8>>,
@@ -50,7 +54,7 @@ pub(super) fn recv_request(
     socket: &UdpSocket,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> (Vec<u8>, SocketAddr) {
-    let mut buf = [0_u8; 512];
+    let mut buf = vec![0_u8; REQUEST_BUFFER_LEN];
     let (size, peer) = socket.recv_from(&mut buf).unwrap();
     let packet = buf[..size].to_vec();
     tx.send(packet.clone()).unwrap();
@@ -155,7 +159,7 @@ pub(super) fn recv_request_timeout(
     socket: &UdpSocket,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Option<(Vec<u8>, SocketAddr)> {
-    let mut buf = [0_u8; 512];
+    let mut buf = vec![0_u8; REQUEST_BUFFER_LEN];
     match socket.recv_from(&mut buf) {
         Ok((size, peer)) => {
             let packet = buf[..size].to_vec();

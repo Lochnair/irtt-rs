@@ -22,7 +22,8 @@ pub(crate) fn recv_datagram(
     buf: &mut [u8],
     _rx_timestamping: bool,
 ) -> Result<ReceivedDatagram, io::Error> {
-    let len = socket.recv(buf)?;
+    let capacity = buf.len();
+    let len = truncated_receive_len(socket.recv(buf), capacity)?;
     let received_at = ClientTimestamp::now();
 
     Ok(ReceivedDatagram {
@@ -30,6 +31,28 @@ pub(crate) fn recv_datagram(
         received_at,
         meta: ReceiveMeta::default(),
     })
+}
+
+/// Reports a datagram larger than the receive buffer as a full buffer.
+///
+/// Unix returns such a datagram truncated to the buffer. Windows fails the
+/// receive with `WSAEMSGSIZE` instead, after filling the buffer with the
+/// datagram's leading bytes. Either way the buffer holds `capacity` bytes, and
+/// the receive buffer is sized one byte past the longest valid reply, so the
+/// session classifies the result as an overlong packet and warns, rather than
+/// an unsolicited datagram failing the receive.
+#[cfg(windows)]
+fn truncated_receive_len(received: io::Result<usize>, capacity: usize) -> io::Result<usize> {
+    const WSAEMSGSIZE: i32 = 10040;
+    match received {
+        Err(error) if error.raw_os_error() == Some(WSAEMSGSIZE) => Ok(capacity),
+        received => received,
+    }
+}
+
+#[cfg(all(not(windows), not(all(target_os = "linux", feature = "ancillary"))))]
+fn truncated_receive_len(received: io::Result<usize>, _capacity: usize) -> io::Result<usize> {
+    received
 }
 
 #[cfg(all(target_os = "linux", feature = "ancillary"))]
@@ -50,7 +73,8 @@ pub(crate) fn try_recv_tokio_datagram(
     buf: &mut [u8],
     _rx_timestamping: bool,
 ) -> Result<ReceivedDatagram, io::Error> {
-    let len = socket.try_recv(buf)?;
+    let capacity = buf.len();
+    let len = truncated_receive_len(socket.try_recv(buf), capacity)?;
     let received_at = ClientTimestamp::now();
 
     Ok(ReceivedDatagram {
