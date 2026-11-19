@@ -245,16 +245,54 @@ pub fn parse_duration(input: &str) -> Result<Duration, String> {
 }
 
 pub fn parse_test_duration(input: &str) -> Result<Duration, String> {
+    let input = input.trim();
     if input == "0" {
         return Ok(Duration::ZERO);
     }
-    let span: jiff::Span = input
-        .parse()
-        .map_err(|error: jiff::Error| error.to_string())?;
-    let duration = span
-        .to_duration(jiff::SpanRelativeTo::days_are_24_hours())
+    // fundu reads a bare number as seconds; keep requiring an explicit unit.
+    if input.ends_with(|ch: char| ch.is_ascii_digit()) {
+        return Err("duration must end with a unit, such as ms, s, m, or h".to_owned());
+    }
+    let duration = duration_parser()
+        .parse(input)
         .map_err(|error| error.to_string())?;
-    Duration::try_from(duration).map_err(|_| "duration must not be negative".to_owned())
+    Duration::try_from(duration).map_err(|error| error.to_string())
+}
+
+/// Parses durations the way `humantime::parse_duration`, which earlier
+/// releases used, did: one or more `<value><unit>` terms such as `250ms`,
+/// `1.5h`, `1m30s`, or `1 hour 30 minutes`, with humantime's unit names and its
+/// 30.44-day months and 365.25-day years. Exponents, infinity, and negative
+/// values are rejected.
+fn duration_parser() -> fundu::CustomDurationParser<'static> {
+    use fundu::{CustomDurationParserBuilder, CustomTimeUnit, Multiplier, TimeUnit::*};
+
+    CustomDurationParserBuilder::new()
+        .time_units(&[
+            CustomTimeUnit::with_default(NanoSecond, &["nanos", "nsec", "ns"]),
+            CustomTimeUnit::with_default(MicroSecond, &["usec", "us", "µs"]),
+            CustomTimeUnit::with_default(MilliSecond, &["millis", "msec", "ms"]),
+            CustomTimeUnit::with_default(Second, &["seconds", "second", "secs", "sec", "s"]),
+            CustomTimeUnit::with_default(Minute, &["minutes", "minute", "min", "mins", "m"]),
+            CustomTimeUnit::with_default(Hour, &["hours", "hour", "hr", "hrs", "h"]),
+            CustomTimeUnit::with_default(Day, &["days", "day", "d"]),
+            CustomTimeUnit::with_default(Week, &["weeks", "week", "wk", "wks", "w"]),
+            CustomTimeUnit::new(
+                Second,
+                &["months", "month", "M"],
+                Some(Multiplier(2_630_016, 0)),
+            ),
+            CustomTimeUnit::new(
+                Second,
+                &["years", "year", "yr", "yrs", "y"],
+                Some(Multiplier(31_557_600, 0)),
+            ),
+        ])
+        .allow_time_unit_delimiter()
+        .disable_exponent()
+        .disable_infinity()
+        .parse_multiple(None)
+        .build()
 }
 
 pub fn parse_length(input: &str) -> Result<u32, String> {

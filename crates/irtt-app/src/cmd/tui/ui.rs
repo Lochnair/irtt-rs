@@ -18,7 +18,6 @@ use irtt_client::{
     ClientEvent, ClientTimestamp, NegotiationResult, OneWayDelaySample, RttSample, SignedDuration,
 };
 use irtt_stats::{StatsCollector, TimeStats};
-use jiff::{tz::TimeZone, Timestamp, ZonedDateTime};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
@@ -1664,12 +1663,52 @@ fn graph_wall_time(anchor: ClientTimestamp, tick: Instant) -> Option<SystemTime>
     }
 }
 
-fn graph_local_time(wall: SystemTime) -> Option<ZonedDateTime> {
-    // Jiff caches the system time zone, and falls back to a UTC-like zone
-    // when it cannot be found.
-    Timestamp::try_from(wall)
-        .ok()
-        .map(|timestamp| timestamp.to_zoned_datetime(TimeZone::system()))
+fn graph_local_time(wall: SystemTime) -> Option<tz::DateTime> {
+    let (seconds, nanoseconds) = match wall.duration_since(SystemTime::UNIX_EPOCH) {
+        Ok(after) => (i64::try_from(after.as_secs()).ok()?, after.subsec_nanos()),
+        Err(error) => {
+            let before = error.duration();
+            let seconds = -i64::try_from(before.as_secs()).ok()?;
+            match before.subsec_nanos() {
+                0 => (seconds, 0),
+                nanos => (seconds - 1, 1_000_000_000 - nanos),
+            }
+        }
+    };
+    #[cfg(unix)]
+    {
+        tz::DateTime::from_timespec(seconds, nanoseconds, local_time_zone().as_ref()).ok()
+    }
+    #[cfg(not(unix))]
+    {
+        // tz-rs cannot find the system time zone off Unix, so ask the OS for
+        // the offset in effect at this instant, falling back to UTC.
+        let offset = time::OffsetDateTime::from_unix_timestamp(seconds)
+            .ok()
+            .and_then(|at| time::UtcOffset::local_offset_at(at).ok())
+            .map_or(0, time::UtcOffset::whole_seconds);
+        let local = tz::LocalTimeType::with_ut_offset(offset).ok()?;
+        tz::DateTime::from_timespec_and_local(seconds, nanoseconds, local).ok()
+    }
+}
+
+/// The local time zone, loaded once: `TZ` when set, otherwise the system zone,
+/// falling back to UTC when neither can be read.
+#[cfg(unix)]
+fn local_time_zone() -> &'static tz::TimeZone {
+    use std::sync::OnceLock;
+
+    static LOCAL: OnceLock<tz::TimeZone> = OnceLock::new();
+    LOCAL.get_or_init(|| {
+        // tz-rs's `local()` reads only /etc/localtime, so honour TZ here.
+        std::env::var("TZ")
+            .ok()
+            .filter(|zone| !zone.is_empty())
+            .map_or_else(tz::TimeZone::local, |zone| {
+                tz::TimeZone::from_posix_tz(&zone)
+            })
+            .unwrap_or_else(|_| tz::TimeZone::utc())
+    })
 }
 
 fn viewport_x_axis_labels(
@@ -1683,7 +1722,10 @@ fn viewport_x_axis_labels(
     let local_at = |tick| graph_wall_time(anchor, tick).and_then(graph_local_time);
     let date_boundary = local_at(viewport.start)
         .zip(local_at(viewport.end))
-        .is_some_and(|(start, end)| start.date() != end.date());
+        .is_some_and(|(start, end)| {
+            (start.year(), start.month(), start.month_day())
+                != (end.year(), end.month(), end.month_day())
+        });
     // Reserve space for the borders/y axis and a gap between labels. Use the
     // longest possible label for this window so narrow charts remain readable.
     let fractional = viewport.window < Duration::from_secs(8);
@@ -1699,12 +1741,17 @@ fn viewport_x_axis_labels(
                 viewport.start.checked_add(step * idx as u32)
             };
             let label = tick.and_then(local_at).map(|local| {
-                let mut label = local.strftime("%H:%M:%S").to_string();
+                let mut label = format!(
+                    "{:02}:{:02}:{:02}",
+                    local.hour(),
+                    local.minute(),
+                    local.second()
+                );
                 if fractional {
-                    label.push_str(&format!(".{}", local.millisecond() / 100));
+                    label.push_str(&format!(".{}", local.nanoseconds() / 100_000_000));
                 }
                 if date_boundary && (idx == 0 || idx == count - 1) {
-                    label = format!("{} {label}", local.strftime("%m-%d"));
+                    label = format!("{:02}-{:02} {label}", local.month(), local.month_day());
                 }
                 label
             });
