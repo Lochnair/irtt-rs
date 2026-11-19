@@ -248,7 +248,13 @@ pub fn parse_test_duration(input: &str) -> Result<Duration, String> {
     if input == "0" {
         return Ok(Duration::ZERO);
     }
-    humantime::parse_duration(input).map_err(|error| error.to_string())
+    let span: jiff::Span = input
+        .parse()
+        .map_err(|error: jiff::Error| error.to_string())?;
+    let duration = span
+        .to_duration(jiff::SpanRelativeTo::days_are_24_hours())
+        .map_err(|error| error.to_string())?;
+    Duration::try_from(duration).map_err(|_| "duration must not be negative".to_owned())
 }
 
 pub fn parse_length(input: &str) -> Result<u32, String> {

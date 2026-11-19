@@ -4,7 +4,6 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use chrono::{DateTime, Local, TimeZone, Utc};
 use crossterm::{
     cursor::Show,
     event::KeyCode,
@@ -19,6 +18,7 @@ use irtt_client::{
     ClientEvent, ClientTimestamp, NegotiationResult, OneWayDelaySample, RttSample, SignedDuration,
 };
 use irtt_stats::{StatsCollector, TimeStats};
+use jiff::{tz::TimeZone, Timestamp, ZonedDateTime};
 use ratatui::{
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
@@ -1664,22 +1664,12 @@ fn graph_wall_time(anchor: ClientTimestamp, tick: Instant) -> Option<SystemTime>
     }
 }
 
-fn graph_local_time(wall: SystemTime) -> Option<DateTime<chrono::FixedOffset>> {
-    let nanos = match wall.duration_since(SystemTime::UNIX_EPOCH) {
-        Ok(duration) => duration.as_nanos() as i128,
-        Err(error) => -(error.duration().as_nanos() as i128),
-    };
-    let seconds = i64::try_from(nanos.div_euclid(1_000_000_000)).ok()?;
-    let subsecond = nanos.rem_euclid(1_000_000_000) as u32;
-    let utc = DateTime::<Utc>::from_timestamp(seconds, subsecond)?;
-    // Chrono also falls back to UTC when the system timezone cannot be found.
-    Some(
-        Local
-            .timestamp_opt(seconds, subsecond)
-            .single()
-            .map(|local| local.fixed_offset())
-            .unwrap_or_else(|| utc.fixed_offset()),
-    )
+fn graph_local_time(wall: SystemTime) -> Option<ZonedDateTime> {
+    // Jiff caches the system time zone, and falls back to a UTC-like zone
+    // when it cannot be found.
+    Timestamp::try_from(wall)
+        .ok()
+        .map(|timestamp| timestamp.to_zoned_datetime(TimeZone::system()))
 }
 
 fn viewport_x_axis_labels(
@@ -1693,7 +1683,7 @@ fn viewport_x_axis_labels(
     let local_at = |tick| graph_wall_time(anchor, tick).and_then(graph_local_time);
     let date_boundary = local_at(viewport.start)
         .zip(local_at(viewport.end))
-        .is_some_and(|(start, end)| start.date_naive() != end.date_naive());
+        .is_some_and(|(start, end)| start.date() != end.date());
     // Reserve space for the borders/y axis and a gap between labels. Use the
     // longest possible label for this window so narrow charts remain readable.
     let fractional = viewport.window < Duration::from_secs(8);
@@ -1709,12 +1699,12 @@ fn viewport_x_axis_labels(
                 viewport.start.checked_add(step * idx as u32)
             };
             let label = tick.and_then(local_at).map(|local| {
-                let mut label = local.format("%H:%M:%S").to_string();
+                let mut label = local.strftime("%H:%M:%S").to_string();
                 if fractional {
-                    label.push_str(&format!(".{}", local.timestamp_subsec_millis() / 100));
+                    label.push_str(&format!(".{}", local.millisecond() / 100));
                 }
                 if date_boundary && (idx == 0 || idx == count - 1) {
-                    label = format!("{} {label}", local.format("%m-%d"));
+                    label = format!("{} {label}", local.strftime("%m-%d"));
                 }
                 label
             });
