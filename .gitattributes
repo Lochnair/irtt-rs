@@ -1,0 +1,2 @@
+# Windows CI checks out with core.autocrlf=true; bash cannot run CRLF scripts.
+*.sh text eol=lf

@@ -106,6 +106,7 @@ jobs:
             .gitea/workflows/supply-chain.yml \
             .github/workflows/actions-security.yml \
             .github/workflows/ci-arm.yml \
+            .github/workflows/ci-desktop.yml \
             .github/workflows/osv-scanner.yml \
             .github/workflows/rust-clippy.yml
 

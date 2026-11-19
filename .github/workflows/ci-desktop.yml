@@ -1,0 +1,125 @@
+name: Rust Windows/macOS CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+defaults:
+  run:
+    # Git Bash on Windows, so every step and the smoke test share one shell.
+    shell: bash
+
+jobs:
+  verify:
+    name: cargo ${{ matrix.task }} (${{ matrix.target }})
+    # Gitea has only Linux runners; cover the Windows and macOS release
+    # targets here.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - task: clippy
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+          - task: test
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+          - task: clippy
+            os: macos-latest
+            target: aarch64-apple-darwin
+
+          - task: test
+            os: macos-latest
+            target: aarch64-apple-darwin
+
+          # Intel macOS is a release target without a native runner to test
+          # on; cross-check it from Apple silicon.
+          - task: clippy
+            os: macos-latest
+            target: x86_64-apple-darwin
+
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+
+    env:
+      # `cargo clippy` fails on warnings; `cargo test` takes no lint arguments.
+      LINT_ARGS: ${{ matrix.task == 'clippy' && '-- -D warnings' || '' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@a188e68d0fd2bd36ad51dccb2b07ba6e75105f30 # v2
+        with:
+          target: ${{ matrix.target }}
+          components: clippy
+          cache-key: ${{ matrix.task }}-${{ matrix.target }}
+
+      - name: Run ${{ matrix.task }} with all features
+        run: |
+          # shellcheck disable=SC2086 # LINT_ARGS is intentionally split.
+          cargo ${{ matrix.task }} \
+            --workspace \
+            --all-targets \
+            --all-features \
+            --target ${{ matrix.target }} \
+            --locked \
+            $LINT_ARGS
+
+      # irtt-rs without features is a dispatcher with no applets; its floor is
+      # each applet on its own, checked below.
+      - name: Run ${{ matrix.task }} without default features
+        run: |
+          # shellcheck disable=SC2086 # LINT_ARGS is intentionally split.
+          cargo ${{ matrix.task }} \
+            --workspace \
+            --exclude irtt-rs \
+            --all-targets \
+            --no-default-features \
+            --target ${{ matrix.target }} \
+            --locked \
+            $LINT_ARGS
+
+      - name: Run ${{ matrix.task }} for each irtt-rs applet alone
+        run: |
+          for applet in client server tui; do
+            # shellcheck disable=SC2086 # LINT_ARGS is intentionally split.
+            cargo ${{ matrix.task }} \
+              -p irtt-rs \
+              --all-targets \
+              --no-default-features \
+              --features "$applet" \
+              --target ${{ matrix.target }} \
+              --locked \
+              $LINT_ARGS
+          done
+
+      - name: Build binaries for the smoke test
+        if: matrix.task == 'test'
+        run: |
+          cargo build \
+            -p irtt-rs \
+            --bins \
+            --target ${{ matrix.target }} \
+            --locked
+
+      - name: Smoke test
+        if: matrix.task == 'test'
+        run: scripts/smoke_test.sh "target/${{ matrix.target }}/debug"
