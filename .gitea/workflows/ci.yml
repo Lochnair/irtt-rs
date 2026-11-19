@@ -62,14 +62,29 @@ jobs:
             --locked \
             -- -D warnings
 
+      # irtt-rs without features is a dispatcher with no applets; its floor is
+      # each applet on its own, checked below.
       - name: Run clippy without default features
         run: |
           cargo clippy \
             --workspace \
+            --exclude irtt-rs \
             --all-targets \
             --no-default-features \
             --locked \
             -- -D warnings
+
+      - name: Run clippy for each irtt-rs applet alone
+        run: |
+          for applet in client server tui; do
+            cargo clippy \
+              -p irtt-rs \
+              --all-targets \
+              --no-default-features \
+              --features "$applet" \
+              --locked \
+              -- -D warnings
+          done
 
   verify:
     name: cargo ${{ matrix.task }} (${{ matrix.target }})
@@ -123,14 +138,29 @@ jobs:
             --target ${{ matrix.target }} \
             --locked
 
+      # irtt-rs without features is a dispatcher with no applets; its floor is
+      # each applet on its own, checked below.
       - name: Run ${{ matrix.task }} without default features
         run: |
           cargo ${{ matrix.task }} \
             --workspace \
+            --exclude irtt-rs \
             --all-targets \
             --no-default-features \
             --target ${{ matrix.target }} \
             --locked
+
+      - name: Run ${{ matrix.task }} for each irtt-rs applet alone
+        run: |
+          for applet in client server tui; do
+            cargo ${{ matrix.task }} \
+              -p irtt-rs \
+              --all-targets \
+              --no-default-features \
+              --features "$applet" \
+              --target ${{ matrix.target }} \
+              --locked
+          done
 
   docs:
     name: cargo doc
