@@ -47,7 +47,7 @@ server = ["dep:ctrlc", "dep:hex", "dep:irtt-server", "dep:irtt-proto", "dep:toki
 tui = ["dep:clap-num", "dep:ctrlc", "dep:hex", "dep:fundu", "dep:tokio", "dep:futures-core", "dep:irtt-client", "irtt-client/ancillary", "irtt-client/tokio", "dep:irtt-proto", "stats", "dep:ratatui", "dep:crossterm", "dep:time", "dep:tz-rs"]
 
 [dependencies]
-clap = { version = "4.6.8", features = ["derive", "env"] }
+clap = { version = "4.6.9", features = ["derive", "env"] }
 crossterm = { version = "0.29.0", features = ["event-stream"], optional = true }
 fundu = { version = "2.1.1", default-features = false, features = ["custom"], optional = true }
 futures-core = { version = "0.3.34", default-features = false, optional = true }
